@@ -822,6 +822,160 @@ async def account_edit_form(request: FastAPIRequest, account_id: int):
     )
 
 
+async def retry_password_required_statements(account_id: int, password: str) -> dict:
+    """Retry all password_required statements for the given account.
+
+    Returns a dict with counts of successfully retried statements:
+    {
+        "cc_retried": int,
+        "bank_retried": int,
+        "cc_failed": int,
+        "bank_failed": int,
+    }
+    """
+    from bank_email_fetcher.statements import (
+        parse_statement,
+        reconcile_statement,
+        reconciliation_to_json,
+        enrich_matched_transactions,
+    )
+    from bank_email_fetcher.bank_statements import (
+        parse_bank_statement,
+        reconcile_bank_statement,
+    )
+    from bank_email_fetcher.linker import build_link_context, link_transaction
+
+    result = {"cc_retried": 0, "bank_retried": 0, "cc_failed": 0, "bank_failed": 0}
+
+    # Retry CC statements
+    async with async_session() as session:
+        cc_uploads = (
+            await session.execute(
+                select(StatementUpload)
+                .where(
+                    StatementUpload.account_id == account_id,
+                    StatementUpload.status == "password_required",
+                )
+            )
+        ).scalars().all()
+
+    for upload in cc_uploads:
+        pdf_path = Path(upload.file_path) if upload.file_path else None
+        if not pdf_path or not pdf_path.exists():
+            result["cc_failed"] += 1
+            continue
+
+        try:
+            parsed = await asyncio.to_thread(parse_statement, pdf_path, password)
+
+            # Get transactions for reconciliation
+            async with async_session() as session:
+                db_txns = (
+                    await session.execute(
+                        select(Transaction).where(Transaction.account_id == account_id)
+                    )
+                ).scalars().all()
+
+            recon = reconcile_statement(parsed, db_txns, account_id)
+            await enrich_matched_transactions(recon)
+
+            # Update the upload with parsed data
+            async with async_session() as session:
+                upload_row = await session.get(StatementUpload, upload.id)
+                upload_row.status = "parsed"
+                upload_row.card_number = parsed.card_number
+                upload_row.statement_name = parsed.name
+                upload_row.due_date = parsed.due_date
+                upload_row.total_amount_due = parsed.statement_total_amount_due
+                upload_row.parsed_txn_count = len(recon["matched"]) + len(recon["missing"])
+                upload_row.matched_count = len(recon["matched"])
+                upload_row.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
+                upload_row.reconciliation_data = reconciliation_to_json(recon)
+                upload_row.error = None
+                await session.commit()
+
+            result["cc_retried"] += 1
+            logger.info(
+                "Successfully retried CC statement %d for account %d",
+                upload.id,
+                account_id,
+            )
+        except Exception as e:
+            result["cc_failed"] += 1
+            logger.warning(
+                "Failed to retry CC statement %d for account %d: %s",
+                upload.id,
+                account_id,
+                e,
+            )
+
+    # Retry bank statements
+    async with async_session() as session:
+        bank_uploads = (
+            await session.execute(
+                select(BankStatementUpload)
+                .where(
+                    BankStatementUpload.account_id == account_id,
+                    BankStatementUpload.status == "password_required",
+                )
+            )
+        ).scalars().all()
+
+    for upload in bank_uploads:
+        pdf_path = Path(upload.file_path) if upload.file_path else None
+        if not pdf_path or not pdf_path.exists():
+            result["bank_failed"] += 1
+            continue
+
+        try:
+            parsed = await asyncio.to_thread(parse_bank_statement, pdf_path, upload.bank, password)
+
+            # Get transactions for reconciliation
+            async with async_session() as session:
+                db_txns = (
+                    await session.execute(
+                        select(Transaction).where(Transaction.account_id == account_id)
+                    )
+                ).scalars().all()
+
+            recon = reconcile_bank_statement(parsed, db_txns, account_id)
+            await enrich_matched_transactions(recon)
+
+            # Update the upload with parsed data
+            async with async_session() as session:
+                upload_row = await session.get(BankStatementUpload, upload.id)
+                upload_row.status = "parsed"
+                upload_row.account_number = parsed.account_number
+                upload_row.account_holder_name = parsed.account_holder_name
+                upload_row.opening_balance = parsed.opening_balance
+                upload_row.closing_balance = parsed.closing_balance
+                upload_row.statement_period_start = parsed.statement_period_start
+                upload_row.statement_period_end = parsed.statement_period_end
+                upload_row.parsed_txn_count = len(recon["matched"]) + len(recon["missing"])
+                upload_row.matched_count = len(recon["matched"])
+                upload_row.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
+                upload_row.reconciliation_data = reconciliation_to_json(recon)
+                upload_row.error = None
+                await session.commit()
+
+            result["bank_retried"] += 1
+            logger.info(
+                "Successfully retried bank statement %d for account %d",
+                upload.id,
+                account_id,
+            )
+        except Exception as e:
+            result["bank_failed"] += 1
+            logger.warning(
+                "Failed to retry bank statement %d for account %d: %s",
+                upload.id,
+                account_id,
+                e,
+            )
+
+    return result
+
+
 @app.post("/accounts/{account_id}/edit")
 async def account_update(
     request: FastAPIRequest,
@@ -833,6 +987,9 @@ async def account_update(
     statement_password: str = Form(""),
     statement_password_hint: str = Form(""),
 ):
+    password_changed = False
+    new_password_plain = None
+
     async with async_session() as session:
         account = await session.get(Account, account_id)
         if not account:
@@ -851,6 +1008,8 @@ async def account_update(
             account.statement_password = (
                 get_fernet().encrypt(statement_password.strip().encode()).decode()
             )
+            password_changed = True
+            new_password_plain = statement_password.strip()
         elif not statement_password:
             account.statement_password = None
 
@@ -859,6 +1018,24 @@ async def account_update(
 
     async with async_session() as session:
         await auto_link_transactions(session, account)
+
+    # Automatically retry password-required statements when password is set/changed
+    if password_changed and new_password_plain:
+        try:
+            retry_result = await retry_password_required_statements(account_id, new_password_plain)
+            total_retried = retry_result["cc_retried"] + retry_result["bank_retried"]
+            if total_retried > 0:
+                logger.info(
+                    "Automatically retried %d password-required statements for account %d",
+                    total_retried,
+                    account_id,
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to automatically retry password-required statements for account %d: %s",
+                account_id,
+                e,
+            )
 
     return RedirectResponse(url="/accounts", status_code=303)
 
@@ -1954,7 +2131,7 @@ async def statement_upload(
             try:
                 amount = parse_cc_amount(entry["amount"])
                 txn_date = parse_cc_date(entry["date"])
-            except ValueError, KeyError:
+            except (ValueError, KeyError):
                 continue
             txn = Transaction(
                 statement_upload_id=upload.id,
@@ -2090,7 +2267,7 @@ async def bank_statement_upload(
             try:
                 amount = _parse_amount(entry["amount"])
                 txn_date = _parse_date(entry["date"])
-            except ValueError, KeyError:
+            except (ValueError, KeyError):
                 continue
             txn = Transaction(
                 bank_statement_upload_id=upload.id,
@@ -2246,7 +2423,7 @@ async def bank_statement_retry(
             try:
                 amount = _parse_amount(entry["amount"])
                 txn_date = _parse_date(entry["date"])
-            except ValueError, KeyError:
+            except (ValueError, KeyError):
                 continue
             txn = Transaction(
                 bank_statement_upload_id=upload_id,
@@ -2442,7 +2619,7 @@ async def statement_retry(
             try:
                 amount = parse_cc_amount(entry["amount"])
                 txn_date = parse_cc_date(entry["date"])
-            except ValueError, KeyError:
+            except (ValueError, KeyError):
                 continue
             txn = Transaction(
                 statement_upload_id=upload_id,
