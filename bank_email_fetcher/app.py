@@ -2131,7 +2131,7 @@ async def statement_upload(
             try:
                 amount = parse_cc_amount(entry["amount"])
                 txn_date = parse_cc_date(entry["date"])
-            except (ValueError, KeyError):
+            except ValueError, KeyError:
                 continue
             txn = Transaction(
                 statement_upload_id=upload.id,
@@ -2267,7 +2267,7 @@ async def bank_statement_upload(
             try:
                 amount = _parse_amount(entry["amount"])
                 txn_date = _parse_date(entry["date"])
-            except (ValueError, KeyError):
+            except ValueError, KeyError:
                 continue
             txn = Transaction(
                 bank_statement_upload_id=upload.id,
@@ -2423,7 +2423,7 @@ async def bank_statement_retry(
             try:
                 amount = _parse_amount(entry["amount"])
                 txn_date = _parse_date(entry["date"])
-            except (ValueError, KeyError):
+            except ValueError, KeyError:
                 continue
             txn = Transaction(
                 bank_statement_upload_id=upload_id,
@@ -2619,7 +2619,7 @@ async def statement_retry(
             try:
                 amount = parse_cc_amount(entry["amount"])
                 txn_date = parse_cc_date(entry["date"])
-            except (ValueError, KeyError):
+            except ValueError, KeyError:
                 continue
             txn = Transaction(
                 statement_upload_id=upload_id,
