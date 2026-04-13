@@ -74,6 +74,16 @@ from bank_email_fetcher.fetcher import (
     _process_email,
 )
 from bank_email_fetcher.linker import build_link_context, link_transaction
+from bank_email_fetcher.statements import (
+    parse_statement,
+    reconcile_statement,
+    reconciliation_to_json,
+    enrich_matched_transactions,
+)
+from bank_email_fetcher.bank_statements import (
+    parse_bank_statement,
+    reconcile_bank_statement,
+)
 from bank_email_parser import SUPPORTED_BANKS
 
 logging.basicConfig(
@@ -833,21 +843,9 @@ async def retry_password_required_statements(account_id: int, password: str) -> 
         "bank_failed": int,
     }
     """
-    from bank_email_fetcher.statements import (
-        parse_statement,
-        reconcile_statement,
-        reconciliation_to_json,
-        enrich_matched_transactions,
-    )
-    from bank_email_fetcher.bank_statements import (
-        parse_bank_statement,
-        reconcile_bank_statement,
-    )
-    from bank_email_fetcher.linker import build_link_context, link_transaction
-
     result = {"cc_retried": 0, "bank_retried": 0, "cc_failed": 0, "bank_failed": 0}
 
-    # Retry CC statements
+    # Get all password_required uploads for this account
     async with async_session() as session:
         cc_uploads = (
             await session.execute(
@@ -859,6 +857,24 @@ async def retry_password_required_statements(account_id: int, password: str) -> 
             )
         ).scalars().all()
 
+        bank_uploads = (
+            await session.execute(
+                select(BankStatementUpload)
+                .where(
+                    BankStatementUpload.account_id == account_id,
+                    BankStatementUpload.status == "password_required",
+                )
+            )
+        ).scalars().all()
+
+        # Query transactions once for all reconciliations
+        db_txns = (
+            await session.execute(
+                select(Transaction).where(Transaction.account_id == account_id)
+            )
+        ).scalars().all()
+
+    # Retry CC statements
     for upload in cc_uploads:
         pdf_path = Path(upload.file_path) if upload.file_path else None
         if not pdf_path or not pdf_path.exists():
@@ -867,15 +883,6 @@ async def retry_password_required_statements(account_id: int, password: str) -> 
 
         try:
             parsed = await asyncio.to_thread(parse_statement, pdf_path, password)
-
-            # Get transactions for reconciliation
-            async with async_session() as session:
-                db_txns = (
-                    await session.execute(
-                        select(Transaction).where(Transaction.account_id == account_id)
-                    )
-                ).scalars().all()
-
             recon = reconcile_statement(parsed, db_txns, account_id)
             await enrich_matched_transactions(recon)
 
@@ -910,17 +917,6 @@ async def retry_password_required_statements(account_id: int, password: str) -> 
             )
 
     # Retry bank statements
-    async with async_session() as session:
-        bank_uploads = (
-            await session.execute(
-                select(BankStatementUpload)
-                .where(
-                    BankStatementUpload.account_id == account_id,
-                    BankStatementUpload.status == "password_required",
-                )
-            )
-        ).scalars().all()
-
     for upload in bank_uploads:
         pdf_path = Path(upload.file_path) if upload.file_path else None
         if not pdf_path or not pdf_path.exists():
@@ -929,15 +925,6 @@ async def retry_password_required_statements(account_id: int, password: str) -> 
 
         try:
             parsed = await asyncio.to_thread(parse_bank_statement, pdf_path, upload.bank, password)
-
-            # Get transactions for reconciliation
-            async with async_session() as session:
-                db_txns = (
-                    await session.execute(
-                        select(Transaction).where(Transaction.account_id == account_id)
-                    )
-                ).scalars().all()
-
             recon = reconcile_bank_statement(parsed, db_txns, account_id)
             await enrich_matched_transactions(recon)
 
@@ -987,9 +974,6 @@ async def account_update(
     statement_password: str = Form(""),
     statement_password_hint: str = Form(""),
 ):
-    password_changed = False
-    new_password_plain = None
-
     async with async_session() as session:
         account = await session.get(Account, account_id)
         if not account:
@@ -1008,8 +992,6 @@ async def account_update(
             account.statement_password = (
                 get_fernet().encrypt(statement_password.strip().encode()).decode()
             )
-            password_changed = True
-            new_password_plain = statement_password.strip()
         elif not statement_password:
             account.statement_password = None
 
@@ -1019,10 +1001,10 @@ async def account_update(
     async with async_session() as session:
         await auto_link_transactions(session, account)
 
-    # Automatically retry password-required statements when password is set/changed
-    if password_changed and new_password_plain:
+    # Automatically retry password-required statements when password is provided
+    if statement_password.strip():
         try:
-            retry_result = await retry_password_required_statements(account_id, new_password_plain)
+            retry_result = await retry_password_required_statements(account_id, statement_password.strip())
             total_retried = retry_result["cc_retried"] + retry_result["bank_retried"]
             if total_retried > 0:
                 logger.info(
