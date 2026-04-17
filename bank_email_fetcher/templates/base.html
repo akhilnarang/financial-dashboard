@@ -348,6 +348,27 @@
             letter-spacing: 0;
         }
 
+        /* Primary/ghost modifiers for .btn-action — opt in for form CTAs. */
+        .btn-action.btn-primary {
+            background: var(--nav-pill-active-bg);
+            color: var(--nav-pill-active-fg);
+            border-color: var(--nav-pill-active-bg);
+            font-weight: 600;
+        }
+        .btn-action.btn-primary:hover:not(:disabled) {
+            filter: brightness(1.1);
+            border-color: var(--nav-pill-active-bg);
+        }
+        .btn-action.btn-ghost {
+            border-color: transparent;
+            opacity: 0.75;
+        }
+        .btn-action.btn-ghost:hover:not(:disabled) {
+            opacity: 1;
+            background: var(--surface-muted);
+        }
+        a.btn-action { text-decoration: none; }
+
         .empty-state {
             text-align: center;
             padding: 3rem 1.5rem;

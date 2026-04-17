@@ -43,9 +43,9 @@
                     <input type="text" name="statement_password_hint" value="{{ account.statement_password_hint or '' }}" placeholder="e.g. DOB in DDMMYYYY format" autocomplete="off">
                 </label>
             </div>
-            <div style="margin-top: 1rem; display: flex; gap: 0.5rem;">
-                <button type="submit">Save</button>
-                <a href="/accounts"><button type="button" data-variant="secondary">Cancel</button></a>
+            <div style="margin-top: 1rem; display: flex; gap: 0.5rem; align-items: center;">
+                <button type="submit" class="btn-action btn-primary">Save</button>
+                <a href="/accounts" class="btn-action btn-ghost">Cancel</a>
             </div>
         </form>
     </article>
