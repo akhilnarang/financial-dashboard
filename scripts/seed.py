@@ -197,6 +197,16 @@ RULES = [
     ("gmail", "bom", "mahaalert@mahabank.co.in", None, None, None),
     # Yes Bank (Gmail)
     ("gmail", "yesbank", "alerts@yes.bank.in", "Transaction Alert", None, None),
+    # Jupiter — UPI txn alerts from alerts@, CC statements from noreply@.
+    ("gmail", "jupiter", "alerts@jupiter.money", None, None, None),
+    (
+        "gmail",
+        "jupiter",
+        "noreply@jupiter.money",
+        "credit card statement",
+        None,
+        "cc_statement",
+    ),
 ]
 
 
