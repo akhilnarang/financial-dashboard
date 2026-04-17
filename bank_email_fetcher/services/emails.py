@@ -157,7 +157,11 @@ async def parse_email_by_kind(
         if try_cc:
             try:
                 stmt_result = await process_statement_email(
-                    bank, raw_bytes, subject, source_id=source_id
+                    bank,
+                    raw_bytes,
+                    subject,
+                    source_id=source_id,
+                    password_hint=password_hint,
                 )
             except Exception as stmt_err:
                 logger.warning(

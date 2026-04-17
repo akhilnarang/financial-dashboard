@@ -54,6 +54,7 @@ from bank_email_fetcher.services.settings import (
     should_notify_transactions,
 )
 from bank_email_fetcher.services.statements.cc import extract_pdf_from_email
+from bank_email_fetcher.services.statements.hint import extract_password_hint
 from bank_email_fetcher.services.telegram import (
     build_account_label,
     send_bulk_summary,
@@ -71,34 +72,6 @@ def _safe_filename(filename: str | None) -> str:
     base = Path(filename or "statement.pdf").name or "statement.pdf"
     cleaned = _SAFE_FILENAME_RE.sub("_", base).strip("._") or "statement.pdf"
     return cleaned[:120]
-
-
-def _extract_html_from_email(raw_bytes: bytes) -> str | None:
-    """Extract the first text/html part from raw RFC822 email bytes."""
-    msg = email_lib.message_from_bytes(raw_bytes)
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/html":
-                if payload := part.get_payload(decode=True):
-                    return payload.decode("utf-8", errors="replace")
-    elif msg.get_content_type() == "text/html":
-        if payload := msg.get_payload(decode=True):
-            return payload.decode("utf-8", errors="replace")
-    return None
-
-
-def extract_password_hint(raw_bytes: bytes, bank: str) -> str | None:
-    """Extract password hint from statement email by calling parse_email.
-
-    Used by the fetcher as a fallback when the hint wasn't threaded through
-    from the parse step (e.g., for reprocess-failed paths).
-    """
-    if not (html := _extract_html_from_email(raw_bytes)):
-        return None
-    try:
-        return parse_transaction_email(bank, html).password_hint
-    except ParseError, UnsupportedEmailTypeError:
-        return None
 
 
 # ---------------------------------------------------------------------------

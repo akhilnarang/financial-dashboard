@@ -58,6 +58,7 @@ from bank_email_fetcher.integrations.parsers import (
     parse_cc_token_amount,
 )
 from bank_email_fetcher.services.linker import build_link_context, link_transaction
+from bank_email_fetcher.services.statements.hint import extract_password_hint
 from bank_email_fetcher.services.settings import (
     get_setting_int,
     get_telegram_chat_id,
@@ -422,36 +423,6 @@ def _parse_pdf_bytes_sync(pdf_bytes: bytes, password: str | None = None):
         tmp_path.unlink(missing_ok=True)
 
 
-async def _canonical_bank_name(bank: str) -> str:
-    """Return the canonical spelling for ``bank``.
-
-    Looks for an existing spelling (case-insensitive) in ``Account.bank`` or
-    ``Transaction.bank`` and preserves it so auto-created rows line up with
-    manually-created ones. Falls back to ``bank.upper()`` (the convention used
-    elsewhere in the codebase, e.g. the Add Account form placeholder "HDFC").
-
-    ``.title()`` is avoided because it mangles acronyms like ICICI → Icici and
-    SBI → Sbi.
-    """
-    lowered = bank.lower()
-    async with async_session() as session:
-        existing = await session.execute(
-            select(Account.bank).where(func.lower(Account.bank) == lowered).limit(1)
-        )
-        row = existing.first()
-        if row and row[0]:
-            return row[0]
-        existing = await session.execute(
-            select(Transaction.bank)
-            .where(func.lower(Transaction.bank) == lowered)
-            .limit(1)
-        )
-        row = existing.first()
-        if row and row[0]:
-            return row[0]
-    return bank.upper()
-
-
 async def _find_account(bank: str, parsed) -> "Account | None":
     """Find an existing credit_card account matching the statement's card.
 
@@ -532,6 +503,7 @@ async def process_statement_email(
     raw_bytes: bytes,
     email_subject: str,
     source_id: int | None = None,
+    password_hint: str | None = None,
 ) -> dict | None:
     """Try to process an email as a CC statement.
 
@@ -574,6 +546,11 @@ async def process_statement_email(
             "Skipping CC statement path: no credit_card account for bank=%s", bank
         )
         return None
+
+    if not password_hint:
+        password_hint = extract_password_hint(raw_bytes, bank=bank)
+    if password_hint:
+        logger.info("Password hint: %s", password_hint)
 
     # Extract PDF attachments
     pdfs = extract_pdf_from_email(raw_bytes)
@@ -643,43 +620,40 @@ async def process_statement_email(
                 continue
 
         if not parsed:
-            # No stored password worked — save for manual retry
+            # No stored password worked — save for manual retry.
             STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
             safe_name = filename.replace("/", "_").replace("\\", "_")
             file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
             file_path.write_bytes(pdf_bytes)
 
-            account = cc_accounts[0] if cc_accounts else None
-            upload_bank = account.bank if account else await _canonical_bank_name(bank)
+            # Only attach if there's exactly one CC account for this bank;
+            # otherwise we'd mis-attribute the PDF.
+            account = cc_accounts[0] if len(cc_accounts) == 1 else None
             if not account:
-                # If no credit_card account exists for this bank yet, auto-create
-                # a placeholder so the password_required upload can be saved.
-                async with async_session() as session:
-                    account = Account(
-                        bank=upload_bank,
-                        label=f"{upload_bank} CC",
-                        type="credit_card",
-                        active=True,
-                    )
-                    session.add(account)
-                    await session.commit()
-                    await session.refresh(account)
-                    logger.info(
-                        "Auto-created placeholder account %s (id=%s) for encrypted statement",
-                        account.label,
-                        account.id,
-                    )
+                logger.warning(
+                    "Encrypted CC statement received but %d candidate accounts for bank=%s — leaving unassigned (%s)",
+                    len(cc_accounts),
+                    bank,
+                    safe_name,
+                )
+                return None
 
             async with async_session() as session:
                 upload = StatementUpload(
                     account_id=account.id,
-                    bank=upload_bank,
+                    bank=account.bank,
                     filename=safe_name,
                     file_path=str(file_path),
                     status="password_required",
                     error="PDF is encrypted — provide password via Statements page",
                 )
+                if (
+                    password_hint
+                    and not account.statement_password_hint
+                    and (account_row := await session.get(Account, account.id))
+                ):
+                    account_row.statement_password_hint = password_hint
                 session.add(upload)
                 await session.commit()
                 logger.info(
