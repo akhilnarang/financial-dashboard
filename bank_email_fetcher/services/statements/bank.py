@@ -22,7 +22,6 @@ are used inside async functions to avoid circular import issues.
 
 import asyncio
 import datetime
-import email as email_lib
 import json
 import logging
 import re
@@ -41,12 +40,7 @@ from bank_email_fetcher.db import (
 
 from bank_email_fetcher.config import get_fernet
 from bank_email_fetcher.core.dates import parse_date
-from bank_email_fetcher.integrations.parsers import (
-    ParseError,
-    UnsupportedEmailTypeError,
-    parse_bank_statement_pdf,
-    parse_transaction_email,
-)
+from bank_email_fetcher.integrations.parsers import parse_bank_statement_pdf
 from bank_email_fetcher.services.linker import build_link_context, link_transaction
 from bank_email_fetcher.services.settings import (
     get_setting_int,

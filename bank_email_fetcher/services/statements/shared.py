@@ -14,7 +14,6 @@ from bank_email_fetcher.core.dates import parse_date
 from bank_email_fetcher.db import (
     Account,
     BankStatementUpload,
-    Card,
     StatementUpload,
     Transaction,
     async_session,
@@ -32,10 +31,8 @@ from bank_email_fetcher.services.statements.bank import (
     reconcile_bank_statement,
 )
 from bank_email_fetcher.services.statements.cc import (
-    _extract_digits,
     enrich_matched_transactions,
-    last4_from_card,
-    parse_cc_amount,
+    import_missing_cc_txns,
     parse_statement,
     reconcile_statement,
     reconciliation_to_json,
@@ -97,57 +94,9 @@ async def retry_cc_statement_upload(
         upload.reconciliation_data = reconciliation_to_json(recon)
         upload.error = None
 
-        link_ctx = await build_link_context(session)
-        account_cards = (
-            (await session.execute(select(Card).where(Card.account_id == account_id)))
-            .scalars()
-            .all()
+        imported = len(
+            await import_missing_cc_txns(session, upload, parsed, account, recon)
         )
-        card_last4s = [
-            v for v in (last4_from_card(c.card_mask) for c in account_cards) if v
-        ]
-
-        def resolve_card_mask(raw: str | None) -> str | None:
-            if l4 := last4_from_card(raw):
-                return l4
-            if partial := _extract_digits(raw):
-                for cl4 in card_last4s:
-                    if cl4.endswith(partial):
-                        return cl4
-            return last4_from_card(account.account_number) if account else None
-
-        imported = 0
-        for entry in recon["missing"]:
-            if entry.get("imported"):
-                continue
-            try:
-                amount = parse_cc_amount(entry["amount"])
-                txn_date = parse_date(entry["date"], dayfirst=True)
-            except KeyError, TypeError, ValueError:
-                txn_date = None
-            if txn_date is None:
-                continue
-            txn = Transaction(
-                statement_upload_id=upload_id,
-                account_id=account_id,
-                bank=parsed.bank,
-                email_type="cc_statement",
-                direction=entry["direction"],
-                amount=amount,
-                currency="INR",
-                transaction_date=txn_date,
-                counterparty=entry.get("narration"),
-                card_mask=resolve_card_mask(entry.get("card_number")),
-                channel="cc_statement",
-                raw_description=entry.get("narration"),
-            )
-            session.add(txn)
-            await session.flush()
-            link_transaction(link_ctx, txn)
-            await session.flush()
-            entry["imported"] = True
-            entry["imported_txn_id"] = txn.id
-            imported += 1
 
         upload.imported_count = imported
         upload.missing_count = sum(

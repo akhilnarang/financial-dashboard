@@ -300,6 +300,134 @@ async def enrich_matched_transactions(recon: dict) -> int:
     return enriched
 
 
+async def resolve_cc_card_mask(
+    session,
+    account: "Account | None",
+    raw: str | None,
+) -> str | None:
+    """Resolve a statement's card-number string to a canonical last-4 mask.
+
+    Statement PDFs print the card number in many shapes — `XXXX XXXX XXXX
+    1234`, `XX1234`, `XX34` (SBI), or just blank. This collapses all of
+    those to a single last-4 string (or None) so downstream rows can match
+    across sources, and falls back to addon-card and account-level matches
+    when the raw value is only a partial suffix.
+
+    Resolution order:
+
+    1. Parse ``raw`` directly with ``last4_from_card``. Returns it if found.
+    2. If ``raw`` has at least one digit but didn't match in (1) — meaning
+       the statement only printed a partial suffix — check each card
+       registered on ``account`` and return the one whose last-4 ends with
+       that partial suffix.
+    3. Fall back to ``last4_from_card(account.account_number)`` — the
+       account itself may have been manually created with a last-4 in
+       ``account_number``.
+
+    Args:
+        session: Open async SQLAlchemy session, used to look up
+            ``account``'s cards. Only read, no writes.
+        account: The ``Account`` we're importing into. ``None`` short-
+            circuits the function back to the direct parse (step 1 only).
+        raw: The raw card-number string from the statement entry. May be
+            ``None`` / empty.
+
+    Returns:
+        A 4-digit ``str`` when any of the three steps resolves, otherwise
+        ``None``.
+    """
+    if l4 := last4_from_card(raw):
+        return l4
+    if account is None:
+        return None
+    account_cards = (
+        (await session.execute(select(Card).where(Card.account_id == account.id)))
+        .scalars()
+        .all()
+    )
+    card_last4s = [v for v in (last4_from_card(c.card_mask) for c in account_cards) if v]
+    if partial := _extract_digits(raw):
+        for cl4 in card_last4s:
+            if cl4.endswith(partial):
+                return cl4
+    return last4_from_card(account.account_number)
+
+
+async def import_missing_cc_txns(
+    session,
+    upload: "StatementUpload",
+    parsed,
+    account: "Account | None",
+    recon: dict,
+) -> list["Transaction"]:
+    """Import ``recon["missing"]`` entries as CC-statement ``Transaction`` rows.
+
+    Used by every code path that processes a CC statement — initial upload,
+    polling, password-entry retry, and manual reprocess — so they stay in
+    sync. Each new row is linked to ``upload`` via ``statement_upload_id``,
+    scoped to ``upload.account_id``, and run through ``link_transaction`` so
+    the card mask resolves to an addon card when possible.
+
+    Args:
+        session: Open async SQLAlchemy session. The caller owns the
+            transaction; this function calls ``flush`` but never ``commit``.
+        upload: The ``StatementUpload`` row this statement belongs to. Must
+            already be flushed (``upload.id`` is read and set on each new
+            transaction).
+        parsed: The cc-parser ``ParsedStatement`` — used for ``parsed.bank``
+            on each created row.
+        account: The matching credit_card ``Account`` (or None if unknown).
+            Used as a last-resort fallback for card-mask resolution when
+            the statement entry's card number can't be resolved via the
+            account's linked ``cards``.
+        recon: Reconciliation dict from ``reconcile_statement``. Mutated
+            in place: each imported entry gets ``imported=True`` and
+            ``imported_txn_id=<new txn id>``. Entries already marked
+            ``imported`` are skipped, making this function idempotent.
+            Entries whose amount or date fail to parse are skipped silently.
+
+    Returns:
+        The newly-created ``Transaction`` objects, in order of processing.
+        Excludes rows already imported in a prior call. Callers that only
+        need the count can take ``len()`` of the result.
+    """
+    link_ctx = await build_link_context(session)
+    imported: list[Transaction] = []
+    for entry in recon["missing"]:
+        if entry.get("imported"):
+            continue
+        try:
+            amount = parse_cc_amount(entry["amount"])
+            txn_date = parse_cc_date(entry["date"])
+        except ValueError, KeyError:
+            continue
+        txn = Transaction(
+            statement_upload_id=upload.id,
+            account_id=upload.account_id,
+            bank=parsed.bank,
+            email_type="cc_statement",
+            direction=entry["direction"],
+            amount=amount,
+            currency="INR",
+            transaction_date=txn_date,
+            counterparty=entry.get("narration"),
+            card_mask=await resolve_cc_card_mask(
+                session, account, entry.get("card_number")
+            ),
+            channel="cc_statement",
+            raw_description=entry.get("narration"),
+        )
+        session.add(txn)
+        await session.flush()
+        link_transaction(link_ctx, txn)
+        await session.flush()
+        entry["imported"] = True
+        entry["imported_txn_id"] = txn.id
+        imported.append(txn)
+
+    return imported
+
+
 def reconciliation_to_json(data: dict) -> str:
     """Serialize reconciliation data to JSON."""
     return json.dumps(data)
@@ -717,63 +845,12 @@ async def process_statement_email(
         session.add(upload)
         await session.flush()
 
-        # Auto-import all missing transactions
-        link_ctx = await build_link_context(session)
-
-        # Build a lookup to resolve partial card digits (e.g. SBI "67" → "0567")
-        # against cards registered for this account.
-        acct_cards = (
-            (await session.execute(select(Card).where(Card.account_id == account.id)))
-            .scalars()
-            .all()
+        imported_rows = await import_missing_cc_txns(
+            session, upload, parsed, account, recon
         )
-        _card_l4s = [last4_from_card(c.card_mask) for c in acct_cards]
-        _card_l4s = [v for v in _card_l4s if v]
 
-        def _resolve_card_mask(raw: str | None) -> str | None:
-            l4 = last4_from_card(raw)
-            if l4:
-                return l4
-            partial = _extract_digits(raw)
-            if partial:
-                for cl4 in _card_l4s:
-                    if cl4.endswith(partial):
-                        return cl4
-            return last4_from_card(account.account_number)
-
-        imported = 0
         imported_txns: list[tuple[int, dict]] = []
-        for entry in recon["missing"]:
-            try:
-                amount = parse_cc_amount(entry["amount"])
-                txn_date = parse_cc_date(entry["date"])
-            except ValueError, KeyError:
-                continue
-
-            resolved_mask = _resolve_card_mask(entry.get("card_number"))
-
-            txn = Transaction(
-                statement_upload_id=upload.id,
-                account_id=account.id,
-                bank=bank,
-                email_type="cc_statement",
-                direction=entry["direction"],
-                amount=amount,
-                currency="INR",
-                transaction_date=txn_date,
-                counterparty=entry.get("narration"),
-                card_mask=resolved_mask,
-                channel="cc_statement",
-                raw_description=entry.get("narration"),
-            )
-            session.add(txn)
-            await session.flush()
-            link_transaction(link_ctx, txn)
-            await session.flush()
-
-            entry["imported"] = True
-            entry["imported_txn_id"] = txn.id
-            imported += 1
+        for txn in imported_rows:
             account_obj = (
                 await session.get(Account, txn.account_id) if txn.account_id else None
             )
@@ -795,12 +872,12 @@ async def process_statement_email(
                 )
             )
 
-        upload.imported_count = imported
+        upload.imported_count = len(imported_rows)
         upload.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
         upload.reconciliation_data = reconciliation_to_json(recon)
         if upload.missing_count == 0:
             upload.status = "imported"  # all matched or all imported
-        elif imported > 0:
+        elif imported_rows:
             upload.status = "partial_import"
         await session.commit()
 
@@ -832,13 +909,13 @@ async def process_statement_email(
             account.label,
             len(recon["matched"]),
             len(recon["missing"]),
-            imported,
+            len(imported_rows),
             enriched,
         )
         return {
             "statement_upload_id": upload.id,
             "matched": len(recon["matched"]),
             "missing": len(recon["missing"]),
-            "imported": imported,
+            "imported": len(imported_rows),
             "enriched": enriched,
         }
