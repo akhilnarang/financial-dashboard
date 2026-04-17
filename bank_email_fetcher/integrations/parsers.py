@@ -29,9 +29,11 @@ def parse_transaction_email(bank: str, html: str):
     return _parse_email(bank, html)
 
 
-def parse_cc_statement_pdf(pdf_path: Path, password: str | None = None):
+def parse_cc_statement_pdf(
+    pdf_path: Path, password: str | None = None, bank: str = "auto"
+):
     raw_data = _extract_cc_pdf(pdf_path, include_blocks=True, password=password or None)
-    parser = _get_cc_parser("auto", raw_data)
+    parser = _get_cc_parser(bank, raw_data)
     return parser.parse(raw_data)
 
 

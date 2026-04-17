@@ -253,7 +253,9 @@ async def statement_upload(
 
     # Parse the PDF
     try:
-        parsed = await asyncio.to_thread(parse_statement, file_path, password or None)
+        parsed = await asyncio.to_thread(
+            parse_statement, file_path, password or None, account.bank
+        )
     except Exception as e:
         error_msg = str(e)
         is_encrypted = "encrypt" in error_msg.lower() or "password" in error_msg.lower()
@@ -530,10 +532,11 @@ async def statement_reprocess(
             status_code=303,
         )
 
+    bank = account.bank if account else upload.bank
     pdf_path = Path(file_path) if file_path else None
     if pdf_path and pdf_path.exists():
         try:
-            parsed = await asyncio.to_thread(parse_statement, pdf_path, password)
+            parsed = await asyncio.to_thread(parse_statement, pdf_path, password, bank)
         except Exception as e:
             return _reprocess_fail(f"Parse error: {e}")
     elif email_id:
@@ -575,7 +578,7 @@ async def statement_reprocess(
 
         try:
             parsed = await asyncio.to_thread(
-                _parse_pdf_bytes_sync, pdfs[0][1], password
+                _parse_pdf_bytes_sync, pdfs[0][1], password, bank
             )
         except Exception as e:
             return _reprocess_fail(f"Parse error: {e}")
@@ -596,6 +599,7 @@ async def statement_reprocess(
     await enrich_matched_transactions(recon)
 
     upload = await session.get(StatementUpload, upload_id)
+    upload.bank = parsed.bank
     upload.card_number = parsed.card_number
     upload.statement_name = parsed.name
     if (

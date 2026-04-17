@@ -75,9 +75,9 @@ logger = logging.getLogger(__name__)
 STATEMENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "statements"
 
 
-def parse_statement(pdf_path: Path, password: str | None = None):
+def parse_statement(pdf_path: Path, password: str | None = None, bank: str = "auto"):
     """Parse a CC statement PDF. Returns a ParsedStatement."""
-    return parse_cc_statement_pdf(pdf_path, password)
+    return parse_cc_statement_pdf(pdf_path, password, bank=bank)
 
 
 def parse_cc_amount(amount_str: str) -> Decimal:
@@ -412,13 +412,15 @@ def extract_pdf_from_email(raw_bytes: bytes) -> list[tuple[str, bytes]]:
     return pdfs
 
 
-def _parse_pdf_bytes_sync(pdf_bytes: bytes, password: str | None = None):
+def _parse_pdf_bytes_sync(
+    pdf_bytes: bytes, password: str | None = None, bank: str = "auto"
+):
     """Save PDF bytes to temp file, parse, and clean up. Returns ParsedStatement."""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
         f.write(pdf_bytes)
         tmp_path = Path(f.name)
     try:
-        return parse_statement(tmp_path, password)
+        return parse_statement(tmp_path, password, bank=bank)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -573,7 +575,7 @@ async def process_statement_email(
     # Parse the PDF — try without password first, then with stored passwords
     parsed = None
     try:
-        parsed = await asyncio.to_thread(_parse_pdf_bytes_sync, pdf_bytes)
+        parsed = await asyncio.to_thread(_parse_pdf_bytes_sync, pdf_bytes, None, bank)
     except ValueError as e:
         if "encrypt" not in str(e).lower() and "password" not in str(e).lower():
             logger.warning("Failed to parse statement PDF from email: %s", e)
@@ -609,7 +611,7 @@ async def process_statement_email(
 
         for acc, pw in passwords_to_try:
             try:
-                parsed = await asyncio.to_thread(_parse_pdf_bytes_sync, pdf_bytes, pw)
+                parsed = await asyncio.to_thread(_parse_pdf_bytes_sync, pdf_bytes, pw, bank)
                 logger.info(
                     "Decrypted statement PDF using stored password for %s (%s)",
                     bank,

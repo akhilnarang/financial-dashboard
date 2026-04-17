@@ -55,9 +55,12 @@ async def retry_cc_statement_upload(
             return False
         account_id = upload.account_id
         file_path = upload.file_path
+        bank = upload.bank
 
     try:
-        parsed = await asyncio.to_thread(parse_statement, Path(file_path), password)
+        parsed = await asyncio.to_thread(
+            parse_statement, Path(file_path), password, bank
+        )
     except Exception as exc:
         async with async_session() as session:
             if upload := await session.get(StatementUpload, upload_id):
