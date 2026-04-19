@@ -465,13 +465,28 @@ async def process_bank_statement_email(
             )
 
         passwords_to_try = []
+        accounts_without_password = []
         for acc in bank_accounts:
-            if acc.statement_password:
-                try:
-                    pw = fernet.decrypt(acc.statement_password.encode()).decode()
-                    passwords_to_try.append((acc, pw))
-                except Exception:
-                    pass
+            if not acc.statement_password:
+                accounts_without_password.append(acc.label)
+                continue
+            try:
+                pw = fernet.decrypt(acc.statement_password.encode()).decode()
+                passwords_to_try.append((acc, pw))
+            except Exception as e:
+                logger.warning(
+                    "Failed to decrypt stored statement_password for %s (%s): %s",
+                    bank,
+                    acc.label,
+                    e,
+                )
+        logger.info(
+            "Encrypted PDF: %d/%d bank accounts have a stored password for bank=%s (no password: %s)",
+            len(passwords_to_try),
+            len(bank_accounts),
+            bank,
+            accounts_without_password or "none",
+        )
 
         for acc, pw in passwords_to_try:
             try:
@@ -484,7 +499,13 @@ async def process_bank_statement_email(
                     acc.label,
                 )
                 break
-            except Exception:
+            except Exception as e:
+                logger.info(
+                    "Stored password for %s (%s) did not unlock PDF: %s",
+                    bank,
+                    acc.label,
+                    e,
+                )
                 continue
 
         if not parsed:

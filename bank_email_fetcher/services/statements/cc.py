@@ -345,7 +345,9 @@ async def resolve_cc_card_mask(
         .scalars()
         .all()
     )
-    card_last4s = [v for v in (last4_from_card(c.card_mask) for c in account_cards) if v]
+    card_last4s = [
+        v for v in (last4_from_card(c.card_mask) for c in account_cards) if v
+    ]
     if partial := _extract_digits(raw):
         for cl4 in card_last4s:
             if cl4.endswith(partial):
@@ -729,24 +731,47 @@ async def process_statement_email(
             )
 
         passwords_to_try = []
+        accounts_without_password = []
         for acc in cc_accounts:
-            if acc.statement_password:
-                try:
-                    pw = fernet.decrypt(acc.statement_password.encode()).decode()
-                    passwords_to_try.append((acc, pw))
-                except Exception:
-                    pass
+            if not acc.statement_password:
+                accounts_without_password.append(acc.label)
+                continue
+            try:
+                pw = fernet.decrypt(acc.statement_password.encode()).decode()
+                passwords_to_try.append((acc, pw))
+            except Exception as e:
+                logger.warning(
+                    "Failed to decrypt stored statement_password for %s (%s): %s",
+                    bank,
+                    acc.label,
+                    e,
+                )
+        logger.info(
+            "Encrypted PDF: %d/%d CC accounts have a stored password for bank=%s (no password: %s)",
+            len(passwords_to_try),
+            len(cc_accounts),
+            bank,
+            accounts_without_password or "none",
+        )
 
         for acc, pw in passwords_to_try:
             try:
-                parsed = await asyncio.to_thread(_parse_pdf_bytes_sync, pdf_bytes, pw, bank)
+                parsed = await asyncio.to_thread(
+                    _parse_pdf_bytes_sync, pdf_bytes, pw, bank
+                )
                 logger.info(
                     "Decrypted statement PDF using stored password for %s (%s)",
                     bank,
                     acc.label,
                 )
                 break
-            except Exception:
+            except Exception as e:
+                logger.info(
+                    "Stored password for %s (%s) did not unlock PDF: %s",
+                    bank,
+                    acc.label,
+                    e,
+                )
                 continue
 
         if not parsed:
