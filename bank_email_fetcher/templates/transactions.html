@@ -175,18 +175,28 @@
     function populateCards() {
         const accountId = accountFilter.value;
         cardFilter.innerHTML = '<option value="">All Cards</option>';
+        const accountLabelById = {};
+        for (const as of Object.values(accountsByBank)) {
+            for (const a of as) {
+                accountLabelById[a.id] = a.label;
+            }
+        }
         let cards = [];
         if (accountId) {
-            cards = cardsByAccount[accountId] || [];
+            cards = (cardsByAccount[accountId] || []).map((c) => ({ ...c, accountId }));
         } else {
             for (const [aid, cs] of Object.entries(cardsByAccount)) {
-                cards = cards.concat(cs);
+                for (const c of cs) {
+                    cards.push({ ...c, accountId: aid });
+                }
             }
         }
         for (const c of cards) {
             const opt = document.createElement("option");
             opt.value = c.id;
-            opt.textContent = c.label + " (" + c.mask + ")";
+            const accountLabel = accountLabelById[c.accountId] || accountLabelById[Number(c.accountId)];
+            const prefix = accountLabel ? accountLabel + " - " : "";
+            opt.textContent = prefix + c.label + " (" + c.mask + ")";
             if (String(c.id) === selectedCardId) opt.selected = true;
             cardFilter.appendChild(opt);
         }
