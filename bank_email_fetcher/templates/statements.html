@@ -56,6 +56,19 @@
         letter-spacing: 0.04em; padding: 0.2rem 0.5rem; border-radius: 4px;
         background: var(--nav-pill-active-bg); color: var(--nav-pill-active-fg);
     }
+
+    /* Make entire row ctrl-clickable. An anchor in the first cell stretches across
+       the whole row via ::after, while the row itself is position: relative so the
+       overlay is bounded to that row. Other interactive elements sit above the
+       overlay with z-index. */
+    tr.row-link { position: relative; cursor: pointer; }
+    tr.row-link .row-link-anchor { color: inherit; text-decoration: none; }
+    tr.row-link .row-link-anchor::after {
+        content: ""; position: absolute; inset: 0;
+        z-index: 0;
+    }
+    tr.row-link > td > *:not(.row-link-anchor) { position: relative; z-index: 1; }
+    tr.row-link form, tr.row-link a:not(.row-link-anchor) { position: relative; z-index: 1; }
 </style>
 
 <div class="section-header">
@@ -195,8 +208,8 @@
                 {% set is_bank = u._statement_type == 'bank' %}
                 {% set detail_url = '/statements/bank/' ~ u.id if is_bank else '/statements/' ~ u.id %}
                 {% set delete_url = '/statements/bank/' ~ u.id ~ '/delete' if is_bank else '/statements/' ~ u.id ~ '/delete' %}
-                <tr onclick="window.location='{{ detail_url }}'" style="cursor: pointer;">
-                    <td class="text-sm">{{ u.created_at.strftime("%d %b %Y %H:%M") if u.created_at else "&mdash;"|safe }}</td>
+                <tr class="row-link">
+                    <td class="text-sm"><a href="{{ detail_url }}" class="row-link-anchor">{{ u.created_at.strftime("%d %b %Y %H:%M") if u.created_at else "&mdash;"|safe }}</a></td>
                     <td><span class="badge{% if is_bank %} badge-pending{% endif %}">{{ "Bank" if is_bank else "CC" }}</span></td>
                     <td><span class="badge">{{ u.bank }}</span></td>
                     <td class="text-sm">{% if u.account %}<a href="/accounts/{{ u.account.id }}/edit" onclick="event.stopPropagation()">{{ u.account.label }}</a>{% else %}&mdash;{% endif %}</td>
