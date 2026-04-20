@@ -165,13 +165,7 @@
 const emailsFilterForm = document.getElementById("emails-filter-form");
 if (emailsFilterForm) {
     emailsFilterForm.querySelectorAll('select, input[type="date"]').forEach((f) => {
-        f.addEventListener("change", () => {
-            if (typeof emailsFilterForm.requestSubmit === "function") {
-                emailsFilterForm.requestSubmit();
-            } else {
-                emailsFilterForm.submit();
-            }
-        });
+        f.addEventListener("change", () => emailsFilterForm.requestSubmit());
     });
 }
 

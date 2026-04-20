@@ -139,13 +139,7 @@
     const accountsFilterForm = document.getElementById("accounts-filter-form");
     if (accountsFilterForm) {
         accountsFilterForm.querySelectorAll("select").forEach((f) => {
-            f.addEventListener("change", () => {
-                if (typeof accountsFilterForm.requestSubmit === "function") {
-                    accountsFilterForm.requestSubmit();
-                } else {
-                    accountsFilterForm.submit();
-                }
-            });
+            f.addEventListener("change", () => accountsFilterForm.requestSubmit());
         });
     }
 </script>

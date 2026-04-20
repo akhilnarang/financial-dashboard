@@ -384,11 +384,7 @@
         filterForm.querySelectorAll('select, input[type="date"]').forEach((f) => {
             f.addEventListener("change", () => {
                 if (skipAutoSubmit) return;
-                if (typeof filterForm.requestSubmit === "function") {
-                    filterForm.requestSubmit();
-                } else {
-                    filterForm.submit();
-                }
+                filterForm.requestSubmit();
             });
         });
     }

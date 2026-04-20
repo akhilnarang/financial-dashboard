@@ -142,13 +142,7 @@
     const rulesFilterForm = document.getElementById("rules-filter-form");
     if (rulesFilterForm) {
         rulesFilterForm.querySelectorAll("select").forEach((f) => {
-            f.addEventListener("change", () => {
-                if (typeof rulesFilterForm.requestSubmit === "function") {
-                    rulesFilterForm.requestSubmit();
-                } else {
-                    rulesFilterForm.submit();
-                }
-            });
+            f.addEventListener("change", () => rulesFilterForm.requestSubmit());
         });
     }
 </script>

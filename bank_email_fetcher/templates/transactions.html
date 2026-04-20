@@ -215,11 +215,7 @@
             .forEach((field) => {
                 field.addEventListener("change", () => {
                     if (skipAutoSubmit) return;
-                    if (typeof transactionsFilterForm.requestSubmit === "function") {
-                        transactionsFilterForm.requestSubmit();
-                    } else {
-                        transactionsFilterForm.submit();
-                    }
+                    transactionsFilterForm.requestSubmit();
                 });
             });
     }
