@@ -35,25 +35,39 @@
 <p class="text-sm text-muted" style="margin-top: 0.25rem;">{{ ops_stats.total_emails }} emails processed &middot; {{ ops_stats.active_rules }} active rules</p>
 
 <section>
-    <h3 style="font-size: 1.05rem; font-weight: 700; letter-spacing: -0.01em; margin-bottom: 0.5rem;">Credit Cards Outstanding</h3>
-    <details open>
-        <summary style="cursor: pointer; margin-bottom: 0.75rem; list-style: revert;">
-            <span class="text-sm text-muted">
-                {% if cc_outstanding.summary.total_cards == 0 %}
-                No credit card accounts configured.
+    <details open style="margin-bottom: 1.5rem;">
+        <summary style="cursor: pointer; list-style: revert; margin-bottom: 0.75rem;">
+            <h3 style="display: inline; font-size: 1.05rem; font-weight: 700; letter-spacing: -0.01em;">Credit Cards Outstanding</h3>
+            <span class="text-sm text-muted" style="margin-left: 0.5rem;">
+                {% if not cc_outstanding.summary.has_any %}
+                No statements yet.
                 {% else %}
-                {{ cc_outstanding.summary.grand_total|inr_compact }} outstanding across {{ cc_outstanding.summary.cards_with_outstanding }} of {{ cc_outstanding.summary.total_cards }} cards
+                {{ cc_outstanding.summary.grand_total|inr_compact }} outstanding across {{ cc_outstanding.summary.cards_with_outstanding }} card{{ "s" if cc_outstanding.summary.cards_with_outstanding != 1 else "" }}
                 {% if cc_outstanding.summary.cards_paid %} &middot; {{ cc_outstanding.summary.cards_paid }} paid{% endif %}
-                {% if cc_outstanding.summary.cards_missing %} &middot; {{ cc_outstanding.summary.cards_missing }} missing{% endif %}
-                {% if cc_outstanding.summary.cards_error %} &middot; {{ cc_outstanding.summary.cards_error }} with parse errors{% endif %}
                 {% endif %}
             </span>
         </summary>
-        {% if cc_outstanding.summary.total_cards == 0 %}
-        <article class="card empty-state">
-            <p class="text-sm text-muted">No credit card accounts configured.</p>
-        </article>
-        {% else %}
+        {% if cc_outstanding.summary.has_any %}
+        {% macro cc_row(row) %}
+        <tr>
+            <td class="text-sm"><a href="/accounts/{{ row.account.id }}/edit">{{ row.account.label }}</a></td>
+            <td><span class="badge">{{ row.account.bank }}</span></td>
+            <td class="text-sm"{% if row.overdue %} style="color: var(--clr-debit); font-weight: 600;"{% endif %}>{{ row.due_date_display or "&mdash;"|safe }}{% if row.overdue %} &middot; overdue{% endif %}</td>
+            <td class="amt">{% if row.amount_due is not none %}&#x20B9;{{ "{:,.2f}".format(row.amount_due) }}{% else %}&mdash;{% endif %}</td>
+            <td class="amt">{% if row.paid_amount is not none and row.paid_amount > 0 %}&#x20B9;{{ "{:,.2f}".format(row.paid_amount) }}{% else %}&mdash;{% endif %}</td>
+            <td class="amt {% if row.outstanding is not none and row.outstanding > 0 %}amt-debit{% endif %}">{% if row.outstanding is not none %}&#x20B9;{{ "{:,.2f}".format(row.outstanding) }}{% else %}&mdash;{% endif %}</td>
+            <td>
+                {% if row.status == "paid" %}<span class="badge success">paid</span>
+                {% elif row.status == "late" %}<span class="badge danger">late</span>
+                {% elif row.status == "partially_paid" %}<span class="badge badge-pending">partial</span>
+                {% elif row.status == "unpaid" %}<span class="badge badge-pending">unpaid</span>
+                {% elif row.status == "missing" %}<span class="badge badge-pending">missing</span>
+                {% elif row.status == "error" %}<span class="badge danger">parse error</span>
+                {% else %}<span class="badge">{{ row.status_label }}</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endmacro %}
         <figure style="margin: 0;">
             <div class="table">
                 <table>
@@ -68,43 +82,18 @@
                             <th>Status</th>
                         </tr>
                     </thead>
+                    {% if cc_outstanding.outstanding_rows %}
                     <tbody>
-                        {% for row in cc_outstanding.rows %}
-                        <tr>
-                            <td class="text-sm"><a href="/accounts/{{ row.account.id }}/edit">{{ row.account.label }}</a></td>
-                            <td><span class="badge">{{ row.account.bank }}</span></td>
-                            <td class="text-sm"{% if row.overdue %} style="color: var(--danger, #c00); font-weight: 600;"{% endif %}>
-                                {% if row.due_date_display %}{{ row.due_date_display }}{% if row.overdue %} &middot; overdue{% endif %}{% else %}&mdash;{% endif %}
-                            </td>
-                            <td class="amt">
-                                {% if row.amount_due is not none %}&#8377;{{ "{:,.2f}".format(row.amount_due) }}{% else %}<span class="text-muted">&mdash;</span>{% endif %}
-                            </td>
-                            <td class="amt">
-                                {% if row.paid_amount is not none and row.paid_amount > 0 %}&#8377;{{ "{:,.2f}".format(row.paid_amount) }}{% else %}<span class="text-muted">&mdash;</span>{% endif %}
-                            </td>
-                            <td class="amt {% if row.outstanding is not none and row.outstanding > 0 %}amt-debit{% endif %}">
-                                {% if row.outstanding is not none %}&#8377;{{ "{:,.2f}".format(row.outstanding) }}{% else %}<span class="text-muted">&mdash;</span>{% endif %}
-                            </td>
-                            <td>
-                                {% if row.status == "paid" %}
-                                <span class="badge success">paid</span>
-                                {% elif row.status == "late" %}
-                                <span class="badge danger">late</span>
-                                {% elif row.status == "partially_paid" %}
-                                <span class="badge badge-pending">partial</span>
-                                {% elif row.status == "unpaid" %}
-                                <span class="badge badge-pending">unpaid</span>
-                                {% elif row.status == "missing" %}
-                                <span class="badge badge-pending">missing</span>
-                                {% elif row.status == "error" %}
-                                <span class="badge danger">parse error</span>
-                                {% else %}
-                                <span class="badge">{{ row.status_label }}</span>
-                                {% endif %}
-                            </td>
-                        </tr>
-                        {% endfor %}
+                        <tr><td colspan="7" class="text-sm text-muted" style="background: var(--surface-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.72rem;">Outstanding &middot; {{ cc_outstanding.outstanding_rows|length }}</td></tr>
+                        {% for row in cc_outstanding.outstanding_rows %}{{ cc_row(row) }}{% endfor %}
                     </tbody>
+                    {% endif %}
+                    {% if cc_outstanding.paid_rows %}
+                    <tbody>
+                        <tr><td colspan="7" class="text-sm text-muted" style="background: var(--surface-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.72rem;">Paid &middot; {{ cc_outstanding.paid_rows|length }}</td></tr>
+                        {% for row in cc_outstanding.paid_rows %}{{ cc_row(row) }}{% endfor %}
+                    </tbody>
+                    {% endif %}
                 </table>
             </div>
         </figure>
