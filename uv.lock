@@ -93,7 +93,7 @@ dev = [
 [[package]]
 name = "bank-email-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-email-parser#f5f8c88ea598c3b394fadff5e43ebbde742722ad" }
+source = { git = "https://github.com/akhilnarang/bank-email-parser#e692d8e31567c546a948798ccd590e1185c7dc45" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "pydantic" },
