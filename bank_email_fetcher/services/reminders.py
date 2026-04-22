@@ -43,6 +43,27 @@ ACTIVE_STATUSES = (
 STALE_DAYS = 7  # stop reminding after this many days past due
 
 
+def latest_per_account(uploads: list[StatementUpload]) -> list[StatementUpload]:
+    """Collapse a list of StatementUploads to at most one per account — the latest by due_date.
+
+    Why: a newer statement supersedes all older cycles (any unpaid balance rolls into it),
+    so reminders and payment auto-match should only ever act on the most recent cycle per
+    account. Uploads with unparseable due_date are skipped entirely since we can't rank them.
+    """
+    latest: dict[int, tuple[date, StatementUpload]] = {}
+    for upload in uploads:
+        if not upload.due_date:
+            continue
+        try:
+            due = parse_cc_date(upload.due_date)
+        except ValueError, InvalidOperation:
+            continue
+        current = latest.get(upload.account_id)
+        if current is None or due > current[0]:
+            latest[upload.account_id] = (due, upload)
+    return [pair[1] for pair in latest.values()]
+
+
 async def init_payment_tracking(statement_upload_id: int) -> bool:
     """Set payment_status on a StatementUpload if it has a valid due date.
 
@@ -111,7 +132,7 @@ async def check_and_send_reminders() -> int:
     sent_count = 0
 
     async with async_session() as session:
-        uploads = (
+        all_active = (
             (
                 await session.execute(
                     select(StatementUpload).where(
@@ -122,6 +143,9 @@ async def check_and_send_reminders() -> int:
             .scalars()
             .all()
         )
+        # Why: only remind on the latest cycle per account; older superseded statements
+        # are no longer actionable (any outstanding rolls into the new statement).
+        uploads = latest_per_account(list(all_active))
 
         for upload in uploads:
             if not upload.due_date:
@@ -331,17 +355,13 @@ async def check_payment_received(txn_id: int, account_id: int, amount) -> bool:
             .all()
         )
 
-        # Sort by parsed date (due_date is DD/MM/YYYY string, can't sort lexicographically)
-        dated = []
-        for c in candidates:
-            try:
-                dated.append((parse_cc_date(c.due_date), c))
-            except ValueError, InvalidOperation:
-                continue
-        if not dated:
+        # Why: always act on the latest cycle per account — any unpaid balance from older
+        # cycles rolls into the new statement, so applying a payment to an older row would
+        # double-count.
+        latest = latest_per_account(list(candidates))
+        if not latest:
             return False
-        dated.sort(key=lambda x: x[0])
-        upload = dated[0][1]
+        upload = latest[0]
 
         try:
             amount_due = parse_cc_amount(upload.total_amount_due)
