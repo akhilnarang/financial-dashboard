@@ -34,54 +34,69 @@
 
 <p class="text-sm text-muted" style="margin-top: 0.25rem;">{{ ops_stats.total_emails }} emails processed &middot; {{ ops_stats.active_rules }} active rules</p>
 
-<section style="margin-bottom: 1.5rem;">
-    {% macro cc_ledger_row(row, is_paid=False) %}
-    <div class="cc-row">
-        <div>
+<section class="cc-section" style="margin-bottom: 1.5rem;">
+    {% macro cc_row(row, is_paid=False) %}
+    <tr>
+        <td class="text-sm">
             <span class="badge">{{ row.account.bank }}</span>
             <a href="/accounts/{{ row.account.id }}/edit" style="margin-left: 0.35rem;">{{ row.account.label }}</a>
-        </div>
-        <div class="cc-due text-sm {% if row.overdue %}overdue{% elif is_paid %}text-muted{% endif %}">
+        </td>
+        <td class="text-sm{% if row.overdue %} cc-due-overdue{% endif %}">
             {%- if row.due_date_display -%}
                 {% if row.overdue %}overdue &middot; {{ row.due_date_display }}{% else %}{{ row.due_date_display }}{% endif %}
             {%- else -%}&mdash;{%- endif -%}
-        </div>
-        <div class="cc-amount amt {% if not is_paid and row.outstanding and row.outstanding > 0 %}amt-debit{% endif %}">
-            {%- if row.outstanding is not none -%}
-                &#x20B9;{{ "{:,.2f}".format(row.outstanding if not is_paid else row.amount_due) }}
+        </td>
+        <td class="amt cc-right {% if not is_paid and row.outstanding and row.outstanding > 0 %}amt-debit{% endif %}">
+            {%- set display_amount = row.amount_due if is_paid else row.outstanding -%}
+            {%- if display_amount is not none -%}
+                {% if display_amount < 0 %}&minus;&#x20B9;{{ "{:,.2f}".format(-display_amount) }}{% else %}&#x20B9;{{ "{:,.2f}".format(display_amount) }}{% endif %}
             {%- else -%}&mdash;{%- endif -%}
             {% if row.status == "partially_paid" and row.paid_amount %}
             <span class="cc-partial">&#x20B9;{{ "{:,.2f}".format(row.paid_amount) }} paid</span>
             {% endif %}
-        </div>
-    </div>
+        </td>
+    </tr>
     {% endmacro %}
     <details open>
-        <summary style="cursor: pointer; list-style: revert; margin-bottom: 0.75rem; display: flex; align-items: baseline; gap: 0.75rem; flex-wrap: wrap;">
-            <h3 style="display: inline; font-size: 1.05rem; font-weight: 700; letter-spacing: -0.01em; margin: 0;">Credit Cards Outstanding</h3>
-            <span class="text-sm text-muted" style="flex: 1;">
-                {% if not cc_outstanding.summary.has_any %}
-                No statements yet.
-                {% elif cc_outstanding.summary.cards_with_outstanding == 0 %}
-                All {{ cc_outstanding.summary.cards_paid }} cards paid.
-                {% else %}
-                <span class="amt amt-debit" style="font-weight: 600;">&#x20B9;{{ "{:,.2f}".format(cc_outstanding.summary.grand_total) }}</span> across {{ cc_outstanding.summary.cards_with_outstanding }} card{{ "s" if cc_outstanding.summary.cards_with_outstanding != 1 else "" }}
-                {% if cc_outstanding.summary.cards_paid %} &middot; {{ cc_outstanding.summary.cards_paid }} paid{% endif %}
-                {% endif %}
+        <summary>
+            <span style="display: inline-flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;">
+                <h3 style="display: inline; font-size: 1.05rem; font-weight: 700; letter-spacing: -0.01em; margin: 0;">Credit Cards Outstanding</h3>
+                <span class="text-sm" style="font-weight: 400;">
+                    {% if not cc_outstanding.summary.has_any %}
+                    <span class="text-muted">No statements yet.</span>
+                    {% elif cc_outstanding.summary.cards_with_outstanding == 0 %}
+                    <span class="text-muted">All {{ cc_outstanding.summary.cards_paid }} cards paid.</span>
+                    {% else %}
+                    <span class="cc-total">&#x20B9;{{ "{:,.2f}".format(cc_outstanding.summary.grand_total) }}</span>
+                    <span class="text-muted">across {{ cc_outstanding.summary.cards_with_outstanding }} card{{ "s" if cc_outstanding.summary.cards_with_outstanding != 1 else "" }}{% if cc_outstanding.summary.cards_paid %} &middot; {{ cc_outstanding.summary.cards_paid }} paid{% endif %}</span>
+                    {% endif %}
+                </span>
             </span>
         </summary>
-        {% if cc_outstanding.outstanding_rows %}
-        <div class="cc-ledger">
-            {% for row in cc_outstanding.outstanding_rows %}{{ cc_ledger_row(row) }}{% endfor %}
-        </div>
-        {% endif %}
-        {% if cc_outstanding.paid_rows %}
-        <details class="cc-paid-details">
-            <summary>Paid cards &middot; {{ cc_outstanding.paid_rows|length }}</summary>
-            <div class="cc-ledger">
-                {% for row in cc_outstanding.paid_rows %}{{ cc_ledger_row(row, is_paid=True) }}{% endfor %}
+        {% if cc_outstanding.summary.has_any %}
+        <figure style="margin: 0;">
+            <div class="table">
+                <table>
+                    {% if cc_outstanding.outstanding_rows %}
+                    <tbody>
+                        {% for row in cc_outstanding.outstanding_rows %}{{ cc_row(row) }}{% endfor %}
+                    </tbody>
+                    {% endif %}
+                    {% if cc_outstanding.paid_rows %}
+                    <tbody>
+                        <tr class="cc-paid-toggle">
+                            <td colspan="3">
+                                <button type="button" aria-controls="cc-paid-tbody" aria-expanded="false" onclick="(function(btn){var tb=document.getElementById('cc-paid-tbody');var open=btn.getAttribute('aria-expanded')==='true';btn.setAttribute('aria-expanded', open?'false':'true');tb.hidden=open;})(this)">Paid cards &middot; {{ cc_outstanding.paid_rows|length }}</button>
+                            </td>
+                        </tr>
+                    </tbody>
+                    <tbody id="cc-paid-tbody" class="cc-paid" hidden>
+                        {% for row in cc_outstanding.paid_rows %}{{ cc_row(row, is_paid=True) }}{% endfor %}
+                    </tbody>
+                    {% endif %}
+                </table>
             </div>
-        </details>
+        </figure>
         {% endif %}
     </details>
 </section>
@@ -196,7 +211,30 @@
         };
 
         renderStatus({{ poll_status | tojson }});
-        window.setInterval(refreshStatus, 3000);
+
+        let intervalId = null;
+        const startPolling = () => {
+            if (intervalId === null) {
+                intervalId = window.setInterval(refreshStatus, 3000);
+            }
+        };
+        const stopPolling = () => {
+            if (intervalId !== null) {
+                window.clearInterval(intervalId);
+                intervalId = null;
+            }
+        };
+        document.addEventListener("visibilitychange", () => {
+            if (document.hidden) {
+                stopPolling();
+            } else {
+                refreshStatus();
+                startPolling();
+            }
+        });
+        if (!document.hidden) {
+            startPolling();
+        }
     })();
 </script>
 

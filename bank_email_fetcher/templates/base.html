@@ -380,61 +380,88 @@
         }
 
         /* ---------------------------------------------------------------
-           CC Ledger (dashboard "Credit Cards Outstanding" section)
+           CC Section (dashboard "Credit Cards Outstanding")
+           Overrides oat.ink's default <details>/<summary> card chrome
+           so the section blends with the flat Recent Transactions look.
         --------------------------------------------------------------- */
-        .cc-ledger {
-            display: grid;
-            grid-template-columns: minmax(0, 1fr) auto auto;
-            column-gap: 1rem;
-            row-gap: 0;
-            font-size: 0.88rem;
+        .cc-section > details {
+            border: none;
+            border-radius: 0;
+            overflow: visible;
+            padding: 0;
         }
 
-        .cc-ledger > .cc-row {
-            display: contents;
-        }
-
-        .cc-ledger > .cc-row > * {
-            padding: 0.55rem 0;
-            border-bottom: 1px solid var(--border-light);
-            align-self: center;
-        }
-
-        .cc-ledger > .cc-row:last-of-type > * {
+        .cc-section > details > summary {
             border-bottom: none;
+            padding: 0;
+            margin-bottom: 0.75rem;
+            background: transparent;
+            font-weight: 700;
         }
 
-        .cc-ledger .cc-due.overdue {
+        .cc-section > details > summary:hover {
+            background: transparent;
+        }
+
+        .cc-section .cc-total {
+            font-family: var(--font-mono);
+            font-variant-numeric: tabular-nums;
+            color: var(--clr-debit);
+        }
+
+        .cc-section table .cc-due-overdue {
             color: var(--clr-debit);
             font-weight: 600;
         }
 
-        .cc-ledger .cc-amount {
-            text-align: right;
-            white-space: nowrap;
-        }
-
-        .cc-ledger .cc-partial {
+        .cc-section table .cc-partial {
             display: block;
             font-size: 0.72rem;
             opacity: 0.55;
             font-weight: 400;
         }
 
-        .cc-paid-details {
-            margin-top: 0.5rem;
+        .cc-section table .cc-right {
+            text-align: right;
+            white-space: nowrap;
         }
 
-        .cc-paid-details > summary {
-            padding: 0.5rem 0;
+        .cc-section table .cc-paid-toggle {
+            padding: 0.6rem 0.75rem;
+        }
+
+        .cc-section table .cc-paid-toggle button {
+            background: none;
+            border: none;
+            padding: 0;
+            font: inherit;
+            color: inherit;
             font-size: 0.82rem;
             opacity: 0.55;
             cursor: pointer;
-            list-style: revert;
         }
 
-        .cc-paid-details[open] .cc-ledger {
+        .cc-section table .cc-paid-toggle button:hover {
+            opacity: 0.85;
+            text-decoration: underline;
+        }
+
+        .cc-section table .cc-paid-toggle button::before {
+            content: "▸ ";
+            display: inline-block;
+            transition: transform 0.15s ease;
+        }
+
+        .cc-section table .cc-paid-toggle button[aria-expanded="true"]::before {
+            transform: rotate(90deg);
+        }
+
+        .cc-section tbody.cc-paid {
             opacity: 0.6;
+        }
+
+        .cc-section tbody.cc-paid[hidden] {
+            display: none;
         }
 
         /* ---------------------------------------------------------------
