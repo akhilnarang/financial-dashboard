@@ -32,37 +32,85 @@
     </form>
 </div>
 
-<section class="stats-grid">
-    <article class="card stat-card" style="text-align: left;">
-        <dl>
-            <dt>Debits</dt>
-            <dd class="amt amt-debit" style="font-size: 1.35rem;">&minus;{{ stats.month_debit|inr_compact }}</dd>
-            <dd class="text-sm text-muted" style="margin-top: 0.15rem;">{{ stats.period_label }}</dd>
-        </dl>
-    </article>
-    <article class="card stat-card" style="text-align: left;">
-        <dl>
-            <dt>Credits</dt>
-            <dd class="amt amt-credit" style="font-size: 1.35rem;">+{{ stats.month_credit|inr_compact }}</dd>
-            <dd class="text-sm text-muted" style="margin-top: 0.15rem;">{{ stats.period_label }}</dd>
-        </dl>
-    </article>
-    <article class="card stat-card" style="text-align: left;">
-        <dl>
-            <dt>Transactions</dt>
-            <dd style="font-size: 1.35rem;">{{ "{:,}".format(stats.month_transactions) }}</dd>
-            <dd class="text-sm text-muted" style="margin-top: 0.15rem;">{{ stats.period_label }}</dd>
-        </dl>
-    </article>
-    <article class="card stat-card" style="text-align: left;">
-        <dl>
-            <dt>Net Flow</dt>
-            <dd class="amt {% if stats.net_flow >= 0 %}amt-credit{% else %}amt-debit{% endif %}" style="font-size: 1.35rem;">{% if stats.net_flow >= 0 %}+{% else %}&minus;{% endif %}{{ stats.net_flow|abs|inr_compact }}</dd>
-            <dd class="text-sm text-muted" style="margin-top: 0.15rem;">{{ stats.period_label }}</dd>
-        </dl>
-    </article>
-</section>
 <p class="text-sm text-muted" style="margin-top: 0.25rem;">{{ ops_stats.total_emails }} emails processed &middot; {{ ops_stats.active_rules }} active rules</p>
+
+<section>
+    <h3 style="font-size: 1.05rem; font-weight: 700; letter-spacing: -0.01em; margin-bottom: 0.5rem;">Credit Cards Outstanding</h3>
+    <details open>
+        <summary style="cursor: pointer; margin-bottom: 0.75rem; list-style: revert;">
+            <span class="text-sm text-muted">
+                {% if cc_outstanding.summary.total_cards == 0 %}
+                No credit card accounts configured.
+                {% else %}
+                {{ cc_outstanding.summary.grand_total|inr_compact }} outstanding across {{ cc_outstanding.summary.cards_with_outstanding }} of {{ cc_outstanding.summary.total_cards }} cards
+                {% if cc_outstanding.summary.cards_paid %} &middot; {{ cc_outstanding.summary.cards_paid }} paid{% endif %}
+                {% if cc_outstanding.summary.cards_missing %} &middot; {{ cc_outstanding.summary.cards_missing }} missing{% endif %}
+                {% if cc_outstanding.summary.cards_error %} &middot; {{ cc_outstanding.summary.cards_error }} with parse errors{% endif %}
+                {% endif %}
+            </span>
+        </summary>
+        {% if cc_outstanding.summary.total_cards == 0 %}
+        <article class="card empty-state">
+            <p class="text-sm text-muted">No credit card accounts configured.</p>
+        </article>
+        {% else %}
+        <figure style="margin: 0;">
+            <div class="table">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Account</th>
+                            <th>Bank</th>
+                            <th>Due Date</th>
+                            <th>Amount Due</th>
+                            <th>Paid</th>
+                            <th>Remaining</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in cc_outstanding.rows %}
+                        <tr>
+                            <td class="text-sm"><a href="/accounts/{{ row.account.id }}/edit">{{ row.account.label }}</a></td>
+                            <td><span class="badge">{{ row.account.bank }}</span></td>
+                            <td class="text-sm"{% if row.overdue %} style="color: var(--danger, #c00); font-weight: 600;"{% endif %}>
+                                {% if row.due_date_display %}{{ row.due_date_display }}{% if row.overdue %} &middot; overdue{% endif %}{% else %}&mdash;{% endif %}
+                            </td>
+                            <td class="amt">
+                                {% if row.amount_due is not none %}&#8377;{{ "{:,.2f}".format(row.amount_due) }}{% else %}<span class="text-muted">&mdash;</span>{% endif %}
+                            </td>
+                            <td class="amt">
+                                {% if row.paid_amount is not none and row.paid_amount > 0 %}&#8377;{{ "{:,.2f}".format(row.paid_amount) }}{% else %}<span class="text-muted">&mdash;</span>{% endif %}
+                            </td>
+                            <td class="amt {% if row.outstanding is not none and row.outstanding > 0 %}amt-debit{% endif %}">
+                                {% if row.outstanding is not none %}&#8377;{{ "{:,.2f}".format(row.outstanding) }}{% else %}<span class="text-muted">&mdash;</span>{% endif %}
+                            </td>
+                            <td>
+                                {% if row.status == "paid" %}
+                                <span class="badge success">paid</span>
+                                {% elif row.status == "late" %}
+                                <span class="badge danger">late</span>
+                                {% elif row.status == "partially_paid" %}
+                                <span class="badge badge-pending">partial</span>
+                                {% elif row.status == "unpaid" %}
+                                <span class="badge badge-pending">unpaid</span>
+                                {% elif row.status == "missing" %}
+                                <span class="badge badge-pending">missing</span>
+                                {% elif row.status == "error" %}
+                                <span class="badge danger">parse error</span>
+                                {% else %}
+                                <span class="badge">{{ row.status_label }}</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </figure>
+        {% endif %}
+    </details>
+</section>
 
 <section>
     <h3 style="font-size: 1.05rem; font-weight: 700; letter-spacing: -0.01em; margin-bottom: 0.75rem;">Recent Transactions</h3>
