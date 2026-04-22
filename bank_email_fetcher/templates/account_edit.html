@@ -118,18 +118,18 @@
                 </div>
 
                 <div class="cards-actions">
-                    <details class="cards-delete">
-                        <summary class="text-sm text-muted">Remove card</summary>
-                        <div class="cards-delete-panel">
-                            <span class="text-sm text-muted">Delete card ending in {{ card.card_mask }}?</span>
-                            <form method="post" action="/accounts/{{ account.id }}/cards/{{ card.id }}/delete">
-                                <button type="submit" style="color: var(--clr-debit);">Confirm delete</button>
-                            </form>
-                        </div>
-                    </details>
                     <button type="submit">Save</button>
                 </div>
             </form>
+            <details class="cards-delete">
+                <summary class="text-sm text-muted">Remove card</summary>
+                <div class="cards-delete-panel">
+                    <span class="text-sm text-muted">Delete card ending in {{ card.card_mask }}?</span>
+                    <form method="post" action="/accounts/{{ account.id }}/cards/{{ card.id }}/delete">
+                        <button type="submit" style="color: var(--clr-debit);">Confirm delete</button>
+                    </form>
+                </div>
+            </details>
         </div>
         {% endfor %}
     </div>
