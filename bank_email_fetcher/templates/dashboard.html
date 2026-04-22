@@ -37,10 +37,8 @@
 <section class="cc-section" style="margin-bottom: 1.5rem;">
     {% macro cc_row(row, is_paid=False) %}
     <tr>
-        <td class="text-sm">
-            <span class="badge">{{ row.account.bank }}</span>
-            <a href="/accounts/{{ row.account.id }}/edit" style="margin-left: 0.35rem;">{{ row.account.label }}</a>
-        </td>
+        <td><span class="badge">{{ row.account.bank }}</span></td>
+        <td class="text-sm"><a href="/accounts/{{ row.account.id }}/edit">{{ row.account.label }}</a></td>
         <td class="text-sm{% if row.overdue %} cc-due-overdue{% endif %}">
             {%- if row.due_date_display -%}
                 {% if row.overdue %}overdue &middot; {{ row.due_date_display }}{% else %}{{ row.due_date_display }}{% endif %}
@@ -85,7 +83,7 @@
                     {% if cc_outstanding.paid_rows %}
                     <tbody>
                         <tr class="cc-paid-toggle">
-                            <td colspan="3">
+                            <td colspan="4">
                                 <button type="button" aria-controls="cc-paid-tbody" aria-expanded="false" onclick="(function(btn){var tb=document.getElementById('cc-paid-tbody');var open=btn.getAttribute('aria-expanded')==='true';btn.setAttribute('aria-expanded', open?'false':'true');tb.hidden=open;})(this)">Paid cards &middot; {{ cc_outstanding.paid_rows|length }}</button>
                             </td>
                         </tr>
