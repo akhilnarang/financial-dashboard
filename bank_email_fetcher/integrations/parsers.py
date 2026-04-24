@@ -11,6 +11,7 @@ from bank_email_parser.exceptions import (
     ParseError as ParseError,
     UnsupportedEmailTypeError as UnsupportedEmailTypeError,
 )
+from bank_email_parser.models import ParsedEmail
 from bank_statement_parser.extractor import extract_raw_pdf as _extract_bank_pdf
 from bank_statement_parser.parsers.factory import (
     get_parser as _get_bank_statement_parser,
@@ -25,7 +26,7 @@ def get_supported_banks() -> tuple[str, ...]:
     return tuple(SUPPORTED_BANKS)
 
 
-def parse_transaction_email(bank: str, html: str):
+def parse_transaction_email(bank: str, html: str) -> ParsedEmail:
     return _parse_email(bank, html)
 
 
