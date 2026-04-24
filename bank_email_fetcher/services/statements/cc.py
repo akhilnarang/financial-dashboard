@@ -42,6 +42,7 @@ from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from bank_email_fetcher.db import (
     Account,
     Card,
@@ -52,11 +53,9 @@ from bank_email_fetcher.db import (
 
 from bank_email_fetcher.config import get_fernet
 from bank_email_fetcher.core.dates import parse_date
-from bank_email_fetcher.integrations.parsers import (
-    format_cc_amount,
-    parse_cc_statement_pdf,
-    parse_cc_token_amount,
-)
+from bank_email_parser.models import Money, ParsedEmail
+
+from bank_email_fetcher.integrations.parsers import parse_cc_statement_pdf
 from bank_email_fetcher.services.linker import build_link_context, link_transaction
 from bank_email_fetcher.services.statements.hint import extract_password_hint
 from bank_email_fetcher.services.settings import (
@@ -83,6 +82,21 @@ def parse_statement(pdf_path: Path, password: str | None = None, bank: str = "au
 def parse_cc_amount(amount_str: str) -> Decimal:
     """Convert cc-parser amount string '25,000.00' to Decimal."""
     return Decimal(amount_str.replace(",", ""))
+
+
+def format_cc_amount(amount: Decimal) -> str:
+    """Render a ``Decimal`` in cc-parser's comma-grouped string shape.
+
+    Args:
+        amount: Decimal amount, e.g. ``Decimal("1234.56")``.
+
+    Returns:
+        Comma-grouped, two-decimal string, e.g. ``"1,234.56"``. Matches the
+        shape cc-parser writes to ``parsed.statement_total_amount_due``, so
+        summary-only and PDF-derived ``StatementUpload`` rows stay
+        indistinguishable to downstream consumers.
+    """
+    return f"{amount:,.2f}"
 
 
 def parse_cc_date(date_str: str) -> date_type:
@@ -255,9 +269,9 @@ def _calculate_adjustment_total(pairs, direction: str) -> str:
     for pair in pairs:
         if pair.confidence == "high":
             if direction == "debit" and pair.debit:
-                total += parse_cc_token_amount(pair.debit.amount or "0")
+                total += parse_cc_amount(pair.debit.amount or "0")
             elif direction == "credit" and pair.credit:
-                total += parse_cc_token_amount(pair.credit.amount or "0")
+                total += parse_cc_amount(pair.credit.amount or "0")
 
     return format_cc_amount(total)
 
@@ -516,6 +530,236 @@ _SKIP_PDF_NAMES = {
     "terms and conditions",
     "tnc",
 }
+
+
+def _format_cc_date(value: date_type | None) -> str | None:
+    """Render a ``StatementSummary.due_date`` in CC storage shape.
+
+    Args:
+        value: The parsed due date, or ``None`` if the parser didn't find one.
+
+    Returns:
+        DD/MM/YYYY string (what cc-parser emits and what
+        ``StatementUpload.due_date`` stores), or ``None`` if input is ``None``.
+        Keeping the same shape lets ``parse_cc_date`` consume summary-only
+        rows in the reminder pipeline without special-casing.
+    """
+    if value is None:
+        return None
+    return value.strftime("%d/%m/%Y")
+
+
+def _format_cc_money(value: Money | None) -> str | None:
+    """Render a ``StatementSummary`` money field in CC storage shape.
+
+    Args:
+        value: The ``Money`` object from the parser, or ``None`` if absent.
+
+    Returns:
+        Comma-grouped two-decimal string (``"1,234.56"``), or ``None`` if
+        input is ``None``. Matches the shape cc-parser writes to
+        ``total_amount_due`` in PDF-backed uploads so both row flavors look
+        identical to the dashboard and reminder code.
+    """
+    if value is None:
+        return None
+    return format_cc_amount(value.amount)
+
+
+async def process_cc_statement_email_summary(
+    bank: str,
+    parsed_email: ParsedEmail,
+    email_id: int | None,
+) -> dict | None:
+    """Persist a CC statement summary extracted directly from the email body.
+
+    Used when the email itself carries the total amount due / minimum / due
+    date (e.g. OneCard) — no PDF exists, so there's nothing to reconcile.
+    Creates a ``StatementUpload`` with ``source_kind="email_summary"`` so the
+    UI / reprocess paths can treat it distinctly, then kicks off payment
+    tracking and a Telegram notification.
+
+    Args:
+        bank: Bank name as it appears on the ``FetchRule`` (e.g. ``"onecard"``).
+            Matched case-insensitively against ``Account.bank``.
+        parsed_email: ``ParsedEmail`` whose ``.statement`` carries the summary.
+            If ``.statement`` is ``None`` this function is a no-op.
+        email_id: ``Email`` row id to link the upload to, or ``None`` when the
+            email row doesn't exist yet (the caller links it after this
+            function returns). See comment in ``parse_email_by_kind``.
+
+    Returns:
+        ``{"statement_upload_id": int, "summary_only": True}`` on success, or
+        ``None`` when the summary was refused. Refusal happens for any of:
+        missing ``total_amount_due``/``due_date`` on the parsed summary, no
+        active credit_card ``Account`` for ``bank``, or an ambiguous match
+        across multiple accounts. Each refusal is logged at INFO or WARNING.
+    """
+    summary = parsed_email.statement
+    if summary is None:
+        return None
+
+    # Summary uploads are not retryable once stored — refuse the insert
+    # unless the two dashboard-critical fields are both present. The
+    # ``StatementSummary`` contract allows partial payloads (for future
+    # parsers that only extract subsets), but persisting a summary row
+    # without ``total_amount_due`` + ``due_date`` would create a phantom
+    # entry that the dashboard/reminder pipeline can't act on and that
+    # the user can't fix via reprocess.
+    if summary.total_amount_due is None or summary.due_date is None:
+        logger.info(
+            "incomplete statement summary for bank=%s "
+            "(has_total=%s has_due_date=%s); refusing to persist",
+            bank,
+            summary.total_amount_due is not None,
+            summary.due_date is not None,
+        )
+        return None
+
+    async with async_session() as session:
+        cc_accounts = (
+            (
+                await session.execute(
+                    select(Account).where(
+                        func.lower(Account.bank) == bank.lower(),
+                        Account.type == "credit_card",
+                        Account.active.is_(True),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    if not cc_accounts:
+        logger.info("no CC account for bank=%s; skipping summary email", bank)
+        return None
+
+    card_mask = summary.card_mask
+    if len(cc_accounts) == 1:
+        account = cc_accounts[0]
+    else:
+        match: Account | None = None
+        if stmt_last4 := last4_from_card(card_mask):
+            async with async_session() as session:
+                match = await _match_account_by_last4(session, cc_accounts, stmt_last4)
+        if match is None:
+            logger.warning(
+                "multiple CC accounts for bank=%s; refusing to auto-pick "
+                "(card_mask=%r)",
+                bank,
+                card_mask,
+            )
+            return None
+        account = match
+
+    due_date_str = _format_cc_date(summary.due_date)
+    total_str = _format_cc_money(summary.total_amount_due)
+    min_str = _format_cc_money(summary.minimum_amount_due)
+
+    async with async_session() as session:
+        upload = StatementUpload(
+            account_id=account.id,
+            email_id=email_id,
+            bank=parsed_email.bank or bank,
+            filename="",
+            file_path="",
+            source_kind="email_summary",
+            status="parsed",
+            card_number=card_mask,
+            due_date=due_date_str,
+            total_amount_due=total_str,
+            minimum_amount_due=min_str,
+            parsed_txn_count=0,
+            matched_count=0,
+            missing_count=0,
+            imported_count=0,
+            reconciliation_data=None,
+        )
+        session.add(upload)
+        await session.commit()
+        upload_id = upload.id
+        upload_bank = upload.bank
+        upload_total = upload.total_amount_due
+        upload_min = upload.minimum_amount_due
+        upload_due = upload.due_date
+
+    # function-local: breaks cycle with services.reminders (reminders imports services.statements at top)
+    from bank_email_fetcher.services.reminders import init_payment_tracking
+
+    await init_payment_tracking(upload_id)
+
+    if should_notify_transactions():
+        # function-local: breaks cycle with services.telegram (telegram indirectly imports this module)
+        from bank_email_fetcher.services.telegram import (
+            send_statement_ready_notification,
+        )
+
+        await send_statement_ready_notification(
+            upload_id=upload_id,
+            bank=upload_bank,
+            total_amount_due=upload_total,
+            minimum_amount_due=upload_min,
+            due_date=upload_due,
+            chat_id=get_telegram_chat_id(),
+        )
+
+    return {"statement_upload_id": upload_id, "summary_only": True}
+
+
+async def _match_account_by_last4(
+    session: AsyncSession,
+    cc_accounts: list[Account],
+    stmt_last4: str,
+) -> Account | None:
+    """Pick the CC account whose card last-4 matches ``stmt_last4``.
+
+    Checks both ``Account.account_number`` (older accounts that stored the
+    card number directly) and the ``cards`` table (primary + add-on cards
+    keyed by account). Refuses to auto-pick under any ambiguity so a
+    statement never gets silently attached to the wrong account.
+
+    Args:
+        session: Active async DB session; used to query the ``cards`` table
+            for last-4 matches that didn't hit on ``Account.account_number``.
+        cc_accounts: Candidate active credit_card accounts for the bank
+            (already filtered by caller).
+        stmt_last4: Last-4 digits from the statement's ``card_mask``.
+
+    Returns:
+        The matching ``Account`` iff exactly one account has a last-4 match
+        across both sources. ``None`` when zero or multiple match; the
+        multi-match case logs a WARNING listing the ambiguous account ids.
+    """
+    account_id_matches: set[int] = {
+        acc.id
+        for acc in cc_accounts
+        if last4_from_card(acc.account_number) == stmt_last4
+    }
+    cc_account_ids = {acc.id for acc in cc_accounts}
+    cards = (
+        (await session.execute(select(Card).where(Card.account_id.in_(cc_account_ids))))
+        .scalars()
+        .all()
+    )
+    for card in cards:
+        if last4_from_card(card.card_mask) == stmt_last4:
+            account_id_matches.add(card.account_id)
+
+    if len(account_id_matches) != 1:
+        if len(account_id_matches) > 1:
+            logger.warning(
+                "ambiguous CC account match for last4=%s across accounts=%s; "
+                "refusing to auto-pick",
+                stmt_last4,
+                sorted(account_id_matches),
+            )
+        return None
+    matched_id = next(iter(account_id_matches))
+    for acc in cc_accounts:
+        if acc.id == matched_id:
+            return acc
+    return None
 
 
 def extract_pdf_from_email(raw_bytes: bytes) -> list[tuple[str, bytes]]:

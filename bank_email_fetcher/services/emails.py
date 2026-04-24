@@ -26,11 +26,9 @@ from bank_email_fetcher.integrations.email.parsing import (
     _extract_message_metadata,
     _parse_email_date,
 )
-from bank_email_fetcher.integrations.parsers import (
-    ParseError,
-    UnsupportedEmailTypeError,
-    parse_transaction_email,
-)
+from bank_email_parser import parse_email
+from bank_email_parser.exceptions import ParseError, UnsupportedEmailTypeError
+from bank_email_parser.models import ParsedEmail
 from bank_email_fetcher.services.linker import link_transaction
 from bank_email_fetcher.services.reminders import check_payment_received
 from bank_email_fetcher.services.settings import (
@@ -72,7 +70,7 @@ def _process_email(
         return "No HTML or text body found in email", None, None
 
     try:
-        parsed = parse_transaction_email(bank, html)
+        parsed = parse_email(bank, html)
     except (ParseError, UnsupportedEmailTypeError) as e:
         return str(e), None, None
 

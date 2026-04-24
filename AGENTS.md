@@ -79,7 +79,6 @@ uv run pytest -q
 ## Compatibility rules
 
 - Preserve current HTTP routes, JSON response shapes, template behavior, parser-derived `email_type` values, and script entrypoints unless a task explicitly allows a breaking change.
-- Use `bank_email_fetcher.integrations.parsers` instead of importing sibling parser packages directly from feature code.
 - Shared poll state belongs on `app.state.fetch_service`; avoid new module-level poll loops or duplicate status dicts.
 - Keep `bank_statements.router` registered before `statements.router`.
 

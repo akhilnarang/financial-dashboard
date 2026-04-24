@@ -21,7 +21,6 @@ from bank_email_fetcher.db import (
     StatementUpload,
     Transaction,
 )
-from bank_email_fetcher.integrations.parsers import get_supported_banks
 from bank_email_fetcher.services.statements.cc import parse_cc_amount, parse_cc_date
 
 logging.basicConfig(
@@ -33,7 +32,6 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 templates = get_templates()
-SUPPORTED_BANKS = get_supported_banks()
 router = APIRouter()
 
 
@@ -94,6 +92,7 @@ async def dashboard(
             .scalars()
             .all()
         )
+
         # Why: backfilled older statements can have a newer created_at than the true-latest
         # cycle, so primary sort is parsed due_date. When due_date is unparseable we fall
         # back to created_at on that side only — otherwise a newer upload with a malformed
@@ -174,7 +173,9 @@ async def dashboard(
         # Why: clamp negative outstanding (overpayment credit balance) to 0 so it doesn't reduce the grand total.
         outstanding = max(amount_due - paid_amount, Decimal(0))
         # Why: column is stored as String, so loaded rows give back a str, not a PaymentStatus instance.
-        status_value = str(payment_status) if payment_status else PaymentStatus.UNPAID.value
+        status_value = (
+            str(payment_status) if payment_status else PaymentStatus.UNPAID.value
+        )
         row["status"] = status_value
         row["status_label"] = status_value.replace("_", " ")
         row["outstanding"] = outstanding

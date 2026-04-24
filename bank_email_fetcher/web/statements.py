@@ -46,7 +46,6 @@ from bank_email_fetcher.integrations.email.imap_gmail import _fetch_gmail_single
 from bank_email_fetcher.integrations.email.jmap_fastmail import (
     _fetch_fastmail_single_sync,
 )
-from bank_email_fetcher.integrations.parsers import get_supported_banks
 from bank_email_fetcher.services.accounts import (
     retry_password_required_statements as accounts_retry_password_required_statements,
 )
@@ -84,7 +83,6 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 templates = get_templates()
-SUPPORTED_BANKS = get_supported_banks()
 router = APIRouter()
 
 

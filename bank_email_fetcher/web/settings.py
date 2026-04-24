@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bank_email_fetcher.core.deps import get_session
 from bank_email_fetcher.core.templating import get_templates
-from bank_email_fetcher.integrations.parsers import get_supported_banks
 from bank_email_fetcher.services.settings import (
     get_grouped_settings,
     parse_form_updates,
@@ -27,7 +26,6 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 templates = get_templates()
-SUPPORTED_BANKS = get_supported_banks()
 router = APIRouter()
 
 

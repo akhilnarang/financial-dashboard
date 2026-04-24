@@ -2,11 +2,8 @@
 
 import email as email_lib
 
-from bank_email_fetcher.integrations.parsers import (
-    ParseError,
-    UnsupportedEmailTypeError,
-    parse_transaction_email,
-)
+from bank_email_parser import parse_email
+from bank_email_parser.exceptions import ParseError, UnsupportedEmailTypeError
 
 
 def _extract_html_from_email(raw_bytes: bytes) -> str | None:
@@ -29,6 +26,6 @@ def extract_password_hint(raw_bytes: bytes, bank: str) -> str | None:
     if not (html := _extract_html_from_email(raw_bytes)):
         return None
     try:
-        return parse_transaction_email(bank, html).password_hint
+        return parse_email(bank, html).password_hint
     except ParseError, UnsupportedEmailTypeError:
         return None

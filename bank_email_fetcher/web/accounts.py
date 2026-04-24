@@ -18,7 +18,7 @@ from bank_email_fetcher.db import (
     Card,
     Transaction,
 )
-from bank_email_fetcher.integrations.parsers import get_supported_banks
+from bank_email_parser import SUPPORTED_BANKS
 from bank_email_fetcher.services.accounts import (
     auto_link_account,
     retry_password_required_statements as accounts_retry_password_required_statements,
@@ -33,7 +33,6 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 templates = get_templates()
-SUPPORTED_BANKS = get_supported_banks()
 router = APIRouter()
 
 

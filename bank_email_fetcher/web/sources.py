@@ -16,7 +16,6 @@ from bank_email_fetcher.db import (
     EmailSource,
     FetchRule,
 )
-from bank_email_fetcher.integrations.parsers import get_supported_banks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,7 +26,6 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 templates = get_templates()
-SUPPORTED_BANKS = get_supported_banks()
 router = APIRouter()
 
 
