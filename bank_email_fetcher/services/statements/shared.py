@@ -53,6 +53,21 @@ async def retry_cc_statement_upload(
         account_id = upload.account_id
         file_path = upload.file_path
         bank = upload.bank
+        source_kind = upload.source_kind
+
+    if source_kind == "email_summary":
+        logger.info(
+            "Skipping retry for CC statement #%s: email_summary has no PDF to reparse",
+            upload_id,
+        )
+        return False
+
+    if not file_path:
+        logger.info(
+            "Skipping retry for CC statement #%s: no file_path on disk",
+            upload_id,
+        )
+        return False
 
     try:
         parsed = await asyncio.to_thread(

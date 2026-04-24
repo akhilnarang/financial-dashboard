@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+from typing import NamedTuple
 
 from sqlalchemy.exc import IntegrityError
 
@@ -36,7 +37,10 @@ from bank_email_fetcher.services.settings import (
     get_telegram_chat_id,
 )
 from bank_email_fetcher.services.statements.bank import process_bank_statement_email
-from bank_email_fetcher.services.statements.cc import process_statement_email
+from bank_email_fetcher.services.statements.cc import (
+    process_cc_statement_email_summary,
+    process_statement_email,
+)
 from bank_email_fetcher.services.telegram import (
     build_account_label,
     send_bulk_summary,
@@ -59,23 +63,30 @@ def _is_duplicate_transaction_error(exc: IntegrityError) -> bool:
     )
 
 
-def _process_email(
+def _process_email_full(
     bank: str, raw_bytes: bytes
-) -> tuple[str | None, dict | None, str | None]:
-    """Parse raw email bytes. Returns (error, txn_dict, password_hint)."""
+) -> tuple[str | None, dict | None, str | None, ParsedEmail | None]:
+    """Parse raw email bytes.
+
+    Returns ``(error, txn_dict, password_hint, parsed_email)`` — ``parsed_email``
+    is the raw ``ParsedEmail`` (or None if parsing failed), so callers can read
+    ``parsed.statement`` for summary-only emails.
+    """
     html = _extract_html_body(raw_bytes)
     if not html:
         html = _extract_text_body(raw_bytes)
     if not html:
-        return "No HTML or text body found in email", None, None
+        return "No HTML or text body found in email", None, None, None
 
     try:
         parsed = parse_email(bank, html)
     except (ParseError, UnsupportedEmailTypeError) as e:
-        return str(e), None, None
+        return str(e), None, None, None
+
+    password_hint = parsed.password_hint
 
     if (txn := parsed.transaction) is None:
-        return None, None, parsed.password_hint
+        return None, None, password_hint, parsed
 
     transaction_date = txn.transaction_date
     if transaction_date is None:
@@ -101,7 +112,8 @@ def _process_email(
             "balance": float(txn.balance.amount) if txn.balance else None,
             "raw_description": txn.raw_description,
         },
-        None,
+        password_hint,
+        parsed,
     )
 
 
@@ -112,6 +124,78 @@ _STATEMENT_KINDS = {
 }
 
 
+class EmailDispatchResult(NamedTuple):
+    """Outcome of dispatching one raw email to the parse+route pipeline.
+
+    Tuple-compatible: existing callers that unpack positionally
+    (``error, txn_data, password_hint, stmt_result = ...``) continue to work.
+    """
+
+    error: str | None
+    txn_data: dict | None
+    password_hint: str | None
+    stmt_result: dict | None
+
+
+async def _dispatch_email_summary(
+    *,
+    bank: str,
+    parsed_email: ParsedEmail,
+    password_hint: str | None,
+    log_ref: str,
+) -> EmailDispatchResult:
+    """Dispatch an email whose body already carries a ``StatementSummary``.
+
+    Caller has already established that routing is allowed for this kind and
+    that ``parsed_email.statement`` is populated. The returned result is
+    final — the PDF path is NOT attempted when the summary path was taken,
+    even if the handler refused (see summary-precedence comment in caller).
+
+    Args:
+        bank: Bank identifier from the matching ``FetchRule``.
+        parsed_email: The parser's output; ``.statement`` MUST be populated
+            (caller-enforced).
+        password_hint: Any password hint the HTML parser extracted; threaded
+            through to the result unchanged. Summary emails don't need a
+            password, but the hint may still be useful for a later PDF upload
+            on the same account.
+        log_ref: Identifier (usually ``msg_id``) for log correlation.
+
+    Returns:
+        An ``EmailDispatchResult`` with ``stmt_result`` set on success, or
+        with ``error`` explaining why the summary handler refused (no
+        matching CC account, ambiguous match, or incomplete payload).
+    """
+    stmt_result: dict | None = None
+    handler_error: str | None = None
+    try:
+        # ``email_id=None``: the ``emails`` row does not exist yet here;
+        # it's linked after ``parse_email_by_kind`` returns, in
+        # ``handle_polled_email`` / the reparse route.
+        stmt_result = await process_cc_statement_email_summary(
+            bank, parsed_email, email_id=None
+        )
+    except Exception as stmt_err:
+        logger.warning(
+            "CC statement summary processing error for %s: %s", log_ref, stmt_err
+        )
+        handler_error = f"Statement summary processing error: {stmt_err}"
+
+    # The parser emitted a statement summary — this email *is* a statement.
+    # Distinguish handler exceptions from handler refusals so the email's
+    # ``error`` column doesn't lie about what went wrong.
+    if stmt_result is not None:
+        error: str | None = None
+    elif handler_error is not None:
+        error = handler_error
+    else:
+        error = (
+            "Statement summary could not be persisted "
+            "(no matching CC account or ambiguous match — see logs)"
+        )
+    return EmailDispatchResult(error, None, password_hint, stmt_result)
+
+
 async def parse_email_by_kind(
     *,
     bank: str,
@@ -120,34 +204,70 @@ async def parse_email_by_kind(
     subject: str,
     source_id: int | None,
     log_ref: str,
-) -> tuple[str | None, dict | None, str | None, dict | None]:
+) -> EmailDispatchResult:
     """Run txn and/or statement pipelines based on the rule's email_kind.
 
-    Returns ``(error, txn_data, password_hint, stmt_result)`` — exactly one of
-    txn_data or stmt_result will be populated on success.
+    Exactly one of ``txn_data`` or ``stmt_result`` is populated on success.
     """
-    error: str | None = None
-    txn_data: dict | None = None
-    password_hint: str | None = None
-    stmt_result: dict | None = None
-
-    if email_kind not in _STATEMENT_KINDS:
-        error, txn_data, password_hint = _process_email(bank, raw_bytes)
-
-    try_cc = email_kind in (EmailKind.CC_STATEMENT, EmailKind.STATEMENT) or (
-        email_kind in (None, EmailKind.TRANSACTION) and not txn_data
+    # Always run the HTML parser — statement-kind emails still carry a
+    # ``password_hint`` and may carry a full ``StatementSummary`` in the body
+    # that the statement pipeline needs. For statement routing we discard the
+    # parse error (typically "no transaction parser matched" — expected for a
+    # statement email) and only keep hint + summary.
+    raw_error, txn_data, password_hint, parsed_email = _process_email_full(
+        bank, raw_bytes
     )
-    try_bank = email_kind in (EmailKind.BANK_STATEMENT, EmailKind.STATEMENT) or (
-        email_kind in (None, EmailKind.TRANSACTION) and not txn_data
+
+    # Compute routing booleans once.
+    is_statement_rule = email_kind in _STATEMENT_KINDS
+    is_transaction_rule = email_kind == EmailKind.TRANSACTION
+    is_untyped_rule = email_kind is None
+    allow_summary_route = email_kind in (
+        EmailKind.CC_STATEMENT,
+        EmailKind.STATEMENT,
+        None,
+    )
+
+    if is_statement_rule:
+        # Statement rules don't surface a transaction even if the parser
+        # happened to populate one (wrong routing / ambiguous email type).
+        txn_data = None
+        error: str | None = None
+    else:
+        error = raw_error
+
+    # Email-summary statements take precedence over PDF parsing: if the body
+    # already carries a ``StatementSummary``, we persist from that and never
+    # attempt the PDF path, even if the handler refuses.
+    if (
+        allow_summary_route
+        and parsed_email is not None
+        and parsed_email.statement is not None
+    ):
+        return await _dispatch_email_summary(
+            bank=bank,
+            parsed_email=parsed_email,
+            password_hint=password_hint,
+            log_ref=log_ref,
+        )
+
+    stmt_result: dict | None = None
+    # Txn-capable rules (None / TRANSACTION) only try statement pipelines
+    # as a fallback when transaction parsing didn't produce anything.
+    fallback_to_stmt = (is_untyped_rule or is_transaction_rule) and not txn_data
+    try_cc = (
+        email_kind in (EmailKind.CC_STATEMENT, EmailKind.STATEMENT) or fallback_to_stmt
+    )
+    try_bank = (
+        email_kind in (EmailKind.BANK_STATEMENT, EmailKind.STATEMENT)
+        or fallback_to_stmt
     )
 
     if try_cc or try_bank:
         logger.info(
             "Email %s %s (bank=%s, kind=%s, subject=%r), trying statement path",
             log_ref,
-            "routed to statement pipeline"
-            if email_kind in _STATEMENT_KINDS
-            else "failed parsing",
+            "routed to statement pipeline" if is_statement_rule else "failed parsing",
             bank,
             email_kind,
             subject[:80],
@@ -185,10 +305,10 @@ async def parse_email_by_kind(
                 "Statement processing returned None for %s (no PDF or subject mismatch)",
                 log_ref,
             )
-            if email_kind in _STATEMENT_KINDS:
+            if is_statement_rule:
                 error = "Statement processing returned no result"
 
-    return error, txn_data, password_hint, stmt_result
+    return EmailDispatchResult(error, txn_data, password_hint, stmt_result)
 
 
 async def handle_polled_email(
@@ -206,7 +326,7 @@ async def handle_polled_email(
     metadata = _extract_message_metadata(raw_bytes)
     received_at = _parse_email_date(raw_bytes)
 
-    email_kind = getattr(rule, "email_kind", None)
+    email_kind = rule.email_kind
     subject = metadata.get("subject", "")
     error, txn_data, password_hint, stmt_result = await parse_email_by_kind(
         bank=rule.bank,
@@ -221,13 +341,20 @@ async def handle_polled_email(
         error = None
         stats["parsed"] += 1
         stmt_type = "bank" if stmt_result.get("bank_statement_upload_id") else "CC"
-        logger.info(
-            "Processed %s statement from email %s: matched=%d imported=%d",
-            stmt_type,
-            msg_id,
-            stmt_result["matched"],
-            stmt_result["imported"],
-        )
+        if stmt_result.get("summary_only"):
+            logger.info(
+                "Processed %s statement summary (email-only) from %s",
+                stmt_type,
+                msg_id,
+            )
+        else:
+            logger.info(
+                "Processed %s statement from email %s: matched=%d imported=%d",
+                stmt_type,
+                msg_id,
+                stmt_result.get("matched", 0),
+                stmt_result.get("imported", 0),
+            )
     elif error:
         try:
             _save_failed_email(provider, msg_id, raw_bytes)

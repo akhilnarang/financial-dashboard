@@ -213,7 +213,13 @@
                     <td><span class="badge{% if is_bank %} badge-pending{% endif %}">{{ "Bank" if is_bank else "CC" }}</span></td>
                     <td><span class="badge">{{ u.bank }}</span></td>
                     <td class="text-sm">{% if u.account %}<a href="/accounts/{{ u.account.id }}/edit" onclick="event.stopPropagation()">{{ u.account.label }}</a>{% else %}&mdash;{% endif %}</td>
-                    <td class="text-sm text-muted"><span class="truncate" title="{{ u.filename }}">{{ u.filename }}</span></td>
+                    <td class="text-sm text-muted">
+                        {% if (not is_bank) and u.source_kind == "email_summary" %}
+                        <span class="badge" title="Parsed from email body">Email summary</span>
+                        {% else %}
+                        <span class="truncate" title="{{ u.filename }}">{{ u.filename }}</span>
+                        {% endif %}
+                    </td>
                     <td>
                         {% if u.status == "parsed" %}
                         <span class="badge">parsed</span>

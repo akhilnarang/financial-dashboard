@@ -245,7 +245,7 @@
 <div class="stmt-header">
     <h2>Statement #{{ upload.id }}</h2>
     <div class="stmt-header-actions">
-        {% if upload.file_path or upload.email_id %}
+        {% if upload.source_kind != "email_summary" %}
         <form method="post" action="/statements/{{ upload.id }}/reprocess" style="margin: 0;">
             <button type="submit" class="text-sm" title="Re-parse PDF and rebuild reconciliation data">Reprocess</button>
         </form>
@@ -283,6 +283,38 @@
 <article class="card" style="margin-bottom: 1.5rem;">
     <p><strong>Failed to parse this statement.</strong></p>
     <p class="text-sm text-muted">{{ upload.error }}</p>
+</article>
+
+{% elif upload.source_kind == "email_summary" %}
+<div class="stmt-summary">
+    <div class="stmt-info">
+        <div class="meta-line">
+            <span class="badge">{{ upload.bank }}</span>
+            <span class="badge" title="Extracted from email body">Email summary</span>
+            {% if upload.card_number %}<span class="card-num">{{ upload.card_number }}</span>{% endif %}
+        </div>
+        <div class="meta-secondary">
+            {% if upload.due_date %}<span>Due <b>{{ upload.due_date }}</b></span>{% endif %}
+            {% if upload.minimum_amount_due %}<span>Min due <b>&#8377;{{ upload.minimum_amount_due }}</b></span>{% endif %}
+        </div>
+    </div>
+
+    <div class="stmt-metrics">
+        <dl class="stmt-hero">
+            <dt>Total Due</dt>
+            <dd>{% if upload.total_amount_due %}&#8377;{{ upload.total_amount_due }}{% else %}&mdash;{% endif %}</dd>
+        </dl>
+    </div>
+</div>
+
+<article class="card" style="margin-bottom: 1.5rem;">
+    <p><strong>This statement was extracted from the email body.</strong></p>
+    <p class="text-sm text-muted">
+        {% if upload.email_id %}
+        See the <a href="#" onclick="openDetailModal('/emails/{{ upload.email_id }}/detail'); return false;">source email</a>.
+        {% endif %}
+        Upload a PDF to reconcile transactions.
+    </p>
 </article>
 
 {% elif recon %}

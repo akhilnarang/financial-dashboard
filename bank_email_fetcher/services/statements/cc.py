@@ -577,7 +577,8 @@ async def process_cc_statement_email_summary(
     date (e.g. OneCard) — no PDF exists, so there's nothing to reconcile.
     Creates a ``StatementUpload`` with ``source_kind="email_summary"`` so the
     UI / reprocess paths can treat it distinctly, then kicks off payment
-    tracking and a Telegram notification.
+    tracking. Telegram notifications are handled by the reminder pipeline,
+    not fired here.
 
     Args:
         bank: Bank name as it appears on the ``FetchRule`` (e.g. ``"onecard"``).
@@ -658,51 +659,53 @@ async def process_cc_statement_email_summary(
     min_str = _format_cc_money(summary.minimum_amount_due)
 
     async with async_session() as session:
-        upload = StatementUpload(
-            account_id=account.id,
-            email_id=email_id,
-            bank=parsed_email.bank or bank,
-            filename="",
-            file_path="",
-            source_kind="email_summary",
-            status="parsed",
-            card_number=card_mask,
-            due_date=due_date_str,
-            total_amount_due=total_str,
-            minimum_amount_due=min_str,
-            parsed_txn_count=0,
-            matched_count=0,
-            missing_count=0,
-            imported_count=0,
-            reconciliation_data=None,
-        )
-        session.add(upload)
-        await session.commit()
-        upload_id = upload.id
-        upload_bank = upload.bank
-        upload_total = upload.total_amount_due
-        upload_min = upload.minimum_amount_due
-        upload_due = upload.due_date
-
+        # One row per (account, statement cycle). Reparse hits this path
+        # repeatedly with the same payload; we update the existing row
+        # instead of accumulating duplicates.
+        existing = (
+            await session.execute(
+                select(StatementUpload).where(
+                    StatementUpload.source_kind == "email_summary",
+                    StatementUpload.account_id == account.id,
+                    StatementUpload.due_date == due_date_str,
+                    StatementUpload.total_amount_due == total_str,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            existing.bank = parsed_email.bank or bank
+            existing.card_number = card_mask
+            existing.minimum_amount_due = min_str
+            if email_id is not None:
+                existing.email_id = email_id
+            await session.commit()
+            upload_id = existing.id
+        else:
+            upload = StatementUpload(
+                account_id=account.id,
+                email_id=email_id,
+                bank=parsed_email.bank or bank,
+                filename="",
+                file_path="",
+                source_kind="email_summary",
+                status="parsed",
+                card_number=card_mask,
+                due_date=due_date_str,
+                total_amount_due=total_str,
+                minimum_amount_due=min_str,
+                parsed_txn_count=0,
+                matched_count=0,
+                missing_count=0,
+                imported_count=0,
+                reconciliation_data=None,
+            )
+            session.add(upload)
+            await session.commit()
+            upload_id = upload.id
     # function-local: breaks cycle with services.reminders (reminders imports services.statements at top)
     from bank_email_fetcher.services.reminders import init_payment_tracking
 
     await init_payment_tracking(upload_id)
-
-    if should_notify_transactions():
-        # function-local: breaks cycle with services.telegram (telegram indirectly imports this module)
-        from bank_email_fetcher.services.telegram import (
-            send_statement_ready_notification,
-        )
-
-        await send_statement_ready_notification(
-            upload_id=upload_id,
-            bank=upload_bank,
-            total_amount_due=upload_total,
-            minimum_amount_due=upload_min,
-            due_date=upload_due,
-            chat_id=get_telegram_chat_id(),
-        )
 
     return {"statement_upload_id": upload_id, "summary_only": True}
 

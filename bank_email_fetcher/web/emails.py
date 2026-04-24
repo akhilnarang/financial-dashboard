@@ -392,7 +392,10 @@ async def reparse_email(
     msg = "Email re-parsed successfully"
     if stmt_result:
         stmt_kind = "Bank" if stmt_result.get("bank_statement_upload_id") else "CC"
-        msg = f"{stmt_kind} statement re-processed (matched={stmt_result.get('matched', 0)}, imported={stmt_result.get('imported', 0)})"
+        if stmt_result.get("summary_only"):
+            msg = f"{stmt_kind} statement summary created from email body"
+        else:
+            msg = f"{stmt_kind} statement re-processed (matched={stmt_result.get('matched', 0)}, imported={stmt_result.get('imported', 0)})"
     logger.info("Reparse of email %d succeeded: %s", email_id, msg)
     return ReparseEmailResponse(message=msg, new_status="parsed", txn_id=txn_id)
 

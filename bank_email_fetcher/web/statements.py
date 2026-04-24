@@ -460,6 +460,17 @@ async def statement_reprocess(
     upload = await session.get(StatementUpload, upload_id)
     if not upload:
         return RedirectResponse(url="/statements", status_code=303)
+    if upload.source_kind == "email_summary":
+        return RedirectResponse(
+            url=f"/statements/{upload_id}?"
+            + urlencode(
+                {
+                    "error": "This statement was parsed from the email body — "
+                    "upload a PDF to reconcile transactions."
+                }
+            ),
+            status_code=303,
+        )
     account_id = upload.account_id
     file_path = upload.file_path
     email_id = upload.email_id
