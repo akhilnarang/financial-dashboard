@@ -155,6 +155,175 @@ scripts/
 | `Account` | `accounts` | Bank account, savings account, or credit card |
 | `Card` | `cards` | Physical payment card linked to an account (supports addon cards) |
 | `StatementUpload` | `statement_uploads` | CC statement PDF upload with reconciliation results stored as JSON |
+| `BankStatementUpload` | `bank_statement_uploads` | Bank statement PDF upload with reconciliation results stored as JSON |
+| `Setting` | `settings` | Small key/value store for app-level settings |
+
+### Schema Diagram
+
+```mermaid
+erDiagram
+    EMAIL_SOURCES {
+        int id PK
+        string provider
+        string label
+        string account_identifier
+        string credentials
+        bool active
+        string sync_cursor
+        datetime last_synced_at
+        string last_error
+    }
+
+    ACCOUNTS {
+        int id PK
+        string bank
+        string label
+        string type
+        string account_number
+        string statement_password
+        string statement_password_hint
+        bool active
+    }
+
+    CARDS {
+        int id PK
+        int account_id FK
+        string card_mask
+        string label
+        bool is_primary
+        bool active
+    }
+
+    FETCH_RULES {
+        int id PK
+        string provider
+        int source_id FK
+        string sender
+        string subject
+        string bank
+        string folder
+        string email_kind
+        bool enabled
+        datetime initial_backfill_done_at
+    }
+
+    EMAILS {
+        int id PK
+        string provider
+        string message_id
+        int source_id FK
+        string remote_id
+        string sender
+        string subject
+        datetime received_at
+        datetime fetched_at
+        string status
+        text error
+        int rule_id FK
+    }
+
+    STATEMENT_UPLOADS {
+        int id PK
+        int account_id FK
+        int email_id FK
+        string bank
+        string filename
+        string file_path
+        string source_kind
+        string status
+        string card_number
+        string statement_name
+        string due_date
+        string total_amount_due
+        string minimum_amount_due
+        int parsed_txn_count
+        int matched_count
+        int missing_count
+        int imported_count
+        text reconciliation_data
+        text error
+        datetime created_at
+        string payment_status
+        text payment_sent_offsets
+        datetime payment_last_reminded_at
+        decimal payment_paid_amount
+        datetime payment_paid_at
+    }
+
+    BANK_STATEMENT_UPLOADS {
+        int id PK
+        int account_id FK
+        int email_id FK
+        string bank
+        string filename
+        string file_path
+        string status
+        string account_number
+        string account_holder_name
+        string opening_balance
+        string closing_balance
+        string statement_period_start
+        string statement_period_end
+        int parsed_txn_count
+        int matched_count
+        int missing_count
+        int imported_count
+        text reconciliation_data
+        text error
+        datetime created_at
+    }
+
+    SETTINGS {
+        string key PK
+        text value
+        datetime updated_at
+    }
+
+    TRANSACTIONS {
+        int id PK
+        int email_id FK
+        int account_id FK
+        int card_id FK
+        int statement_upload_id FK
+        int bank_statement_upload_id FK
+        string bank
+        string email_type
+        string direction
+        decimal amount
+        string currency
+        date transaction_date
+        time transaction_time
+        string counterparty
+        string card_mask
+        string account_mask
+        string reference_number
+        string channel
+        decimal balance
+        text raw_description
+        text note
+        string category
+        datetime created_at
+    }
+
+    ACCOUNTS ||--o{ CARDS : has
+    EMAIL_SOURCES ||--o{ FETCH_RULES : assigned_to
+    EMAIL_SOURCES ||--o{ EMAILS : fetched_from
+    FETCH_RULES ||--o{ EMAILS : matched_by
+    ACCOUNTS ||--o{ STATEMENT_UPLOADS : owns
+    EMAILS ||--o{ STATEMENT_UPLOADS : originates
+    ACCOUNTS ||--o{ BANK_STATEMENT_UPLOADS : owns
+    EMAILS ||--o{ BANK_STATEMENT_UPLOADS : originates
+    EMAILS ||--o{ TRANSACTIONS : produces
+    ACCOUNTS ||--o{ TRANSACTIONS : linked_account
+    CARDS ||--o{ TRANSACTIONS : linked_card
+    STATEMENT_UPLOADS ||--o{ TRANSACTIONS : imported_from_cc_statement
+    BANK_STATEMENT_UPLOADS ||--o{ TRANSACTIONS : imported_from_bank_statement
+```
+
+Relationship notes:
+- `transactions.account_id` and `transactions.card_id` are the canonical account/card links after the linker runs; `card_mask` and `account_mask` remain as parser-derived denormalized hints.
+- `settings` is intentionally standalone and has no foreign-key links.
+- Several foreign keys are nullable (`fetch_rules.source_id`, `emails.source_id`, `emails.rule_id`, and the upload/transaction linkage columns), so rows can exist before the related record is known.
 
 ### Key Constraints
 - `emails.message_id` is globally unique (prevents re-inserting the same email).
