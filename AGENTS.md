@@ -83,6 +83,42 @@ uv run pytest -q
 - Shared poll state belongs on `app.state.fetch_service`; avoid new module-level poll loops or duplicate status dicts.
 - Keep `bank_statements.router` registered before `statements.router`.
 
+## Local cross-repo development
+
+**The committed state always uses git/PyPI-tagged sibling versions.**
+`pyproject.toml`'s `[tool.uv.sources]` pins each sibling to its
+`git = "https://github.com/..."` URL, and `uv.lock` records the exact SHA
+that CI, deploys, and reviewers see.
+
+When you're actively developing a change that spans this repo and a
+sibling (`bank-email-parser`, `bank-statement-parser`, `cc-parser`), you can
+**temporarily** swap those git sources for local path sources so edits in
+the sibling are picked up immediately — no reinstall, no version bump, no
+lockfile churn. The siblings live at `../<name>` relative to this repo.
+
+Temporary dev-only block (do NOT commit this):
+
+```toml
+[tool.uv.sources]
+bank-email-parser = { path = "../bank-email-parser", editable = true }
+bank-statement-parser = { path = "../bank-statement-parser", editable = true }
+cc-parser = { path = "../cc-parser", editable = true }
+```
+
+Rules:
+
+- **Before pushing or opening a PR**: revert `[tool.uv.sources]` to the
+  `git = "..."` form and run `uv lock` so the lockfile pins the new SHA
+  (tag the sibling repo first if the change isn't already on `main`).
+  Deploys run off these git sources; path sources would break CI.
+- **Never commit path sources.** If `git diff pyproject.toml uv.lock` shows
+  path entries or a stale lockfile, fix that before pushing.
+- **During dev with path sources**, direct attribute access works and `ty`
+  sees the new sibling shape — no `getattr` scaffolding needed.
+- Sibling repo SHAs pinned by the committed lockfile can be inspected in
+  `uv.lock` under the relevant
+  `[[package]]` block.
+
 ## Quality gates
 
 Run all of these before finishing a refactor:
