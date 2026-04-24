@@ -137,11 +137,15 @@ class StatementUpload(Base):
     bank: Mapped[str] = mapped_column(String, nullable=False)
     filename: Mapped[str] = mapped_column(String, nullable=False)
     file_path: Mapped[str] = mapped_column(String, nullable=False)
+    source_kind: Mapped[str] = mapped_column(
+        String, nullable=False, server_default="pdf", default="pdf"
+    )
     status: Mapped[str] = mapped_column(String, nullable=False, default="parsed")
     card_number: Mapped[str | None] = mapped_column(String)
     statement_name: Mapped[str | None] = mapped_column(String)
     due_date: Mapped[str | None] = mapped_column(String)
     total_amount_due: Mapped[str | None] = mapped_column(String)
+    minimum_amount_due: Mapped[str | None] = mapped_column(String)
     parsed_txn_count: Mapped[int | None] = mapped_column(Integer, default=0)
     matched_count: Mapped[int | None] = mapped_column(Integer, default=0)
     missing_count: Mapped[int | None] = mapped_column(Integer, default=0)

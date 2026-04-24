@@ -118,6 +118,24 @@ async def init_db(engine) -> None:
             await conn.execute(
                 text("ALTER TABLE transactions ADD COLUMN category VARCHAR")
             )
+        try:
+            await conn.execute(
+                text("SELECT source_kind FROM statement_uploads LIMIT 0")
+            )
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE statement_uploads ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'pdf'"
+                )
+            )
+        try:
+            await conn.execute(
+                text("SELECT minimum_amount_due FROM statement_uploads LIMIT 0")
+            )
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE statement_uploads ADD COLUMN minimum_amount_due TEXT")
+            )
         nach_marker = (
             await conn.execute(
                 text(
