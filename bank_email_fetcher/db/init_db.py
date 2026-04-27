@@ -136,6 +136,29 @@ async def init_db(engine) -> None:
             await conn.execute(
                 text("ALTER TABLE statement_uploads ADD COLUMN minimum_amount_due TEXT")
             )
+        ref_index_marker = (
+            await conn.execute(
+                text(
+                    "SELECT 1 FROM settings WHERE key = 'migrations.uq_ref_includes_direction'"
+                )
+            )
+        ).first()
+        if not ref_index_marker:
+            await conn.execute(text("DROP INDEX IF EXISTS uq_transactions_ref"))
+            await conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX uq_transactions_ref "
+                    "ON transactions (bank, reference_number, direction) "
+                    "WHERE reference_number IS NOT NULL"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO settings (key, value) VALUES "
+                    "('migrations.uq_ref_includes_direction', '1')"
+                )
+            )
+
         nach_marker = (
             await conn.execute(
                 text(

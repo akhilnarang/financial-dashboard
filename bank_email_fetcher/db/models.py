@@ -259,6 +259,7 @@ class Transaction(Base):
             "uq_transactions_ref",
             "bank",
             "reference_number",
+            "direction",
             unique=True,
             sqlite_where=text("reference_number IS NOT NULL"),
         ),

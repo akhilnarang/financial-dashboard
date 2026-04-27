@@ -112,16 +112,18 @@ def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> 
     # Build DB candidate pools
     # Pool 1: by (date, amount, direction)
     db_pool: dict[tuple, list] = {}
-    # Pool 2: by reference_number
-    db_ref_pool: dict[str, list] = {}
+    # Pool 2: by (reference_number, direction) — UPI refunds reuse the ref with opposite direction
+    db_ref_pool: dict[tuple[str, str], list] = {}
     for db_txn in db_transactions:
         if db_txn.transaction_date and db_txn.amount is not None:
             key = _match_key(
                 db_txn.transaction_date, Decimal(str(db_txn.amount)), db_txn.direction
             )
             db_pool.setdefault(key, []).append(db_txn)
-        if db_txn.reference_number:
-            db_ref_pool.setdefault(db_txn.reference_number, []).append(db_txn)
+        if db_txn.reference_number and db_txn.direction:
+            db_ref_pool.setdefault(
+                (db_txn.reference_number, db_txn.direction), []
+            ).append(db_txn)
 
     matched = []
     missing = []
@@ -150,15 +152,16 @@ def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> 
         found = None
 
         # Try reference_number match first (highest confidence)
-        if txn.reference_number and txn.reference_number in db_ref_pool:
-            candidates = db_ref_pool[txn.reference_number]
+        ref_key = (txn.reference_number, direction) if txn.reference_number else None
+        if ref_key and ref_key in db_ref_pool:
+            candidates = db_ref_pool[ref_key]
             for cand in candidates:
                 if cand.id not in matched_db_ids:
                     found = cand
                     matched_db_ids.add(cand.id)
                     candidates.remove(cand)
                     if not candidates:
-                        del db_ref_pool[txn.reference_number]
+                        del db_ref_pool[ref_key]
                     break
 
         # Fall back to date+amount+direction matching (±1 day)
