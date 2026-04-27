@@ -82,6 +82,12 @@ uv run pytest -q
 - Shared poll state belongs on `app.state.fetch_service`; avoid new module-level poll loops or duplicate status dicts.
 - Keep `bank_statements.router` registered before `statements.router`.
 
+## Database schema docs
+
+- The Mermaid ER diagram in `README.md` is documentation for `bank_email_fetcher/db/models.py`; when models change, update the diagram, the model summary table, and the key-constraints notes together.
+- Keep every ORM table in the diagram, including standalone tables such as `settings`, and include every real foreign-key edge from `cards`, `fetch_rules`, `emails`, `statement_uploads`, `bank_statement_uploads`, and `transactions`.
+- If a field is only a parser/linker hint (`card_mask`, `account_mask`, similar denormalized values), describe it in nearby prose instead of drawing a fake foreign-key relationship.
+
 ## Local cross-repo development
 
 **The committed state always uses git/PyPI-tagged sibling versions.**
