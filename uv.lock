@@ -104,7 +104,7 @@ dependencies = [
 [[package]]
 name = "bank-statement-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-statement-parser#95cb244b835aaa6751be1a784f4bf755a29838fe" }
+source = { git = "https://github.com/akhilnarang/bank-statement-parser#8c58bc0691e35bf6352616851943c8076f946c92" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },
@@ -879,11 +879,11 @@ wheels = [
 
 [[package]]
 name = "python-multipart"
-version = "0.0.26"
+version = "0.0.27"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/88/71/b145a380824a960ebd60e1014256dbb7d2253f2316ff2d73dfd8928ec2c3/python_multipart-0.0.26.tar.gz", hash = "sha256:08fadc45918cd615e26846437f50c5d6d23304da32c341f289a617127b081f17", size = 43501, upload-time = "2026-04-10T14:09:59.473Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/69/9b/f23807317a113dc36e74e75eb265a02dd1a4d9082abc3c1064acd22997c4/python_multipart-0.0.27.tar.gz", hash = "sha256:9870a6a8c5a20a5bf4f07c017bd1489006ff8836cff097b6933355ee2b49b602", size = 44043, upload-time = "2026-04-27T10:51:26.649Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9a/22/f1925cdda983ab66fc8ec6ec8014b959262747e58bdca26a4e3d1da29d56/python_multipart-0.0.26-py3-none-any.whl", hash = "sha256:c0b169f8c4484c13b0dcf2ef0ec3a4adb255c4b7d18d8e420477d2b1dd03f185", size = 28847, upload-time = "2026-04-10T14:09:58.131Z" },
+    { url = "https://files.pythonhosted.org/packages/99/78/4126abcbdbd3c559d43e0db7f7b9173fc6befe45d39a2856cc0b8ec2a5a6/python_multipart-0.0.27-py3-none-any.whl", hash = "sha256:6fccfad17a27334bd0193681b369f476eda3409f17381a2d65aa7df3f7275645", size = 29254, upload-time = "2026-04-27T10:51:24.997Z" },
 ]
 
 [[package]]
@@ -1075,7 +1075,7 @@ wheels = [
 
 [[package]]
 name = "typer"
-version = "0.24.2"
+version = "0.25.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "annotated-doc" },
@@ -1083,9 +1083,9 @@ dependencies = [
     { name = "rich" },
     { name = "shellingham" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/83/b8/9ebb531b6c2d377af08ac6746a5df3425b21853a5d2260876919b58a2a4a/typer-0.24.2.tar.gz", hash = "sha256:ec070dcfca1408e85ee203c6365001e818c3b7fffe686fd07ff2d68095ca0480", size = 119849, upload-time = "2026-04-22T17:45:34.413Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7b/27/ede8cec7596e0041ba7e7b80b47d132562f56ff454313a16f6084e555c9f/typer-0.25.0.tar.gz", hash = "sha256:123eaf9f19bb40fd268310e12a542c0c6b4fab9c98d9d23342a01ff95e3ce930", size = 120150, upload-time = "2026-04-26T08:46:14.767Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/d1/9484b497e0a0410b901c12b8251c3e746e1e863f7d28419ffe06f7892fda/typer-0.24.2-py3-none-any.whl", hash = "sha256:b618bc3d721f9a8d30f3e05565be26416d06e9bcc29d49bc491dc26aba674fa8", size = 55977, upload-time = "2026-04-22T17:45:33.055Z" },
+    { url = "https://files.pythonhosted.org/packages/9a/72/193d4e586ec5a4db834a36bbeb47641a62f951f114ffd0fe5b1b46e8d56f/typer-0.25.0-py3-none-any.whl", hash = "sha256:ac01b48823d3db9a83c9e164338057eadbb1c9957a2a6b4eeb486669c560b5dc", size = 55993, upload-time = "2026-04-26T08:46:15.889Z" },
 ]
 
 [[package]]
