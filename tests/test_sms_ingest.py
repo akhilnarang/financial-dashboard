@@ -75,3 +75,62 @@ class TestSmsIngestRequestSchema:
         assert req.received_at == datetime.datetime(
             2026, 5, 2, 8, 53, 11, tzinfo=datetime.UTC
         )
+
+
+# ---------------------------------------------------------------------------
+# Service tests
+# ---------------------------------------------------------------------------
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from bank_email_fetcher.db import Base, SmsMessage
+from bank_email_fetcher.services.sms import ingest_sms
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.fixture
+async def session():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with maker() as s:
+        yield s
+    await engine.dispose()
+
+
+def _payload() -> SmsIngestRequest:
+    return SmsIngestRequest.model_validate({
+        "bank": "HDFC",
+        "sender": "VK-HDFCBK",
+        "body": "Sent Rs.500 from A/c XX1234 to ...",
+        "received_at": "2026-05-02T14:23:11+05:30",
+    })
+
+
+@pytest.mark.anyio
+class TestIngestSmsService:
+    async def test_happy_path_stores_row(self, session):
+        row, stored = await ingest_sms(session, _payload())
+
+        assert stored is True
+        assert row.id is not None
+        assert row.bank == "HDFC"
+        assert row.sender == "VK-HDFCBK"
+        assert row.body == "Sent Rs.500 from A/c XX1234 to ..."
+
+        # received_at stored as UTC (08:53:11 == 14:23:11+05:30)
+        assert row.received_at.replace(tzinfo=datetime.UTC) == datetime.datetime(
+            2026, 5, 2, 8, 53, 11, tzinfo=datetime.UTC
+        )
+
+        # Confirm a single row was actually committed
+        result = await session.execute(select(SmsMessage))
+        rows = result.scalars().all()
+        assert len(rows) == 1
+        assert rows[0].id == row.id
