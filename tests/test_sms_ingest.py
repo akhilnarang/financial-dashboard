@@ -134,3 +134,54 @@ class TestIngestSmsService:
         rows = result.scalars().all()
         assert len(rows) == 1
         assert rows[0].id == row.id
+
+    async def test_dedup_returns_existing_row(self, session):
+        row1, stored1 = await ingest_sms(session, _payload())
+        assert stored1 is True
+
+        row2, stored2 = await ingest_sms(session, _payload())
+        assert stored2 is False
+        assert row2.id == row1.id
+
+        result = await session.execute(select(SmsMessage))
+        rows = result.scalars().all()
+        assert len(rows) == 1
+
+    async def test_dedup_ignores_bank_difference(self, session):
+        """Same (sender, received_at, body) but different bank label is still a duplicate.
+
+        Per the spec: dedup key omits `bank`. The existing row's bank is NOT updated.
+        """
+        row1, stored1 = await ingest_sms(session, _payload())
+        assert stored1 is True
+        assert row1.bank == "HDFC"
+
+        # Repost with a corrected bank label
+        repost = SmsIngestRequest.model_validate({
+            "bank": "ICICI",  # different
+            "sender": "VK-HDFCBK",
+            "body": "Sent Rs.500 from A/c XX1234 to ...",
+            "received_at": "2026-05-02T14:23:11+05:30",
+        })
+        row2, stored2 = await ingest_sms(session, repost)
+        assert stored2 is False
+        assert row2.id == row1.id
+        assert row2.bank == "HDFC"  # unchanged
+
+    async def test_different_sms_does_not_dedup(self, session):
+        row1, stored1 = await ingest_sms(session, _payload())
+        assert stored1 is True
+
+        other = SmsIngestRequest.model_validate({
+            "bank": "HDFC",
+            "sender": "VK-HDFCBK",
+            "body": "A different message body",
+            "received_at": "2026-05-02T14:23:11+05:30",
+        })
+        row2, stored2 = await ingest_sms(session, other)
+        assert stored2 is True
+        assert row2.id != row1.id
+
+        result = await session.execute(select(SmsMessage))
+        rows = result.scalars().all()
+        assert len(rows) == 2
