@@ -264,3 +264,22 @@ class Transaction(Base):
             sqlite_where=text("reference_number IS NOT NULL"),
         ),
     )
+
+
+class SmsMessage(Base):
+    __tablename__ = "sms_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bank: Mapped[str] = mapped_column(String, nullable=False)
+    sender: Mapped[str] = mapped_column(String, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    received_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "sender", "received_at", "body", name="uq_sms_sender_received_body"
+        ),
+    )

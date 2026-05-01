@@ -14,6 +14,7 @@ from bank_email_fetcher.db.models import (
     EmailSource,
     FetchRule,
     Setting,
+    SmsMessage,
     StatementUpload,
     Transaction,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "FetchRule",
     "PaymentStatus",
     "Setting",
+    "SmsMessage",
     "StatementUpload",
     "Transaction",
     "async_session",
