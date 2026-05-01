@@ -10,10 +10,18 @@ from bank_email_fetcher.services.sms import ingest_sms
 router = APIRouter()
 
 
-@router.post("/sms")
+@router.post(
+    "/sms",
+    status_code=201,
+    response_class=Response,
+    responses={
+        201: {"description": "SMS stored"},
+        204: {"description": "Duplicate — existing row, no change"},
+    },
+)
 async def post_sms(
     payload: SmsIngestRequest,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
-    _row, stored = await ingest_sms(session, payload)
+    _, stored = await ingest_sms(session, payload)
     return Response(status_code=201 if stored else 204)
