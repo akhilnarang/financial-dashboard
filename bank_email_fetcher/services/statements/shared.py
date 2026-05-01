@@ -209,7 +209,7 @@ async def retry_bank_statement_upload(
                 amount=amount,
                 currency="INR",
                 transaction_date=txn_date,
-                counterparty=entry.get("narration"),
+                counterparty=entry.get("counterparty") or entry.get("narration"),
                 account_mask=bank_last4(parsed.account_number),
                 reference_number=entry.get("reference_number"),
                 channel=entry.get("channel") or "bank_statement",

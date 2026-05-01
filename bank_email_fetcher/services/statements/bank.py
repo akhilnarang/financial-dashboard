@@ -141,6 +141,7 @@ def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> 
                     "amount": txn.amount,
                     "direction": direction,
                     "narration": txn.narration,
+                    "counterparty": txn.counterparty,
                     "reference_number": txn.reference_number,
                     "channel": txn.channel,
                     "balance": txn.balance,
@@ -189,6 +190,7 @@ def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> 
                     "amount": txn.amount,
                     "direction": direction,
                     "narration": txn.narration,
+                    "counterparty": txn.counterparty,
                     "reference_number": txn.reference_number,
                     "channel": txn.channel,
                     "balance": txn.balance,
@@ -208,6 +210,7 @@ def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> 
                     "amount": txn.amount,
                     "direction": direction,
                     "narration": txn.narration,
+                    "counterparty": txn.counterparty,
                     "reference_number": txn.reference_number,
                     "channel": txn.channel,
                     "balance": txn.balance,
@@ -247,12 +250,19 @@ _GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment do
 
 
 async def enrich_matched_transactions(recon: dict) -> int:
-    """Update DB transaction counterparty from statement narration for matched transactions."""
+    """Update DB transaction counterparty from statement for matched transactions.
+
+    Prefers the parser-derived `counterparty` (clean merchant/beneficiary
+    pulled out of structured narrations like UPI/MMT/IMPS) and falls back
+    to the raw narration when the parser couldn't extract one.
+    """
     enriched = 0
     async with async_session() as session:
         for entry in recon.get("matched", []):
+            counterparty = (entry.get("counterparty") or "").strip()
             narration = (entry.get("narration") or "").strip()
-            if not narration:
+            new_value = counterparty or narration
+            if not new_value:
                 continue
 
             db_txn_id = entry.get("db_txn_id")
@@ -267,7 +277,7 @@ async def enrich_matched_transactions(recon: dict) -> int:
             if existing and existing.lower() not in _GENERIC_COUNTERPARTIES:
                 continue
 
-            txn.counterparty = narration
+            txn.counterparty = new_value
             enriched += 1
             entry["enriched"] = True
 
@@ -643,7 +653,7 @@ async def process_bank_statement_email(
                 amount=amount,
                 currency="INR",
                 transaction_date=txn_date,
-                counterparty=entry.get("narration"),
+                counterparty=entry.get("counterparty") or entry.get("narration"),
                 account_mask=_last4(parsed.account_number),
                 reference_number=entry.get("reference_number"),
                 channel=entry.get("channel") or "bank_statement",
