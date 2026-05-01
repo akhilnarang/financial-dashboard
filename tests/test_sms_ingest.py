@@ -185,3 +185,92 @@ class TestIngestSmsService:
         result = await session.execute(select(SmsMessage))
         rows = result.scalars().all()
         assert len(rows) == 2
+
+
+# ---------------------------------------------------------------------------
+# Endpoint integration tests
+# ---------------------------------------------------------------------------
+
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+
+from bank_email_fetcher.api import router as api_router
+from bank_email_fetcher.core.deps import get_session
+
+
+def _build_test_app(session_dep):
+    """Mount the real api_router with `get_session` overridden to a test session."""
+    app = FastAPI()
+    app.include_router(api_router)
+    app.dependency_overrides[get_session] = session_dep
+    return app
+
+
+def _valid_request_json() -> dict:
+    return {
+        "bank": "HDFC",
+        "sender": "VK-HDFCBK",
+        "body": "Sent Rs.500 from A/c XX1234 to ...",
+        "received_at": "2026-05-02T14:23:11+05:30",
+    }
+
+
+@pytest.mark.anyio
+class TestSmsEndpoint:
+    async def _client(self, session):
+        async def _override():
+            yield session
+
+        app = _build_test_app(_override)
+        return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+    async def test_post_new_returns_201_empty_body(self, session):
+        async with await self._client(session) as client:
+            r = await client.post("/api/sms", json=_valid_request_json())
+            assert r.status_code == 201
+            assert r.content == b""
+
+        result = await session.execute(select(SmsMessage))
+        assert len(result.scalars().all()) == 1
+
+    async def test_post_duplicate_returns_204_empty_body(self, session):
+        async with await self._client(session) as client:
+            r1 = await client.post("/api/sms", json=_valid_request_json())
+            assert r1.status_code == 201
+
+            r2 = await client.post("/api/sms", json=_valid_request_json())
+            assert r2.status_code == 204
+            assert r2.content == b""
+
+        result = await session.execute(select(SmsMessage))
+        assert len(result.scalars().all()) == 1
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            {"bank": ""},
+            {"sender": "   "},
+            {"body": ""},
+            {"received_at": "2026-05-02T14:23:11"},  # naive
+            {"received_at": "not-a-date"},
+        ],
+    )
+    async def test_post_invalid_returns_422(self, session, mutation):
+        payload = _valid_request_json()
+        payload.update(mutation)
+        async with await self._client(session) as client:
+            r = await client.post("/api/sms", json=payload)
+            assert r.status_code == 422
+
+        result = await session.execute(select(SmsMessage))
+        assert result.scalars().all() == []
+
+    async def test_post_missing_field_returns_422(self, session):
+        payload = _valid_request_json()
+        del payload["sender"]
+        async with await self._client(session) as client:
+            r = await client.post("/api/sms", json=payload)
+            assert r.status_code == 422
+
+        result = await session.execute(select(SmsMessage))
+        assert result.scalars().all() == []
