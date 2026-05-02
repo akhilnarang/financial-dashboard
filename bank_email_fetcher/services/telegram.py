@@ -6,11 +6,13 @@ If the user replies to a notification, the reply text is saved as the
 transaction's note. Only the configured chat_id is authorized.
 """
 
+import asyncio
 import html
 import logging
 import re
 
 from telegram import Update
+from telegram.error import NetworkError, RetryAfter
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
 from bank_email_fetcher.db import Transaction, async_session
@@ -81,6 +83,43 @@ def build_account_label(account, card) -> str:
     return ""
 
 
+async def _send_with_retry(app, *, chat_id, text, parse_mode="HTML", attempts=3):
+    """Send a message with retries on transient network errors.
+
+    - Retries up to `attempts` total tries on `telegram.error.NetworkError`
+      (which includes `TimedOut`), with exponential backoff (1s, 2s, 4s, ...).
+    - On `RetryAfter`, sleeps the bot's recommended duration plus a small
+      buffer before retrying. RetryAfter does NOT consume an attempt —
+      it's a server-issued rate-limit, not a transient network failure.
+    - Re-raises the last `NetworkError` if all attempts fail.
+    """
+    network_attempt = 0
+    while True:
+        try:
+            return await app.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=parse_mode
+            )
+        except RetryAfter as e:
+            retry_after = e.retry_after
+            delay = (
+                retry_after.total_seconds()
+                if hasattr(retry_after, "total_seconds")
+                else float(retry_after)
+            )
+            await asyncio.sleep(delay + 0.5)
+            continue
+        except NetworkError as e:
+            network_attempt += 1
+            if network_attempt >= attempts:
+                raise
+            backoff = 2 ** (network_attempt - 1)  # 1s, 2s, 4s, ...
+            logger.warning(
+                "Telegram send attempt %d/%d failed (%s); retrying in %ds",
+                network_attempt, attempts, e, backoff,
+            )
+            await asyncio.sleep(backoff)
+
+
 async def send_transaction_notification(
     txn_id: int, txn_info: dict, chat_id: int
 ) -> None:
@@ -140,11 +179,7 @@ async def send_transaction_notification(
 
         text = "\n".join(lines)
 
-        await app.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode="HTML",
-        )
+        await _send_with_retry(app, chat_id=chat_id, text=text)
     except Exception as e:
         logger.warning(
             "Failed to send Telegram notification for txn #%s: %s", txn_id, e
@@ -189,7 +224,7 @@ async def send_bulk_summary(
                 lines.append(" \u00b7 ".join(parts))
 
         text = "\n".join(lines)
-        await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        await _send_with_retry(app, chat_id=chat_id, text=text)
     except Exception as e:
         logger.warning("Failed to send Telegram bulk summary: %s", e)
 
