@@ -30,6 +30,7 @@ from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from bank_email_fetcher.db import (
     Account,
     BankStatementUpload,
@@ -58,6 +59,19 @@ from bank_email_fetcher.services.telegram import (
 logger = logging.getLogger(__name__)
 
 STATEMENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "statements"
+
+
+class BankStatementProcessingError(Exception):
+    """Raised when a bank statement was identified for processing but
+    processing failed in a way the caller should surface to the user.
+
+    Returning ``None`` from ``process_bank_statement_email`` is reserved
+    for *skips* (not a bank statement, no PDF, no matching account, etc.)
+    where the email simply doesn't apply. Anything past that boundary —
+    PDF unparseable, encryption deadlock, post-parse import collapse —
+    raises this error so the caller can put a real message in front of
+    the user instead of "Statement processing returned no result".
+    """
 
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -95,6 +109,80 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
     return (txn_date, amount, direction)
 
 
+def _take_first_unconsumed(
+    candidates: list[int] | None, consumed: set[int]
+) -> int | None:
+    """Return the first id in ``candidates`` not already consumed."""
+    if not candidates:
+        return None
+    for cid in candidates:
+        if cid not in consumed:
+            return cid
+    return None
+
+
+def _take_first_compatible(
+    candidates: list[int] | None,
+    consumed: set[int],
+    db_by_id: dict[int, object],
+    stmt_ref: str | None,
+) -> int | None:
+    """Return the first usable id from ``candidates`` for fuzzy fallback.
+
+    A DB candidate is incompatible when both rows carry a reference number
+    and those references differ — they cannot be the same logical
+    transaction even if date/amount/direction line up. (If the DB row has
+    no ref, we still allow the match: email parsers don't always capture
+    one.)
+    """
+    if not candidates:
+        return None
+    for cid in candidates:
+        if cid in consumed:
+            continue
+        cand = db_by_id.get(cid)
+        if cand is None:
+            continue
+        cand_ref = getattr(cand, "reference_number", None)
+        if stmt_ref and cand_ref and stmt_ref != cand_ref:
+            continue
+        return cid
+    return None
+
+
+def _missing_entry(stmt_idx: int, direction: str, txn) -> dict:
+    return {
+        "stmt_idx": stmt_idx,
+        "date": txn.date,
+        "amount": txn.amount,
+        "direction": direction,
+        "narration": txn.narration,
+        "counterparty": txn.counterparty,
+        "reference_number": txn.reference_number,
+        "channel": txn.channel,
+        "balance": txn.balance,
+        "imported": False,
+    }
+
+
+def _matched_entry(stmt_idx: int, direction: str, txn, found) -> dict:
+    return {
+        "stmt_idx": stmt_idx,
+        "date": txn.date,
+        "amount": txn.amount,
+        "direction": direction,
+        "narration": txn.narration,
+        "counterparty": txn.counterparty,
+        "reference_number": txn.reference_number,
+        "channel": txn.channel,
+        "balance": txn.balance,
+        "db_txn_id": found.id,
+        "db_counterparty": found.counterparty,
+        "db_reference": found.reference_number,
+        "db_date": str(found.transaction_date) if found.transaction_date else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Reconciliation
 # ---------------------------------------------------------------------------
@@ -103,120 +191,100 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
 def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> dict:
     """Match statement transactions against DB transactions.
 
+    Two-pass matching:
+
+    1. Walk every statement row that has a ``reference_number`` and claim
+       the DB row sharing ``(reference_number, direction)``. These are
+       deterministic high-confidence matches.
+
+    2. For statement rows still unmatched, fall back to
+       ``(date ±1 day, amount, direction)``. The fallback is *reference-
+       aware*: if the statement row carries a non-null ref and the DB
+       candidate carries a different non-null ref, we refuse the fuzzy
+       match — they cannot be the same logical transaction.
+
+    Splitting these passes prevents an early statement row whose ref
+    happens to be absent from the DB from greedily eating, via the
+    date-fallback, a DB row that a later statement row legitimately owns
+    by reference.
+
     Returns a dict with matched, missing lists and balance verification.
     """
-    stmt_txns = []
-    for txn in parsed.transactions or []:
-        stmt_txns.append((txn.transaction_type, txn))
+    stmt_txns: list[tuple[str, object]] = [
+        (txn.transaction_type, txn) for txn in parsed.transactions or []
+    ]
 
-    # Build DB candidate pools
-    # Pool 1: by (date, amount, direction)
-    db_pool: dict[tuple, list] = {}
-    # Pool 2: by (reference_number, direction) — UPI refunds reuse the ref with opposite direction
-    db_ref_pool: dict[tuple[str, str], list] = {}
-    for db_txn in db_transactions:
-        if db_txn.transaction_date and db_txn.amount is not None:
-            key = _match_key(
-                db_txn.transaction_date, Decimal(str(db_txn.amount)), db_txn.direction
-            )
-            db_pool.setdefault(key, []).append(db_txn)
-        if db_txn.reference_number and db_txn.direction:
-            db_ref_pool.setdefault(
-                (db_txn.reference_number, db_txn.direction), []
-            ).append(db_txn)
-
+    # Pre-parse amount/date once so every pass uses the same normalized form
+    # and parse failures land in `missing` immediately.
+    parsed_rows: list[tuple[int, str, object, Decimal | None, date_type | None]] = []
     matched = []
     missing = []
-    matched_db_ids: set[int] = set()
-
     for stmt_idx, (direction, txn) in enumerate(stmt_txns):
         try:
             amount = _parse_amount(txn.amount)
             txn_date = _parse_date(txn.date)
-        except ValueError, InvalidOperation:
-            missing.append(
-                {
-                    "stmt_idx": stmt_idx,
-                    "date": txn.date,
-                    "amount": txn.amount,
-                    "direction": direction,
-                    "narration": txn.narration,
-                    "counterparty": txn.counterparty,
-                    "reference_number": txn.reference_number,
-                    "channel": txn.channel,
-                    "balance": txn.balance,
-                    "imported": False,
-                }
-            )
+        except (ValueError, InvalidOperation):
+            missing.append(_missing_entry(stmt_idx, direction, txn))
             continue
+        parsed_rows.append((stmt_idx, direction, txn, amount, txn_date))
 
-        found = None
-
-        # Try reference_number match first (highest confidence)
-        ref_key = (txn.reference_number, direction) if txn.reference_number else None
-        if ref_key and ref_key in db_ref_pool:
-            candidates = db_ref_pool[ref_key]
-            for cand in candidates:
-                if cand.id not in matched_db_ids:
-                    found = cand
-                    matched_db_ids.add(cand.id)
-                    candidates.remove(cand)
-                    if not candidates:
-                        del db_ref_pool[ref_key]
-                    break
-
-        # Fall back to date+amount+direction matching (±1 day)
-        if not found:
-            for offset in (0, -1, 1):
-                key = _match_key(txn_date + timedelta(days=offset), amount, direction)
-                candidates = db_pool.get(key)
-                if candidates:
-                    for cand in candidates:
-                        if cand.id not in matched_db_ids:
-                            found = cand
-                            matched_db_ids.add(cand.id)
-                            candidates.remove(cand)
-                            if not candidates:
-                                del db_pool[key]
-                            break
-                if found:
-                    break
-
-        if found:
-            matched.append(
-                {
-                    "stmt_idx": stmt_idx,
-                    "date": txn.date,
-                    "amount": txn.amount,
-                    "direction": direction,
-                    "narration": txn.narration,
-                    "counterparty": txn.counterparty,
-                    "reference_number": txn.reference_number,
-                    "channel": txn.channel,
-                    "balance": txn.balance,
-                    "db_txn_id": found.id,
-                    "db_counterparty": found.counterparty,
-                    "db_reference": found.reference_number,
-                    "db_date": str(found.transaction_date)
-                    if found.transaction_date
-                    else None,
-                }
+    # Build DB candidate pools.
+    # ref_pool: (reference_number, direction) — UPI refunds may reuse the
+    # same ref with the opposite direction, so direction stays in the key.
+    # date_pool: (date, amount, direction) for fuzzy fallback.
+    db_by_id: dict[int, object] = {db_txn.id: db_txn for db_txn in db_transactions}
+    ref_pool: dict[tuple[str, str], list[int]] = {}
+    date_pool: dict[tuple, list[int]] = {}
+    for db_txn in db_transactions:
+        if db_txn.reference_number and db_txn.direction:
+            ref_pool.setdefault(
+                (db_txn.reference_number, db_txn.direction), []
+            ).append(db_txn.id)
+        if db_txn.transaction_date and db_txn.amount is not None and db_txn.direction:
+            key = _match_key(
+                db_txn.transaction_date,
+                Decimal(str(db_txn.amount)),
+                db_txn.direction,
             )
+            date_pool.setdefault(key, []).append(db_txn.id)
+
+    consumed: set[int] = set()
+    matched_db_ids: dict[int, object] = {}
+
+    # Pass 1: reference-number matches across all stmt rows.
+    for stmt_idx, direction, txn, _amount, _txn_date in parsed_rows:
+        if not txn.reference_number:
+            continue
+        ref_key = (txn.reference_number, direction)
+        candidate_id = _take_first_unconsumed(ref_pool.get(ref_key), consumed)
+        if candidate_id is None:
+            continue
+        consumed.add(candidate_id)
+        matched_db_ids[stmt_idx] = db_by_id[candidate_id]
+
+    # Pass 2: date+amount+direction fallback for stmt rows still unmatched.
+    # Refuse the fuzzy match when both rows have refs and they disagree.
+    for stmt_idx, direction, txn, amount, txn_date in parsed_rows:
+        if stmt_idx in matched_db_ids:
+            continue
+        for offset in (0, -1, 1):
+            key = _match_key(txn_date + timedelta(days=offset), amount, direction)
+            candidate_id = _take_first_compatible(
+                date_pool.get(key), consumed, db_by_id, txn.reference_number
+            )
+            if candidate_id is None:
+                continue
+            consumed.add(candidate_id)
+            matched_db_ids[stmt_idx] = db_by_id[candidate_id]
+            break
+
+    # Build matched / missing entries in original statement order.
+    for stmt_idx, direction, txn, _amount, _txn_date in parsed_rows:
+        cand = matched_db_ids.get(stmt_idx)
+        if cand is not None:
+            matched.append(_matched_entry(stmt_idx, direction, txn, cand))
         else:
-            missing.append(
-                {
-                    "stmt_idx": stmt_idx,
-                    "date": txn.date,
-                    "amount": txn.amount,
-                    "direction": direction,
-                    "narration": txn.narration,
-                    "counterparty": txn.counterparty,
-                    "reference_number": txn.reference_number,
-                    "channel": txn.channel,
-                    "balance": txn.balance,
-                    "imported": False,
-                }
-            )
+            missing.append(_missing_entry(stmt_idx, direction, txn))
 
     # Balance verification
     balance_verification = None
@@ -458,7 +526,9 @@ async def process_bank_statement_email(
     except ValueError as e:
         if "encrypt" not in str(e).lower() and "password" not in str(e).lower():
             logger.warning("Failed to parse bank statement PDF: %s", e)
-            return None
+            raise BankStatementProcessingError(
+                f"Failed to parse {bank} statement PDF {filename!r}: {e}"
+            ) from e
 
         # PDF is encrypted — try stored passwords
         fernet = get_fernet()
@@ -568,10 +638,18 @@ async def process_bank_statement_email(
                         "missing": 0,
                         "imported": 0,
                     }
-            return None
-    except Exception:
+            raise BankStatementProcessingError(
+                f"Encrypted {bank} statement PDF could not be decrypted with any "
+                f"stored password and {len(bank_accounts)} candidate accounts exist "
+                f"for this bank — leaving unassigned ({safe_name})"
+            )
+    except BankStatementProcessingError:
+        raise
+    except Exception as e:
         logger.exception("Failed to parse bank statement PDF")
-        return None
+        raise BankStatementProcessingError(
+            f"Unexpected error processing {bank} statement PDF {filename!r}: {e}"
+        ) from e
 
     # Verify it looks like a bank account statement (not a CC statement)
     # If the parsed result has no transactions, bail
@@ -632,16 +710,23 @@ async def process_bank_statement_email(
         session.add(upload)
         await session.flush()
 
-        # Auto-import all missing transactions
+        # Auto-import all missing transactions. Each row runs inside its own
+        # SAVEPOINT so a single duplicate / constraint violation cannot abort
+        # the entire statement import. The upload row stays committed with
+        # whatever subset succeeded; failures are tagged on the missing
+        # entries so the UI can show them.
         link_ctx = await build_link_context(session)
 
         imported = 0
+        duplicate_count = 0
+        import_error_count = 0
         imported_txns: list[tuple[int, dict]] = []
         for entry in recon["missing"]:
             try:
                 amount = _parse_amount(entry["amount"])
                 txn_date = _parse_date(entry["date"])
-            except ValueError, KeyError:
+            except (ValueError, KeyError, InvalidOperation):
+                entry["import_error"] = "could not parse amount/date"
                 continue
 
             txn = Transaction(
@@ -659,10 +744,36 @@ async def process_bank_statement_email(
                 channel=entry.get("channel") or "bank_statement",
                 raw_description=entry.get("narration"),
             )
-            session.add(txn)
-            await session.flush()
-            link_transaction(link_ctx, txn)
-            await session.flush()
+
+            try:
+                async with session.begin_nested():
+                    session.add(txn)
+                    await session.flush()
+                    link_transaction(link_ctx, txn)
+                    await session.flush()
+            except IntegrityError as e:
+                duplicate_count += 1
+                entry["duplicate"] = True
+                entry["import_error"] = "duplicate transaction"
+                logger.info(
+                    "Skipping duplicate %s stmt txn (ref=%s direction=%s "
+                    "date=%s amount=%s): %s",
+                    bank,
+                    entry.get("reference_number"),
+                    entry["direction"],
+                    entry["date"],
+                    entry["amount"],
+                    e.orig,
+                )
+                continue
+            except Exception as e:
+                import_error_count += 1
+                entry["import_error"] = f"{type(e).__name__}: {e}"
+                logger.exception(
+                    "Unexpected error importing stmt txn (ref=%s)",
+                    entry.get("reference_number"),
+                )
+                continue
 
             entry["imported"] = True
             entry["imported_txn_id"] = txn.id
@@ -695,6 +806,16 @@ async def process_bank_statement_email(
             upload.status = "imported"
         elif imported > 0:
             upload.status = "partial_import"
+        if import_error_count or duplicate_count:
+            details = []
+            if duplicate_count:
+                details.append(f"{duplicate_count} duplicate")
+            if import_error_count:
+                details.append(f"{import_error_count} unexpected error")
+            upload.error = (
+                f"Skipped {', '.join(details)} row(s) during auto-import; "
+                "see reconciliation details."
+            )
         await session.commit()
         upload_id = upload.id
 
@@ -718,12 +839,15 @@ async def process_bank_statement_email(
     enriched = await enrich_matched_transactions(recon)
 
     logger.info(
-        "Processed bank statement email: bank=%s account=%s matched=%d missing=%d imported=%d enriched=%d",
+        "Processed bank statement email: bank=%s account=%s matched=%d missing=%d "
+        "imported=%d duplicates=%d errors=%d enriched=%d",
         bank,
         account.label,
         len(recon["matched"]),
         len(recon["missing"]),
         imported,
+        duplicate_count,
+        import_error_count,
         enriched,
     )
     return {
@@ -731,5 +855,7 @@ async def process_bank_statement_email(
         "matched": len(recon["matched"]),
         "missing": len(recon["missing"]),
         "imported": imported,
+        "duplicates": duplicate_count,
+        "import_errors": import_error_count,
         "enriched": enriched,
     }

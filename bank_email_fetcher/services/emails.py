@@ -36,7 +36,10 @@ from bank_email_fetcher.services.settings import (
     get_setting_int,
     get_telegram_chat_id,
 )
-from bank_email_fetcher.services.statements.bank import process_bank_statement_email
+from bank_email_fetcher.services.statements.bank import (
+    BankStatementProcessingError,
+    process_bank_statement_email,
+)
 from bank_email_fetcher.services.statements.cc import (
     process_cc_statement_email_summary,
     process_statement_email,
@@ -286,6 +289,7 @@ async def parse_email_by_kind(
                     "CC statement processing error for %s: %s", log_ref, stmt_err
                 )
 
+        bank_stmt_error: str | None = None
         if stmt_result is None and try_bank:
             try:
                 stmt_result = await process_bank_statement_email(
@@ -295,9 +299,19 @@ async def parse_email_by_kind(
                     source_id=source_id,
                     password_hint=password_hint,
                 )
-            except Exception as stmt_err:
+            except BankStatementProcessingError as stmt_err:
+                bank_stmt_error = str(stmt_err)
                 logger.warning(
-                    "Bank statement processing error for %s: %s", log_ref, stmt_err
+                    "Bank statement processing error for %s: %s",
+                    log_ref,
+                    bank_stmt_error,
+                )
+            except Exception as stmt_err:
+                bank_stmt_error = (
+                    f"Unexpected {type(stmt_err).__name__}: {stmt_err}"
+                )
+                logger.exception(
+                    "Bank statement processing crashed for %s", log_ref
                 )
 
         if stmt_result is None:
@@ -306,7 +320,7 @@ async def parse_email_by_kind(
                 log_ref,
             )
             if is_statement_rule:
-                error = "Statement processing returned no result"
+                error = bank_stmt_error or "Statement processing returned no result"
 
     return EmailDispatchResult(error, txn_data, password_hint, stmt_result)
 
