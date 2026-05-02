@@ -21,6 +21,7 @@ from bank_email_fetcher.db import (
 from bank_email_parser import SUPPORTED_BANKS
 from bank_email_fetcher.services.accounts import (
     auto_link_account,
+    ensure_default_primary_card,
     retry_password_required_statements as accounts_retry_password_required_statements,
 )
 
@@ -104,6 +105,8 @@ async def account_create(
     session.add(account)
     await session.commit()
     await session.refresh(account)
+    if await ensure_default_primary_card(session, account):
+        await session.commit()
     await auto_link_account(session, account)
 
     return RedirectResponse(url="/accounts", status_code=303)
@@ -181,6 +184,8 @@ async def account_update(
 
     await session.commit()
     await session.refresh(account)
+    if await ensure_default_primary_card(session, account):
+        await session.commit()
     await auto_link_account(session, account)
 
     # Automatically retry password-required statements when password is provided

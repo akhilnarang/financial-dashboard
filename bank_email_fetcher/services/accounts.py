@@ -7,7 +7,12 @@ import logging
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bank_email_fetcher.db import BankStatementUpload, StatementUpload, Transaction
+from bank_email_fetcher.db import (
+    BankStatementUpload,
+    Card,
+    StatementUpload,
+    Transaction,
+)
 from bank_email_fetcher.services.linker import build_link_context, link_transaction
 from bank_email_fetcher.services.statements.shared import (
     retry_bank_statement_upload,
@@ -15,6 +20,29 @@ from bank_email_fetcher.services.statements.shared import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def ensure_default_primary_card(session: AsyncSession, account) -> Card | None:
+    """For credit_card accounts with no cards, seed a primary card from the account number.
+
+    Returns the new Card if one was inserted, else None. Caller must commit.
+    """
+    if account.type != "credit_card" or not account.account_number:
+        return None
+    has_card = await session.scalar(
+        select(func.count(Card.id)).where(Card.account_id == account.id)
+    )
+    if has_card:
+        return None
+    card = Card(
+        account_id=account.id,
+        card_mask=account.account_number,
+        label="self",
+        is_primary=True,
+        active=True,
+    )
+    session.add(card)
+    return card
 
 
 async def auto_link_account(session: AsyncSession, account) -> None:
