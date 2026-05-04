@@ -3,6 +3,8 @@ name = "bank-email-fetcher"
 version = "0.1.0"
 description = "Self-hosted bank transaction email fetcher and dashboard"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
     "pydantic-settings>=2.0,<3",
