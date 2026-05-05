@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Annotated
 from urllib.parse import urlencode
 
@@ -44,6 +45,7 @@ from bank_email_fetcher.schemas.emails import (
 )
 from bank_email_fetcher.services.emails import parse_email_by_kind
 from bank_email_fetcher.services.linker import build_link_context, link_transaction
+from bank_email_fetcher.services.reminders import check_payment_received
 from bank_email_fetcher.services.settings import (
     get_telegram_chat_id,
     should_notify_transactions,
@@ -346,6 +348,7 @@ async def reparse_email(
 
         txn_id = None
         duplicate_error: str | None = None
+        pending_payment_check: tuple[int, int, Decimal] | None = None
         if txn_data:
             try:
                 async with session.begin_nested():
@@ -370,6 +373,12 @@ async def reparse_email(
                         account_obj, card_obj
                     )
                     txn_data["channel"] = txn_row.channel
+                    if txn_row.direction == "credit" and txn_row.account_id:
+                        pending_payment_check = (
+                            txn_row.id,
+                            txn_row.account_id,
+                            txn_row.amount,
+                        )
             except IntegrityError:
                 em.status = "skipped"
                 em.error = "Duplicate transaction skipped because an identical transaction row already exists"
@@ -387,6 +396,19 @@ async def reparse_email(
         except Exception as tg_err:
             logger.warning(
                 "Telegram notification failed for reparsed txn #%s: %s", txn_id, tg_err
+            )
+
+    # Mirror the polling pipeline (services/emails.py:513-522): credit
+    # transactions against an account may satisfy a pending statement payment.
+    # Runs after the Telegram notification so the user sees the txn first.
+    if pending_payment_check:
+        try:
+            await check_payment_received(*pending_payment_check)
+        except Exception as exc:
+            logger.warning(
+                "Payment-received check failed for reparsed txn %s: %s",
+                pending_payment_check[0],
+                exc,
             )
 
     msg = "Email re-parsed successfully"
@@ -455,6 +477,7 @@ async def reparse_all_failed(
             continue
 
         was_skipped = False
+        pending_payment_check: tuple[int, int, Decimal] | None = None
         async with session.begin():
             em = await session.get(Email, email_row.id)
             if not em:
@@ -483,10 +506,26 @@ async def reparse_all_failed(
                         _link_ctx = await build_link_context(session)
                         link_transaction(_link_ctx, txn_row)
                         await session.flush()
+                        if txn_row.direction == "credit" and txn_row.account_id:
+                            pending_payment_check = (
+                                txn_row.id,
+                                txn_row.account_id,
+                                txn_row.amount,
+                            )
                 except IntegrityError:
                     em.status = "skipped"
                     em.error = "Duplicate transaction skipped"
                     was_skipped = True
+
+        if pending_payment_check:
+            try:
+                await check_payment_received(*pending_payment_check)
+            except Exception as exc:
+                logger.warning(
+                    "Payment-received check failed for bulk-reparsed txn %s: %s",
+                    pending_payment_check[0],
+                    exc,
+                )
 
         if was_skipped:
             skipped += 1
