@@ -82,9 +82,15 @@ def _equitas_payment_eml(amount: str, card_last4: str) -> bytes:
     return msg.as_bytes()
 
 
-async def _seed(maker, *, due_amount: str = "100,000.00") -> int:
+async def _seed(
+    maker,
+    *,
+    due_amount: str = "100,000.00",
+    email_count: int = 1,
+) -> list[int]:
     """Create a credit_card account, matching card, active statement upload,
-    and a failed Email row tied to a fetch rule. Returns the email id."""
+    and ``email_count`` failed Email rows tied to a fetch rule. Returns the
+    list of email ids in insertion order."""
     async with maker() as session:
         rule = FetchRule(
             provider="gmail",
@@ -128,25 +134,31 @@ async def _seed(maker, *, due_amount: str = "100,000.00") -> int:
         )
         session.add(upload)
 
-        email_row = Email(
-            provider="gmail",
-            message_id="test-msg-id-1",
-            sender="cc-alerts@equitas.bank.in",
-            subject="Payment received !",
-            received_at=datetime.datetime(2026, 5, 6, 0, 28, tzinfo=datetime.UTC),
-            status="failed",
-            error="Previous parse failed",
-            rule_id=rule.id,
-        )
-        session.add(email_row)
+        email_ids: list[int] = []
+        for i in range(email_count):
+            email_row = Email(
+                provider="gmail",
+                message_id=f"test-msg-id-{i + 1}",
+                sender="cc-alerts@equitas.bank.in",
+                subject="Payment received !",
+                received_at=datetime.datetime(
+                    2026, 5, 6, 0, 28 + i, tzinfo=datetime.UTC
+                ),
+                status="failed",
+                error="Previous parse failed",
+                rule_id=rule.id,
+            )
+            session.add(email_row)
+            await session.flush()
+            email_ids.append(email_row.id)
         await session.commit()
-        return email_row.id
+        return email_ids
 
 
 @pytest.mark.anyio
 class TestReparseEmailInvokesPaymentCheck:
     async def test_credit_txn_partially_pays_active_statement(self, session_maker):
-        email_id = await _seed(session_maker, due_amount="100,000.00")
+        [email_id] = await _seed(session_maker, due_amount="100,000.00")
 
         raw = _equitas_payment_eml("12,345.00", "9999")
         with (
@@ -177,7 +189,7 @@ class TestReparseEmailInvokesPaymentCheck:
             assert upload.payment_status == PaymentStatus.PARTIALLY_PAID
 
     async def test_credit_txn_fully_pays_active_statement(self, session_maker):
-        email_id = await _seed(session_maker, due_amount="12,345.00")
+        [email_id] = await _seed(session_maker, due_amount="12,345.00")
 
         raw = _equitas_payment_eml("12,345.00", "9999")
         with (
@@ -202,3 +214,53 @@ class TestReparseEmailInvokesPaymentCheck:
             assert upload.payment_paid_amount == Decimal("12345.00")
             assert upload.payment_status == PaymentStatus.PAID
             assert upload.payment_paid_at is not None
+
+
+@pytest.mark.anyio
+class TestReparseAllFailedBulkRoute:
+    """Regression coverage for /emails/reparse-all-failed.
+
+    Without ``session.expunge_all()`` before the post-select rollback, the
+    loop's first access of ``email_row.provider`` triggered an async
+    lazy-load with no greenlet attached and raised MissingGreenlet.
+    """
+
+    async def test_bulk_reparse_processes_each_email_and_bumps_statement(
+        self, session_maker
+    ):
+        email_ids = await _seed(
+            session_maker, due_amount="100,000.00", email_count=2
+        )
+        assert len(email_ids) == 2
+
+        raw = _equitas_payment_eml("12,345.00", "9999")
+        with (
+            patch(
+                "bank_email_fetcher.web.emails.load_or_fetch_raw_email",
+                new=AsyncMock(return_value=(raw, None)),
+            ),
+            patch(
+                "bank_email_fetcher.web.emails.should_notify_transactions",
+                return_value=False,
+            ),
+        ):
+            app = _build_test_app(session_maker)
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                r = await client.post("/emails/reparse-all-failed")
+                assert r.status_code == 200, r.text
+                body = r.json()
+                assert body["succeeded"] == 2
+                assert body["failed"] == 0
+
+        async with session_maker() as s:
+            txns = (await s.execute(select(Transaction))).scalars().all()
+            assert len(txns) == 2
+            assert all(t.direction == "credit" for t in txns)
+            assert all(t.amount == Decimal("12345.00") for t in txns)
+
+            upload = (await s.execute(select(StatementUpload))).scalars().one()
+            # Both credit transactions should have bumped paid_amount.
+            assert upload.payment_paid_amount == Decimal("24690.00")
+            assert upload.payment_status == PaymentStatus.PARTIALLY_PAID

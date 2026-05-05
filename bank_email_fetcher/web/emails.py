@@ -441,8 +441,14 @@ async def reparse_all_failed(
         )
     ).all()
 
-    # Close the implicit read transaction opened by the select above so the
-    # per-email session.begin() below can start cleanly.
+    # Detach the loaded rows before closing the read transaction. Without
+    # this, the rollback expires the ORM attributes; the next access (e.g.
+    # email_row.provider in load_or_fetch_raw_email) would trigger an async
+    # lazy-load with no greenlet attached and raise MissingGreenlet.
+    # Detached instances keep their already-loaded simple-column values,
+    # which is all we need until session.get(Email, ...) re-attaches inside
+    # the per-iteration begin block.
+    session.expunge_all()
     await session.rollback()
 
     for email_row, rule in rows:
