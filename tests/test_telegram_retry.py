@@ -1,6 +1,5 @@
 """Tests for _send_with_retry network-error retry logic."""
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest

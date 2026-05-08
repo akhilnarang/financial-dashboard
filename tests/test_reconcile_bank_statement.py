@@ -15,7 +15,7 @@ real DB.
 from __future__ import annotations
 
 import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
 
 from bank_statement_parser.models import BankTransaction, ParsedBankStatement
