@@ -120,8 +120,7 @@ async def dashboard(
     cards_paid = 0
 
     for account in credit_card_accounts:
-        upload = latest_upload_by_account.get(account.id)
-        if upload is None:
+        if (upload := latest_upload_by_account.get(account.id)) is None:
             continue
 
         payment_status = upload.payment_status
@@ -129,8 +128,8 @@ async def dashboard(
 
         try:
             amount_due = (
-                parse_cc_amount(upload.total_amount_due)
-                if upload.total_amount_due
+                parse_cc_amount(total_amount_due)
+                if (total_amount_due := upload.total_amount_due)
                 else None
             )
         except Exception:
@@ -150,17 +149,17 @@ async def dashboard(
             "status_label": "unpaid",
         }
 
-        if upload.due_date:
+        if due_date := upload.due_date:
             try:
-                parsed_due = parse_cc_date(upload.due_date)
+                parsed_due = parse_cc_date(due_date)
                 row["due_date_display"] = parsed_due.strftime("%d %b %Y")
                 if parsed_due < today and payment_status != PaymentStatus.PAID:
                     row["overdue"] = True
             except Exception:
                 # Why: due_date comes from raw PDF parsing and can be malformed — show the raw string rather than hiding it.
-                row["due_date_display"] = upload.due_date
+                row["due_date_display"] = due_date
 
-        if payment_status == PaymentStatus.PAID:
+        if payment_status == PaymentStatus.PAID or amount_due <= 0:
             cards_paid += 1
             row["status"] = "paid"
             row["status_label"] = "paid"

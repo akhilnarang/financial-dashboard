@@ -6,12 +6,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import tempfile
 from datetime import date, datetime, timezone
 from decimal import InvalidOperation
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlencode
 
+from cc_parser.cli import write_transactions_csv
 from fastapi import (
     APIRouter,
     Depends,
@@ -21,7 +23,7 @@ from fastapi import (
     Request as FastAPIRequest,
     UploadFile,
 )
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -324,8 +326,7 @@ async def statement_detail(
     request: FastAPIRequest,
     session: AsyncSession = Depends(get_session),
 ):
-    upload = await session.get(StatementUpload, upload_id)
-    if not upload:
+    if not (upload := await session.get(StatementUpload, upload_id)):
         return HTMLResponse("<p>Statement not found.</p>", 404)
 
     recon = None
@@ -346,6 +347,65 @@ async def statement_detail(
             "person_groups": person_groups,
             "card_summaries": card_summaries,
             "error": request.query_params.get("error"),
+        },
+    )
+
+
+@router.get("/statements/{upload_id}/csv")
+async def statement_csv_download(
+    upload_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    upload = await session.get(StatementUpload, upload_id)
+    if not upload:
+        return HTMLResponse("<p>Statement not found.</p>", 404)
+
+    def _csv_export_fail(msg: str):
+        logger.warning("CSV export failed for statement %d: %s", upload_id, msg)
+        return RedirectResponse(
+            url=f"/statements/{upload_id}?{urlencode({'error': msg})}",
+            status_code=303,
+        )
+
+    if upload.source_kind == "email_summary":
+        return _csv_export_fail(
+            "This statement was parsed from the email body — "
+            "upload a PDF to export CSV."
+        )
+
+    if (
+        not (file_path := upload.file_path)
+        or not (pdf_path := Path(file_path)).exists()
+    ):
+        return _csv_export_fail(
+            "PDF file missing; CSV export requires the saved statement PDF."
+        )
+
+    password = None
+    if account := await session.get(Account, upload.account_id):
+        bank = account.bank
+        if encrypted_password := account.statement_password:
+            try:
+                password = get_fernet().decrypt(encrypted_password.encode()).decode()
+            except Exception:
+                pass
+    else:
+        bank = upload.bank
+
+    try:
+        parsed = await asyncio.to_thread(parse_statement, pdf_path, password, bank)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / f"statement-{upload_id}.csv"
+            await asyncio.to_thread(write_transactions_csv, parsed, csv_path)
+            csv_bytes = csv_path.read_bytes()
+    except Exception as e:
+        return _csv_export_fail(f"CSV export failed: {e}")
+
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="statement-{upload_id}.csv"'
         },
     )
 

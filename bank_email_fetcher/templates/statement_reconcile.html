@@ -238,7 +238,7 @@
 
 {% if error %}
 <article class="card" style="margin-bottom: 1.5rem; border-left: 3px solid var(--clr-debit);">
-    <strong>Reprocess failed:</strong> {{ error }}
+    <strong>Statement action failed:</strong> {{ error }}
 </article>
 {% endif %}
 
@@ -249,6 +249,7 @@
         <form method="post" action="/statements/{{ upload.id }}/reprocess" style="margin: 0;">
             <button type="submit" class="text-sm" title="Re-parse PDF and rebuild reconciliation data">Reprocess</button>
         </form>
+        <a href="/statements/{{ upload.id }}/csv">Download CSV</a>
         {% endif %}
         {% if upload.email_id %}<a href="#" onclick="openDetailModal('/emails/{{ upload.email_id }}/detail'); return false;">View Email</a>{% endif %}
         <a href="/statements">&larr; Back to Statements</a>
