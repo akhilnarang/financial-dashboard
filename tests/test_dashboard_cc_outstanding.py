@@ -1,9 +1,11 @@
 """Dashboard regression tests for credit-card outstanding grouping."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from starlette.requests import Request
 
 from bank_email_fetcher.db import Account, Base, StatementUpload
 from bank_email_fetcher.web import dashboard as dashboard_module
@@ -26,13 +28,30 @@ async def session_factory():
 
 class CapturingTemplates:
     def __init__(self):
-        self.context = None
+        self.context: dict[str, Any] | None = None
 
     def TemplateResponse(self, request, template_name, context):
         self.context = context
         return SimpleNamespace(
             request=request, template_name=template_name, context=context
         )
+
+
+def _request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+            "app": SimpleNamespace(state=SimpleNamespace()),
+        }
+    )
+
+
+def _captured_context(templates: CapturingTemplates) -> dict[str, Any]:
+    assert templates.context is not None
+    return templates.context
 
 
 @pytest.mark.anyio
@@ -83,10 +102,9 @@ async def test_zero_due_statements_without_paid_status_are_grouped_as_paid(
         )
         await session.commit()
 
-        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
-        await dashboard_module.dashboard(request, session)
+        await dashboard_module.dashboard(_request(), session)
 
-    cc_outstanding = templates.context["cc_outstanding"]
+    cc_outstanding = _captured_context(templates)["cc_outstanding"]
     assert cc_outstanding["outstanding_rows"] == []
     assert [row["account"].label for row in cc_outstanding["paid_rows"]] == [
         "No Due CC",
@@ -123,8 +141,7 @@ async def test_outstanding_rows_link_to_latest_statement(session_factory, monkey
         session.add(upload)
         await session.commit()
 
-        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
-        await dashboard_module.dashboard(request, session)
+        await dashboard_module.dashboard(_request(), session)
 
-    row = templates.context["cc_outstanding"]["outstanding_rows"][0]
+    row = _captured_context(templates)["cc_outstanding"]["outstanding_rows"][0]
     assert row["statement_url"] == f"/statements/{upload.id}"

@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Literal
 
 from bank_statement_parser.models import BankTransaction, ParsedBankStatement
 
@@ -54,7 +55,7 @@ def _txn(
     *,
     date: str,
     amount: str,
-    direction: str,
+    direction: Literal["debit", "credit"],
     ref: str | None = None,
     narration: str = "",
 ) -> BankTransaction:
@@ -62,7 +63,7 @@ def _txn(
         date=date,
         narration=narration,
         amount=amount,
-        transaction_type=direction,  # type: ignore[arg-type]
+        transaction_type=direction,
         reference_number=ref,
     )
 
