@@ -38,4 +38,6 @@ cc-parser = { git = "https://github.com/akhilnarang/cc-parser" }
 dev = [
     "pytest>=9.0,<10",
     "pytest-anyio>=0.0.0",
+    "ruff>=0.15.12",
+    "ty>=0.0.34",
 ]
