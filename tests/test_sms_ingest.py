@@ -2,10 +2,18 @@
 
 import datetime
 
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from bank_email_fetcher.api import router as api_router
+from bank_email_fetcher.core.deps import get_session
+from bank_email_fetcher.db import Base, SmsMessage
 from bank_email_fetcher.schemas.sms import SmsIngestRequest
+from bank_email_fetcher.services.sms import ingest_sms
 
 
 # ---------------------------------------------------------------------------
@@ -80,12 +88,6 @@ class TestSmsIngestRequestSchema:
 # ---------------------------------------------------------------------------
 # Service tests
 # ---------------------------------------------------------------------------
-
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
-from bank_email_fetcher.db import Base, SmsMessage
-from bank_email_fetcher.services.sms import ingest_sms
 
 
 @pytest.fixture
@@ -196,12 +198,6 @@ class TestIngestSmsService:
 # ---------------------------------------------------------------------------
 # Endpoint integration tests
 # ---------------------------------------------------------------------------
-
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
-
-from bank_email_fetcher.api import router as api_router
-from bank_email_fetcher.core.deps import get_session
 
 
 def _build_test_app(session_dep):
