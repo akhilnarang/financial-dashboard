@@ -307,12 +307,8 @@ async def parse_email_by_kind(
                     bank_stmt_error,
                 )
             except Exception as stmt_err:
-                bank_stmt_error = (
-                    f"Unexpected {type(stmt_err).__name__}: {stmt_err}"
-                )
-                logger.exception(
-                    "Bank statement processing crashed for %s", log_ref
-                )
+                bank_stmt_error = f"Unexpected {type(stmt_err).__name__}: {stmt_err}"
+                logger.exception("Bank statement processing crashed for %s", log_ref)
 
         if stmt_result is None:
             logger.info(

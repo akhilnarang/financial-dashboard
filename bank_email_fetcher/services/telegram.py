@@ -115,7 +115,10 @@ async def _send_with_retry(app, *, chat_id, text, parse_mode="HTML", attempts=3)
             backoff = 2 ** (network_attempt - 1)  # 1s, 2s, 4s, ...
             logger.warning(
                 "Telegram send attempt %d/%d failed (%s); retrying in %ds",
-                network_attempt, attempts, e, backoff,
+                network_attempt,
+                attempts,
+                e,
+                backoff,
             )
             await asyncio.sleep(backoff)
 

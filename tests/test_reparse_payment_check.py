@@ -228,9 +228,7 @@ class TestReparseAllFailedBulkRoute:
     async def test_bulk_reparse_processes_each_email_and_bumps_statement(
         self, session_maker
     ):
-        email_ids = await _seed(
-            session_maker, due_amount="100,000.00", email_count=2
-        )
+        email_ids = await _seed(session_maker, due_amount="100,000.00", email_count=2)
         assert len(email_ids) == 2
 
         raw = _equitas_payment_eml("12,345.00", "9999")

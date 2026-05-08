@@ -59,12 +59,14 @@ class TestSendWithRetry:
         monkeypatch.setattr("asyncio.sleep", sleep_mock)
 
         # 2 RetryAfters (don't count) + 1 TimedOut (1 attempt used) + success
-        app = _mock_app([
-            RetryAfter(2),
-            RetryAfter(1),
-            TimedOut(),
-            None,
-        ])
+        app = _mock_app(
+            [
+                RetryAfter(2),
+                RetryAfter(1),
+                TimedOut(),
+                None,
+            ]
+        )
         await _send_with_retry(app, chat_id=1, text="hi")
 
         assert app.bot.send_message.await_count == 4

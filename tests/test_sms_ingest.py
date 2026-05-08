@@ -105,12 +105,14 @@ async def session():
 
 
 def _payload() -> SmsIngestRequest:
-    return SmsIngestRequest.model_validate({
-        "bank": "HDFC",
-        "sender": "VK-HDFCBK",
-        "body": "Sent Rs.500 from A/c XX1234 to ...",
-        "received_at": "2026-05-02T14:23:11+05:30",
-    })
+    return SmsIngestRequest.model_validate(
+        {
+            "bank": "HDFC",
+            "sender": "VK-HDFCBK",
+            "body": "Sent Rs.500 from A/c XX1234 to ...",
+            "received_at": "2026-05-02T14:23:11+05:30",
+        }
+    )
 
 
 @pytest.mark.anyio
@@ -157,12 +159,14 @@ class TestIngestSmsService:
         assert row1.bank == "HDFC"
 
         # Repost with a corrected bank label
-        repost = SmsIngestRequest.model_validate({
-            "bank": "ICICI",  # different
-            "sender": "VK-HDFCBK",
-            "body": "Sent Rs.500 from A/c XX1234 to ...",
-            "received_at": "2026-05-02T14:23:11+05:30",
-        })
+        repost = SmsIngestRequest.model_validate(
+            {
+                "bank": "ICICI",  # different
+                "sender": "VK-HDFCBK",
+                "body": "Sent Rs.500 from A/c XX1234 to ...",
+                "received_at": "2026-05-02T14:23:11+05:30",
+            }
+        )
         row2, stored2 = await ingest_sms(session, repost)
         assert stored2 is False
         assert row2.id == row1.id
@@ -172,12 +176,14 @@ class TestIngestSmsService:
         row1, stored1 = await ingest_sms(session, _payload())
         assert stored1 is True
 
-        other = SmsIngestRequest.model_validate({
-            "bank": "HDFC",
-            "sender": "VK-HDFCBK",
-            "body": "A different message body",
-            "received_at": "2026-05-02T14:23:11+05:30",
-        })
+        other = SmsIngestRequest.model_validate(
+            {
+                "bank": "HDFC",
+                "sender": "VK-HDFCBK",
+                "body": "A different message body",
+                "received_at": "2026-05-02T14:23:11+05:30",
+            }
+        )
         row2, stored2 = await ingest_sms(session, other)
         assert stored2 is True
         assert row2.id != row1.id

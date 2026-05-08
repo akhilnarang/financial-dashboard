@@ -73,6 +73,7 @@ class BankStatementProcessingError(Exception):
     the user instead of "Statement processing returned no result".
     """
 
+
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -223,7 +224,7 @@ def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> 
         try:
             amount = _parse_amount(txn.amount)
             txn_date = _parse_date(txn.date)
-        except (ValueError, InvalidOperation):
+        except ValueError, InvalidOperation:
             missing.append(_missing_entry(stmt_idx, direction, txn))
             continue
         parsed_rows.append((stmt_idx, direction, txn, amount, txn_date))
@@ -237,9 +238,9 @@ def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> 
     date_pool: dict[tuple, list[int]] = {}
     for db_txn in db_transactions:
         if db_txn.reference_number and db_txn.direction:
-            ref_pool.setdefault(
-                (db_txn.reference_number, db_txn.direction), []
-            ).append(db_txn.id)
+            ref_pool.setdefault((db_txn.reference_number, db_txn.direction), []).append(
+                db_txn.id
+            )
         if db_txn.transaction_date and db_txn.amount is not None and db_txn.direction:
             key = _match_key(
                 db_txn.transaction_date,
@@ -725,7 +726,7 @@ async def process_bank_statement_email(
             try:
                 amount = _parse_amount(entry["amount"])
                 txn_date = _parse_date(entry["date"])
-            except (ValueError, KeyError, InvalidOperation):
+            except ValueError, KeyError, InvalidOperation:
                 entry["import_error"] = "could not parse amount/date"
                 continue
 
