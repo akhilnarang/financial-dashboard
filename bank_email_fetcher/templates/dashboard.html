@@ -36,9 +36,9 @@
 
 <section class="cc-section" style="margin-bottom: 1.5rem;">
     {% macro cc_row(row, is_paid=False) %}
-    <tr>
+    <tr onclick="window.location.href='{{ row.statement_url }}'" style="cursor: pointer;">
         <td><span class="badge">{{ row.account.bank }}</span></td>
-        <td class="text-sm"><a href="/accounts/{{ row.account.id }}/edit">{{ row.account.label }}</a></td>
+        <td class="text-sm"><a href="/accounts/{{ row.account.id }}/edit" onclick="event.stopPropagation();">{{ row.account.label }}</a></td>
         <td class="text-sm{% if row.overdue %} cc-due-overdue{% endif %}">
             {%- if row.due_date_display -%}
                 {% if row.overdue %}overdue &middot; {{ row.due_date_display }}{% else %}{{ row.due_date_display }}{% endif %}

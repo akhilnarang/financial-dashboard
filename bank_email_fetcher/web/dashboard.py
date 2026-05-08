@@ -140,6 +140,7 @@ async def dashboard(
 
         row: dict = {
             "account": account,
+            "statement_url": f"/statements/{upload.id}",
             "amount_due": amount_due,
             "paid_amount": paid_amount if paid_amount else None,
             "outstanding": None,
