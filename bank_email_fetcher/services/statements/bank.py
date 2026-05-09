@@ -122,32 +122,215 @@ def _take_first_unconsumed(
     return None
 
 
-def _take_first_compatible(
+# Tokens we never count as distinctive overlap evidence for fuzzy
+# matching: banking nouns/verbs, transfer purpose words, generic header
+# words. Compared upper-case after extracting alphabetic runs of length
+# ≥ 4 from both narrations.
+_OVERLAP_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "PAYMENT", "PAYMENTS", "PAID",
+        "CREDIT", "CREDITS", "CREDITED", "CRED",
+        "DEBIT", "DEBITS", "DEBITED",
+        "TRANSFER", "TRANSFERS", "TRANSFERRED", "SELFTRANSFER", "SELF",
+        "BANK", "ACCOUNT", "BENEFICIARY", "REMITTER", "SENDER",
+        "FROM", "VIA", "FOR", "WITH",
+        "RECEIVED", "RECEIPT", "SENT",
+        "AMOUNT", "BALANCE", "AVAILABLE", "INDIA", "INTERNATIONAL",
+        "TRANSACTION", "TXNRECONCILE", "TXN",
+        "REFUND", "REFUNDS", "REVERSAL", "REVERSED",
+        "UPI", "IMPS", "NEFT", "RTGS", "ACH", "NACH",
+        "SLICE", "ICICI", "HDFC", "AXIS", "KOTAK", "IDFC", "INDUSIND",
+        "SBI", "YESBANK", "EQUITAS", "JUPITER", "ONECARD", "HSBC",
+        "OKAXIS", "OKICICI", "OKHDFCBANK", "OKSBI", "YBL", "PAYTM",
+    }
+)
+
+_TOKEN_RE = re.compile(r"[A-Za-z]{4,}")
+
+# Minimum length for a reference number to count as substring evidence.
+# Below this we risk matching on an accidental embedded run (a 4-digit
+# number inside a longer txn id, a year fragment, etc.).
+_MIN_REF_SUBSTRING_LEN = 6
+
+
+def _ref_appears_in(ref: str | None, text: str | None) -> bool:
+    """Word-boundary-aware containment check used as fuzzy match evidence.
+
+    Plain ``ref in text`` is too permissive — a short ref can fall
+    accidentally inside an unrelated longer numeric/alphanumeric run.
+    We require:
+
+    - ``ref`` is at least ``_MIN_REF_SUBSTRING_LEN`` chars (cuts out
+      noise-prone short tokens), and
+    - ``ref`` appears at an alphanumeric word boundary in ``text``
+      (so e.g. ``"3456"`` does NOT match inside ``"12345678901234"``,
+      but ``"123456789012"`` does match in ``"ref 123456789012 to"``).
+    """
+    if not ref or not text or len(ref) < _MIN_REF_SUBSTRING_LEN:
+        return False
+    return bool(
+        re.search(
+            r"(?<![A-Za-z0-9])" + re.escape(ref) + r"(?![A-Za-z0-9])",
+            text,
+        )
+    )
+
+
+def _significant_tokens(text: str | None, exclude: frozenset[str] | set[str]) -> set[str]:
+    """Extract alphabetic tokens of length ≥ 4 (upper-cased), minus the
+    excluded set. Used to test whether two narrations share a distinctive
+    counterparty token."""
+    if not text:
+        return set()
+    return {tok.upper() for tok in _TOKEN_RE.findall(text)} - exclude
+
+
+def _holder_name_tokens(name: str | None) -> set[str]:
+    """Tokens making up the account holder's own name. We exclude these
+    when scoring overlap because they appear in BOTH self-transfer
+    narrations and as the user's beneficiary name on inward transfers,
+    so they are not distinctive evidence."""
+    if not name:
+        return set()
+    return {tok.upper() for tok in _TOKEN_RE.findall(name)}
+
+
+def _is_compatible(
+    cand,
+    *,
+    stmt_ref: str | None,
+    stmt_narration: str | None,
+    stmt_channel: str | None,
+    holder_tokens: set[str],
+    is_fuzzy_date: bool,
+) -> bool:
+    """Decide whether a date+amount+direction-matching DB candidate could
+    be the same logical transaction as a statement row.
+
+    Compatibility rules:
+
+    - Refs agree, or at least one side has no ref → compatible. This is
+      the common case: email parsers often miss the ref, statement
+      parsers usually capture one. Allowed at any date offset (the ±1
+      day window stays for timezone slop in the no-ref-disagreement
+      case).
+
+    - Both rows have refs and they differ → ambiguous by ref alone.
+      We *only* attempt this rescue at exact date — once both sides have
+      refs, a mismatch is already a strong negative signal and we should
+      not double the collision window on top. So we refuse outright when
+      the date is fuzzy. At exact date we look for narration evidence:
+
+        a) DB ref appears at a word boundary inside stmt narration (UPI
+           case where the email-extracted UTR is embedded in the stmt
+           narration but the stmt ref column carries the bank's internal
+           txn id), OR
+        b) Stmt ref appears at a word boundary inside DB raw_description
+           (symmetric but rarer), OR
+        c) Channel is UPI on BOTH sides AND counterparty narration
+           shares at least one distinctive token (excluding the account
+           holder's own name and a stopword list of banking/purpose
+           words).
+
+      Strict-channel-UPI on (c) is deliberate: IMPS self-transfers
+      collide easily on the holder's name and lack distinctive merchant
+      tokens, so we prefer false-split there over false-merge. The
+      word-boundary check on (a)/(b) prevents short refs from matching
+      accidentally as embedded substrings of unrelated long ids.
+
+    - Otherwise → incompatible.
+    """
+    cand_ref = getattr(cand, "reference_number", None)
+    cand_raw = getattr(cand, "raw_description", None) or getattr(
+        cand, "counterparty", None
+    )
+    cand_channel = getattr(cand, "channel", None)
+
+    if not (stmt_ref and cand_ref) or stmt_ref == cand_ref:
+        return True
+
+    if is_fuzzy_date:
+        return False
+
+    if _ref_appears_in(cand_ref, stmt_narration):
+        return True
+    if _ref_appears_in(stmt_ref, cand_raw):
+        return True
+
+    if (
+        stmt_channel == "upi"
+        and cand_channel == "upi"
+        and (
+            _significant_tokens(cand_raw, _OVERLAP_STOPWORDS | holder_tokens)
+            & _significant_tokens(stmt_narration, _OVERLAP_STOPWORDS | holder_tokens)
+        )
+    ):
+        return True
+
+    return False
+
+
+def _select_unique_compatible(
     candidates: list[int] | None,
     consumed: set[int],
     db_by_id: dict[int, object],
+    *,
     stmt_ref: str | None,
+    stmt_narration: str | None,
+    stmt_channel: str | None,
+    holder_tokens: set[str],
+    is_fuzzy_date: bool,
 ) -> int | None:
-    """Return the first usable id from ``candidates`` for fuzzy fallback.
+    """Return the unique compatible candidate, or ``None``.
 
-    A DB candidate is incompatible when both rows carry a reference number
-    and those references differ — they cannot be the same logical
-    transaction even if date/amount/direction line up. (If the DB row has
-    no ref, we still allow the match: email parsers don't always capture
-    one.)
+    Uniqueness is enforced in two tiers so distinctive narration evidence
+    can break ties:
+
+    1. If at least one candidate matches by ref-substring (DB ref ⊆ stmt
+       narration, or stmt ref ⊆ DB raw_description, both word-bounded),
+       restrict to that set. This is high-confidence evidence.
+    2. Otherwise consider all compatible candidates.
+
+    Within the chosen tier, return the candidate iff exactly one passes —
+    never silently pick the first of multiple. Refusal pushes the row
+    into ``missing`` so the operator can resolve manually rather than
+    have us merge into the wrong sibling row.
     """
     if not candidates:
         return None
-    for cid in candidates:
-        if cid in consumed:
-            continue
+
+    pool = [cid for cid in candidates if cid not in consumed]
+    if not pool:
+        return None
+
+    strong: list[int] = []
+    compatible: list[int] = []
+    for cid in pool:
         cand = db_by_id.get(cid)
         if cand is None:
             continue
-        cand_ref = getattr(cand, "reference_number", None)
-        if stmt_ref and cand_ref and stmt_ref != cand_ref:
+        if not _is_compatible(
+            cand,
+            stmt_ref=stmt_ref,
+            stmt_narration=stmt_narration,
+            stmt_channel=stmt_channel,
+            holder_tokens=holder_tokens,
+            is_fuzzy_date=is_fuzzy_date,
+        ):
             continue
-        return cid
+        compatible.append(cid)
+        cand_ref = getattr(cand, "reference_number", None)
+        cand_raw = getattr(cand, "raw_description", None) or getattr(
+            cand, "counterparty", None
+        )
+        if _ref_appears_in(cand_ref, stmt_narration) or _ref_appears_in(
+            stmt_ref, cand_raw
+        ):
+            strong.append(cid)
+
+    pool_to_use = strong or compatible
+    if len(pool_to_use) == 1:
+        return pool_to_use[0]
     return None
 
 
@@ -264,14 +447,28 @@ def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> 
         matched_db_ids[stmt_idx] = db_by_id[candidate_id]
 
     # Pass 2: date+amount+direction fallback for stmt rows still unmatched.
-    # Refuse the fuzzy match when both rows have refs and they disagree.
+    # Compatibility is ref-and-narration-aware (see ``_is_compatible``).
+    # The ±1 day window stays as the date-pool walk so timezone-slop
+    # cases (DB row dated one off, stmt is exact, neither side has a
+    # disagreeing ref) still match. Per-candidate exactness for the
+    # both-refs-disagree path lives inside ``_is_compatible`` via the
+    # ``is_fuzzy_date`` flag.
+    holder_tokens = _holder_name_tokens(parsed.account_holder_name)
     for stmt_idx, direction, txn, amount, txn_date in parsed_rows:
         if stmt_idx in matched_db_ids:
             continue
+        stmt_ref = txn.reference_number
         for offset in (0, -1, 1):
             key = _match_key(txn_date + timedelta(days=offset), amount, direction)
-            candidate_id = _take_first_compatible(
-                date_pool.get(key), consumed, db_by_id, txn.reference_number
+            candidate_id = _select_unique_compatible(
+                date_pool.get(key),
+                consumed,
+                db_by_id,
+                stmt_ref=stmt_ref,
+                stmt_narration=txn.narration,
+                stmt_channel=txn.channel,
+                holder_tokens=holder_tokens,
+                is_fuzzy_date=offset != 0,
             )
             if candidate_id is None:
                 continue
