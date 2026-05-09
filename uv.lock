@@ -97,7 +97,7 @@ dev = [
 [[package]]
 name = "bank-email-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-email-parser#b06be749b4279f27d065b439b98c00bf8b8e774e" }
+source = { git = "https://github.com/akhilnarang/bank-email-parser#db217f142241c0e79d0469087272b2ed5bc3c0d8" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "pydantic" },
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "bank-statement-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-statement-parser#f2936b2a1dd34647c34c8ae52e33b1f7011c37b8" }
+source = { git = "https://github.com/akhilnarang/bank-statement-parser#0db9b9e262e7fdca49e830ef201edfe23094c42b" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },
