@@ -4,38 +4,45 @@ Resolves account_id and card_id on Transaction rows by matching the
 card_mask / account_mask emitted by the parser against the accounts and
 cards tables.
 
-Indian bank emails use at least five distinct mask formats:
+Indian bank emails and SMSes use at least these mask formats:
 
-    "XX2001"               -- short X-prefix, last-4 suffix
-    "xx0298"               -- same, lowercase
-    "XXXXXXX8669"          -- long X-prefix, last-4 suffix
-    "4611 XXXX XXXX 2002"  -- full 16-digit card layout with spaces
-    "5524 XXXX XXXX 2001"  -- same
-    "15XXXXXX4006"         -- partial mask, digits at both ends
-    "0567"                 -- bare last-4 (SBI, some others)
+    "XX1234"               -- short X-prefix, last-4 suffix
+    "xx1234"               -- same, lowercase
+    "XX123"                -- short X-prefix, last-3 (ICICI savings SMSes)
+    "XXXXXXX1234"          -- long X-prefix, last-4 suffix
+    "0000 XXXX XXXX 1234"  -- full 16-digit card layout with spaces
+    "12XXXXXX1234"         -- partial mask, digits at both ends
+    "1234"                 -- bare last-4 (SBI, some bare-numeric forms)
 
-_last4() strips everything that isn't a digit and returns the trailing
-four characters.  That one rule handles all formats.
+The matcher works on the **digit run** of the incoming mask: it strips
+non-digit characters, then suffix-matches against the stored digits of
+each account/card scoped to the same bank. The stored digit string
+can be longer than the incoming one — whichever is shorter must be a
+suffix of the longer. So an account_number `000000001234` matches
+incoming mask `XX234` because `234` is a suffix of `000000001234`.
+A minimum of 3 trailing digits is required to avoid pathological
+matches.
+
+Lookup is scoped by bank, so a card in one bank cannot collide with
+an unrelated account in another bank that happens to share the same
+trailing digits.
 
 Lookup precedence (per transaction):
   1. card_mask  -> cards table  (sets both card_id AND account_id)
-  2. card_mask  -> accounts table  (addon/debit cards stored as account_number)
+  2. card_mask  -> accounts table  (debit cards stored as account_number)
   3. account_mask -> accounts table
   4. bank-only  -> accounts table  (only when no mask at all and exactly one
                                      account exists for that bank)
 
-Batch usage (fetcher.py, seed_accounts.py):
+When more than one account/card within the same bank shares the matched
+suffix, the linker refuses to guess and leaves the row unlinked.
+
+Batch usage:
 
     ctx = await build_link_context(session)
     for txn in orphan_transactions:
         link_transaction(ctx, txn)
     await session.commit()
-
-Single-transaction usage (fetcher.py inline, right after INSERT):
-
-    ctx = await build_link_context(session)
-    link_transaction(ctx, txn_row)
-    # session.commit() happens in the caller
 """
 
 from __future__ import annotations
@@ -57,26 +64,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _last4(mask: str) -> str:
-    """Return the last 4 digit characters of any mask string.
+MIN_MASK_DIGITS = 3
+"""Minimum trailing-digit count required to attempt a match.
 
-    Strips all non-digit characters (X, x, spaces, hyphens, …) and
-    returns the final 4 digits.  Returns an empty string when fewer than
-    4 digits are present so callers can safely guard with ``if digits:``.
+ICICI savings SMSes carry as few as 3 digits in the account_mask
+(e.g. ``XX234``). Shorter masks produce dangerous false positives
+(e.g. matching every account ending in ``1``).
+"""
+
+
+def _trailing_digits(mask: str) -> str:
+    """Return every digit in *mask*, in order, with non-digits stripped.
+
+    For an incoming mask the matcher uses the full digit string and asks
+    "is this a suffix of the stored account number?". For an existing
+    account, we store the same digit string and let the suffix-match
+    happen on the *stored* side.
 
     Examples
     --------
-    >>> _last4("XX2001")        == "2001"
-    >>> _last4("xx0298")        == "0298"
-    >>> _last4("XXXXXXX8669")   == "8669"
-    >>> _last4("4611 XXXX XXXX 2002") == "2002"
-    >>> _last4("15XXXXXX4006")  == "4006"
-    >>> _last4("0567")          == "0567"
-    >>> _last4("10225478669")   == "8669"   # full account number
-    >>> _last4("")              == ""
+    >>> _trailing_digits("XX1234")        == "1234"
+    >>> _trailing_digits("xx5678")        == "5678"
+    >>> _trailing_digits("XX234")         == "234"
+    >>> _trailing_digits("0000 XXXX XXXX 1234") == "00001234"
+    >>> _trailing_digits("1234")          == "1234"
+    >>> _trailing_digits("")              == ""
     """
-    digits = re.sub(r"[^0-9]", "", mask)
-    return digits[-4:] if len(digits) >= 4 else digits
+    return re.sub(r"[^0-9]", "", mask)
 
 
 # ---------------------------------------------------------------------------
@@ -88,18 +102,16 @@ def _last4(mask: str) -> str:
 class LinkContext:
     """Preloaded lookup structures built once and reused for a batch.
 
-    card_by_last4:
-        last-4 digits -> (account_id, card_id)
-        Populated from the cards table.  When a transaction's card_mask
-        matches here we set both fields, correctly attributing addon-card
-        spend to the parent account.
+    cards_by_bank:
+        bank (lowercase) -> list of (digit_string, account_id, card_id)
+        One entry per Card. digit_string is the trailing digit run of
+        Card.card_mask. Matched by suffix-equality against the incoming
+        transaction's mask digits.
 
-    account_by_last4:
-        last-4 digits -> account_id
-        Populated from the accounts table using each account's
-        account_number.  Handles savings-account masks like "xx0298"
-        (last-4 of "033325229090298" == "0298") and cards stored as
-        account rows with a 4-digit account_number.
+    accounts_by_bank_with_digits:
+        bank (lowercase) -> list of (digit_string, account_id)
+        One entry per Account that has a non-empty account_number.
+        Matched the same way as cards.
 
     accounts_by_bank:
         bank (lowercase) -> list[account_id]
@@ -108,48 +120,118 @@ class LinkContext:
         bank, we link to it.
     """
 
-    card_by_last4: dict[str, tuple[int, int]] = field(default_factory=dict)
-    account_by_last4: dict[str, int] = field(default_factory=dict)
+    cards_by_bank: dict[str, list[tuple[str, int, int]]] = field(default_factory=dict)
+    accounts_by_bank_with_digits: dict[str, list[tuple[str, int]]] = field(
+        default_factory=dict
+    )
     accounts_by_bank: dict[str, list[int]] = field(default_factory=dict)
+
+
+def _suffix_match(incoming: str, stored: str) -> bool:
+    """True iff the shorter of *incoming* and *stored* is a suffix of
+    the longer.
+
+    Both are digit-only strings (non-digit chars already stripped).
+    """
+    if not incoming or not stored:
+        return False
+    if len(incoming) <= len(stored):
+        return stored.endswith(incoming)
+    return incoming.endswith(stored)
 
 
 async def build_link_context(session: AsyncSession) -> LinkContext:
     """Load all accounts and cards from the DB and build lookup tables.
 
-    Call this once before processing a batch of transactions.  The
-    returned LinkContext is a plain Python object -- no further DB
+    Call this once before processing a batch of transactions. The
+    returned LinkContext is a plain Python object — no further DB
     queries are needed until you want to refresh it.
     """
     ctx = LinkContext()
 
-    # ---- accounts ----
     accounts = (await session.execute(select(Account))).scalars().all()
     for acct in accounts:
         bank_key = acct.bank.strip().lower()
         ctx.accounts_by_bank.setdefault(bank_key, []).append(acct.id)
 
         if acct.account_number:
-            digits = _last4(acct.account_number)
+            digits = _trailing_digits(acct.account_number)
             if digits:
-                # Later rows intentionally overwrite earlier ones for the
-                # same last-4 within a bank -- the cards table is the
-                # authoritative source for card matching anyway.
-                ctx.account_by_last4[digits] = acct.id
+                ctx.accounts_by_bank_with_digits.setdefault(bank_key, []).append(
+                    (digits, acct.id)
+                )
 
-    # ---- cards ----
     cards = (await session.execute(select(Card))).scalars().all()
     for card in cards:
-        digits = _last4(card.card_mask)
-        if digits:
-            ctx.card_by_last4[digits] = (card.account_id, card.id)
+        digits = _trailing_digits(card.card_mask)
+        if not digits:
+            continue
+        # Look up the card's owning account to get its bank.
+        acct = next((a for a in accounts if a.id == card.account_id), None)
+        if acct is None:
+            continue
+        bank_key = acct.bank.strip().lower()
+        ctx.cards_by_bank.setdefault(bank_key, []).append(
+            (digits, card.account_id, card.id)
+        )
 
     logger.debug(
-        "LinkContext built: %d card entries, %d account entries, %d banks",
-        len(ctx.card_by_last4),
-        len(ctx.account_by_last4),
+        "LinkContext built: %d banks with cards, %d banks with accounts, %d banks total",
+        len(ctx.cards_by_bank),
+        len(ctx.accounts_by_bank_with_digits),
         len(ctx.accounts_by_bank),
     )
     return ctx
+
+
+def _find_card_match(
+    ctx: LinkContext, bank_key: str, incoming_digits: str
+) -> tuple[int, int] | None:
+    """Find a card in *bank_key* whose stored digits suffix-match
+    *incoming_digits*.
+
+    Returns (account_id, card_id) on a unique match, None otherwise.
+    Logs a warning when multiple candidates suffix-match (ambiguous).
+    """
+    matches = [
+        (acct_id, card_id)
+        for stored, acct_id, card_id in ctx.cards_by_bank.get(bank_key, [])
+        if _suffix_match(incoming_digits, stored)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        logger.warning(
+            "Ambiguous card-mask match in bank %r: incoming digits %r matched "
+            "%d cards %r — refusing to link.",
+            bank_key, incoming_digits, len(matches), matches,
+        )
+    return None
+
+
+def _find_account_match(
+    ctx: LinkContext, bank_key: str, incoming_digits: str
+) -> int | None:
+    """Find an account in *bank_key* whose account_number digits
+    suffix-match *incoming_digits*.
+
+    Returns account_id on a unique match, None otherwise.
+    Logs a warning on ambiguity.
+    """
+    matches = [
+        acct_id
+        for stored, acct_id in ctx.accounts_by_bank_with_digits.get(bank_key, [])
+        if _suffix_match(incoming_digits, stored)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        logger.warning(
+            "Ambiguous account-mask match in bank %r: incoming digits %r matched "
+            "%d accounts %r — refusing to link.",
+            bank_key, incoming_digits, len(matches), matches,
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -189,50 +271,48 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
         # Already linked -- nothing to do.
         return True
 
+    bank_key = txn.bank.strip().lower() if txn.bank else ""
+
     # ---- 1. card_mask -> cards table ----
     if txn.card_mask:
-        digits = _last4(txn.card_mask)
-        if digits and digits in ctx.card_by_last4:
-            acct_id, card_id = ctx.card_by_last4[digits]
-            txn.account_id = acct_id
-            txn.card_id = card_id
-            logger.debug(
-                "txn %s: linked via cards table (mask=%r -> last4=%s, account=%s card=%s)",
-                txn.id,
-                txn.card_mask,
-                digits,
-                acct_id,
-                card_id,
-            )
-            return True
+        digits = _trailing_digits(txn.card_mask)
+        if digits and len(digits) >= MIN_MASK_DIGITS:
+            hit = _find_card_match(ctx, bank_key, digits)
+            if hit is not None:
+                acct_id, card_id = hit
+                txn.account_id = acct_id
+                txn.card_id = card_id
+                logger.debug(
+                    "txn %s: linked via cards table (mask=%r -> digits=%s, account=%s card=%s)",
+                    txn.id, txn.card_mask, digits, acct_id, card_id,
+                )
+                return True
 
     # ---- 2. card_mask -> accounts table ----
     if txn.card_mask:
-        digits = _last4(txn.card_mask)
-        if digits and digits in ctx.account_by_last4:
-            txn.account_id = ctx.account_by_last4[digits]
-            logger.debug(
-                "txn %s: linked via accounts table by card_mask (mask=%r -> last4=%s, account=%s)",
-                txn.id,
-                txn.card_mask,
-                digits,
-                txn.account_id,
-            )
-            return True
+        digits = _trailing_digits(txn.card_mask)
+        if digits and len(digits) >= MIN_MASK_DIGITS:
+            hit = _find_account_match(ctx, bank_key, digits)
+            if hit is not None:
+                txn.account_id = hit
+                logger.debug(
+                    "txn %s: linked via accounts table by card_mask (mask=%r -> digits=%s, account=%s)",
+                    txn.id, txn.card_mask, digits, hit,
+                )
+                return True
 
     # ---- 3. account_mask -> accounts table ----
     if txn.account_mask:
-        digits = _last4(txn.account_mask)
-        if digits and digits in ctx.account_by_last4:
-            txn.account_id = ctx.account_by_last4[digits]
-            logger.debug(
-                "txn %s: linked via accounts table by account_mask (mask=%r -> last4=%s, account=%s)",
-                txn.id,
-                txn.account_mask,
-                digits,
-                txn.account_id,
-            )
-            return True
+        digits = _trailing_digits(txn.account_mask)
+        if digits and len(digits) >= MIN_MASK_DIGITS:
+            hit = _find_account_match(ctx, bank_key, digits)
+            if hit is not None:
+                txn.account_id = hit
+                logger.debug(
+                    "txn %s: linked via accounts table by account_mask (mask=%r -> digits=%s, account=%s)",
+                    txn.id, txn.account_mask, digits, hit,
+                )
+                return True
 
     # ---- 4. bank-only fallback ----
     # Only link when the bank has exactly ONE account registered.  If there
