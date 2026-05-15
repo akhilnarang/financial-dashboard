@@ -181,6 +181,83 @@ async def init_db(engine) -> None:
                 )
             )
 
+        # --- SMS pipeline columns ---
+        try:
+            await conn.execute(
+                text("SELECT sms_message_id FROM transactions LIMIT 0")
+            )
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE transactions ADD COLUMN sms_message_id INTEGER "
+                    "REFERENCES sms_messages(id)"
+                )
+            )
+        try:
+            await conn.execute(text("SELECT source FROM transactions LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE transactions ADD COLUMN source TEXT")
+            )
+            # Backfill: every existing transaction was created by the email
+            # path (the only path before this spec). Runs only on the same
+            # code path that adds the column, so the UPDATE fires once.
+            await conn.execute(
+                text("UPDATE transactions SET source = 'email' WHERE source IS NULL")
+            )
+        try:
+            await conn.execute(
+                text("SELECT notified_channel FROM transactions LIMIT 0")
+            )
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE transactions ADD COLUMN notified_channel TEXT")
+            )
+            await conn.execute(
+                text(
+                    "UPDATE transactions SET notified_channel = 'email' "
+                    "WHERE notified_channel IS NULL"
+                )
+            )
+        try:
+            await conn.execute(text("SELECT enriched_at FROM transactions LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE transactions ADD COLUMN enriched_at DATETIME")
+            )
+        try:
+            await conn.execute(text("SELECT status FROM sms_messages LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE sms_messages ADD COLUMN status TEXT NOT NULL "
+                    "DEFAULT 'pending'"
+                )
+            )
+        try:
+            await conn.execute(
+                text("SELECT transaction_id FROM sms_messages LIMIT 0")
+            )
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE sms_messages ADD COLUMN transaction_id INTEGER "
+                    "REFERENCES transactions(id)"
+                )
+            )
+        try:
+            await conn.execute(text("SELECT parse_error FROM sms_messages LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE sms_messages ADD COLUMN parse_error TEXT")
+            )
+        try:
+            await conn.execute(text("SELECT parsed_at FROM sms_messages LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE sms_messages ADD COLUMN parsed_at DATETIME")
+            )
+
     # function-local: breaks cycle with services.settings (settings imports db at top)
     from financial_dashboard.services.settings import load_all_settings
 

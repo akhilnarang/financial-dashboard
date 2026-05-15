@@ -248,6 +248,12 @@ class Transaction(Base):
     raw_description: Mapped[str | None] = mapped_column(Text)
     note: Mapped[str | None] = mapped_column(Text)
     category: Mapped[str | None] = mapped_column(String)
+    sms_message_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("sms_messages.id"), nullable=True
+    )
+    source: Mapped[str | None] = mapped_column(String)
+    notified_channel: Mapped[str | None] = mapped_column(String)
+    enriched_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime, default=utc_now
     )
@@ -277,6 +283,14 @@ class SmsMessage(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, nullable=False, default=utc_now
     )
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending", server_default="pending"
+    )
+    transaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("transactions.id"), nullable=True
+    )
+    parse_error: Mapped[str | None] = mapped_column(Text)
+    parsed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
 
     __table_args__ = (
         UniqueConstraint(
