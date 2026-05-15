@@ -9,8 +9,8 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from bank_email_fetcher.db import Base, Email, EmailSource
-from bank_email_fetcher.integrations.email import body as fetcher_module
+from financial_dashboard.db import Base, Email, EmailSource
+from financial_dashboard.integrations.email import body as fetcher_module
 
 
 @pytest.fixture

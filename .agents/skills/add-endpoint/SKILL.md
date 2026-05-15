@@ -1,6 +1,6 @@
 ---
 name: add-endpoint
-description: Add or update a bank-email-fetcher endpoint using the per-domain router -> service -> schema layout.
+description: Add or update a financial-dashboard endpoint using the per-domain router -> service -> schema layout.
 ---
 
 # Add or Update an Endpoint
@@ -9,7 +9,7 @@ description: Add or update a bank-email-fetcher endpoint using the per-domain ro
 
 - `AGENTS.md`
 - `README.md`
-- the matching files under `bank_email_fetcher/api/`, `bank_email_fetcher/web/`, `bank_email_fetcher/services/`, and `bank_email_fetcher/schemas/`
+- the matching files under `financial_dashboard/api/`, `financial_dashboard/web/`, `financial_dashboard/services/`, and `financial_dashboard/schemas/`
 
 ## Layout
 
@@ -28,7 +28,7 @@ Keep `web/bank_statements.py` included before `web/statements.py`, otherwise `/s
 ## Compatibility
 
 - Preserve URLs, methods, response shapes, template names, and template context keys.
-- Use `bank_email_fetcher.integrations.parsers` for parser calls.
+- Use `financial_dashboard.integrations.parsers` for parser calls.
 - Keep polling state on `app.state.fetch_service`.
 
 ## Validate
@@ -36,8 +36,8 @@ Keep `web/bank_statements.py` included before `web/statements.py`, otherwise `/s
 Before committing, run:
 
 ```bash
-uv run ruff check bank_email_fetcher tests scripts
-uv run ruff format --check bank_email_fetcher tests scripts
-uv run ty check bank_email_fetcher
+uv run ruff check financial_dashboard tests scripts
+uv run ruff format --check financial_dashboard tests scripts
+uv run ty check financial_dashboard
 uv run pytest -q
 ```

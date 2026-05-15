@@ -1,9 +1,9 @@
-# AGENTS.md — AI assistant instructions for bank-email-fetcher
+# AGENTS.md — AI assistant instructions for financial-dashboard
 
 ## Project layout
 
 ```text
-bank_email_fetcher/
+financial_dashboard/
   main.py                 FastAPI app factory + lifespan wiring
   api/                    JSON routes
   web/
@@ -84,7 +84,7 @@ uv run pytest -q
 
 ## Database schema docs
 
-- The Mermaid ER diagram in `README.md` is documentation for `bank_email_fetcher/db/models.py`; when models change, update the diagram, the model summary table, and the key-constraints notes together.
+- The Mermaid ER diagram in `README.md` is documentation for `financial_dashboard/db/models.py`; when models change, update the diagram, the model summary table, and the key-constraints notes together.
 - Keep every ORM table in the diagram, including standalone tables such as `settings`, and include every real foreign-key edge from `cards`, `fetch_rules`, `emails`, `statement_uploads`, `bank_statement_uploads`, and `transactions`.
 - If a field is only a parser/linker hint (`card_mask`, `account_mask`, similar denormalized values), describe it in nearby prose instead of drawing a fake foreign-key relationship.
 
@@ -128,9 +128,9 @@ Rules:
 
 Run all of these before finishing a refactor:
 
-- `uv run ruff check bank_email_fetcher tests scripts`
-- `uv run ruff format --check bank_email_fetcher tests scripts`
-- `uv run ty check bank_email_fetcher`
+- `uv run ruff check financial_dashboard tests scripts`
+- `uv run ruff format --check financial_dashboard tests scripts`
+- `uv run ty check financial_dashboard`
 - `uv run pytest -q`
 
 Use `uv run` for every command. PEP 758 parenthesis-free `except X, Y:` syntax is valid in this repo. Prefer `python-dateutil` helpers from `core/dates.py`.

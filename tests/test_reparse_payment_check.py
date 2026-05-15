@@ -22,11 +22,11 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-import bank_email_fetcher.core.deps as core_deps
-import bank_email_fetcher.services.reminders as reminders_module
-from bank_email_fetcher.core.deps import get_session
-from bank_email_fetcher.web import get_router as get_web_router
-from bank_email_fetcher.db import (
+import financial_dashboard.core.deps as core_deps
+import financial_dashboard.services.reminders as reminders_module
+from financial_dashboard.core.deps import get_session
+from financial_dashboard.web import get_router as get_web_router
+from financial_dashboard.db import (
     Account,
     Base,
     Card,
@@ -35,7 +35,7 @@ from bank_email_fetcher.db import (
     StatementUpload,
     Transaction,
 )
-from bank_email_fetcher.db.enums import PaymentStatus
+from financial_dashboard.db.enums import PaymentStatus
 
 
 @pytest.fixture
@@ -163,11 +163,11 @@ class TestReparseEmailInvokesPaymentCheck:
         raw = _equitas_payment_eml("12,345.00", "9999")
         with (
             patch(
-                "bank_email_fetcher.web.emails.load_or_fetch_raw_email",
+                "financial_dashboard.web.emails.load_or_fetch_raw_email",
                 new=AsyncMock(return_value=(raw, None)),
             ),
             patch(
-                "bank_email_fetcher.web.emails.should_notify_transactions",
+                "financial_dashboard.web.emails.should_notify_transactions",
                 return_value=False,
             ),
         ):
@@ -194,11 +194,11 @@ class TestReparseEmailInvokesPaymentCheck:
         raw = _equitas_payment_eml("12,345.00", "9999")
         with (
             patch(
-                "bank_email_fetcher.web.emails.load_or_fetch_raw_email",
+                "financial_dashboard.web.emails.load_or_fetch_raw_email",
                 new=AsyncMock(return_value=(raw, None)),
             ),
             patch(
-                "bank_email_fetcher.web.emails.should_notify_transactions",
+                "financial_dashboard.web.emails.should_notify_transactions",
                 return_value=False,
             ),
         ):
@@ -234,11 +234,11 @@ class TestReparseAllFailedBulkRoute:
         raw = _equitas_payment_eml("12,345.00", "9999")
         with (
             patch(
-                "bank_email_fetcher.web.emails.load_or_fetch_raw_email",
+                "financial_dashboard.web.emails.load_or_fetch_raw_email",
                 new=AsyncMock(return_value=(raw, None)),
             ),
             patch(
-                "bank_email_fetcher.web.emails.should_notify_transactions",
+                "financial_dashboard.web.emails.should_notify_transactions",
                 return_value=False,
             ),
         ):

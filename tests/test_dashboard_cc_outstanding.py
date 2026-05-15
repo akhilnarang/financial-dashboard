@@ -7,8 +7,8 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
-from bank_email_fetcher.db import Account, Base, StatementUpload
-from bank_email_fetcher.web import dashboard as dashboard_module
+from financial_dashboard.db import Account, Base, StatementUpload
+from financial_dashboard.web import dashboard as dashboard_module
 
 
 @pytest.fixture

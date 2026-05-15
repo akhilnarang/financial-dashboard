@@ -13,19 +13,19 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from bank_email_fetcher.main import create_app
-import bank_email_fetcher.core.deps as core_deps
-from bank_email_fetcher.db import (
+from financial_dashboard.main import create_app
+import financial_dashboard.core.deps as core_deps
+from financial_dashboard.db import (
     Account,
     Base,
     BankStatementUpload,
     StatementUpload,
 )
-from bank_email_fetcher.services import accounts as accounts_module
-from bank_email_fetcher.services.statements import dates as dates_module
-from bank_email_fetcher.services.statements import shared as statements_shared
-from bank_email_fetcher.web import bank_statements as bank_routes
-from bank_email_fetcher.web import statements as cc_routes
+from financial_dashboard.services import accounts as accounts_module
+from financial_dashboard.services.statements import dates as dates_module
+from financial_dashboard.services.statements import shared as statements_shared
+from financial_dashboard.web import bank_statements as bank_routes
+from financial_dashboard.web import statements as cc_routes
 
 
 @pytest.fixture

@@ -5,10 +5,10 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from bank_email_fetcher.main import create_app
-import bank_email_fetcher.core.deps as core_deps
-from bank_email_fetcher.db import Account, Base, StatementUpload
-from bank_email_fetcher.web import statements as statement_routes
+from financial_dashboard.main import create_app
+import financial_dashboard.core.deps as core_deps
+from financial_dashboard.db import Account, Base, StatementUpload
+from financial_dashboard.web import statements as statement_routes
 
 
 @pytest.fixture

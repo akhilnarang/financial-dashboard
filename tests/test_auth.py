@@ -10,9 +10,9 @@ from fastapi.security import HTTPBasicCredentials
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 
-from bank_email_fetcher.config import Settings
-from bank_email_fetcher.core.deps import verify_credentials
-from bank_email_fetcher.core.security import check_credentials
+from financial_dashboard.config import Settings
+from financial_dashboard.core.deps import verify_credentials
+from financial_dashboard.core.security import check_credentials
 
 
 # ---------------------------------------------------------------------------
@@ -53,16 +53,16 @@ def _make_creds(username: str, password: str):
 
 class TestCheckCredentials:
     def test_disabled_allows_none(self):
-        with patch("bank_email_fetcher.core.security.settings", _make_settings()):
+        with patch("financial_dashboard.core.security.settings", _make_settings()):
             check_credentials(None)  # should not raise
 
     def test_disabled_allows_any_creds(self):
-        with patch("bank_email_fetcher.core.security.settings", _make_settings()):
+        with patch("financial_dashboard.core.security.settings", _make_settings()):
             check_credentials(_make_creds("whoever", "whatever"))
 
     def test_enabled_rejects_none(self):
         with patch(
-            "bank_email_fetcher.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
         ):
             with pytest.raises(HTTPException) as exc_info:
                 check_credentials(None)
@@ -72,13 +72,13 @@ class TestCheckCredentials:
 
     def test_enabled_accepts_correct(self):
         with patch(
-            "bank_email_fetcher.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
         ):
             check_credentials(_make_creds("admin", "pass"))
 
     def test_enabled_rejects_wrong_username(self):
         with patch(
-            "bank_email_fetcher.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
         ):
             with pytest.raises(HTTPException) as exc_info:
                 check_credentials(_make_creds("wrong", "pass"))
@@ -86,7 +86,7 @@ class TestCheckCredentials:
 
     def test_enabled_rejects_wrong_password(self):
         with patch(
-            "bank_email_fetcher.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
         ):
             with pytest.raises(HTTPException) as exc_info:
                 check_credentials(_make_creds("admin", "wrong"))
@@ -94,7 +94,7 @@ class TestCheckCredentials:
 
     def test_enabled_rejects_both_wrong(self):
         with patch(
-            "bank_email_fetcher.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
         ):
             with pytest.raises(HTTPException) as exc_info:
                 check_credentials(_make_creds("wrong", "wrong"))
@@ -103,21 +103,21 @@ class TestCheckCredentials:
     def test_password_with_colons(self):
         """Colons in password must not break Basic auth's user:pass splitting."""
         with patch(
-            "bank_email_fetcher.core.security.settings",
+            "financial_dashboard.core.security.settings",
             _make_settings("admin", "p:a:s:s"),
         ):
             check_credentials(_make_creds("admin", "p:a:s:s"))
 
     def test_non_ascii_credentials(self):
         with patch(
-            "bank_email_fetcher.core.security.settings",
+            "financial_dashboard.core.security.settings",
             _make_settings("ユーザー", "пароль"),
         ):
             check_credentials(_make_creds("ユーザー", "пароль"))
 
     def test_non_ascii_wrong_password_rejected(self):
         with patch(
-            "bank_email_fetcher.core.security.settings",
+            "financial_dashboard.core.security.settings",
             _make_settings("ユーザー", "пароль"),
         ):
             with pytest.raises(HTTPException) as exc_info:
@@ -149,7 +149,7 @@ def _basic_auth_header(username: str, password: str) -> dict[str, str]:
 @pytest.mark.anyio
 class TestAuthIntegration:
     async def test_auth_disabled_no_header(self):
-        with patch("bank_email_fetcher.core.security.settings", _make_settings()):
+        with patch("financial_dashboard.core.security.settings", _make_settings()):
             async with AsyncClient(
                 transport=ASGITransport(app=_build_app()), base_url="http://test"
             ) as client:
@@ -159,7 +159,7 @@ class TestAuthIntegration:
 
     async def test_auth_disabled_with_header_still_passes(self):
         """When auth is disabled, a stray Authorization header should not cause errors."""
-        with patch("bank_email_fetcher.core.security.settings", _make_settings()):
+        with patch("financial_dashboard.core.security.settings", _make_settings()):
             async with AsyncClient(
                 transport=ASGITransport(app=_build_app()), base_url="http://test"
             ) as client:
@@ -171,7 +171,7 @@ class TestAuthIntegration:
 
     async def test_auth_enabled_no_header_returns_401(self):
         with patch(
-            "bank_email_fetcher.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=_build_app()), base_url="http://test"
@@ -182,7 +182,7 @@ class TestAuthIntegration:
 
     async def test_auth_enabled_correct_creds(self):
         with patch(
-            "bank_email_fetcher.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=_build_app()), base_url="http://test"
@@ -193,7 +193,7 @@ class TestAuthIntegration:
 
     async def test_auth_enabled_wrong_creds_returns_401(self):
         with patch(
-            "bank_email_fetcher.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=_build_app()), base_url="http://test"
@@ -203,7 +203,7 @@ class TestAuthIntegration:
 
     async def test_auth_enabled_wrong_username_returns_401(self):
         with patch(
-            "bank_email_fetcher.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=_build_app()), base_url="http://test"
@@ -213,7 +213,7 @@ class TestAuthIntegration:
 
     async def test_password_with_colons(self):
         with patch(
-            "bank_email_fetcher.core.security.settings",
+            "financial_dashboard.core.security.settings",
             _make_settings("admin", "p:a:s:s"),
         ):
             async with AsyncClient(

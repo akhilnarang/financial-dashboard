@@ -16,12 +16,12 @@ from pathlib import Path
 
 from sqlalchemy import select
 
-from bank_email_fetcher.db import EmailSource, FetchRule, init_db, async_session
+from financial_dashboard.db import EmailSource, FetchRule, init_db, async_session
 
 
 def _ensure_fernet_key():
     """Generate EMAIL_SOURCE_MASTER_KEY and write to .env if not already set."""
-    from bank_email_fetcher.config import Settings
+    from financial_dashboard.config import Settings
 
     if Settings().email_source_master_key:
         return

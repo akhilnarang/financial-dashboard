@@ -9,8 +9,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from bank_email_fetcher.db import Account, Base, Card
-from bank_email_fetcher.services.accounts import ensure_default_primary_card
+from financial_dashboard.db import Account, Base, Card
+from financial_dashboard.services.accounts import ensure_default_primary_card
 
 
 @pytest.fixture

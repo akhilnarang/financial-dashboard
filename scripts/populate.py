@@ -21,7 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from bank_email_parser.api import parse_email
 from bank_email_parser.exceptions import ParseError, UnsupportedEmailTypeError
 
-from bank_email_fetcher.db import Base, Email, Transaction, async_session, engine
+from financial_dashboard.db import Base, Email, Transaction, async_session, engine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
-DB_PATH = DATA_DIR / "bank_email_fetcher.db"
+DB_PATH = DATA_DIR / "financial_dashboard.db"
 
 KNOWN_BANKS = {
     "axis",

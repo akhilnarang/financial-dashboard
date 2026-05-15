@@ -21,7 +21,7 @@ from typing import Literal
 
 from bank_statement_parser.models import BankTransaction, ParsedBankStatement
 
-from bank_email_fetcher.services.statements.bank import reconcile_bank_statement
+from financial_dashboard.services.statements.bank import reconcile_bank_statement
 
 
 @dataclass

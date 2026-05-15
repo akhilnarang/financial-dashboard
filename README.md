@@ -1,4 +1,4 @@
-# bank-email-fetcher
+# financial-dashboard
 
 Self-hosted personal finance service that fetches bank transaction alert emails from Gmail and Fastmail, parses them into structured transactions, reconciles credit card statements, and provides a web dashboard for viewing and managing your financial data.
 
@@ -14,8 +14,8 @@ Self-hosted personal finance service that fetches bank transaction alert emails 
 ## Quickstart
 
 ```bash
-git clone https://github.com/AkhilNarang/bank-email-fetcher.git
-cd bank-email-fetcher
+git clone https://github.com/AkhilNarang/financial-dashboard.git
+cd financial-dashboard
 mkdir -p data
 uv sync --no-dev
 uv run python scripts/seed.py   # generates .env with Fernet key + seeds fetch rules
@@ -35,7 +35,7 @@ Once running:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `EMAIL_SOURCE_MASTER_KEY` | (required) | Fernet key for encrypting credentials at rest. If unset, an ephemeral key is generated on each startup (credentials will not survive restarts). |
-| `DB_URL` | `sqlite+aiosqlite:///./data/bank_email_fetcher.db` | SQLAlchemy database URL |
+| `DB_URL` | `sqlite+aiosqlite:///./data/financial_dashboard.db` | SQLAlchemy database URL |
 | `POLL_INTERVAL_MINUTES` | `15` | Automatic background polling interval |
 | `POLL_FETCH_LIMIT_PER_RULE` | `50` | Max new emails fetched per rule per poll cycle |
 | `TELEGRAM_BOT_TOKEN` | (optional) | Telegram bot token for real-time transaction notifications |
@@ -53,7 +53,7 @@ Once running:
 ### Transaction Parsing
 - Emails are parsed using **bank-email-parser**, which handles 12 Indian banks (Slice, ICICI, HDFC, Axis, IndusInd, Kotak, SBI, HSBC, IDFC FIRST, Equitas, OneCard, Union Bank of India) and 28+ email formats.
 - Each parsed email produces a `Transaction` row with: bank, email type, direction (debit/credit), amount, currency, date, counterparty, card/account mask, reference number (UTR/UPI), channel, and available balance.
-- Failed emails are saved to `bank_email_fetcher/data/failed/` as `.eml` files for debugging. Files older than 7 days are auto-cleaned.
+- Failed emails are saved to `financial_dashboard/data/failed/` as `.eml` files for debugging. Files older than 7 days are auto-cleaned.
 
 ### CC Statement Reconciliation
 - **Automatic via email**: Statement emails (those with "statement" in the subject and a PDF attachment) are detected during polling. The PDF is extracted, parsed with **cc-parser**, and reconciled automatically.
@@ -61,7 +61,7 @@ Once running:
 - **Reconciliation**: Statement transactions are matched to existing DB transactions by `(date, amount, direction)` with a ±1 day tolerance. Results are classified as matched, missing (in statement but not DB), or extra (in DB but not statement).
 - **Auto-import**: Missing transactions are automatically imported as `Transaction` rows with `email_type="cc_statement"` and `channel="cc_statement"`.
 - **Narration enrichment**: For matched transactions where the DB counterparty is null or a generic placeholder (e.g. "payment received"), the statement narration is written back to the `counterparty` field.
-- **Password handling**: Encrypted PDFs are tried against all stored statement passwords for the bank. If none work, the PDF is saved to `bank_email_fetcher/data/statements/` with status `password_required` for manual retry via the UI. Passwords can be stored per-account (encrypted with Fernet) on the account edit page and will be used for future automated processing.
+- **Password handling**: Encrypted PDFs are tried against all stored statement passwords for the bank. If none work, the PDF is saved to `financial_dashboard/data/statements/` with status `password_required` for manual retry via the UI. Passwords can be stored per-account (encrypted with Fernet) on the account edit page and will be used for future automated processing.
 - **Auto-account creation**: If no matching credit card account is found for a statement's card number, a new Account (and Card) row is created automatically.
 
 ### Account and Card Management
@@ -106,7 +106,7 @@ Linking is performed inline during polling and in batch via the `relink_orphans(
 ## Architecture Overview
 
 ```
-bank_email_fetcher/
+financial_dashboard/
   main.py         # FastAPI app factory and lifespan wiring
   api/            # JSON endpoints
   web/
@@ -133,7 +133,7 @@ scripts/
 
 ### Request Lifecycle
 
-1. FastAPI `lifespan` in `bank_email_fetcher.main` initializes the DB, starts support services, and stores a shared `FetchService` on `app.state`.
+1. FastAPI `lifespan` in `financial_dashboard.main` initializes the DB, starts support services, and stores a shared `FetchService` on `app.state`.
 2. On each poll tick (or manual trigger), `FetchService.poll_all()` delegates to `integrations/email/orchestrator.py`.
 3. HTML routes are split by domain under `web/` and aggregated by `web/__init__.py`.
 4. Routes use `core.deps.get_session`, while supporting services live under `services/`.

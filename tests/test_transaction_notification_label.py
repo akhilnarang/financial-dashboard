@@ -19,9 +19,9 @@ import pytest
 from sqlalchemy.exc import MissingGreenlet
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from bank_email_fetcher.db import Account, Base, Card, Transaction
-from bank_email_fetcher.services.linker import build_link_context, link_transaction
-from bank_email_fetcher.services.telegram import build_account_label
+from financial_dashboard.db import Account, Base, Card, Transaction
+from financial_dashboard.services.linker import build_link_context, link_transaction
+from financial_dashboard.services.telegram import build_account_label
 
 
 @pytest.fixture

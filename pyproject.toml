@@ -1,5 +1,5 @@
 [project]
-name = "bank-email-fetcher"
+name = "financial-dashboard"
 version = "0.1.0"
 description = "Self-hosted bank transaction email fetcher and dashboard"
 readme = "README.md"
@@ -27,7 +27,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.fastapi]
-entrypoint = "bank_email_fetcher.main:create_app"
+entrypoint = "financial_dashboard.main:create_app"
 
 [tool.uv.sources]
 bank-email-parser = { git = "https://github.com/akhilnarang/bank-email-parser" }

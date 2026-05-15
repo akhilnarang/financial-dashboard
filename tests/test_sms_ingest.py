@@ -9,11 +9,11 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from bank_email_fetcher.api import router as api_router
-from bank_email_fetcher.core.deps import get_session
-from bank_email_fetcher.db import Base, SmsMessage
-from bank_email_fetcher.schemas.sms import SmsIngestRequest
-from bank_email_fetcher.services.sms import ingest_sms
+from financial_dashboard.api import router as api_router
+from financial_dashboard.core.deps import get_session
+from financial_dashboard.db import Base, SmsMessage
+from financial_dashboard.schemas.sms import SmsIngestRequest
+from financial_dashboard.services.sms import ingest_sms
 
 
 # ---------------------------------------------------------------------------

@@ -20,15 +20,15 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from bank_email_fetcher.db import (
+from financial_dashboard.db import (
     Account,
     Base,
     Card,
     StatementUpload,
 )
-from bank_email_fetcher.db.init_db import init_db as _init_db
-import bank_email_fetcher.services.emails as emails_service
-from bank_email_fetcher.services.statements import cc as cc_module
+from financial_dashboard.db.init_db import init_db as _init_db
+import financial_dashboard.services.emails as emails_service
+from financial_dashboard.services.statements import cc as cc_module
 from bank_email_parser.models import Money, ParsedEmail, StatementSummary
 
 
@@ -107,7 +107,7 @@ async def test_summary_creates_statement_upload_with_correct_fields(
     async def _noop(_uid):
         return True
 
-    import bank_email_fetcher.services.reminders as reminders_mod
+    import financial_dashboard.services.reminders as reminders_mod
 
     monkeypatch.setattr(reminders_mod, "init_payment_tracking", _noop)
 
@@ -252,7 +252,7 @@ async def test_summary_picks_matching_account_by_card_mask(
 
     monkeypatch.setattr(cc_module, "should_notify_transactions", lambda: False)
 
-    import bank_email_fetcher.services.reminders as reminders_mod
+    import financial_dashboard.services.reminders as reminders_mod
 
     async def _noop(_uid):
         return True
@@ -279,7 +279,7 @@ async def test_summary_dedupes_on_reparse(session_factory, monkeypatch):
     parsed = _parsed_with(_default_summary())
     monkeypatch.setattr(cc_module, "should_notify_transactions", lambda: False)
 
-    import bank_email_fetcher.services.reminders as reminders_mod
+    import financial_dashboard.services.reminders as reminders_mod
 
     async def _noop(_uid):
         return True
@@ -551,7 +551,7 @@ async def test_init_db_is_idempotent(tmp_path, monkeypatch):
 
     # Patch load_all_settings — it's called at the tail of init_db but needs
     # the real async_session, which we aren't using here.
-    import bank_email_fetcher.services.settings as settings_mod
+    import financial_dashboard.services.settings as settings_mod
 
     async def _noop_load() -> dict[str, str]:
         return {}
@@ -578,7 +578,7 @@ async def test_init_db_summary_columns_present_and_filename_non_null(
     db_path = tmp_path / "schema.sqlite"
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
 
-    import bank_email_fetcher.services.settings as settings_mod
+    import financial_dashboard.services.settings as settings_mod
 
     async def _noop_load() -> dict[str, str]:
         return {}
@@ -614,7 +614,7 @@ async def test_init_db_migrates_pre_branch_schema(tmp_path, monkeypatch):
     db_path = tmp_path / "pre_branch.sqlite"
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
 
-    import bank_email_fetcher.services.settings as settings_mod
+    import financial_dashboard.services.settings as settings_mod
 
     async def _noop_load() -> dict[str, str]:
         return {}
@@ -722,7 +722,7 @@ async def test_retry_cc_statement_upload_skips_email_summary(
     uploads — they have no PDF to reparse. Guards against the retry pipeline
     attempting to load an empty ``file_path`` for ``source_kind='email_summary'``
     rows."""
-    from bank_email_fetcher.services.statements import shared as shared_module
+    from financial_dashboard.services.statements import shared as shared_module
 
     monkeypatch.setattr(shared_module, "async_session", session_factory)
 

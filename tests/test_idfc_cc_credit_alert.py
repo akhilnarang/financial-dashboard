@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from email.message import EmailMessage
 
-from bank_email_fetcher.services.emails import _process_email_full
+from financial_dashboard.services.emails import _process_email_full
 
 
 def _raw_email(body: str) -> bytes:

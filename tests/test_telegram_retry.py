@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
-from bank_email_fetcher.services.telegram import _send_with_retry
+from financial_dashboard.services.telegram import _send_with_retry
 
 
 @pytest.fixture
