@@ -42,59 +42,6 @@ wheels = [
 ]
 
 [[package]]
-name = "bank-email-fetcher"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "aiosqlite" },
-    { name = "bank-email-parser" },
-    { name = "bank-statement-parser" },
-    { name = "cc-parser" },
-    { name = "cryptography" },
-    { name = "fastapi", extra = ["standard"] },
-    { name = "jinja2" },
-    { name = "pydantic-settings" },
-    { name = "python-dateutil" },
-    { name = "python-telegram-bot" },
-    { name = "rich" },
-    { name = "sqlalchemy", extra = ["asyncio"] },
-    { name = "uvicorn", extra = ["standard"] },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-anyio" },
-    { name = "ruff" },
-    { name = "ty" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiosqlite", specifier = ">=0.20,<1" },
-    { name = "bank-email-parser", git = "https://github.com/akhilnarang/bank-email-parser" },
-    { name = "bank-statement-parser", git = "https://github.com/akhilnarang/bank-statement-parser" },
-    { name = "cc-parser", git = "https://github.com/akhilnarang/cc-parser" },
-    { name = "cryptography", specifier = ">=44.0,<47" },
-    { name = "fastapi", extras = ["standard"], specifier = ">=0.135,<1" },
-    { name = "jinja2", specifier = ">=3.1,<4" },
-    { name = "pydantic-settings", specifier = ">=2.0,<3" },
-    { name = "python-dateutil", specifier = ">=2.9.0.post0" },
-    { name = "python-telegram-bot", specifier = ">=22.7,<23" },
-    { name = "rich", specifier = ">=14.0,<15" },
-    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=9.0,<10" },
-    { name = "pytest-anyio", specifier = ">=0.0.0" },
-    { name = "ruff", specifier = ">=0.15.12" },
-    { name = "ty", specifier = ">=0.0.34" },
-]
-
-[[package]]
 name = "bank-email-parser"
 version = "0.1.0"
 source = { git = "https://github.com/akhilnarang/bank-email-parser#4420022fbae82574161010f1a015fd500762e5b2" }
@@ -431,6 +378,59 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/83/18/7a7c15657a3da5569b26fc51cde6a80f8d84cb54b3b1aea6d74a103db4ad/fastar-0.11.0-cp314-cp314t-win32.whl", hash = "sha256:5744551bc67c6fc6581cbd0e34a0fd6e2cd0bd30b43e94b1c3119cf35064b162", size = 453601, upload-time = "2026-04-13T17:11:53.726Z" },
     { url = "https://files.pythonhosted.org/packages/6d/d8/331b59a6de279f3ad75c10c02c40a12f21d64a437d9c3d6f1af2dcbd7a76/fastar-0.11.0-cp314-cp314t-win_amd64.whl", hash = "sha256:f4ce44e3b56c47cf38244b98d29f269b259740a580c47a2552efa5b96a5458fb", size = 486436, upload-time = "2026-04-13T17:11:40.089Z" },
     { url = "https://files.pythonhosted.org/packages/6b/fd/5390ec4f49100f3ecb9968a392f9e6d039f1e3fe0ecd28443716ff01e589/fastar-0.11.0-cp314-cp314t-win_arm64.whl", hash = "sha256:76c1359314355eafbc6989f20fb1ad565a3d10200117923b9da765a17e2f6f11", size = 461049, upload-time = "2026-04-13T17:11:25.918Z" },
+]
+
+[[package]]
+name = "financial-dashboard"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "aiosqlite" },
+    { name = "bank-email-parser" },
+    { name = "bank-statement-parser" },
+    { name = "cc-parser" },
+    { name = "cryptography" },
+    { name = "fastapi", extra = ["standard"] },
+    { name = "jinja2" },
+    { name = "pydantic-settings" },
+    { name = "python-dateutil" },
+    { name = "python-telegram-bot" },
+    { name = "rich" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-anyio" },
+    { name = "ruff" },
+    { name = "ty" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiosqlite", specifier = ">=0.20,<1" },
+    { name = "bank-email-parser", git = "https://github.com/akhilnarang/bank-email-parser" },
+    { name = "bank-statement-parser", git = "https://github.com/akhilnarang/bank-statement-parser" },
+    { name = "cc-parser", git = "https://github.com/akhilnarang/cc-parser" },
+    { name = "cryptography", specifier = ">=44.0,<47" },
+    { name = "fastapi", extras = ["standard"], specifier = ">=0.135,<1" },
+    { name = "jinja2", specifier = ">=3.1,<4" },
+    { name = "pydantic-settings", specifier = ">=2.0,<3" },
+    { name = "python-dateutil", specifier = ">=2.9.0.post0" },
+    { name = "python-telegram-bot", specifier = ">=22.7,<23" },
+    { name = "rich", specifier = ">=14.0,<15" },
+    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0,<3" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.34,<1" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.0,<10" },
+    { name = "pytest-anyio", specifier = ">=0.0.0" },
+    { name = "ruff", specifier = ">=0.15.12" },
+    { name = "ty", specifier = ">=0.0.34" },
 ]
 
 [[package]]
