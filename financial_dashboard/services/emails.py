@@ -15,7 +15,6 @@ from financial_dashboard.db import (
     Email,
     EmailKind,
     StatementUpload,
-    Transaction,
     async_session,
 )
 from financial_dashboard.integrations.email.body import (
@@ -47,6 +46,7 @@ from financial_dashboard.services.statements.cc import (
 from financial_dashboard.services.telegram import (
     build_account_label,
     send_bulk_summary,
+    send_enrichment_notification,
     send_transaction_notification,
 )
 
@@ -61,8 +61,16 @@ def _serialize_datetime(value: datetime.datetime | None) -> str | None:
 
 def _is_duplicate_transaction_error(exc: IntegrityError) -> bool:
     message = str(exc.orig)
-    return "uq_transaction_dedup" in message or (
-        "UNIQUE constraint failed:" in message and "transactions." in message
+    # Accept both the stale name (uq_transaction_dedup, still in the message
+    # check for backwards compat) and the real one (uq_transactions_ref per
+    # db/models.py:259).
+    return (
+        "uq_transactions_ref" in message
+        or "uq_transaction_dedup" in message
+        or (
+            "UNIQUE constraint failed:" in message
+            and "transactions." in message
+        )
     )
 
 
@@ -372,6 +380,7 @@ async def handle_polled_email(
             logger.warning("Could not save failed email to spool: %s", save_err)
 
     pending_notifications: list[tuple[int, dict]] = []
+    pending_enrichment_notifications: list[tuple[int, object]] = []
     pending_payment_checks: list[tuple[int, int, object]] = []
 
     async with async_session() as session:
@@ -430,12 +439,16 @@ async def handle_polled_email(
                     txn_data["_declined"] = True
                     pending_notifications.append((0, txn_data))
             elif txn_data:
+                from financial_dashboard.services.txn_merge import merge_transaction
                 try:
-                    async with session.begin_nested():
-                        txn_row = Transaction(email_id=email_row.id, **txn_data)
-                        session.add(txn_row)
-                        await session.flush()
+                    outcome, txn_row, diff = await merge_transaction(
+                        session, "email", txn_data, email_id=email_row.id
+                    )
                 except IntegrityError as exc:
+                    # Defense-in-depth: merge_transaction already catches
+                    # uq_transactions_ref races, so this branch should be
+                    # unreachable. Keep it to preserve the existing behavior
+                    # for any other unique constraint.
                     if not _is_duplicate_transaction_error(exc):
                         raise
                     email_row.status = "skipped"
@@ -443,18 +456,34 @@ async def handle_polled_email(
                     stats["skipped"] += 1
                     logger.warning(
                         "Skipping duplicate transaction for email %s (rule=%s, source=%s): %s",
-                        msg_id,
-                        rule.id,
-                        source_id,
-                        exc.orig,
+                        msg_id, rule.id, source_id, exc.orig,
                     )
                 else:
                     email_row.status = "parsed"
                     email_row.error = None
                     stats["parsed"] += 1
-                    link_transaction(link_context, txn_row)
-                    await session.flush()
-                    if should_notify:
+                    if outcome == "created":
+                        link_transaction(link_context, txn_row)
+                        await session.flush()
+                    elif outcome == "enriched":
+                        # Re-link if the enrichment filled card_mask/account_mask
+                        # and the row is still unlinked.
+                        if txn_row.account_id is None and (
+                            diff.filled.get("card_mask")
+                            or diff.filled.get("account_mask")
+                        ):
+                            link_transaction(link_context, txn_row)
+                            await session.flush()
+                        # Queue an enrichment notification when this email
+                        # added or overwrote fields on an existing row. The
+                        # bulk dispatcher below drops these when one poll
+                        # produces more than `telegram.bulk_threshold`
+                        # primaries — they'd be lost in the summary anyway.
+                        if should_notify and diff.changed_fields:
+                            pending_enrichment_notifications.append(
+                                (txn_row.id, diff)
+                            )
+                    if should_notify and outcome == "created":
                         account_obj = (
                             await session.get(Account, txn_row.account_id)
                             if txn_row.account_id
@@ -497,13 +526,37 @@ async def handle_polled_email(
         bulk_threshold = get_setting_int("telegram.bulk_threshold", 5)
         if len(pending_notifications) <= bulk_threshold:
             for txn_id, txn_info in pending_notifications:
-                await send_transaction_notification(txn_id, txn_info, chat_id)
+                await send_transaction_notification(
+                    txn_id, txn_info, chat_id, source="email"
+                )
+            # Enrichment notifications fire alongside primaries only on the
+            # per-row dispatch path. The bulk-summary path below collapses
+            # everything into one message and can't represent diffs.
+            if pending_enrichment_notifications:
+                for enrich_txn_id, diff in pending_enrichment_notifications:
+                    await send_enrichment_notification(
+                        enrich_txn_id, diff, chat_id, source="email"
+                    )
         else:
             await send_bulk_summary(
                 len(pending_notifications),
                 chat_id,
                 source="email",
                 txns=pending_notifications,
+            )
+            # Drop per-row enrichments when the batch took the bulk path.
+            if pending_enrichment_notifications:
+                logger.info(
+                    "Dropped %d enrichment notifications in bulk email poll",
+                    len(pending_enrichment_notifications),
+                )
+    elif pending_enrichment_notifications:
+        # No primaries fired (everything was enrichment-only); still emit
+        # the per-row enrichments — they're not part of the bulk path.
+        chat_id = get_telegram_chat_id()
+        for enrich_txn_id, diff in pending_enrichment_notifications:
+            await send_enrichment_notification(
+                enrich_txn_id, diff, chat_id, source="email"
             )
 
     if pending_payment_checks:
