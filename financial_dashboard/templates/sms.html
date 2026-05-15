@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+{% block title %}SMS - Ledger{% endblock %}
+{% block content %}
+
+<div class="section-header">
+    <h2>SMS Processing Log</h2>
+    <div style="display: flex; align-items: center; gap: 1rem;">
+        {% if failed_count > 0 %}
+        <button
+            id="reparse-all-btn"
+            class="btn-action"
+            type="button"
+            onclick="reparseAllFailedSms(this)"
+        >Reprocess pending/error<span class="btn-action-count">{{ failed_count }}</span></button>
+        {% endif %}
+        <span class="result-count">{{ "{:,}".format(total_count) }} SMS{{ "es" if total_count != 1 }}</span>
+    </div>
+</div>
+
+<form method="get" class="filter-bar" id="sms-filter-form">
+    <label data-field>
+        Bank
+        <select name="bank">
+            <option value="">All Banks</option>
+            {% for b in banks %}
+            <option value="{{ b }}" {% if filters.bank == b %}selected{% endif %}>{{ b }}</option>
+            {% endfor %}
+        </select>
+    </label>
+    <label data-field>
+        Status
+        <select name="status">
+            <option value="">All Statuses</option>
+            <option value="pending" {% if filters.status == "pending" %}selected{% endif %}>Pending</option>
+            <option value="parsed" {% if filters.status == "parsed" %}selected{% endif %}>Parsed</option>
+            <option value="enriched" {% if filters.status == "enriched" %}selected{% endif %}>Enriched</option>
+            <option value="error" {% if filters.status == "error" %}selected{% endif %}>Error</option>
+            <option value="skipped" {% if filters.status == "skipped" %}selected{% endif %}>Skipped</option>
+        </select>
+    </label>
+    <label data-field>
+        Received From
+        <input type="date" name="date_from" value="{{ filters.date_from or '' }}">
+    </label>
+    <label data-field>
+        Received To
+        <input type="date" name="date_to" value="{{ filters.date_to or '' }}">
+    </label>
+    <label data-field style="min-width: 220px; flex: 1 1 220px;">
+        Search
+        <input type="search" name="q" value="{{ filters.q or '' }}" placeholder="Search sender or body...">
+    </label>
+    {% if filters.bank or filters.status or filters.date_from or filters.date_to or filters.q %}
+    <a href="/sms" aria-label="Clear filters" title="Clear filters"
+       style="display: inline-flex; align-items: center; justify-content: center; width: 2rem; min-width: 2rem; height: 2rem; padding: 0; border-radius: 999px; border: 1px solid #dc2626; color: #dc2626; text-decoration: none; font-size: 1rem; line-height: 1; align-self: flex-end;">&times;</a>
+    {% endif %}
+</form>
+
+<section>
+{% if sms_rows %}
+<figure style="margin: 0;">
+    <div class="table">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Bank</th>
+                    <th>Sender</th>
+                    <th>Body</th>
+                    <th>Status</th>
+                    <th>Received</th>
+                    <th>Parsed</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for sms in sms_rows %}
+                <tr onclick="openDetailModal('/sms/{{ sms.id }}/detail')" style="cursor: pointer;">
+                    <td class="text-sm text-muted" style="font-family: var(--font-mono);">{{ sms.id }}</td>
+                    <td><span class="badge">{{ sms.bank }}</span></td>
+                    <td class="text-sm"><span class="truncate" title="{{ sms.sender }}">{{ sms.sender }}</span></td>
+                    <td><span class="truncate" title="{{ sms.body }}">{{ sms.body[:80] }}{{ "…" if sms.body|length > 80 }}</span></td>
+                    <td>
+                        {% if sms.status == "parsed" %}
+                        <span class="badge success">parsed</span>
+                        {% elif sms.status == "enriched" %}
+                        <span class="badge success-outline">enriched</span>
+                        {% elif sms.status == "error" %}
+                        <span class="badge danger" title="{{ sms.parse_error or '' }}">error</span>
+                        {% elif sms.status == "pending" %}
+                        <span class="badge badge-pending">pending</span>
+                        {% elif sms.status == "skipped" %}
+                        <span class="badge">skipped</span>
+                        {% else %}
+                        <span class="badge">{{ sms.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td class="text-sm">{{ sms.received_at.strftime("%d %b %Y %H:%M") if sms.received_at else "&mdash;"|safe }}</td>
+                    <td class="text-sm">{{ sms.parsed_at.strftime("%d %b %Y %H:%M") if sms.parsed_at else "&mdash;"|safe }}</td>
+                    <td onclick="event.stopPropagation()">
+                        {% if sms.status in ("pending", "error") %}
+                        <button class="btn-action" type="button" onclick="reparseSms(this, {{ sms.id }})">Reparse</button>
+                        {% else %}
+                        <span class="text-muted">&mdash;</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</figure>
+
+{% if total_pages > 1 %}
+<nav style="display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; font-size: 0.85rem;">
+    <span class="text-muted">
+        Showing {{ "{:,}".format((page - 1) * page_size + 1) }}&ndash;{{ "{:,}".format([page * page_size, total_count]|min) }} of {{ "{:,}".format(total_count) }}
+    </span>
+    <span style="display: flex; gap: 0.25rem; align-items: center;">
+        {% if page > 1 %}
+        <a href="/sms?{{ base_qs }}{% if base_qs %}&{% endif %}page={{ page - 1 }}">&laquo; Prev</a>
+        {% endif %}
+        {% set ns = namespace(prev=0) %}
+        {% for p in page_window %}
+            {% if p - ns.prev > 1 %}<span class="text-muted">&hellip;</span>{% endif %}
+            {% if p == page %}
+            <strong style="padding: 0.15rem 0.45rem; background: var(--bg-muted, #eee); border-radius: 4px;">{{ p }}</strong>
+            {% else %}
+            <a href="/sms?{{ base_qs }}{% if base_qs %}&{% endif %}page={{ p }}" style="padding: 0.15rem 0.45rem;">{{ p }}</a>
+            {% endif %}
+            {% set ns.prev = p %}
+        {% endfor %}
+        {% if page < total_pages %}
+        <a href="/sms?{{ base_qs }}{% if base_qs %}&{% endif %}page={{ page + 1 }}">Next &raquo;</a>
+        {% endif %}
+    </span>
+</nav>
+{% endif %}
+
+{% else %}
+<article class="card empty-state">
+    <p>No SMSes received yet.</p>
+    <p class="text-sm text-muted">Configure the Android forwarder to POST to /api/sms.</p>
+</article>
+{% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const smsFilterForm = document.getElementById("sms-filter-form");
+if (smsFilterForm) {
+    smsFilterForm.querySelectorAll('select, input[type="date"]').forEach((f) => {
+        f.addEventListener("change", () => smsFilterForm.requestSubmit());
+    });
+}
+
+async function reparseSms(btn, smsId) {
+    btn.disabled = true;
+    btn.textContent = 'Reparsing…';
+    try {
+        const resp = await fetch(`/sms/${smsId}/reparse`, { method: 'POST' });
+        const data = await resp.json().catch(() => ({}));
+        const row = btn.closest('tr');
+        if (resp.ok) {
+            const statusCell = row.querySelector('td:nth-child(5)');
+            if (statusCell) {
+                const cls = data.new_status === "enriched" ? "success-outline" :
+                            data.new_status === "parsed" ? "success" : "";
+                statusCell.innerHTML = `<span class="badge ${cls}">${data.new_status}</span>`;
+            }
+            btn.closest('td').innerHTML = '<span class="text-muted">&mdash;</span>';
+        } else {
+            btn.disabled = false;
+            btn.textContent = 'Reparse';
+            alert('Reparse failed: ' + (data.detail || `HTTP ${resp.status}`));
+        }
+    } catch (e) {
+        btn.disabled = false;
+        btn.textContent = 'Reparse';
+        alert('Request failed: ' + e);
+    }
+}
+
+async function reparseAllFailedSms(btn) {
+    btn.disabled = true;
+    const origHTML = btn.innerHTML;
+    btn.textContent = 'Reprocessing…';
+    try {
+        const resp = await fetch('/sms/reparse-all-failed', { method: 'POST' });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) {
+            btn.textContent = `Done: ${data.processed} processed, ${data.still_error} still error, ${data.skipped} skipped`;
+            btn.style.opacity = '0.6';
+            setTimeout(() => window.location.reload(), 1500);
+        } else {
+            btn.disabled = false;
+            btn.innerHTML = origHTML;
+            alert('Bulk reparse failed: ' + (data.detail || `HTTP ${resp.status}`));
+        }
+    } catch (e) {
+        btn.disabled = false;
+        btn.innerHTML = origHTML;
+        alert('Request failed: ' + e);
+    }
+}
+</script>
+{% endblock %}

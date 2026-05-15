@@ -10,6 +10,7 @@ from financial_dashboard.web import (
     polling,
     rules,
     settings,
+    sms,
     sources,
     statements,
     transactions,
@@ -23,6 +24,7 @@ router.include_router(accounts.router)
 router.include_router(sources.router)
 router.include_router(rules.router)
 router.include_router(settings.router)
+router.include_router(sms.router)
 router.include_router(bank_statements.router)
 router.include_router(statements.router)
 router.include_router(polling.router)

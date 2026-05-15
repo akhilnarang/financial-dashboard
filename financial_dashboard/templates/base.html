@@ -263,6 +263,12 @@
             color: var(--clr-pending-fg);
         }
 
+        .badge.success-outline {
+            background: transparent;
+            color: var(--clr-credit);
+            border: 1px solid var(--clr-credit);
+        }
+
         /* ---------------------------------------------------------------
            Utilities
         --------------------------------------------------------------- */
@@ -484,6 +490,7 @@
             <a href="/" {% if active_page == "dashboard" %}aria-current="page"{% endif %}>Dashboard</a>
             <a href="/transactions" {% if active_page == "transactions" %}aria-current="page"{% endif %}>Transactions</a>
             <a href="/emails" {% if active_page == "emails" %}aria-current="page"{% endif %}>Emails</a>
+            <a href="/sms" {% if active_page == "sms" %}aria-current="page"{% endif %}>SMS</a>
             <a href="/sources" {% if active_page == "sources" %}aria-current="page"{% endif %}>Sources</a>
             <a href="/accounts" {% if active_page == "accounts" %}aria-current="page"{% endif %}>Accounts</a>
             <a href="/statements" {% if active_page == "statements" %}aria-current="page"{% endif %}>Statements</a>
