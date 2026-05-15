@@ -14,6 +14,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0,<3",
     "aiosqlite>=0.20,<1",
     "bank-email-parser",
+    "bank-sms-parser",
     "bank-statement-parser",
     "cc-parser",
     "fastapi[standard]>=0.135,<1",
@@ -31,6 +32,7 @@ entrypoint = "financial_dashboard.main:create_app"
 
 [tool.uv.sources]
 bank-email-parser = { git = "https://github.com/akhilnarang/bank-email-parser" }
+bank-sms-parser = { git = "https://github.com/akhilnarang/bank-sms-parser" }
 bank-statement-parser = { git = "https://github.com/akhilnarang/bank-statement-parser" }
 cc-parser = { git = "https://github.com/akhilnarang/cc-parser" }
 

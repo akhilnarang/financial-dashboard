@@ -10,8 +10,10 @@ import asyncio
 import html
 import logging
 import re
+from decimal import Decimal
+from typing import Literal
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, RetryAfter
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
@@ -124,7 +126,11 @@ async def _send_with_retry(app, *, chat_id, text, parse_mode="HTML", attempts=3)
 
 
 async def send_transaction_notification(
-    txn_id: int, txn_info: dict, chat_id: int
+    txn_id: int,
+    txn_info: dict,
+    chat_id: int,
+    *,
+    source: Literal["sms", "email"] | None = None,
 ) -> None:
     """Send a transaction notification. Includes #txn_id for reply matching."""
     app = tg_app
@@ -156,7 +162,9 @@ async def send_transaction_notification(
         # Build notification text
         id_suffix = f"  #{txn_id}" if txn_id else ""
         lines = [
-            f"{direction_emoji} <b>{bank}</b> {direction_label}{id_suffix}",
+            f"{direction_emoji} <b>{bank}</b> {direction_label}"
+            f"{' · via SMS' if source == 'sms' else ' · via Email' if source == 'email' else ''}"
+            f"{id_suffix}",
             f"<b>{sign}\u20b9{amount_str}</b>",
         ]
         if counterparty:
@@ -243,8 +251,11 @@ async def _handle_callback(update: Update, context) -> None:
         from financial_dashboard.services.reminders import handle_mark_paid_callback
 
         await handle_mark_paid_callback(update, context)
-    else:
-        await query.answer("Unknown action")
+        return
+    if query.data.startswith("cc_pay_pick:"):
+        await _handle_cc_pay_pick_callback(update, context)
+        return
+    await query.answer("Unknown action")
 
 
 async def _handle_reply(update: Update, context) -> None:
@@ -293,3 +304,131 @@ async def _handle_reply(update: Update, context) -> None:
             await msg.reply_text(f"Saved {saved} for #{txn_id}")
         else:
             await msg.reply_text(f"Transaction #{txn_id} not found")
+
+
+async def send_enrichment_notification(
+    txn_id: int,
+    diff,  # EnrichmentDiff (typed loosely to avoid circular import)
+    chat_id: int,
+    *,
+    source: Literal["sms", "email"],
+) -> None:
+    """Fire a follow-up Telegram message describing what changed when
+    a second source enriched an existing Transaction.
+
+    Caller MUST gate this on ``diff.changed_fields`` being non-empty.
+    """
+    app = tg_app
+    if not app:
+        return
+    badge = "via SMS" if source == "sms" else "via Email"
+    try:
+        lines = [f"\U0001f504 #{txn_id} enriched {badge}"]
+        if diff.filled:
+            filled_str = ", ".join(
+                f"{k}={html.escape(str(v))}" for k, v in diff.filled.items()
+                if k != "raw_description"
+            )
+            if filled_str:
+                lines.append(f"Filled: {filled_str}")
+        if diff.overwritten:
+            updated_str = ", ".join(
+                f"{k}: {html.escape(str(old))} → {html.escape(str(new))}"
+                for k, (old, new) in diff.overwritten.items()
+                if k != "raw_description"
+            )
+            if updated_str:
+                lines.append(f"Updated: {updated_str}")
+        if len(lines) == 1:
+            # No diff content (only raw_description changed). Stay silent.
+            return
+        await _send_with_retry(app, chat_id=chat_id, text="\n".join(lines))
+    except Exception as e:
+        logger.warning(
+            "Failed to send enrichment notification for txn #%s: %s", txn_id, e
+        )
+
+
+async def send_disambiguation_prompt(payload: dict, chat_id: int) -> None:
+    """Telegram inline-keyboard prompt for CC payment account picker.
+
+    payload shape (built by sms_pipeline._build_disambiguation):
+      {txn_id, candidate_account_ids, candidate_labels, amount, bank}
+    """
+    app = tg_app
+    if not app:
+        return
+    txn_id = payload["txn_id"]
+    amount = payload["amount"]
+    bank = payload["bank"]
+    text = (
+        f"\U0001f4b3 #{txn_id} — couldn't auto-match this payment to a card\n"
+        f"+₹{Decimal(str(amount)):,.2f} · {html.escape(bank)}\n"
+        f"Which card did you pay?"
+    )
+    buttons = []
+    for acct_id in payload["candidate_account_ids"]:
+        label = payload["candidate_labels"].get(acct_id, f"Account #{acct_id}")
+        buttons.append([
+            InlineKeyboardButton(
+                label, callback_data=f"cc_pay_pick:{txn_id}:{acct_id}"
+            )
+        ])
+    buttons.append([
+        InlineKeyboardButton(
+            "Skip", callback_data=f"cc_pay_pick:{txn_id}:skip"
+        )
+    ])
+    await app.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML",
+    )
+
+
+async def _handle_cc_pay_pick_callback(update, context) -> None:
+    """User picked which CC account a maskless payment-received SMS hit."""
+    from financial_dashboard.db import Transaction, async_session
+    from financial_dashboard.services.reminders import check_payment_received
+
+    query = update.callback_query
+    await query.answer()
+    # Format: cc_pay_pick:{txn_id}:{account_id|skip}
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        return
+    _, txn_id_str, choice = parts
+    try:
+        txn_id = int(txn_id_str)
+    except ValueError:
+        return
+
+    if choice == "skip":
+        await query.edit_message_text(
+            f"#{txn_id}: skipped (no statement marked paid)"
+        )
+        return
+
+    try:
+        account_id = int(choice)
+    except ValueError:
+        return
+
+    async with async_session() as session:
+        async with session.begin():
+            txn = await session.get(Transaction, txn_id)
+            if txn is None:
+                await query.edit_message_text(f"#{txn_id}: transaction not found")
+                return
+            txn.account_id = account_id
+            amount = txn.amount
+
+    try:
+        await check_payment_received(txn_id, account_id, amount)
+    except Exception as exc:
+        logger.warning("check_payment_received failed for txn %s: %s", txn_id, exc)
+
+    await query.edit_message_text(
+        f"#{txn_id}: applied to account #{account_id}"
+    )

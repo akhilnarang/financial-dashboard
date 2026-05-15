@@ -53,6 +53,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bank-sms-parser"
+version = "0.1.0"
+source = { git = "https://github.com/akhilnarang/bank-sms-parser#2671bfb8376c49a509e039c168380bb58d6b02a9" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+    { name = "typer" },
+]
+
+[[package]]
 name = "bank-statement-parser"
 version = "0.1.0"
 source = { git = "https://github.com/akhilnarang/bank-statement-parser#ecaed620dbd818330bd7c1833464e2b28a05d587" }
@@ -387,6 +397,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "bank-email-parser" },
+    { name = "bank-sms-parser" },
     { name = "bank-statement-parser" },
     { name = "cc-parser" },
     { name = "cryptography" },
@@ -412,6 +423,7 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20,<1" },
     { name = "bank-email-parser", git = "https://github.com/akhilnarang/bank-email-parser" },
+    { name = "bank-sms-parser", git = "https://github.com/akhilnarang/bank-sms-parser" },
     { name = "bank-statement-parser", git = "https://github.com/akhilnarang/bank-statement-parser" },
     { name = "cc-parser", git = "https://github.com/akhilnarang/cc-parser" },
     { name = "cryptography", specifier = ">=44.0,<47" },
