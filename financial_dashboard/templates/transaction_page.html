@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Transaction #{{ txn.id }} - Ledger{% endblock %}
+{% block content %}
+
+<div class="section-header">
+    <h2>Transaction #{{ txn.id }}</h2>
+    <a href="/transactions" class="text-sm text-muted">&laquo; All transactions</a>
+</div>
+
+<article class="card" style="max-width: 900px;">
+    {% include "partials/transaction_detail.html" %}
+</article>
+
+{% endblock %}

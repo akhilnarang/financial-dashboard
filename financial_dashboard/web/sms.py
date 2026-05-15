@@ -326,23 +326,59 @@ async def sms_list(
     )
 
 
+async def _load_sms(
+    session: AsyncSession, sms_id: int
+) -> tuple[SmsMessage, Transaction | None] | None:
+    """Load an SmsMessage with its linked Transaction (if any), or None.
+
+    Looks up the linked Transaction via sms.transaction_id (not the
+    reverse FK on Transaction.sms_message_id — that points at whichever
+    SMS arrived first, which may be a different row).
+    """
+    sms = await session.get(SmsMessage, sms_id)
+    if sms is None:
+        return None
+    txn = (
+        await session.get(Transaction, sms.transaction_id)
+        if sms.transaction_id
+        else None
+    )
+    return sms, txn
+
+
 @router.get("/sms/{sms_id}/detail", response_class=HTMLResponse)
 async def sms_detail(
     sms_id: int,
     request: FastAPIRequest,
     session: AsyncSession = Depends(get_session),
 ):
-    sms = await session.get(SmsMessage, sms_id)
-    if sms is None:
+    loaded = await _load_sms(session, sms_id)
+    if loaded is None:
         return HTMLResponse("<p>SMS not found.</p>", 404)
-    # Look up the linked Transaction via sms.transaction_id (not the
-    # reverse FK on Transaction.sms_message_id — that points at whichever
-    # SMS arrived first, which may be a different row).
-    txn = (
-        await session.get(Transaction, sms.transaction_id) if sms.transaction_id else None
-    )
+    sms, txn = loaded
     return templates.TemplateResponse(
         request,
         "partials/sms_detail.html",
         {"sms": sms, "txn": txn},
+    )
+
+
+@router.get("/sms/{sms_id}", response_class=HTMLResponse)
+async def sms_page(
+    sms_id: int,
+    request: FastAPIRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    loaded = await _load_sms(session, sms_id)
+    if loaded is None:
+        return HTMLResponse("<p>SMS not found.</p>", 404)
+    sms, txn = loaded
+    return templates.TemplateResponse(
+        request,
+        "sms_page.html",
+        {
+            "active_page": "sms",
+            "sms": sms,
+            "txn": txn,
+        },
     )

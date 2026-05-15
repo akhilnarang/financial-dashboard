@@ -177,12 +177,10 @@ async def email_list(
     )
 
 
-@router.get("/emails/{email_id}/detail", response_class=HTMLResponse)
-async def email_detail(
-    email_id: int,
-    request: FastAPIRequest,
-    session: AsyncSession = Depends(get_session),
-):
+async def _load_email(
+    session: AsyncSession, email_id: int
+) -> tuple[Email, Transaction | None] | None:
+    """Load an Email with its linked Transaction (if any), or None."""
     result = await session.execute(
         select(Email, Transaction)
         .outerjoin(Transaction, Transaction.email_id == Email.id)
@@ -190,12 +188,42 @@ async def email_detail(
     )
     row = result.first()
     if not row:
+        return None
+    return tuple(row)  # type: ignore[return-value]
+
+
+@router.get("/emails/{email_id}/detail", response_class=HTMLResponse)
+async def email_detail(
+    email_id: int,
+    request: FastAPIRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    loaded = await _load_email(session, email_id)
+    if loaded is None:
         return HTMLResponse("<p>Email not found.</p>", 404)
-    email_row, txn = row
+    email_row, txn = loaded
     return templates.TemplateResponse(
         request,
         "partials/email_detail.html",
+        {"email": email_row, "txn": txn},
+    )
+
+
+@router.get("/emails/{email_id}", response_class=HTMLResponse)
+async def email_page(
+    email_id: int,
+    request: FastAPIRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    loaded = await _load_email(session, email_id)
+    if loaded is None:
+        return HTMLResponse("<p>Email not found.</p>", 404)
+    email_row, txn = loaded
+    return templates.TemplateResponse(
+        request,
+        "email_page.html",
         {
+            "active_page": "emails",
             "email": email_row,
             "txn": txn,
         },

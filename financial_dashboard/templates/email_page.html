@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Email #{{ email.id }} - Ledger{% endblock %}
+{% block content %}
+
+<div class="section-header">
+    <h2>Email #{{ email.id }}</h2>
+    <a href="/emails" class="text-sm text-muted">&laquo; All emails</a>
+</div>
+
+<article class="card" style="max-width: 900px;">
+    {% include "partials/email_detail.html" %}
+</article>
+
+{% endblock %}

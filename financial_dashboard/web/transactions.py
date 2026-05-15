@@ -203,12 +203,10 @@ async def transaction_list(
     )
 
 
-@router.get("/transactions/{txn_id}/detail", response_class=HTMLResponse)
-async def transaction_detail(
-    txn_id: int,
-    request: FastAPIRequest,
-    session: AsyncSession = Depends(get_session),
-):
+async def _load_transaction(
+    session: AsyncSession, txn_id: int
+) -> tuple[Transaction, Email | None, Account | None] | None:
+    """Load a Transaction with its linked Email and Account, or None."""
     result = await session.execute(
         select(Transaction, Email, Account)
         .outerjoin(Email, Transaction.email_id == Email.id)
@@ -217,12 +215,42 @@ async def transaction_detail(
     )
     row = result.first()
     if not row:
+        return None
+    return tuple(row)  # type: ignore[return-value]
+
+
+@router.get("/transactions/{txn_id}/detail", response_class=HTMLResponse)
+async def transaction_detail(
+    txn_id: int,
+    request: FastAPIRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    loaded = await _load_transaction(session, txn_id)
+    if loaded is None:
         return HTMLResponse("<p>Transaction not found.</p>", 404)
-    txn, email, account = row
+    txn, email, account = loaded
     return templates.TemplateResponse(
         request,
         "partials/transaction_detail.html",
+        {"txn": txn, "email": email, "account": account},
+    )
+
+
+@router.get("/transactions/{txn_id}", response_class=HTMLResponse)
+async def transaction_page(
+    txn_id: int,
+    request: FastAPIRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    loaded = await _load_transaction(session, txn_id)
+    if loaded is None:
+        return HTMLResponse("<p>Transaction not found.</p>", 404)
+    txn, email, account = loaded
+    return templates.TemplateResponse(
+        request,
+        "transaction_page.html",
         {
+            "active_page": "transactions",
             "txn": txn,
             "email": email,
             "account": account,

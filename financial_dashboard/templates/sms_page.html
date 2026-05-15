@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}SMS #{{ sms.id }} - Ledger{% endblock %}
+{% block content %}
+
+<div class="section-header">
+    <h2>SMS #{{ sms.id }}</h2>
+    <a href="/sms" class="text-sm text-muted">&laquo; All SMSes</a>
+</div>
+
+<article class="card" style="max-width: 900px;">
+    {% include "partials/sms_detail.html" %}
+</article>
+
+{% endblock %}
