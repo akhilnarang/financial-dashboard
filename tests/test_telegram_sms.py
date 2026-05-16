@@ -123,3 +123,70 @@ async def test_send_enrichment_notification_renders_diff():
     assert "counterparty" in captured["text"]
     assert "PZCREDIT0000000" in captured["text"]
     assert "Phone Pe" in captured["text"]
+
+
+@pytest.mark.anyio
+async def test_send_enrichment_notification_inline_format_with_txn_info():
+    """When txn_info is passed, the enrichment renders as a single
+    inline line with bank/amount/counterparty context."""
+    from financial_dashboard.services.telegram import send_enrichment_notification
+
+    captured = {}
+
+    async def fake_send(app, *, chat_id, text):
+        captured["text"] = text
+
+    diff = EnrichmentDiff(filled={"channel": "upi"})
+
+    with patch("financial_dashboard.services.telegram.tg_app", new=object()):
+        with patch(
+            "financial_dashboard.services.telegram._send_with_retry",
+            new=AsyncMock(side_effect=fake_send),
+        ):
+            await send_enrichment_notification(
+                42,
+                diff,
+                12345,
+                source="sms",
+                txn_info={
+                    "bank": "hdfc",
+                    "direction": "debit",
+                    "amount": Decimal("500"),
+                    "counterparty": "Zomato",
+                },
+            )
+    text = captured["text"]
+    # Single-line inline form: txn id, bank, signed amount, counterparty,
+    # diff fragment, source badge — all on one line.
+    assert "\n" not in text
+    assert "#42" in text
+    assert "HDFC" in text
+    assert "-₹500.00" in text
+    assert "Zomato" in text
+    assert "filled channel=upi" in text
+    assert "via SMS" in text
+
+
+@pytest.mark.anyio
+async def test_send_enrichment_notification_trims_time_to_hhmm():
+    """transaction_time values with microsecond precision get rendered
+    as HH:MM only — matching the primary notification's format."""
+    from financial_dashboard.services.telegram import send_enrichment_notification
+
+    captured = {}
+
+    async def fake_send(app, *, chat_id, text):
+        captured["text"] = text
+
+    diff = EnrichmentDiff(filled={"transaction_time": "22:30:50.583000"})
+
+    with patch("financial_dashboard.services.telegram.tg_app", new=object()):
+        with patch(
+            "financial_dashboard.services.telegram._send_with_retry",
+            new=AsyncMock(side_effect=fake_send),
+        ):
+            await send_enrichment_notification(99, diff, 12345, source="sms")
+    text = captured["text"]
+    assert "transaction_time=22:30" in text
+    assert "583000" not in text  # microseconds dropped
+    assert "22:30:50" not in text  # seconds dropped

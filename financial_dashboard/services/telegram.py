@@ -306,43 +306,78 @@ async def _handle_reply(update: Update, context) -> None:
             await msg.reply_text(f"Transaction #{txn_id} not found")
 
 
+def _format_diff_value(key: str, value) -> str:
+    """Render a diff value compactly. Time values are trimmed to HH:MM
+    to match the primary notification's date+time line; everything else
+    is HTML-escaped."""
+    if key in ("transaction_time", "transaction_date") and value is not None:
+        return html.escape(str(value)[:5] if key == "transaction_time" else str(value))
+    return html.escape(str(value))
+
+
 async def send_enrichment_notification(
     txn_id: int,
     diff,  # EnrichmentDiff (typed loosely to avoid circular import)
     chat_id: int,
     *,
     source: Literal["sms", "email"],
+    txn_info: dict | None = None,
 ) -> None:
     """Fire a follow-up Telegram message describing what changed when
     a second source enriched an existing Transaction.
 
     Caller MUST gate this on ``diff.changed_fields`` being non-empty.
+    When ``txn_info`` is provided (bank/direction/amount/counterparty),
+    the notification renders as a single inline line:
+
+        🔄 HDFC #1234 -₹500.00 Zomato — filled transaction_time
+
+    Otherwise it falls back to the txn-id-only form.
     """
     app = tg_app
     if not app:
         return
     badge = "via SMS" if source == "sms" else "via Email"
     try:
-        lines = [f"\U0001f504 #{txn_id} enriched {badge}"]
-        if diff.filled:
-            filled_str = ", ".join(
-                f"{k}={html.escape(str(v))}" for k, v in diff.filled.items()
-                if k != "raw_description"
-            )
-            if filled_str:
-                lines.append(f"Filled: {filled_str}")
-        if diff.overwritten:
-            updated_str = ", ".join(
-                f"{k}: {html.escape(str(old))} → {html.escape(str(new))}"
-                for k, (old, new) in diff.overwritten.items()
-                if k != "raw_description"
-            )
-            if updated_str:
-                lines.append(f"Updated: {updated_str}")
-        if len(lines) == 1:
-            # No diff content (only raw_description changed). Stay silent.
+        # Build the diff fragment: ignore raw_description (debug-only).
+        filled = [
+            f"{k}={_format_diff_value(k, v)}"
+            for k, v in diff.filled.items()
+            if k != "raw_description"
+        ]
+        overwritten = [
+            f"{k}: {_format_diff_value(k, old)}→{_format_diff_value(k, new)}"
+            for k, (old, new) in diff.overwritten.items()
+            if k != "raw_description"
+        ]
+        diff_parts = []
+        if filled:
+            diff_parts.append(f"filled {', '.join(filled)}")
+        if overwritten:
+            diff_parts.append(f"updated {', '.join(overwritten)}")
+        if not diff_parts:
+            # Only raw_description changed — stay silent.
             return
-        await _send_with_retry(app, chat_id=chat_id, text="\n".join(lines))
+        diff_text = " · ".join(diff_parts)
+
+        if txn_info:
+            direction = txn_info.get("direction", "")
+            sign = "-" if direction == "debit" else "+"
+            amount = txn_info.get("amount", 0)
+            amount_str = f"{amount:,.2f}"
+            bank = html.escape(str(txn_info.get("bank", "")).upper())
+            counterparty = html.escape(str(txn_info.get("counterparty", "") or ""))
+            header = (
+                f"\U0001f504 <b>{bank}</b> #{txn_id} "
+                f"{sign}₹{amount_str}"
+            )
+            if counterparty:
+                header += f" {counterparty}"
+            header += f" — {diff_text} ({badge})"
+            text = header
+        else:
+            text = f"\U0001f504 #{txn_id} enriched {badge} — {diff_text}"
+        await _send_with_retry(app, chat_id=chat_id, text=text)
     except Exception as e:
         logger.warning(
             "Failed to send enrichment notification for txn #%s: %s", txn_id, e

@@ -158,3 +158,81 @@ async def test_cross_bank_mask_collision_is_not_linked(session):
     assert link_transaction(ctx, txn2) is True
     assert txn2.account_id == hdfc.id
     assert txn2.card_id == hdfc_card.id
+
+
+@pytest.mark.anyio
+async def test_bank_only_fallback_uses_email_type_for_disambiguation(session):
+    """A bank with both a bank_account and a credit_card account must
+    still resolve correctly for maskless SMSes — the linker uses the
+    email_type's '_cc_' / '_account_' marker to pick the right one."""
+    savings = Account(
+        bank="slice",
+        type="bank_account",
+        label="Slice Savings",
+        account_number="000000001111",
+    )
+    cc = Account(
+        bank="slice",
+        type="credit_card",
+        label="Slice CC",
+        account_number="2222",
+    )
+    session.add_all([savings, cc])
+    await session.flush()
+    ctx = await build_link_context(session)
+
+    # A CC bill-paid SMS carries no mask but has '_cc_' in email_type.
+    cc_txn = _txn(
+        bank="slice",
+        email_type="slice_cc_bill_paid_alert",
+        direction="credit",
+    )
+    assert link_transaction(ctx, cc_txn) is True
+    assert cc_txn.account_id == cc.id
+
+    # A savings UPI alert carries no mask but has '_account_' in email_type.
+    savings_txn = _txn(
+        bank="slice",
+        email_type="slice_account_upi_credit_alert",
+        direction="credit",
+    )
+    assert link_transaction(ctx, savings_txn) is True
+    assert savings_txn.account_id == savings.id
+
+
+@pytest.mark.anyio
+async def test_bank_only_fallback_refuses_when_two_candidates_of_same_type(session):
+    """When the email_type-narrowed candidate set still has >1 accounts
+    (e.g. two CCs under the same bank), the linker must not guess."""
+    cc1 = Account(
+        bank="hdfc", type="credit_card", label="HDFC Diners", account_number="1111"
+    )
+    cc2 = Account(
+        bank="hdfc", type="credit_card", label="HDFC Millenia", account_number="2222"
+    )
+    session.add_all([cc1, cc2])
+    await session.flush()
+    ctx = await build_link_context(session)
+
+    txn = _txn(bank="hdfc", email_type="hdfc_cc_payment_received_alert")
+    assert link_transaction(ctx, txn) is False
+    assert txn.account_id is None
+
+
+@pytest.mark.anyio
+async def test_bank_only_fallback_falls_back_to_unfiltered_when_email_type_uninformative(
+    session,
+):
+    """When the email_type carries no '_cc_' / '_account_' marker, the
+    linker keeps the legacy behaviour: link only when the bank has
+    exactly one account total."""
+    acct = Account(
+        bank="x-bank", type="bank_account", label="X", account_number="0001"
+    )
+    session.add(acct)
+    await session.flush()
+    ctx = await build_link_context(session)
+
+    txn = _txn(bank="x-bank", email_type="x_bank_misc_alert")
+    assert link_transaction(ctx, txn) is True
+    assert txn.account_id == acct.id

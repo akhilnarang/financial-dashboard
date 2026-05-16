@@ -67,10 +67,10 @@ async def post_sms(
             except Exception as exc:
                 logger.warning("Telegram primary dispatch failed: %s", exc)
         if enrichment is not None:
-            txn_id, diff = enrichment
+            txn_id, diff, txn_info = enrichment
             try:
                 await send_enrichment_notification(
-                    txn_id, diff, chat_id, source="sms"
+                    txn_id, diff, chat_id, source="sms", txn_info=txn_info
                 )
             except Exception as exc:
                 logger.warning("Telegram enrichment dispatch failed: %s", exc)

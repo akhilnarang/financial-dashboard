@@ -33,7 +33,10 @@ class ProcessSmsOutcome:
     status: Literal["parsed", "enriched", "error", "skipped"]
     transaction_id: int | None
     primary_notification: dict | None = None
-    enrichment_notification: tuple[int, object] | None = None
+    enrichment_notification: tuple[int, object, dict] | None = None
+    """(txn_id, EnrichmentDiff, txn_info_payload) — txn_info matches the
+    shape of primary_notification so the Telegram renderer can produce a
+    concise inline message with bank/amount/counterparty context."""
     # The second tuple member is an EnrichmentDiff (typed as object here to
     # avoid a circular import with txn_merge).
     pending_payment_check: tuple[int, int, Decimal] | None = None
@@ -195,7 +198,11 @@ async def process_sms_row(
     if outcome == "created":
         primary_notification = await _notification_payload(txn_row, session)
     elif outcome == "enriched" and diff.changed_fields:
-        enrichment_notification = (txn_row.id, diff)
+        enrichment_notification = (
+            txn_row.id,
+            diff,
+            await _notification_payload(txn_row, session),
+        )
 
     pending_payment_check = None
     pending_disambiguation = None

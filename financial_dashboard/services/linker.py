@@ -125,6 +125,28 @@ class LinkContext:
         default_factory=dict
     )
     accounts_by_bank: dict[str, list[int]] = field(default_factory=dict)
+    account_types: dict[int, str] = field(default_factory=dict)
+    """account_id -> account.type (e.g. 'bank_account', 'credit_card'). Used by
+    the bank-only fallback to disambiguate between e.g. Slice Savings vs
+    Slice CC when the SMS body carries no mask."""
+
+
+def _expected_account_type(email_type: str | None) -> str | None:
+    """Infer the Account.type a transaction's email_type implies.
+
+    Returns:
+      - "credit_card" for any '*_cc_*' email_type
+      - "bank_account" for any '*_account_*' or '*_dc_*' email_type (the
+        debit-card-on-savings shape)
+      - None when the email_type doesn't carry an account-vs-card hint
+    """
+    if not email_type:
+        return None
+    if "_cc_" in email_type:
+        return "credit_card"
+    if "_account_" in email_type or "_dc_" in email_type:
+        return "bank_account"
+    return None
 
 
 def _suffix_match(incoming: str, stored: str) -> bool:
@@ -153,6 +175,8 @@ async def build_link_context(session: AsyncSession) -> LinkContext:
     for acct in accounts:
         bank_key = acct.bank.strip().lower()
         ctx.accounts_by_bank.setdefault(bank_key, []).append(acct.id)
+        if acct.type:
+            ctx.account_types[acct.id] = acct.type
 
         if acct.account_number:
             digits = _trailing_digits(acct.account_number)
@@ -315,35 +339,39 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
                 return True
 
     # ---- 4. bank-only fallback ----
-    # Only link when the bank has exactly ONE account registered.  If there
-    # are multiple accounts (e.g. IndusInd has a savings account AND several
-    # credit cards), we must NOT guess -- doing so silently attaches the
-    # transaction to the wrong account.  A concrete example: IndusInd CC
-    # payment-received emails (email_type='indusind_cc_payment_alert') carry
-    # no card_mask and no account_mask because the email body never mentions
-    # which CC was credited.  Without this guard those transactions would fall
-    # through to the first (savings) account, which is wrong.  Leaving
-    # account_id=NULL lets downstream reconciliation (e.g. statement matching
-    # by date+amount) attach them correctly later.
+    # Used when the message body carries no mask (typical for CC bill-paid
+    # / statement-ready alerts, and some maskless payment-received shapes).
+    # The candidate set is narrowed by the account *type* the email_type
+    # implies — '*_cc_*' restricts to credit_card accounts, '*_account_*'
+    # / '*_dc_*' to bank_account. This disambiguates a bank that has both
+    # a savings account and a CC registered without needing a mask.
     if not txn.card_mask and not txn.account_mask:
         bank_key = txn.bank.strip().lower()
         acct_ids = ctx.accounts_by_bank.get(bank_key, [])
+        expected_type = _expected_account_type(txn.email_type)
+        if expected_type is not None:
+            acct_ids = [
+                a for a in acct_ids if ctx.account_types.get(a) == expected_type
+            ]
         if len(acct_ids) == 1:
             txn.account_id = acct_ids[0]
             logger.debug(
-                "txn %s: linked via bank-only fallback (bank=%r, account=%s)",
+                "txn %s: linked via bank-only fallback (bank=%r, type=%r, account=%s)",
                 txn.id,
                 txn.bank,
+                expected_type,
                 txn.account_id,
             )
             return True
         if len(acct_ids) > 1:
             logger.warning(
-                "txn %s: bank-only fallback skipped -- %d accounts for bank %r "
-                "(no card_mask / account_mask; leaving unlinked to avoid wrong attribution)",
+                "txn %s: bank-only fallback skipped -- %d candidates for "
+                "bank %r type=%r (no card_mask / account_mask; leaving unlinked "
+                "to avoid wrong attribution)",
                 txn.id,
                 len(acct_ids),
                 txn.bank,
+                expected_type,
             )
 
     logger.debug(

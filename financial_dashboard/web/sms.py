@@ -76,10 +76,10 @@ async def reparse_sms(
             except Exception as exc:
                 logger.warning("Reparse Telegram primary dispatch failed: %s", exc)
         if outcome.enrichment_notification is not None:
-            txn_id, diff = outcome.enrichment_notification
+            txn_id, diff, txn_info = outcome.enrichment_notification
             try:
                 await send_enrichment_notification(
-                    txn_id, diff, chat_id, source="sms"
+                    txn_id, diff, chat_id, source="sms", txn_info=txn_info
                 )
             except Exception as exc:
                 logger.warning("Reparse Telegram enrichment dispatch failed: %s", exc)
@@ -112,7 +112,7 @@ async def reparse_sms(
 
     diff_list = None
     if outcome.enrichment_notification is not None:
-        _, diff_obj = outcome.enrichment_notification
+        _, diff_obj, _ = outcome.enrichment_notification
         diff_list = diff_obj.changed_fields
 
     return ReparseSmsResponse(
@@ -194,10 +194,14 @@ async def reparse_all_failed_sms(
                             sms_id, exc,
                         )
                 if outcome.enrichment_notification is not None:
-                    enrich_txn_id, diff = outcome.enrichment_notification
+                    enrich_txn_id, diff, enrich_info = outcome.enrichment_notification
                     try:
                         await send_enrichment_notification(
-                            enrich_txn_id, diff, chat_id_for_dispatch, source="sms"
+                            enrich_txn_id,
+                            diff,
+                            chat_id_for_dispatch,
+                            source="sms",
+                            txn_info=enrich_info,
                         )
                     except Exception as exc:
                         logger.warning(

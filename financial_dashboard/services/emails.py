@@ -380,7 +380,7 @@ async def handle_polled_email(
             logger.warning("Could not save failed email to spool: %s", save_err)
 
     pending_notifications: list[tuple[int, dict]] = []
-    pending_enrichment_notifications: list[tuple[int, object]] = []
+    pending_enrichment_notifications: list[tuple[int, object, dict]] = []
     pending_payment_checks: list[tuple[int, int, object]] = []
 
     async with async_session() as session:
@@ -480,8 +480,34 @@ async def handle_polled_email(
                         # produces more than `telegram.bulk_threshold`
                         # primaries — they'd be lost in the summary anyway.
                         if should_notify and diff.changed_fields:
+                            enrich_account = (
+                                await session.get(Account, txn_row.account_id)
+                                if txn_row.account_id
+                                else None
+                            )
+                            enrich_card = (
+                                await session.get(Card, txn_row.card_id)
+                                if txn_row.card_id
+                                else None
+                            )
                             pending_enrichment_notifications.append(
-                                (txn_row.id, diff)
+                                (
+                                    txn_row.id,
+                                    diff,
+                                    {
+                                        "bank": txn_row.bank,
+                                        "direction": txn_row.direction,
+                                        "amount": txn_row.amount,
+                                        "counterparty": txn_row.counterparty,
+                                        "transaction_date": txn_row.transaction_date,
+                                        "transaction_time": txn_row.transaction_time,
+                                        "card_mask": txn_row.card_mask,
+                                        "account_label": build_account_label(
+                                            enrich_account, enrich_card
+                                        ),
+                                        "channel": txn_row.channel,
+                                    },
+                                )
                             )
                     if should_notify and outcome == "created":
                         account_obj = (
@@ -533,9 +559,13 @@ async def handle_polled_email(
             # per-row dispatch path. The bulk-summary path below collapses
             # everything into one message and can't represent diffs.
             if pending_enrichment_notifications:
-                for enrich_txn_id, diff in pending_enrichment_notifications:
+                for enrich_txn_id, diff, enrich_info in pending_enrichment_notifications:
                     await send_enrichment_notification(
-                        enrich_txn_id, diff, chat_id, source="email"
+                        enrich_txn_id,
+                        diff,
+                        chat_id,
+                        source="email",
+                        txn_info=enrich_info,
                     )
         else:
             await send_bulk_summary(
@@ -554,9 +584,13 @@ async def handle_polled_email(
         # No primaries fired (everything was enrichment-only); still emit
         # the per-row enrichments — they're not part of the bulk path.
         chat_id = get_telegram_chat_id()
-        for enrich_txn_id, diff in pending_enrichment_notifications:
+        for enrich_txn_id, diff, enrich_info in pending_enrichment_notifications:
             await send_enrichment_notification(
-                enrich_txn_id, diff, chat_id, source="email"
+                enrich_txn_id,
+                diff,
+                chat_id,
+                source="email",
+                txn_info=enrich_info,
             )
 
     if pending_payment_checks:
