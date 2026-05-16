@@ -113,12 +113,24 @@ async def process_sms_row(
     sms_row.parsed_at = now
 
     # 1. Parse.
+    # SQLite drops tzinfo on round-trip, but schemas/sms.py normalises
+    # incoming payloads to UTC at insert time. bank-sms-parser rejects
+    # naive datetimes for the IST date-fallback path, so re-attach UTC
+    # before handing the value over.
+    received_at_for_parser = sms_row.received_at
+    if (
+        received_at_for_parser is not None
+        and received_at_for_parser.tzinfo is None
+    ):
+        received_at_for_parser = received_at_for_parser.replace(
+            tzinfo=datetime.UTC
+        )
     try:
         parsed = parse_sms(
             sms_row.bank,
             sms_row.body,
             sender=sms_row.sender,
-            received_at=sms_row.received_at,
+            received_at=received_at_for_parser,
         )
     except UnsupportedSmsTypeError as e:
         sms_row.status = "skipped"

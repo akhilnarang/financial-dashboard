@@ -133,6 +133,37 @@ async def test_process_sms_row_happy_path_creates_transaction(
 
 
 @pytest.mark.anyio
+async def test_process_sms_row_naive_received_at_still_parses(session):
+    """Regression: SQLite returns naive datetimes for DateTime columns.
+    bank-sms-parser rejects naive received_at when it falls back to it
+    for transaction_date, so the pipeline must re-attach UTC before
+    calling parse_sms. The IndusInd UPI parser is the canary — it
+    always consults received_at when the body lacks a date."""
+    sms = SmsMessage(
+        bank="indusind",
+        sender="AD-INDUSB-S",
+        body=(
+            "A/C *XX1234 credited by Rs 5000.00 from 9999999999@bank."
+            " RRN:000000000001. Avl Bal:10000.00."
+            " Not you? Call 18602677777 - IndusInd bank"
+        ),
+        # Naive datetime — what SQLAlchemy hands back after a session.refresh().
+        received_at=datetime.datetime(2026, 5, 2, 9, 0, 0),
+    )
+    session.add(sms)
+    await session.flush()
+
+    from financial_dashboard.services.linker import build_link_context
+    link_ctx = await build_link_context(session)
+
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.status == "parsed", f"got error: {sms.parse_error}"
+    assert outcome.transaction_id is not None
+
+
+@pytest.mark.anyio
 async def test_process_sms_row_parse_error_marks_row_error(session):
     sms = SmsMessage(
         bank="hdfc",
