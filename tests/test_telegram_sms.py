@@ -168,9 +168,11 @@ async def test_send_enrichment_notification_inline_format_with_txn_info():
 
 
 @pytest.mark.anyio
-async def test_send_enrichment_notification_trims_time_to_hhmm():
+async def test_send_enrichment_notification_trims_time_microseconds():
     """transaction_time values with microsecond precision get rendered
-    as HH:MM only — matching the primary notification's format."""
+    as HH:MM:SS — seconds are kept so seconds-level diffs (e.g. a
+    received_at-derived guess vs a body-parsed exact time) are visible
+    instead of looking like 'HH:MM→HH:MM' no-ops."""
     from financial_dashboard.services.telegram import send_enrichment_notification
 
     captured = {}
@@ -187,6 +189,32 @@ async def test_send_enrichment_notification_trims_time_to_hhmm():
         ):
             await send_enrichment_notification(99, diff, 12345, source="sms")
     text = captured["text"]
-    assert "transaction_time=22:30" in text
+    assert "transaction_time=22:30:50" in text
     assert "583000" not in text  # microseconds dropped
-    assert "22:30:50" not in text  # seconds dropped
+
+
+@pytest.mark.anyio
+async def test_send_enrichment_notification_shows_seconds_for_overwritten_time():
+    """When an existing transaction_time gets overwritten, the diff
+    renders both old and new with HH:MM:SS so a seconds-level diff
+    (e.g. SMS-fallback 12:55:35 vs email-body 12:55:20) doesn't look
+    like a no-op '12:55→12:55'."""
+    from financial_dashboard.services.telegram import send_enrichment_notification
+
+    captured = {}
+
+    async def fake_send(app, *, chat_id, text):
+        captured["text"] = text
+
+    diff = EnrichmentDiff(
+        overwritten={"transaction_time": ("12:55:35", "12:55:20")},
+    )
+
+    with patch("financial_dashboard.services.telegram.tg_app", new=object()):
+        with patch(
+            "financial_dashboard.services.telegram._send_with_retry",
+            new=AsyncMock(side_effect=fake_send),
+        ):
+            await send_enrichment_notification(123, diff, 12345, source="email")
+    text = captured["text"]
+    assert "12:55:35→12:55:20" in text

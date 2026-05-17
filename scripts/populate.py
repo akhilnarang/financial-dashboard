@@ -12,6 +12,7 @@ import datetime
 import email as email_lib
 import email.utils
 import logging
+from decimal import Decimal
 from email.header import decode_header
 from pathlib import Path
 
@@ -22,6 +23,10 @@ from bank_email_parser.api import parse_email
 from bank_email_parser.exceptions import ParseError, UnsupportedEmailTypeError
 
 from financial_dashboard.db import Base, Email, Transaction, async_session, engine
+from financial_dashboard.services.emails import (
+    _AMBIGUOUS_12H_TIME_EMAIL_TYPES,
+    _disambiguate_am_pm,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -112,8 +117,18 @@ def _parse_email_date(msg: email_lib.message.Message) -> datetime.datetime | Non
 # ---------------------------------------------------------------------------
 
 
-def _process_eml(bank: str, raw_bytes: bytes) -> tuple[str | None, dict | None]:
-    """Parse a single .eml file. Returns (error, transaction_dict)."""
+def _process_eml(
+    bank: str,
+    raw_bytes: bytes,
+    received_at: datetime.datetime | None = None,
+) -> tuple[str | None, dict | None]:
+    """Parse a single .eml file. Returns (error, transaction_dict).
+
+    ``received_at`` is the email's Date header (aware datetime). Used to
+    disambiguate AM/PM for email types that emit 12-hour times without
+    an AM/PM marker (e.g. ICICI CC transaction alerts). Falls back to
+    the parser's date when the body has no date.
+    """
     html = _extract_html_body(raw_bytes)
     if not html:
         return "No HTML/text body found in email", None
@@ -126,19 +141,31 @@ def _process_eml(bank: str, raw_bytes: bytes) -> tuple[str | None, dict | None]:
     txn = parsed.transaction
     if txn is None:
         return None, None
+    transaction_date = txn.transaction_date
+    if transaction_date is None and received_at is not None:
+        transaction_date = received_at.date()
+    transaction_time = txn.transaction_time
+    if (
+        transaction_time is not None
+        and parsed.email_type in _AMBIGUOUS_12H_TIME_EMAIL_TYPES
+    ):
+        transaction_time = _disambiguate_am_pm(
+            transaction_time, transaction_date, received_at
+        )
     return None, {
         "bank": parsed.bank,
         "email_type": parsed.email_type,
         "direction": txn.direction,
-        "amount": float(txn.amount.amount),
+        "amount": Decimal(str(txn.amount.amount)),
         "currency": txn.amount.currency,
-        "transaction_date": txn.transaction_date,
+        "transaction_date": transaction_date,
+        "transaction_time": transaction_time,
         "counterparty": txn.counterparty,
         "card_mask": txn.card_mask,
         "account_mask": txn.account_mask,
         "reference_number": txn.reference_number,
         "channel": txn.channel,
-        "balance": float(txn.balance.amount) if txn.balance else None,
+        "balance": Decimal(str(txn.balance.amount)) if txn.balance else None,
         "raw_description": txn.raw_description,
     }
 
@@ -198,7 +225,7 @@ async def populate() -> None:
         known_message_ids.add(message_id)
 
         # Parse the email content
-        error, txn_data = _process_eml(bank, raw_bytes)
+        error, txn_data = _process_eml(bank, raw_bytes, received_at)
 
         # Insert into DB
         async with async_session() as session:

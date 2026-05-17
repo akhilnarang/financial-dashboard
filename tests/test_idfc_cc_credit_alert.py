@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from email.message import EmailMessage
 
 from financial_dashboard.services.emails import _process_email_full
@@ -32,7 +33,7 @@ def test_idfc_cc_credit_alert_is_processed_as_credit_transaction():
     assert txn_data["bank"] == "idfc"
     assert txn_data["email_type"] == "idfc_cc_credit_alert"
     assert txn_data["direction"] == "credit"
-    assert txn_data["amount"] == 1234.56
+    assert txn_data["amount"] == Decimal("1234.56")
     assert txn_data["currency"] == "INR"
     assert txn_data["counterparty"] == "Payment received"
     assert txn_data["card_mask"] == "XX1234"

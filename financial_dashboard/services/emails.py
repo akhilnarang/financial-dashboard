@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import datetime
 import logging
+from decimal import Decimal
 from typing import NamedTuple
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import IntegrityError
 
@@ -74,6 +76,101 @@ def _is_duplicate_transaction_error(exc: IntegrityError) -> bool:
     )
 
 
+_IST = ZoneInfo("Asia/Kolkata")
+
+# Email types known to emit transaction time in 12-hour format with no
+# AM/PM marker. For these, we disambiguate against the email's Date header.
+#
+# Add a type here ONLY after confirming with a real sample that the
+# source body uses a 12-hour clock with stripped AM/PM. False positives
+# here will corrupt timestamps for non-ambiguous (24-hour) bodies.
+#
+# Known candidates not yet added (parsers also emit bare HH:MM:SS but
+# the clock convention isn't confirmed):
+#   - onecard_debit_alert: "Time: 10:30:00" — convention unverified.
+_AMBIGUOUS_12H_TIME_EMAIL_TYPES = frozenset({"icici_cc_transaction_alert"})
+
+# A few minutes of slack to absorb clock skew between the bank and the
+# Date header. Beyond this, a candidate that lands *after* received_at
+# is treated as in-the-future and rejected.
+_RECEIVED_AT_FUTURE_TOLERANCE = datetime.timedelta(minutes=5)
+
+# Bank transaction alerts arrive seconds-to-minutes after the
+# transaction. A candidate more than this far before received_at is
+# implausible and rejected — including the next-day-midnight case where
+# the body date is yesterday and both candidates are >12h in the past,
+# at which point the data is unrecoverable from the email alone and we
+# leave the parsed time as-is.
+_RECEIVED_AT_PAST_LIMIT = datetime.timedelta(hours=12)
+
+
+def _disambiguate_am_pm(
+    parsed_time: datetime.time,
+    transaction_date: datetime.date | None,
+    received_at: datetime.datetime | None,
+) -> datetime.time:
+    """Resolve AM/PM for a 12-hour parsed time by anchoring to the email's
+    Date header.
+
+    ICICI CC transaction-alert emails render time on a 12-hour clock and
+    strip the AM/PM marker:
+        '06:37:31' could be 06:37 AM or 06:37 PM
+        '12:55:20' could be 12:55 AM (00:55) or 12:55 PM (12:55)
+
+    Strategy: enumerate the two 24-hour candidates, anchor each to
+    ``transaction_date`` in IST, reject candidates that are >5 min in
+    the email's future (transactions can't post-date their own alert)
+    or >12 h in the past (alerts arrive promptly), and pick the
+    surviving candidate closest to ``received_at``.
+
+    If ``received_at`` is missing or no candidate survives, the parsed
+    time is returned unchanged — the data is unrecoverable from the
+    email alone.
+    """
+    if transaction_date is None or received_at is None:
+        return parsed_time
+    hour = parsed_time.hour
+    if hour == 0:
+        # A 12-hour clock with stripped AM/PM produces hour ∈ {1..12};
+        # hour 0 can only come from a 24-hour body and is already
+        # unambiguous (midnight). Pass through untouched.
+        return parsed_time
+    if hour < 12:
+        candidates = (parsed_time, parsed_time.replace(hour=hour + 12))
+    elif hour == 12:
+        # 12 in a 12-hour clock means 00 (midnight) OR 12 (noon).
+        candidates = (parsed_time.replace(hour=0), parsed_time)
+    else:
+        # Body already on a 24-hour clock (hour > 12); unambiguous.
+        return parsed_time
+
+    if received_at.tzinfo is None:
+        # Defensive: _parse_email_date returns aware datetimes, but if a
+        # caller hands us a naive one, treat it as IST wall-time.
+        received_ist = received_at.replace(tzinfo=_IST)
+    else:
+        received_ist = received_at.astimezone(_IST)
+
+    best: tuple[datetime.timedelta, datetime.time] | None = None
+    for cand_time in candidates:
+        cand_dt = datetime.datetime.combine(
+            transaction_date, cand_time, tzinfo=_IST
+        )
+        delta = cand_dt - received_ist
+        # Reject candidates too far after the email arrived — the
+        # transaction can't be in the email's future.
+        if delta > _RECEIVED_AT_FUTURE_TOLERANCE:
+            continue
+        # Reject candidates implausibly far before the email arrived
+        # — bank alerts don't lag the transaction by half a day.
+        if -delta > _RECEIVED_AT_PAST_LIMIT:
+            continue
+        gap = abs(delta)
+        if best is None or gap < best[0]:
+            best = (gap, cand_time)
+    return best[1] if best is not None else parsed_time
+
+
 def _process_email_full(
     bank: str, raw_bytes: bytes
 ) -> tuple[str | None, dict | None, str | None, ParsedEmail | None]:
@@ -100,10 +197,18 @@ def _process_email_full(
         return None, None, password_hint, parsed
 
     transaction_date = txn.transaction_date
-    if transaction_date is None:
-        received_at = _parse_email_date(raw_bytes)
-        if received_at is not None:
-            transaction_date = received_at.date()
+    received_at = _parse_email_date(raw_bytes)
+    if transaction_date is None and received_at is not None:
+        transaction_date = received_at.date()
+
+    transaction_time = txn.transaction_time
+    if (
+        transaction_time is not None
+        and parsed.email_type in _AMBIGUOUS_12H_TIME_EMAIL_TYPES
+    ):
+        transaction_time = _disambiguate_am_pm(
+            transaction_time, transaction_date, received_at
+        )
 
     return (
         None,
@@ -111,16 +216,16 @@ def _process_email_full(
             "bank": parsed.bank,
             "email_type": parsed.email_type,
             "direction": txn.direction,
-            "amount": float(txn.amount.amount),
+            "amount": Decimal(str(txn.amount.amount)),
             "currency": txn.amount.currency,
             "transaction_date": transaction_date,
-            "transaction_time": txn.transaction_time,
+            "transaction_time": transaction_time,
             "counterparty": txn.counterparty,
             "card_mask": txn.card_mask,
             "account_mask": txn.account_mask,
             "reference_number": txn.reference_number,
             "channel": txn.channel,
-            "balance": float(txn.balance.amount) if txn.balance else None,
+            "balance": Decimal(str(txn.balance.amount)) if txn.balance else None,
             "raw_description": txn.raw_description,
         },
         password_hint,

@@ -307,11 +307,11 @@ async def _handle_reply(update: Update, context) -> None:
 
 
 def _format_diff_value(key: str, value) -> str:
-    """Render a diff value compactly. Time values are trimmed to HH:MM
-    to match the primary notification's date+time line; everything else
-    is HTML-escaped."""
-    if key in ("transaction_time", "transaction_date") and value is not None:
-        return html.escape(str(value)[:5] if key == "transaction_time" else str(value))
+    """Render a diff value compactly. Time values keep HH:MM:SS so a
+    diff like 12:55:35→12:55:20 doesn't render as 12:55→12:55 (which
+    looks like a no-op). Everything else is HTML-escaped."""
+    if key == "transaction_time" and value is not None:
+        return html.escape(str(value)[:8])
     return html.escape(str(value))
 
 
