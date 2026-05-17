@@ -23,9 +23,9 @@ from bank_email_parser.api import parse_email
 from bank_email_parser.exceptions import ParseError, UnsupportedEmailTypeError
 
 from financial_dashboard.db import Base, Email, Transaction, async_session, engine
-from financial_dashboard.services.emails import (
-    _AMBIGUOUS_12H_TIME_EMAIL_TYPES,
-    _disambiguate_am_pm,
+from financial_dashboard.services.emails import _disambiguate_am_pm
+from financial_dashboard.services.parser_quirks import (
+    AMBIGUOUS_12H_TIME_EMAIL_TYPES as _AMBIGUOUS_12H_TIME_EMAIL_TYPES,
 )
 
 logging.basicConfig(

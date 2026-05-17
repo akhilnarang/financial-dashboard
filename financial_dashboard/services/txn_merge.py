@@ -19,9 +19,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import Transaction
+from financial_dashboard.services.parser_quirks import (
+    AMBIGUOUS_12H_TIME_EMAIL_TYPES,
+)
 
 Channel = Literal["sms", "email"]
 MergeOutcome = Literal["created", "enriched"]
+MatchKind = Literal["standard", "am_pm_alias"]
 
 
 @dataclass(frozen=True)
@@ -103,18 +107,25 @@ def _counterparty_match(a: str | None, b: str | None) -> bool:
 
 async def find_match(
     session: AsyncSession, txn_data: dict
-) -> Transaction | None:
+) -> tuple[Transaction, MatchKind] | None:
     """Return an existing Transaction representing the same logical
-    event, or None.
+    event, paired with the match kind, or None.
 
     Strategy:
     1. (bank, reference_number, direction) when ref is non-empty on
-       both sides — the strongest signal we have.
+       both sides — the strongest signal we have. Returns ("standard").
     2. Fuzzy fallback on (bank, direction, amount, currency) within a
        ±10-minute window in IST-local wall time, with merchant substring
        as a tiebreaker. Date-only windows (one side has no time)
        additionally require counterparty agreement — prevents wrongly
-       merging two same-day same-amount card swipes.
+       merging two same-day same-amount card swipes. Returns ("standard").
+    3. AM/PM alias retry — when the fuzzy pass found nothing, retry with
+       the incoming time shifted -12h, restricted to candidates whose
+       ``email_type`` is in ``AMBIGUOUS_12H_TIME_EMAIL_TYPES`` (i.e. the
+       bank's parser is known to drop AM/PM markers and may have stored
+       an AM time for a real PM transaction). Counterparty must agree.
+       Returns ("am_pm_alias"); the caller overwrites the candidate's
+       transaction_time on enrichment.
     """
     ref = (txn_data.get("reference_number") or "").strip()
     if ref:
@@ -129,7 +140,7 @@ async def find_match(
         )
         rows = result.scalars().all()
         if len(rows) == 1:
-            return rows[0]
+            return rows[0], "standard"
         if len(rows) > 1:
             return None
         # 0 rows: fall through to fuzzy.
@@ -176,31 +187,136 @@ async def find_match(
             return lower <= c_dt <= upper
         candidates = [c for c in candidates if in_window(c)]
 
-    if not candidates:
-        return None
-
-    # Date-only safety: if either side lacks transaction_time, a singleton
-    # candidate is NOT auto-accepted — require counterparty agreement.
-    # Two ₹500 card swipes on the same card on the same day would otherwise
-    # silently merge.
     incoming_cp = txn_data.get("counterparty")
-    if incoming_time is None or any(c.transaction_time is None for c in candidates):
+
+    if candidates:
+        # Date-only safety: if either side lacks transaction_time, a
+        # singleton candidate is NOT auto-accepted — require counterparty
+        # agreement. Two ₹500 card swipes on the same card on the same
+        # day would otherwise silently merge.
+        if incoming_time is None or any(c.transaction_time is None for c in candidates):
+            filtered = [
+                c for c in candidates if _counterparty_match(c.counterparty, incoming_cp)
+            ]
+            if len(filtered) == 1:
+                return filtered[0], "standard"
+            return None
+
+        if len(candidates) == 1:
+            return candidates[0], "standard"
+
+        # >1 candidates in time window: apply counterparty tiebreaker.
         filtered = [
             c for c in candidates if _counterparty_match(c.counterparty, incoming_cp)
         ]
         if len(filtered) == 1:
-            return filtered[0]
+            return filtered[0], "standard"
         return None
 
-    if len(candidates) == 1:
-        return candidates[0]
+    # Standard fuzzy returned nothing. Try the AM/PM alias retry.
+    if incoming_time is None:
+        return None
+    aliased = await _find_am_pm_alias_match(
+        session,
+        txn_data,
+        txn_date=txn_date,
+        incoming_time=incoming_time,
+        incoming_currency=incoming_currency,
+        incoming_cp=incoming_cp,
+    )
+    if aliased is not None:
+        return aliased, "am_pm_alias"
+    return None
 
-    # >1 candidates in time window: apply counterparty tiebreaker.
-    filtered = [
+
+async def _find_am_pm_alias_match(
+    session: AsyncSession,
+    txn_data: dict,
+    *,
+    txn_date,
+    incoming_time,
+    incoming_currency: str,
+    incoming_cp: str | None,
+) -> Transaction | None:
+    """Retry the fuzzy match with the incoming time shifted by ±12h,
+    restricted to candidates of known-AM/PM-ambiguous email_types.
+
+    Why: ICICI CC transaction-alert emails parsed before the email-side
+    AM/PM disambiguator shipped have a transaction_time that may be 12h
+    off in either direction:
+
+      - hour<12 case: real 22:33 PM stored as 10:33 AM (pre-fix parser
+        treated the 12-hour body time as 24-hour). Recover via the
+        ``incoming - 12h`` window.
+      - hour==12 case: real 00:55 midnight stored as 12:55 noon (the
+        body says "12:55:20" — the pre-fix parser chose 12:55 from
+        the two 12-hour candidates). Recover via the ``incoming + 12h``
+        window.
+
+    Counterparty must be present on BOTH sides AND match: it's the
+    primary protection against false-merging two genuine same-amount
+    same-card same-day purchases that happen to be exactly 12h apart
+    at the same merchant.
+
+    Returns the single matching candidate across both alias windows,
+    or None on zero / multiple matches (including the counterparty-
+    mismatch refuse case).
+    """
+    if not incoming_cp:
+        return None
+
+    anchor = datetime.combine(txn_date, incoming_time)
+
+    def _window(offset_hours: int) -> tuple[datetime, datetime, object, object]:
+        center = anchor + timedelta(hours=offset_hours)
+        lo = center - timedelta(minutes=_FUZZY_MATCH_WINDOW_MINUTES)
+        hi = center + timedelta(minutes=_FUZZY_MATCH_WINDOW_MINUTES)
+        return lo, hi, lo.date(), hi.date()
+
+    from sqlalchemy import and_, or_
+    from sqlalchemy import func as sa_func
+
+    minus_lo, minus_hi, minus_date_lo, minus_date_hi = _window(-12)
+    plus_lo, plus_hi, plus_date_lo, plus_date_hi = _window(+12)
+
+    # One query covering both ±12h date ranges. Per-row window
+    # membership is enforced in Python so the SQL stays simple.
+    result = await session.execute(
+        select(Transaction).where(
+            Transaction.bank == txn_data["bank"],
+            Transaction.direction == txn_data["direction"],
+            Transaction.amount == txn_data["amount"],
+            sa_func.coalesce(Transaction.currency, "INR") == incoming_currency,
+            Transaction.email_type.in_(AMBIGUOUS_12H_TIME_EMAIL_TYPES),
+            Transaction.transaction_time.is_not(None),
+            Transaction.transaction_date.is_not(None),
+            or_(
+                and_(
+                    Transaction.transaction_date >= minus_date_lo,
+                    Transaction.transaction_date <= minus_date_hi,
+                ),
+                and_(
+                    Transaction.transaction_date >= plus_date_lo,
+                    Transaction.transaction_date <= plus_date_hi,
+                ),
+            ),
+        )
+    )
+    rows = list(result.scalars().all())
+
+    def in_either_window(c) -> bool:
+        c_dt = datetime.combine(c.transaction_date, c.transaction_time)
+        return (minus_lo <= c_dt <= minus_hi) or (plus_lo <= c_dt <= plus_hi)
+
+    candidates = [c for c in rows if in_either_window(c)]
+    # Counterparty prerequisite: BOTH sides must have a counterparty
+    # AND they must agree. Already gated above that incoming_cp is
+    # truthy; here filter candidates whose counterparty matches.
+    candidates = [
         c for c in candidates if _counterparty_match(c.counterparty, incoming_cp)
     ]
-    if len(filtered) == 1:
-        return filtered[0]
+    if len(candidates) == 1:
+        return candidates[0]
     return None
 
 
@@ -228,8 +344,8 @@ async def merge_transaction(
     and does NOT fire Telegram. Returns (outcome, row, diff); when
     outcome=="created" the diff is empty.
     """
-    match = await find_match(session, txn_data)
-    if match is None:
+    match_result = await find_match(session, txn_data)
+    if match_result is None:
         try:
             async with session.begin_nested():
                 row = Transaction(
@@ -244,12 +360,14 @@ async def merge_transaction(
         except IntegrityError as exc:
             if not _is_duplicate_transaction_error(exc):
                 raise
-            match = await find_match(session, txn_data)
-            if match is None:
+            match_result = await find_match(session, txn_data)
+            if match_result is None:
                 # Constraint hit we didn't model; surface it.
                 raise
         else:
             return "created", row, EnrichmentDiff()
+
+    match, match_kind = match_result
 
     # Enrichment path.
     diff = compute_enrichment_diff(match, txn_data, channel)
@@ -257,6 +375,19 @@ async def merge_transaction(
         setattr(match, key, value)
     for key, (_old, new) in diff.overwritten.items():
         setattr(match, key, new)
+
+    # AM/PM alias match: by construction the candidate's stored
+    # transaction_time is known-wrong by 12h (that's why the alias pass
+    # had to fire), and the incoming row's time is the corrected source
+    # of truth. Force-overwrite it, bypassing the usual channel rule
+    # that says "SMS does NOT overwrite email" — the email's time here
+    # is a pre-fix artifact, not real evidence.
+    if match_kind == "am_pm_alias":
+        new_time = txn_data.get("transaction_time")
+        if new_time is not None and match.transaction_time != new_time:
+            old_time = match.transaction_time
+            match.transaction_time = new_time
+            diff.overwritten["transaction_time"] = (old_time, new_time)
 
     if match.source != channel and match.source is not None:
         match.source = "sms+email"

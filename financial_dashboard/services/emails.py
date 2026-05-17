@@ -84,16 +84,11 @@ def _is_duplicate_transaction_error(exc: IntegrityError) -> bool:
 _IST = ZoneInfo("Asia/Kolkata")
 
 # Email types known to emit transaction time in 12-hour format with no
-# AM/PM marker. For these, we disambiguate against the email's Date header.
-#
-# Add a type here ONLY after confirming with a real sample that the
-# source body uses a 12-hour clock with stripped AM/PM. False positives
-# here will corrupt timestamps for non-ambiguous (24-hour) bodies.
-#
-# Known candidates not yet added (parsers also emit bare HH:MM:SS but
-# the clock convention isn't confirmed):
-#   - onecard_debit_alert: "Time: 10:30:00" — convention unverified.
-_AMBIGUOUS_12H_TIME_EMAIL_TYPES = frozenset({"icici_cc_transaction_alert"})
+# AM/PM marker. Defined in services/parser_quirks because the same set
+# also gates the SMS-side alias-merge in services/txn_merge.
+from financial_dashboard.services.parser_quirks import (  # noqa: E402
+    AMBIGUOUS_12H_TIME_EMAIL_TYPES as _AMBIGUOUS_12H_TIME_EMAIL_TYPES,
+)
 
 # A few minutes of slack to absorb clock skew between the bank and the
 # Date header. Beyond this, a candidate that lands *after* received_at

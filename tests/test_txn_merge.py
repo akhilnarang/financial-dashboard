@@ -147,7 +147,9 @@ async def test_find_match_by_reference_number_hits(session: AsyncSession):
         "reference_number": "IMPS:000000000001",
     })
     assert match is not None
-    assert match.id == existing.id
+    row, kind = match
+    assert row.id == existing.id
+    assert kind == "standard"
 
 
 @pytest.mark.anyio
@@ -178,7 +180,8 @@ async def test_find_match_by_reference_number_direction_distinguishes(
         "reference_number": "IMPS:2",
     })
     assert match is not None
-    assert match.id == credit.id
+    assert match[0].id == credit.id
+    assert match[1] == "standard"
 
 
 @pytest.mark.anyio
@@ -222,7 +225,8 @@ async def test_find_match_fuzzy_window_hits_within_10min(
         "transaction_time": time(14, 28, 0),
     })
     assert match is not None
-    assert match.id == existing.id
+    assert match[0].id == existing.id
+    assert match[1] == "standard"
 
 
 @pytest.mark.anyio
@@ -316,7 +320,8 @@ async def test_find_match_fuzzy_counterparty_tiebreaker(
         "counterparty": "ZOMATO",
     })
     assert match is not None
-    assert match.id == t1.id
+    assert match[0].id == t1.id
+    assert match[1] == "standard"
 
 
 @pytest.mark.anyio
@@ -523,3 +528,305 @@ async def test_merge_transaction_email_type_is_immutable(
     )
     # email_type stays at first-arrival's classification.
     assert row.email_type == "hdfc_dc_transaction_alert"
+
+
+# ---------------------------------------------------------------------------
+# AM/PM alias-pass match (services/txn_merge.find_match step 3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_am_pm_alias_match_recovers_pm_stored_as_am(session: AsyncSession):
+    """hour<12 case: a pre-fix ICICI CC email row stored
+    transaction_time=10:33:11 (interpreted as 24h AM, but the real txn
+    was at 22:33 PM). The matching SMS arrives later with the correct
+    received_at-derived time 22:33:30. The alias pass at incoming-12h
+    finds it, gated by counterparty + AM/PM-ambiguous email_type."""
+    existing = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("320000"),
+        currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(10, 33, 11),  # wrong: should be 22:33:11
+        counterparty="INDIAN INSTITUTE OF MA",
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(session, {
+        "bank": "icici",
+        "direction": "debit",
+        "amount": Decimal("320000"),
+        "currency": "INR",
+        "reference_number": None,
+        "transaction_date": date(2026, 5, 16),
+        "transaction_time": time(22, 33, 30),  # SMS-derived correct time
+        "counterparty": "INDIAN INSTITUT",
+    })
+    assert match is not None
+    row, kind = match
+    assert row.id == existing.id
+    assert kind == "am_pm_alias"
+
+
+@pytest.mark.anyio
+async def test_am_pm_alias_match_recovers_midnight_stored_as_noon(
+    session: AsyncSession,
+):
+    """hour==12 case: a pre-fix ICICI CC email for a real 00:55 IST
+    (midnight) transaction stored transaction_time=12:55:20 — because
+    the body said '12:55:20' which on a 12-hour clock means either
+    00:55 or 12:55 and the pre-fix parser stored 24-hour 12:55 by
+    default. Reality is 00:55 (12:55 AM). The matching SMS arrives
+    later with received_at-derived time 00:55:30. The alias pass at
+    incoming+12h must find this candidate (the mirror of the
+    PM-stored-as-AM case)."""
+    existing = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(12, 55, 20),  # wrong: should be 00:55:20
+        counterparty="LATE NIGHT KITCHEN",
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(session, {
+        "bank": "icici",
+        "direction": "debit",
+        "amount": Decimal("500"),
+        "currency": "INR",
+        "reference_number": None,
+        "transaction_date": date(2026, 5, 16),
+        "transaction_time": time(0, 55, 30),  # SMS-derived correct time
+        "counterparty": "LATE NIGHT KITCHEN",
+    })
+    assert match is not None
+    row, kind = match
+    assert row.id == existing.id
+    assert kind == "am_pm_alias"
+
+
+@pytest.mark.anyio
+async def test_am_pm_alias_match_does_not_fire_for_safe_email_types(
+    session: AsyncSession,
+):
+    """Same shape, but the candidate's email_type is NOT in the
+    AM/PM-ambiguous set. Alias pass must skip it — those types are
+    24-hour and any 12h-offset row is a genuinely different event."""
+    existing = Transaction(
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",  # 24-hour, not ambiguous
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(10, 33, 11),
+        counterparty="ZOMATO",
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(session, {
+        "bank": "hdfc",
+        "direction": "debit",
+        "amount": Decimal("500"),
+        "currency": "INR",
+        "reference_number": None,
+        "transaction_date": date(2026, 5, 16),
+        "transaction_time": time(22, 33, 11),
+        "counterparty": "ZOMATO",
+    })
+    assert match is None
+
+
+@pytest.mark.anyio
+async def test_am_pm_alias_match_requires_counterparty_agreement(
+    session: AsyncSession,
+):
+    """Two ICICI CC purchases of the same amount on the same card on
+    the same day, exactly 12h apart, at DIFFERENT merchants. The
+    counterparty-prerequisite guard must refuse the alias merge."""
+    existing = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(10, 30, 0),
+        counterparty="STARBUCKS",
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(session, {
+        "bank": "icici",
+        "direction": "debit",
+        "amount": Decimal("500"),
+        "currency": "INR",
+        "reference_number": None,
+        "transaction_date": date(2026, 5, 16),
+        "transaction_time": time(22, 30, 0),  # 12h offset
+        "counterparty": "DOMINOS PIZZA",  # different merchant
+    })
+    assert match is None
+
+
+@pytest.mark.anyio
+async def test_am_pm_alias_refuses_when_either_side_lacks_counterparty(
+    session: AsyncSession,
+):
+    """Counterparty is the alias pass's primary safety. If either side
+    lacks one, refuse the merge — better to land a duplicate than
+    silently glue together two same-amount events that might be
+    distinct."""
+    existing = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(10, 30, 0),
+        counterparty="STARBUCKS",
+    )
+    session.add(existing)
+    await session.flush()
+
+    # Incoming with no counterparty — must NOT match.
+    match = await find_match(session, {
+        "bank": "icici",
+        "direction": "debit",
+        "amount": Decimal("500"),
+        "currency": "INR",
+        "reference_number": None,
+        "transaction_date": date(2026, 5, 16),
+        "transaction_time": time(22, 30, 0),
+        "counterparty": None,
+    })
+    assert match is None
+
+
+@pytest.mark.anyio
+async def test_am_pm_alias_returns_none_when_multiple_alias_candidates(
+    session: AsyncSession,
+):
+    """Two pre-fix ICICI rows survive the alias-window + counterparty
+    filter (same merchant, same amount, both stored ~12h off). The
+    pass must refuse rather than guess."""
+    t1 = Transaction(
+        bank="icici", email_type="icici_cc_transaction_alert",
+        direction="debit", amount=Decimal("500"), currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(10, 30, 0),
+        counterparty="STARBUCKS",
+    )
+    t2 = Transaction(
+        bank="icici", email_type="icici_cc_transaction_alert",
+        direction="debit", amount=Decimal("500"), currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(10, 32, 0),  # also within the aliased window
+        counterparty="STARBUCKS",
+    )
+    session.add_all([t1, t2])
+    await session.flush()
+
+    match = await find_match(session, {
+        "bank": "icici",
+        "direction": "debit",
+        "amount": Decimal("500"),
+        "currency": "INR",
+        "reference_number": None,
+        "transaction_date": date(2026, 5, 16),
+        "transaction_time": time(22, 30, 30),  # 12h offset from t1
+        "counterparty": "STARBUCKS",
+    })
+    assert match is None
+
+
+@pytest.mark.anyio
+async def test_am_pm_alias_does_not_run_when_standard_pass_succeeds(
+    session: AsyncSession,
+):
+    """Standard pass must take precedence. If a candidate is in the
+    standard ±10-min window, the alias pass should not fire at all."""
+    existing = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("100"),
+        currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(22, 30, 0),
+        counterparty="ZEPTO",
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(session, {
+        "bank": "icici",
+        "direction": "debit",
+        "amount": Decimal("100"),
+        "currency": "INR",
+        "reference_number": None,
+        "transaction_date": date(2026, 5, 16),
+        "transaction_time": time(22, 33, 0),  # within ±10 min
+        "counterparty": "ZEPTO",
+    })
+    assert match is not None
+    row, kind = match
+    assert row.id == existing.id
+    assert kind == "standard"  # not am_pm_alias
+
+
+@pytest.mark.anyio
+async def test_merge_transaction_alias_match_overwrites_transaction_time(
+    session: AsyncSession,
+):
+    """End-to-end through merge_transaction: alias-pass match must
+    rewrite the candidate's transaction_time to the incoming value.
+    This is how the pre-fix email row self-heals when the SMS arrives."""
+    from financial_dashboard.services.txn_merge import merge_transaction
+
+    existing = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("320000"),
+        currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(10, 33, 11),  # wrong AM
+        counterparty="INDIAN INSTITUTE OF MA",
+        source="email",
+    )
+    session.add(existing)
+    await session.flush()
+
+    outcome, row, diff = await merge_transaction(
+        session, "sms",
+        {
+            "bank": "icici",
+            "email_type": "icici_cc_payment_received_alert",  # SMS shape
+            "direction": "debit",
+            "amount": Decimal("320000"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(22, 33, 30),
+            "counterparty": "INDIAN INSTITUT",
+        },
+        sms_message_id=99,
+    )
+    assert outcome == "enriched"
+    assert row.id == existing.id
+    # Critical: the pre-fix email's time was rewritten to the SMS time,
+    # bypassing the channel rule that normally blocks SMS overwrites.
+    assert row.transaction_time == time(22, 33, 30)
+    assert "transaction_time" in diff.overwritten
+    assert diff.overwritten["transaction_time"] == (time(10, 33, 11), time(22, 33, 30))
