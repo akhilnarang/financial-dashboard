@@ -189,7 +189,27 @@ async def process_sms_row(
             link_transaction(link_context, txn_row)
             await session.flush()
 
-    # 5. Record row state and notification payload.
+    # 5. CC bill-payment account resolution (runs BEFORE the notification
+    # payload so the primary message includes the resolved account label).
+    # The helper handles single-CC short-circuit + amount-match against
+    # open statements; returns the prompt payload only when both fail.
+    pending_payment_check = None
+    pending_disambiguation = None
+    if outcome == "created":
+        from financial_dashboard.services.cc_disambiguation import (
+            resolve_cc_payment_account,
+            should_auto_reconcile_statement,
+        )
+
+        pending_disambiguation = await resolve_cc_payment_account(
+            session, txn_row
+        )
+        if should_auto_reconcile_statement(txn_row):
+            pending_payment_check = (
+                txn_row.id, txn_row.account_id, txn_row.amount
+            )
+
+    # 6. Record row state and notification payload.
     sms_row.transaction_id = txn_row.id
     sms_row.status = "parsed" if outcome == "created" else "enriched"
 
@@ -204,32 +224,6 @@ async def process_sms_row(
             await _notification_payload(txn_row, session),
         )
 
-    pending_payment_check = None
-    pending_disambiguation = None
-    if (
-        outcome == "created"
-        and txn_row.direction == "credit"
-        and txn_row.email_type.endswith("_cc_payment_received_alert")
-    ):
-        if txn_row.account_id is not None:
-            pending_payment_check = (
-                txn_row.id, txn_row.account_id, txn_row.amount
-            )
-        else:
-            # account_id couldn't be resolved → try CC-account lookup.
-            disambiguation = await _build_disambiguation(session, txn_row)
-            if disambiguation is not None and len(disambiguation["candidate_account_ids"]) == 1:
-                # Exactly one CC account for this bank → auto-resolve.
-                pending_payment_check = (
-                    txn_row.id,
-                    disambiguation["candidate_account_ids"][0],
-                    txn_row.amount,
-                )
-            else:
-                # Multiple CC candidates for this bank — ask the user
-                # which card the payment hit via Telegram inline keyboard.
-                pending_disambiguation = disambiguation
-
     return ProcessSmsOutcome(
         status=sms_row.status,
         transaction_id=txn_row.id,
@@ -240,33 +234,6 @@ async def process_sms_row(
     )
 
 
-async def _build_disambiguation(session, txn_row) -> dict | None:
-    """Build payload for the Telegram inline-keyboard prompt.
-
-    Returns ``None`` if there are no candidate accounts (in which case
-    the caller falls back to no-op — the txn row exists but no
-    statement-marking happens).
-    """
-    from financial_dashboard.db import Account
-    from sqlalchemy import select
-
-    candidates = (
-        await session.execute(
-            select(Account).where(
-                Account.bank == txn_row.bank,
-                Account.type == "credit_card",
-            )
-        )
-    ).scalars().all()
-    if not candidates:
-        return None
-    return {
-        "txn_id": txn_row.id,
-        "candidate_account_ids": [a.id for a in candidates],
-        "candidate_labels": {a.id: a.label for a in candidates},
-        "amount": txn_row.amount,
-        "bank": txn_row.bank,
-    }
 
 
 async def _notification_payload(txn_row, session) -> dict:

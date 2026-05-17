@@ -31,6 +31,10 @@ from financial_dashboard.integrations.email.parsing import (
 from bank_email_parser import parse_email
 from bank_email_parser.exceptions import ParseError, UnsupportedEmailTypeError
 from bank_email_parser.models import ParsedEmail
+from financial_dashboard.services.cc_disambiguation import (
+    resolve_cc_payment_account,
+    should_auto_reconcile_statement,
+)
 from financial_dashboard.services.linker import link_transaction
 from financial_dashboard.services.reminders import check_payment_received
 from financial_dashboard.services.settings import (
@@ -48,6 +52,7 @@ from financial_dashboard.services.statements.cc import (
 from financial_dashboard.services.telegram import (
     build_account_label,
     send_bulk_summary,
+    send_disambiguation_prompt,
     send_enrichment_notification,
     send_transaction_notification,
 )
@@ -487,6 +492,7 @@ async def handle_polled_email(
     pending_notifications: list[tuple[int, dict]] = []
     pending_enrichment_notifications: list[tuple[int, object, dict]] = []
     pending_payment_checks: list[tuple[int, int, object]] = []
+    pending_disambiguations: list[dict] = []
 
     async with async_session() as session:
         async with session.begin():
@@ -570,6 +576,22 @@ async def handle_polled_email(
                     if outcome == "created":
                         link_transaction(link_context, txn_row)
                         await session.flush()
+                        # Maskless CC bill-payment: try amount-match against
+                        # open statements; else queue a Telegram prompt.
+                        prompt_payload = await resolve_cc_payment_account(
+                            session, txn_row
+                        )
+                        if prompt_payload is not None:
+                            pending_disambiguations.append(prompt_payload)
+                        # Queue statement reconciliation for true CC
+                        # bill-payment credits only. Scoped to `created`:
+                        # an enriched row (second source for an already-
+                        # seen payment) must NOT re-fire — payment_paid_amount
+                        # is cumulative and would double-count.
+                        if should_auto_reconcile_statement(txn_row):
+                            pending_payment_checks.append(
+                                (txn_row.id, txn_row.account_id, txn_row.amount)
+                            )
                     elif outcome == "enriched":
                         # Re-link if the enrichment filled card_mask/account_mask
                         # and the row is still unlinked.
@@ -643,10 +665,6 @@ async def handle_polled_email(
                                 },
                             )
                         )
-                    if txn_row.direction == "credit" and txn_row.account_id:
-                        pending_payment_checks.append(
-                            (txn_row.id, txn_row.account_id, txn_row.amount)
-                        )
             elif error:
                 stats["failed"] += 1
             else:
@@ -706,5 +724,17 @@ async def handle_polled_email(
                 logger.warning(
                     "Payment-received check failed for txn %s: %s",
                     txn_id,
+                    exc,
+                )
+
+    if pending_disambiguations:
+        chat_id = get_telegram_chat_id()
+        for payload in pending_disambiguations:
+            try:
+                await send_disambiguation_prompt(payload, chat_id)
+            except Exception as exc:
+                logger.warning(
+                    "CC disambiguation prompt failed for txn %s: %s",
+                    payload.get("txn_id"),
                     exc,
                 )

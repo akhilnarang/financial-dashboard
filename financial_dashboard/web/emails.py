@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException, Query, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func, or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.crypto import decrypt_credentials
@@ -43,6 +43,10 @@ from financial_dashboard.schemas.emails import (
     ReparseAllFailedResponse,
     ReparseEmailResponse,
 )
+from financial_dashboard.services.cc_disambiguation import (
+    resolve_cc_payment_account,
+    should_auto_reconcile_statement,
+)
 from financial_dashboard.services.emails import parse_email_by_kind
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.reminders import check_payment_received
@@ -52,6 +56,7 @@ from financial_dashboard.services.settings import (
 )
 from financial_dashboard.services.telegram import (
     build_account_label,
+    send_disambiguation_prompt,
     send_transaction_notification,
 )
 
@@ -377,15 +382,48 @@ async def reparse_email(
         txn_id = None
         duplicate_error: str | None = None
         pending_payment_check: tuple[int, int, Decimal] | None = None
+        pending_disambiguation: dict | None = None
         if txn_data:
             try:
                 async with session.begin_nested():
-                    txn_row = Transaction(email_id=em.id, **txn_data)
-                    session.add(txn_row)
+                    # Upsert: if a transaction is already attached to this
+                    # email (the common case when reparse is invoked to
+                    # pick up a downstream fix like the new CC
+                    # disambiguation), update it in place rather than
+                    # inserting a duplicate. Account/card FKs are cleared
+                    # so the linker re-runs from scratch on the refreshed
+                    # parser fields.
+                    existing = (
+                        await session.execute(
+                            select(Transaction).where(Transaction.email_id == em.id)
+                        )
+                    ).scalar_one_or_none()
+                    # `was_orphaned` distinguishes "fix a historical
+                    # unlinked row" (account_id was None → the original
+                    # parse never fired check_payment_received, so
+                    # firing now is correct) from "re-apply an
+                    # already-processed payment" (account_id was set →
+                    # the statement was already credited, so firing
+                    # again would double-count).
+                    was_orphaned = existing is None or existing.account_id is None
+                    if existing is not None:
+                        for key, value in txn_data.items():
+                            setattr(existing, key, value)
+                        existing.account_id = None
+                        existing.card_id = None
+                        txn_row = existing
+                    else:
+                        txn_row = Transaction(email_id=em.id, **txn_data)
+                        session.add(txn_row)
                     await session.flush()
                     _link_ctx = await build_link_context(session)
                     link_transaction(_link_ctx, txn_row)
                     await session.flush()
+                    # Maskless CC bill-payment: try amount-match against
+                    # open statements; else queue a Telegram prompt.
+                    pending_disambiguation = await resolve_cc_payment_account(
+                        session, txn_row
+                    )
                     txn_id = txn_row.id
                     account_obj = (
                         await session.get(Account, txn_row.account_id)
@@ -401,7 +439,17 @@ async def reparse_email(
                         account_obj, card_obj
                     )
                     txn_data["channel"] = txn_row.channel
-                    if txn_row.direction == "credit" and txn_row.account_id:
+                    # Only auto-reconcile when the original parse did
+                    # NOT already credit the statement. Two cases qualify:
+                    #   - Fresh insert (no prior txn for this email).
+                    #   - Upsert of a previously-orphaned txn (prior
+                    #     account_id was None, so check_payment_received
+                    #     never fired the first time round — this is the
+                    #     "fix a historical orphan via reparse" workflow).
+                    # If the prior row was already linked, the statement
+                    # was already credited; re-firing would double-count
+                    # payment_paid_amount on a PARTIALLY_PAID statement.
+                    if was_orphaned and should_auto_reconcile_statement(txn_row):
                         pending_payment_check = (
                             txn_row.id,
                             txn_row.account_id,
@@ -411,6 +459,20 @@ async def reparse_email(
                 em.status = "skipped"
                 em.error = "Duplicate transaction skipped because an identical transaction row already exists"
                 duplicate_error = em.error
+            except MultipleResultsFound:
+                # The upsert lookup assumes 1:1 between Email and
+                # Transaction. If a historical data quirk produced two
+                # txns for one email, surface that loudly instead of
+                # silently picking one — the operator needs to merge or
+                # delete the duplicates first.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Email {email_id} has more than one attached "
+                        f"transaction; resolve the duplicates manually "
+                        f"before reparsing."
+                    ),
+                )
 
     if duplicate_error:
         raise HTTPException(status_code=409, detail=duplicate_error)
@@ -436,6 +498,18 @@ async def reparse_email(
             logger.warning(
                 "Payment-received check failed for reparsed txn %s: %s",
                 pending_payment_check[0],
+                exc,
+            )
+
+    if pending_disambiguation is not None:
+        try:
+            await send_disambiguation_prompt(
+                pending_disambiguation, get_telegram_chat_id()
+            )
+        except Exception as exc:
+            logger.warning(
+                "CC disambiguation prompt failed for reparsed txn %s: %s",
+                pending_disambiguation.get("txn_id"),
                 exc,
             )
 
@@ -512,6 +586,7 @@ async def reparse_all_failed(
 
         was_skipped = False
         pending_payment_check: tuple[int, int, Decimal] | None = None
+        pending_disambiguation: dict | None = None
         async with session.begin():
             em = await session.get(Email, email_row.id)
             if not em:
@@ -534,13 +609,43 @@ async def reparse_all_failed(
             if txn_data:
                 try:
                     async with session.begin_nested():
-                        txn_row = Transaction(email_id=em.id, **txn_data)
-                        session.add(txn_row)
+                        # Upsert: failed emails reaching the bulk-reparse
+                        # path rarely have an attached txn already, but
+                        # mirror the single-email reparse logic so a
+                        # mixed batch (e.g. some rows previously parsed
+                        # and re-failed) doesn't insert duplicates.
+                        existing = (
+                            await session.execute(
+                                select(Transaction).where(Transaction.email_id == em.id)
+                            )
+                        ).scalar_one_or_none()
+                        was_orphaned = (
+                            existing is None or existing.account_id is None
+                        )
+                        if existing is not None:
+                            for key, value in txn_data.items():
+                                setattr(existing, key, value)
+                            existing.account_id = None
+                            existing.card_id = None
+                            txn_row = existing
+                        else:
+                            txn_row = Transaction(email_id=em.id, **txn_data)
+                            session.add(txn_row)
                         await session.flush()
                         _link_ctx = await build_link_context(session)
                         link_transaction(_link_ctx, txn_row)
                         await session.flush()
-                        if txn_row.direction == "credit" and txn_row.account_id:
+                        # Maskless CC bill-payment: try amount-match
+                        # against open statements; else queue a prompt.
+                        pending_disambiguation = await resolve_cc_payment_account(
+                            session, txn_row
+                        )
+                        # Only auto-reconcile when the original parse
+                        # did not already credit the statement (either a
+                        # fresh insert or an upsert of a previously-
+                        # orphaned txn). See the per-email reparse path
+                        # for the full rationale.
+                        if was_orphaned and should_auto_reconcile_statement(txn_row):
                             pending_payment_check = (
                                 txn_row.id,
                                 txn_row.account_id,
@@ -550,6 +655,15 @@ async def reparse_all_failed(
                     em.status = "skipped"
                     em.error = "Duplicate transaction skipped"
                     was_skipped = True
+                except MultipleResultsFound:
+                    # Skip this row but keep the batch going — the
+                    # operator can deal with the duplicate manually.
+                    em.status = "skipped"
+                    em.error = (
+                        "More than one attached transaction; resolve "
+                        "manually before reparsing."
+                    )
+                    was_skipped = True
 
         if pending_payment_check:
             try:
@@ -558,6 +672,18 @@ async def reparse_all_failed(
                 logger.warning(
                     "Payment-received check failed for bulk-reparsed txn %s: %s",
                     pending_payment_check[0],
+                    exc,
+                )
+
+        if pending_disambiguation is not None:
+            try:
+                await send_disambiguation_prompt(
+                    pending_disambiguation, get_telegram_chat_id()
+                )
+            except Exception as exc:
+                logger.warning(
+                    "CC disambiguation prompt failed for bulk-reparsed txn %s: %s",
+                    pending_disambiguation.get("txn_id"),
                     exc,
                 )
 

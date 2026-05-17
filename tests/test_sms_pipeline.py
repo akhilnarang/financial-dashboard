@@ -4,6 +4,7 @@ import datetime
 from decimal import Decimal
 
 import pytest  # noqa: F401
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from bank_sms_parser.models import Money, ParsedSms, SmsTransactionAlert
@@ -294,3 +295,146 @@ async def test_process_sms_row_cc_payment_received_calls_check_payment_received(
     assert outcome.pending_payment_check is not None
     assert outcome.pending_payment_check[1] == acct.id  # account_id
     assert outcome.pending_payment_check[2] == Decimal("15000")  # amount
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_cc_payment_amount_match_resolves_account(
+    session, monkeypatch
+):
+    """Maskless CC bill-payment SMS with multiple CC candidates: the
+    amount-based matcher resolves to the single CC whose open statement
+    total_amount_due equals the payment amount. The resolved account_id
+    must be persisted on the Transaction row AND surfaced in the
+    pending_payment_check tuple."""
+    from financial_dashboard.db import Account, PaymentStatus, StatementUpload
+    from bank_sms_parser.models import Money, SmsTransactionAlert
+
+    a = Account(bank="indusind", type="credit_card", label="IndusInd A")
+    b = Account(bank="indusind", type="credit_card", label="IndusInd B")
+    c = Account(bank="indusind", type="credit_card", label="IndusInd C")
+    session.add_all([a, b, c])
+    await session.flush()
+    session.add_all([
+        StatementUpload(
+            account_id=a.id, bank="indusind", filename="x.pdf",
+            file_path="/tmp/x.pdf", status="imported",
+            due_date="20/05/2026", total_amount_due="1,616.00",
+            payment_status=PaymentStatus.UNPAID,
+        ),
+        StatementUpload(
+            account_id=b.id, bank="indusind", filename="x.pdf",
+            file_path="/tmp/x.pdf", status="imported",
+            due_date="20/05/2026", total_amount_due="133.00",
+            payment_status=PaymentStatus.UNPAID,
+        ),
+        StatementUpload(
+            account_id=c.id, bank="indusind", filename="x.pdf",
+            file_path="/tmp/x.pdf", status="imported",
+            due_date="20/05/2026", total_amount_due="4,661.00",
+            payment_status=PaymentStatus.UNPAID,
+        ),
+    ])
+    await session.flush()
+
+    parsed = ParsedSms(
+        email_type="indusind_cc_payment_received_alert",
+        bank="indusind",
+        transaction=SmsTransactionAlert(
+            direction="credit",
+            amount=Money(amount=Decimal("133"), currency="INR"),
+            transaction_date=datetime.date(2026, 5, 17),
+        ),
+    )
+
+    def _fake_parse(*args, **kwargs):
+        return parsed
+    monkeypatch.setattr("financial_dashboard.services.sms_pipeline.parse_sms", _fake_parse)
+
+    sms = SmsMessage(
+        bank="indusind", sender="VK-INDBNK",
+        body="<indusind payment received body>",
+        received_at=datetime.datetime(2026, 5, 17, 13, 12, 35, tzinfo=datetime.UTC),
+    )
+    session.add(sms)
+    await session.flush()
+
+    from financial_dashboard.services.linker import build_link_context
+    link_ctx = await build_link_context(session)
+
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.pending_payment_check is not None
+    assert outcome.pending_payment_check[1] == b.id  # resolved by amount
+    assert outcome.pending_disambiguation is None
+    # The Transaction row itself must carry the resolved account_id, so a
+    # subsequent notification render shows the correct account label.
+    from financial_dashboard.db import Transaction
+    txn = (await session.execute(
+        select(Transaction).where(Transaction.id == outcome.transaction_id)
+    )).scalar_one()
+    assert txn.account_id == b.id
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_cc_payment_no_amount_match_emits_prompt(
+    session, monkeypatch
+):
+    """Maskless CC bill-payment SMS with multiple CC candidates and no
+    matching statement total — the outcome carries pending_disambiguation
+    (so the caller fires the Telegram inline-keyboard prompt) and the
+    Transaction row stays unlinked."""
+    from financial_dashboard.db import Account, PaymentStatus, StatementUpload
+    from bank_sms_parser.models import Money, SmsTransactionAlert
+
+    a = Account(bank="indusind", type="credit_card", label="IndusInd A")
+    b = Account(bank="indusind", type="credit_card", label="IndusInd B")
+    session.add_all([a, b])
+    await session.flush()
+    session.add_all([
+        StatementUpload(
+            account_id=a.id, bank="indusind", filename="x.pdf",
+            file_path="/tmp/x.pdf", status="imported",
+            due_date="20/05/2026", total_amount_due="500.00",
+            payment_status=PaymentStatus.UNPAID,
+        ),
+        StatementUpload(
+            account_id=b.id, bank="indusind", filename="x.pdf",
+            file_path="/tmp/x.pdf", status="imported",
+            due_date="20/05/2026", total_amount_due="999.00",
+            payment_status=PaymentStatus.UNPAID,
+        ),
+    ])
+    await session.flush()
+
+    parsed = ParsedSms(
+        email_type="indusind_cc_payment_received_alert",
+        bank="indusind",
+        transaction=SmsTransactionAlert(
+            direction="credit",
+            amount=Money(amount=Decimal("133"), currency="INR"),
+            transaction_date=datetime.date(2026, 5, 17),
+        ),
+    )
+
+    def _fake_parse(*args, **kwargs):
+        return parsed
+    monkeypatch.setattr("financial_dashboard.services.sms_pipeline.parse_sms", _fake_parse)
+
+    sms = SmsMessage(
+        bank="indusind", sender="VK-INDBNK",
+        body="<indusind payment received body>",
+        received_at=datetime.datetime(2026, 5, 17, 13, 12, 35, tzinfo=datetime.UTC),
+    )
+    session.add(sms)
+    await session.flush()
+
+    from financial_dashboard.services.linker import build_link_context
+    link_ctx = await build_link_context(session)
+
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.pending_disambiguation is not None
+    assert outcome.pending_payment_check is None
+    assert set(outcome.pending_disambiguation["candidate_account_ids"]) == {a.id, b.id}
