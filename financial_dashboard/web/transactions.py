@@ -20,6 +20,7 @@ from financial_dashboard.db import (
     Account,
     Card,
     Email,
+    SmsMessage,
     Transaction,
 )
 
@@ -205,12 +206,13 @@ async def transaction_list(
 
 async def _load_transaction(
     session: AsyncSession, txn_id: int
-) -> tuple[Transaction, Email | None, Account | None] | None:
-    """Load a Transaction with its linked Email and Account, or None."""
+) -> tuple[Transaction, Email | None, Account | None, SmsMessage | None] | None:
+    """Load a Transaction with its linked Email, Account, and SMS, or None."""
     result = await session.execute(
-        select(Transaction, Email, Account)
+        select(Transaction, Email, Account, SmsMessage)
         .outerjoin(Email, Transaction.email_id == Email.id)
         .outerjoin(Account, Transaction.account_id == Account.id)
+        .outerjoin(SmsMessage, Transaction.sms_message_id == SmsMessage.id)
         .where(Transaction.id == txn_id)
     )
     row = result.first()
@@ -228,11 +230,11 @@ async def transaction_detail(
     loaded = await _load_transaction(session, txn_id)
     if loaded is None:
         return HTMLResponse("<p>Transaction not found.</p>", 404)
-    txn, email, account = loaded
+    txn, email, account, sms = loaded
     return templates.TemplateResponse(
         request,
         "partials/transaction_detail.html",
-        {"txn": txn, "email": email, "account": account},
+        {"txn": txn, "email": email, "account": account, "sms": sms},
     )
 
 
@@ -245,7 +247,7 @@ async def transaction_page(
     loaded = await _load_transaction(session, txn_id)
     if loaded is None:
         return HTMLResponse("<p>Transaction not found.</p>", 404)
-    txn, email, account = loaded
+    txn, email, account, sms = loaded
     return templates.TemplateResponse(
         request,
         "transaction_page.html",
@@ -254,5 +256,6 @@ async def transaction_page(
             "txn": txn,
             "email": email,
             "account": account,
+            "sms": sms,
         },
     )

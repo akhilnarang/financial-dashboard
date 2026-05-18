@@ -71,6 +71,13 @@
         <dd class="text-sm"><a href="#" onclick="openDetailModal('/emails/{{ email.id }}/detail'); return false;" style="cursor: pointer;">{{ email.subject or "(no subject)" }}</a></dd>
     </div>
     {% endif %}
+    {% if sms %}
+    {% set sms_body = (sms.body or "").strip() %}
+    <div>
+        <dt>Linked SMS</dt>
+        <dd class="text-sm"><a href="#" onclick="openDetailModal('/sms/{{ sms.id }}/detail'); return false;" style="cursor: pointer;" title="{{ sms.body }}">{{ sms_body[:60] }}{% if sms_body|length > 60 %}…{% endif %}</a></dd>
+    </div>
+    {% endif %}
 </dl>
 
 <div style="margin-top: 1rem;">
