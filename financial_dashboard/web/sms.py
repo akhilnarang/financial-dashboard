@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 from datetime import date as _date, datetime as _datetime
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal, cast
 from urllib.parse import urlencode
+
+if TYPE_CHECKING:
+    from financial_dashboard.services.txn_merge import EnrichmentDiff
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import Request as FastAPIRequest
@@ -31,7 +34,9 @@ from financial_dashboard.services.telegram import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-templates = get_templates()  # matches the pattern in web/emails.py and web/bank_statements.py
+templates = (
+    get_templates()
+)  # matches the pattern in web/emails.py and web/bank_statements.py
 
 
 class ReparseSmsResponse(BaseModel):
@@ -88,6 +93,7 @@ async def reparse_sms(
     # CC-payment-received SMS should still mark the statement paid.
     if outcome.pending_payment_check is not None:
         from financial_dashboard.services.reminders import check_payment_received
+
         try:
             await check_payment_received(*outcome.pending_payment_check)
         except Exception as exc:
@@ -100,6 +106,7 @@ async def reparse_sms(
         from financial_dashboard.services.telegram import (
             send_disambiguation_prompt,
         )
+
         try:
             await send_disambiguation_prompt(
                 outcome.pending_disambiguation, get_telegram_chat_id()
@@ -113,7 +120,11 @@ async def reparse_sms(
     diff_list = None
     if outcome.enrichment_notification is not None:
         _, diff_obj, _ = outcome.enrichment_notification
-        diff_list = diff_obj.changed_fields
+        # ProcessSmsOutcome.enrichment_notification's second element is
+        # typed `object` to avoid a circular import in the dataclass;
+        # the runtime type is always EnrichmentDiff. Cast here so the
+        # attribute access types cleanly.
+        diff_list = cast("EnrichmentDiff", diff_obj).changed_fields
 
     return ReparseSmsResponse(
         message=f"SMS #{sms_id} → {outcome.status}",
@@ -136,12 +147,14 @@ async def reparse_all_failed_sms(
 ) -> ReparseAllSmsResponse:
     # 1. Read row IDs only.
     ids = (
-        await session.execute(
-            select(SmsMessage.id).where(
-                SmsMessage.status.in_(("pending", "error"))
+        (
+            await session.execute(
+                select(SmsMessage.id).where(SmsMessage.status.in_(("pending", "error")))
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     await session.rollback()
 
     # Build link_context once for the whole batch.
@@ -191,7 +204,8 @@ async def reparse_all_failed_sms(
                     except Exception as exc:
                         logger.warning(
                             "Bulk reparse Telegram primary failed for SMS %d: %s",
-                            sms_id, exc,
+                            sms_id,
+                            exc,
                         )
                 if outcome.enrichment_notification is not None:
                     enrich_txn_id, diff, enrich_info = outcome.enrichment_notification
@@ -206,7 +220,8 @@ async def reparse_all_failed_sms(
                     except Exception as exc:
                         logger.warning(
                             "Bulk reparse Telegram enrichment failed for SMS %d: %s",
-                            sms_id, exc,
+                            sms_id,
+                            exc,
                         )
 
             # CC payment marking + disambiguation also still fire on reparse.
@@ -216,7 +231,8 @@ async def reparse_all_failed_sms(
                 except Exception as exc:
                     logger.warning(
                         "Bulk reparse payment-check failed for SMS %d: %s",
-                        sms_id, exc,
+                        sms_id,
+                        exc,
                     )
             if (
                 outcome.pending_disambiguation is not None
@@ -229,7 +245,8 @@ async def reparse_all_failed_sms(
                 except Exception as exc:
                     logger.warning(
                         "Bulk reparse disambiguation prompt failed for SMS %d: %s",
-                        sms_id, exc,
+                        sms_id,
+                        exc,
                     )
         except Exception:
             logger.exception("Bulk reparse: row %d crashed", sms_id)
@@ -270,7 +287,9 @@ async def sms_list(
             pass
     if q:
         like = f"%{q}%"
-        stmt = stmt.where(or_(SmsMessage.sender.ilike(like), SmsMessage.body.ilike(like)))
+        stmt = stmt.where(
+            or_(SmsMessage.sender.ilike(like), SmsMessage.body.ilike(like))
+        )
 
     total_count = (
         await session.execute(select(func.count()).select_from(stmt.subquery()))
@@ -306,9 +325,9 @@ async def sms_list(
         "date_to": date_to,
         "q": q,
     }
-    qs_items = {k: v for k, v in filters.items() if v}
+    qs_items: dict[str, str] = {k: v for k, v in filters.items() if v}
     if page_size != 50:
-        qs_items["page_size"] = page_size
+        qs_items["page_size"] = str(page_size)
     base_qs = urlencode(qs_items)
 
     return templates.TemplateResponse(

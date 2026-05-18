@@ -582,7 +582,14 @@ async def handle_polled_email(
                         # an enriched row (second source for an already-
                         # seen payment) must NOT re-fire — payment_paid_amount
                         # is cumulative and would double-count.
-                        if should_auto_reconcile_statement(txn_row):
+                        # The redundant `account_id is not None` check is
+                        # for ty's benefit: should_auto_reconcile_statement
+                        # already guarantees it at runtime, but ty can't
+                        # narrow through helper calls.
+                        if (
+                            should_auto_reconcile_statement(txn_row)
+                            and txn_row.account_id is not None
+                        ):
                             pending_payment_checks.append(
                                 (txn_row.id, txn_row.account_id, txn_row.amount)
                             )

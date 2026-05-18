@@ -195,12 +195,24 @@ async def process_sms_row(
         )
 
         pending_disambiguation = await resolve_cc_payment_account(session, txn_row)
-        if should_auto_reconcile_statement(txn_row):
+        # The redundant `account_id is not None` check is for ty —
+        # should_auto_reconcile_statement already guarantees it at
+        # runtime but ty can't narrow through helper calls.
+        if should_auto_reconcile_statement(txn_row) and txn_row.account_id is not None:
             pending_payment_check = (txn_row.id, txn_row.account_id, txn_row.amount)
 
     # 6. Record row state and notification payload.
+    # Use a literal-typed local so both `sms_row.status` (a plain str
+    # column in the DB) and `ProcessSmsOutcome.status` (a Literal in
+    # the dataclass) are assigned from the same narrowed value. This
+    # also makes future control-flow edits visible at the type-check
+    # layer — if a new code path sets a different status, ty will
+    # flag it.
+    final_status: Literal["parsed", "enriched"] = (
+        "parsed" if outcome == "created" else "enriched"
+    )
     sms_row.transaction_id = txn_row.id
-    sms_row.status = "parsed" if outcome == "created" else "enriched"
+    sms_row.status = final_status
 
     primary_notification = None
     enrichment_notification = None
@@ -214,7 +226,7 @@ async def process_sms_row(
         )
 
     return ProcessSmsOutcome(
-        status=sms_row.status,
+        status=final_status,
         transaction_id=txn_row.id,
         primary_notification=primary_notification,
         enrichment_notification=enrichment_notification,

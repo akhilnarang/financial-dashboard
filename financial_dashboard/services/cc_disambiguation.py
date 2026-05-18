@@ -174,6 +174,11 @@ async def find_cc_account_by_total_due(
     target = Decimal(str(amount))
     matches: list[int] = []
     for upload in latest:
+        if upload.total_amount_due is None:
+            # Defense in depth — the SQL also filters NOT NULL, but
+            # narrowing here keeps the parse call typed cleanly and
+            # protects against schema-level relaxations later.
+            continue
         try:
             due = parse_cc_amount(upload.total_amount_due)
         except ValueError, InvalidOperation:

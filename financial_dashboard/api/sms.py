@@ -43,7 +43,7 @@ async def post_sms(
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     primary: dict | None = None
-    enrichment: tuple[int, object] | None = None
+    enrichment: tuple[int, object, dict] | None = None
     outcome = None
 
     async with session.begin():
@@ -77,17 +77,17 @@ async def post_sms(
 
     if outcome is not None and outcome.pending_payment_check is not None:
         from financial_dashboard.services.reminders import check_payment_received
+
         try:
             await check_payment_received(*outcome.pending_payment_check)
         except Exception as exc:
-            logger.warning(
-                "Payment-received check failed for SMS-derived txn: %s", exc
-            )
+            logger.warning("Payment-received check failed for SMS-derived txn: %s", exc)
 
     if outcome is not None and outcome.pending_disambiguation is not None:
         from financial_dashboard.services.telegram import (
             send_disambiguation_prompt,
         )
+
         try:
             await send_disambiguation_prompt(
                 outcome.pending_disambiguation, get_telegram_chat_id()
