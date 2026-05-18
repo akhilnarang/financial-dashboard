@@ -65,8 +65,10 @@ async def test_send_transaction_notification_with_email_source_includes_badge():
             await send_transaction_notification(
                 42,
                 {
-                    "bank": "hdfc", "direction": "debit",
-                    "amount": Decimal("500"), "counterparty": "Zomato",
+                    "bank": "hdfc",
+                    "direction": "debit",
+                    "amount": Decimal("500"),
+                    "counterparty": "Zomato",
                     "card_mask": "x1234",
                 },
                 chat_id=12345,

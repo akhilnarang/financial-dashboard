@@ -34,6 +34,8 @@ from __future__ import annotations
 # Known candidates not yet added (parsers also emit bare HH:MM:SS but
 # the clock convention isn't confirmed):
 #   - onecard_debit_alert: "Time: 10:30:00" — convention unverified.
-AMBIGUOUS_12H_TIME_EMAIL_TYPES: frozenset[str] = frozenset({
-    "icici_cc_transaction_alert",
-})
+AMBIGUOUS_12H_TIME_EMAIL_TYPES: frozenset[str] = frozenset(
+    {
+        "icici_cc_transaction_alert",
+    }
+)

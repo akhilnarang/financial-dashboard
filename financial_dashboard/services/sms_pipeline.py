@@ -48,9 +48,7 @@ class ProcessSmsOutcome:
     has more than one CC for this bank registered)."""
 
 
-def parsed_sms_to_txn_data(
-    parsed: ParsedSms, sms_row: SmsMessage
-) -> dict | None:
+def parsed_sms_to_txn_data(parsed: ParsedSms, sms_row: SmsMessage) -> dict | None:
     """Map ``ParsedSms.transaction`` → ``txn_data`` dict shape used by
     ``merge_transaction``. Returns ``None`` if ``parsed.transaction`` is
     ``None`` (non-transaction SMS shape, e.g. OneCard statement-ready).
@@ -121,13 +119,8 @@ async def process_sms_row(
     # naive datetimes for the IST date-fallback path, so re-attach UTC
     # before handing the value over.
     received_at_for_parser = sms_row.received_at
-    if (
-        received_at_for_parser is not None
-        and received_at_for_parser.tzinfo is None
-    ):
-        received_at_for_parser = received_at_for_parser.replace(
-            tzinfo=datetime.UTC
-        )
+    if received_at_for_parser is not None and received_at_for_parser.tzinfo is None:
+        received_at_for_parser = received_at_for_parser.replace(tzinfo=datetime.UTC)
     try:
         parsed = parse_sms(
             sms_row.bank,
@@ -201,13 +194,9 @@ async def process_sms_row(
             should_auto_reconcile_statement,
         )
 
-        pending_disambiguation = await resolve_cc_payment_account(
-            session, txn_row
-        )
+        pending_disambiguation = await resolve_cc_payment_account(session, txn_row)
         if should_auto_reconcile_statement(txn_row):
-            pending_payment_check = (
-                txn_row.id, txn_row.account_id, txn_row.amount
-            )
+            pending_payment_check = (txn_row.id, txn_row.account_id, txn_row.amount)
 
     # 6. Record row state and notification payload.
     sms_row.transaction_id = txn_row.id
@@ -234,8 +223,6 @@ async def process_sms_row(
     )
 
 
-
-
 async def _notification_payload(txn_row, session) -> dict:
     """Build the dict shape that send_transaction_notification expects."""
     from financial_dashboard.db import Account, Card
@@ -244,9 +231,7 @@ async def _notification_payload(txn_row, session) -> dict:
     account_obj = (
         await session.get(Account, txn_row.account_id) if txn_row.account_id else None
     )
-    card_obj = (
-        await session.get(Card, txn_row.card_id) if txn_row.card_id else None
-    )
+    card_obj = await session.get(Card, txn_row.card_id) if txn_row.card_id else None
     return {
         "bank": txn_row.bank,
         "direction": txn_row.direction,

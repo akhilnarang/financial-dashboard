@@ -57,7 +57,8 @@ async def test_sms_first_then_email_enriches(session):
     # 2. Email arrives with same ref but richer counterparty.
     async with session.begin_nested():
         outcome, row, diff = await merge_transaction(
-            session, "email",
+            session,
+            "email",
             {
                 "bank": "indusind",
                 "email_type": "indusind_account_transaction_alert",
@@ -84,7 +85,8 @@ async def test_email_first_then_sms_does_not_overwrite(session):
     # 1. Email arrives first.
     async with session.begin():
         outcome, row, _ = await merge_transaction(
-            session, "email",
+            session,
+            "email",
             {
                 "bank": "hdfc",
                 "email_type": "hdfc_dc_transaction_alert",
@@ -103,7 +105,8 @@ async def test_email_first_then_sms_does_not_overwrite(session):
     # 2. SMS arrives second.
     async with session.begin():
         outcome2, row2, diff = await merge_transaction(
-            session, "sms",
+            session,
+            "sms",
             {
                 "bank": "hdfc",
                 "email_type": "hdfc_dc_transaction_alert",
@@ -130,11 +133,15 @@ async def test_no_pairing_when_amounts_differ_creates_two_rows(session):
     """₹500 SMS and ₹501 email are kept as two separate rows."""
     async with session.begin():
         await merge_transaction(
-            session, "sms",
+            session,
+            "sms",
             {
-                "bank": "hdfc", "email_type": "hdfc_dc_transaction_alert",
-                "direction": "debit", "amount": Decimal("500"),
-                "currency": "INR", "reference_number": None,
+                "bank": "hdfc",
+                "email_type": "hdfc_dc_transaction_alert",
+                "direction": "debit",
+                "amount": Decimal("500"),
+                "currency": "INR",
+                "reference_number": None,
                 "transaction_date": datetime.date(2026, 5, 2),
                 "transaction_time": datetime.time(14, 23),
                 "counterparty": "Zomato",
@@ -142,11 +149,15 @@ async def test_no_pairing_when_amounts_differ_creates_two_rows(session):
         )
     async with session.begin():
         outcome, _, _ = await merge_transaction(
-            session, "email",
+            session,
+            "email",
             {
-                "bank": "hdfc", "email_type": "hdfc_dc_transaction_alert",
-                "direction": "debit", "amount": Decimal("501"),
-                "currency": "INR", "reference_number": None,
+                "bank": "hdfc",
+                "email_type": "hdfc_dc_transaction_alert",
+                "direction": "debit",
+                "amount": Decimal("501"),
+                "currency": "INR",
+                "reference_number": None,
                 "transaction_date": datetime.date(2026, 5, 2),
                 "transaction_time": datetime.time(14, 23),
                 "counterparty": "Zomato",

@@ -176,14 +176,15 @@ async def find_cc_account_by_total_due(
     for upload in latest:
         try:
             due = parse_cc_amount(upload.total_amount_due)
-        except (ValueError, InvalidOperation):
+        except ValueError, InvalidOperation:
             # An unparseable total_amount_due in a row that passed the
             # NOT NULL filter is a data-quality issue, not a routine
             # condition — log it so a silent skip is debuggable.
             logger.warning(
                 "Skipping statement %s during amount-based disambiguation: "
                 "total_amount_due=%r is not parseable.",
-                upload.id, upload.total_amount_due,
+                upload.id,
+                upload.total_amount_due,
             )
             continue
         if due == target:
@@ -195,7 +196,10 @@ async def find_cc_account_by_total_due(
         logger.warning(
             "Amount-based CC disambiguation ambiguous for bank=%r amount=%s: "
             "matched %d statements %r — refusing to guess.",
-            bank, target, len(matches), matches,
+            bank,
+            target,
+            len(matches),
+            matches,
         )
     return None
 

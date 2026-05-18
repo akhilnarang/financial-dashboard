@@ -36,7 +36,9 @@ def get_provider(source: EmailSource) -> EmailProvider:
 
         return GmailProvider()
     if source.provider == "fastmail":
-        from financial_dashboard.integrations.email.jmap_fastmail import FastmailProvider
+        from financial_dashboard.integrations.email.jmap_fastmail import (
+            FastmailProvider,
+        )
 
         return FastmailProvider()
     raise ValueError(f"unknown source kind: {source.provider}")

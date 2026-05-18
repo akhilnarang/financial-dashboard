@@ -62,7 +62,8 @@ class TestCheckCredentials:
 
     def test_enabled_rejects_none(self):
         with patch(
-            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings",
+            _make_settings("admin", "pass"),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 check_credentials(None)
@@ -72,13 +73,15 @@ class TestCheckCredentials:
 
     def test_enabled_accepts_correct(self):
         with patch(
-            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings",
+            _make_settings("admin", "pass"),
         ):
             check_credentials(_make_creds("admin", "pass"))
 
     def test_enabled_rejects_wrong_username(self):
         with patch(
-            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings",
+            _make_settings("admin", "pass"),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 check_credentials(_make_creds("wrong", "pass"))
@@ -86,7 +89,8 @@ class TestCheckCredentials:
 
     def test_enabled_rejects_wrong_password(self):
         with patch(
-            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings",
+            _make_settings("admin", "pass"),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 check_credentials(_make_creds("admin", "wrong"))
@@ -94,7 +98,8 @@ class TestCheckCredentials:
 
     def test_enabled_rejects_both_wrong(self):
         with patch(
-            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings",
+            _make_settings("admin", "pass"),
         ):
             with pytest.raises(HTTPException) as exc_info:
                 check_credentials(_make_creds("wrong", "wrong"))
@@ -171,7 +176,8 @@ class TestAuthIntegration:
 
     async def test_auth_enabled_no_header_returns_401(self):
         with patch(
-            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings",
+            _make_settings("admin", "pass"),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=_build_app()), base_url="http://test"
@@ -182,7 +188,8 @@ class TestAuthIntegration:
 
     async def test_auth_enabled_correct_creds(self):
         with patch(
-            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings",
+            _make_settings("admin", "pass"),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=_build_app()), base_url="http://test"
@@ -193,7 +200,8 @@ class TestAuthIntegration:
 
     async def test_auth_enabled_wrong_creds_returns_401(self):
         with patch(
-            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings",
+            _make_settings("admin", "pass"),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=_build_app()), base_url="http://test"
@@ -203,7 +211,8 @@ class TestAuthIntegration:
 
     async def test_auth_enabled_wrong_username_returns_401(self):
         with patch(
-            "financial_dashboard.core.security.settings", _make_settings("admin", "pass")
+            "financial_dashboard.core.security.settings",
+            _make_settings("admin", "pass"),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=_build_app()), base_url="http://test"

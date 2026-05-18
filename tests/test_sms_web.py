@@ -38,7 +38,10 @@ def _build_app(session_factory):
 async def _client(session):
     async def _override():
         yield session
-    return AsyncClient(transport=ASGITransport(app=_build_app(_override)), base_url="http://test")
+
+    return AsyncClient(
+        transport=ASGITransport(app=_build_app(_override)), base_url="http://test"
+    )
 
 
 @pytest.mark.anyio
@@ -96,20 +99,23 @@ async def test_reparse_single_not_found_returns_404(session):
 @pytest.mark.anyio
 async def test_reparse_all_pending_and_error(session):
     good = SmsMessage(
-        bank="hdfc", sender="VK-HDFCBK",
+        bank="hdfc",
+        sender="VK-HDFCBK",
         body="Spent Rs.500 From HDFC Bank Card x1234 At Zomato On 2026-05-02:14:23:00 Bal Rs.1000",
         received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
         status="pending",
     )
     bad = SmsMessage(
-        bank="hdfc", sender="VK-HDFCBK",
+        bank="hdfc",
+        sender="VK-HDFCBK",
         body="OTP for your transaction is 123456",
         received_at=datetime.datetime(2026, 5, 2, 8, 54, 0, tzinfo=datetime.UTC),
         status="error",
         parse_error="prior parse error",
     )
     skipped = SmsMessage(
-        bank="hdfc", sender="VK-HDFCBK",
+        bank="hdfc",
+        sender="VK-HDFCBK",
         body="(already skipped row that must NOT be reprocessed)",
         received_at=datetime.datetime(2026, 5, 2, 8, 55, 0, tzinfo=datetime.UTC),
         status="skipped",

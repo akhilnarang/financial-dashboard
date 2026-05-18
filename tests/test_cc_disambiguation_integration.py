@@ -107,38 +107,50 @@ async def _seed_three_indusind_ccs_with_statements(
         session.add_all([a, b, c])
         await session.flush()
 
-        session.add_all([
-            StatementUpload(
-                account_id=a.id, bank="indusind",
-                filename="a.pdf", file_path="/tmp/a.pdf", status="imported",
-                due_date="20/05/2026", total_amount_due="1,616.00",
-                payment_status=PaymentStatus.UNPAID,
-                payment_paid_amount=Decimal("0"),
-            ),
-            StatementUpload(
-                account_id=b.id, bank="indusind",
-                filename="b.pdf", file_path="/tmp/b.pdf", status="imported",
-                due_date="20/05/2026", total_amount_due=target_total,
-                payment_status=PaymentStatus.UNPAID,
-                payment_paid_amount=Decimal("0"),
-            ),
-            StatementUpload(
-                account_id=c.id, bank="indusind",
-                filename="c.pdf", file_path="/tmp/c.pdf", status="imported",
-                due_date="20/05/2026", total_amount_due="4,661.00",
-                payment_status=PaymentStatus.UNPAID,
-                payment_paid_amount=Decimal("0"),
-            ),
-        ])
+        session.add_all(
+            [
+                StatementUpload(
+                    account_id=a.id,
+                    bank="indusind",
+                    filename="a.pdf",
+                    file_path="/tmp/a.pdf",
+                    status="imported",
+                    due_date="20/05/2026",
+                    total_amount_due="1,616.00",
+                    payment_status=PaymentStatus.UNPAID,
+                    payment_paid_amount=Decimal("0"),
+                ),
+                StatementUpload(
+                    account_id=b.id,
+                    bank="indusind",
+                    filename="b.pdf",
+                    file_path="/tmp/b.pdf",
+                    status="imported",
+                    due_date="20/05/2026",
+                    total_amount_due=target_total,
+                    payment_status=PaymentStatus.UNPAID,
+                    payment_paid_amount=Decimal("0"),
+                ),
+                StatementUpload(
+                    account_id=c.id,
+                    bank="indusind",
+                    filename="c.pdf",
+                    file_path="/tmp/c.pdf",
+                    status="imported",
+                    due_date="20/05/2026",
+                    total_amount_due="4,661.00",
+                    payment_status=PaymentStatus.UNPAID,
+                    payment_paid_amount=Decimal("0"),
+                ),
+            ]
+        )
 
         email_row = Email(
             provider="gmail",
             message_id="test-indusind-1",
             sender="transactionalert@indusind.com",
             subject="Payment Confirmation on your IndusInd Bank Credit Card",
-            received_at=datetime.datetime(
-                2026, 5, 17, 18, 42, 35, tzinfo=datetime.UTC
-            ),
+            received_at=datetime.datetime(2026, 5, 17, 18, 42, 35, tzinfo=datetime.UTC),
             status="failed",
             error="Previous parse failed",
             rule_id=rule.id,
@@ -180,8 +192,10 @@ async def test_maskless_indusind_cc_payment_resolves_via_amount(session_maker):
         assert txn.amount == Decimal("133")
         assert txn.account_id == b_id  # ← the matching-total CC
 
-        uploads = {u.account_id: u for u in
-                   (await s.execute(select(StatementUpload))).scalars().all()}
+        uploads = {
+            u.account_id: u
+            for u in (await s.execute(select(StatementUpload))).scalars().all()
+        }
         # Account b's statement was fully paid by check_payment_received.
         assert uploads[b_id].payment_status == PaymentStatus.PAID
         assert uploads[b_id].payment_paid_amount == Decimal("133")
@@ -201,7 +215,8 @@ async def test_maskless_indusind_cc_payment_with_no_match_stays_unlinked(
     send_disambiguation_prompt to a no-op since Telegram isn't configured
     in tests.)"""
     a_id, b_id, c_id, email_id = await _seed_three_indusind_ccs_with_statements(
-        session_maker, target_total="999.00"  # ← doesn't match payment
+        session_maker,
+        target_total="999.00",  # ← doesn't match payment
     )
 
     raw = _indusind_payment_eml("133.00")
@@ -232,8 +247,10 @@ async def test_maskless_indusind_cc_payment_with_no_match_stays_unlinked(
         assert txn.account_id is None  # ← still orphaned, by design
 
         # No statement was touched.
-        uploads = {u.account_id: u for u in
-                   (await s.execute(select(StatementUpload))).scalars().all()}
+        uploads = {
+            u.account_id: u
+            for u in (await s.execute(select(StatementUpload))).scalars().all()
+        }
         for acct_id in (a_id, b_id, c_id):
             assert uploads[acct_id].payment_status == PaymentStatus.UNPAID
             assert uploads[acct_id].payment_paid_amount == Decimal("0")
@@ -276,8 +293,10 @@ async def test_bulk_reparse_disambiguates_maskless_cc_payment(session_maker):
     async with session_maker() as s:
         txn = (await s.execute(select(Transaction))).scalars().one()
         assert txn.account_id == b_id
-        uploads = {u.account_id: u for u in
-                   (await s.execute(select(StatementUpload))).scalars().all()}
+        uploads = {
+            u.account_id: u
+            for u in (await s.execute(select(StatementUpload))).scalars().all()
+        }
         assert uploads[b_id].payment_status == PaymentStatus.PAID
         for other_id in (a_id, c_id):
             assert uploads[other_id].payment_status == PaymentStatus.UNPAID
@@ -337,8 +356,10 @@ async def test_reparse_upserts_existing_attached_transaction(session_maker):
         assert rows[0].account_id == b_id
 
         # Statement #b got marked paid.
-        ups = {u.account_id: u for u in
-               (await s.execute(select(StatementUpload))).scalars().all()}
+        ups = {
+            u.account_id: u
+            for u in (await s.execute(select(StatementUpload))).scalars().all()
+        }
         assert ups[b_id].payment_status == PaymentStatus.PAID
         assert ups[a_id].payment_status == PaymentStatus.UNPAID
 
@@ -378,21 +399,31 @@ async def test_cc_reversal_credit_does_not_mark_statement_paid(session_maker):
         await session.flush()
 
         account = Account(
-            bank="icici", type="credit_card", label="ICICI CC", active=True,
+            bank="icici",
+            type="credit_card",
+            label="ICICI CC",
+            active=True,
         )
         session.add(account)
         await session.flush()
 
         card = Card(
-            account_id=account.id, card_mask="XX2308",
-            label="self", is_primary=True, active=True,
+            account_id=account.id,
+            card_mask="XX2308",
+            label="self",
+            is_primary=True,
+            active=True,
         )
         session.add(card)
 
         upload = StatementUpload(
-            account_id=account.id, bank="icici",
-            filename="x.pdf", file_path="/tmp/x.pdf", status="imported",
-            due_date="20/05/2026", total_amount_due="500.00",
+            account_id=account.id,
+            bank="icici",
+            filename="x.pdf",
+            file_path="/tmp/x.pdf",
+            status="imported",
+            due_date="20/05/2026",
+            total_amount_due="500.00",
             payment_status=PaymentStatus.UNPAID,
             payment_paid_amount=Decimal("0"),
         )
@@ -403,9 +434,7 @@ async def test_cc_reversal_credit_does_not_mark_statement_paid(session_maker):
             message_id="test-icici-reversal-1",
             sender="credit_cards@icici.bank.in",
             subject="ICICI Bank Credit Card Reversal",
-            received_at=datetime.datetime(
-                2026, 5, 17, 12, 0, 0, tzinfo=datetime.UTC
-            ),
+            received_at=datetime.datetime(2026, 5, 17, 12, 0, 0, tzinfo=datetime.UTC),
             status="failed",
             error="Previous parse failed",
             rule_id=rule.id,
@@ -518,8 +547,10 @@ async def test_reparse_does_not_re_credit_already_linked_txn(session_maker):
         assert len(rows) == 1
         assert rows[0].account_id == b_id
 
-        ups = {u.account_id: u for u in
-               (await s.execute(select(StatementUpload))).scalars().all()}
+        ups = {
+            u.account_id: u
+            for u in (await s.execute(select(StatementUpload))).scalars().all()
+        }
         # The CRITICAL assertion: payment_paid_amount stayed at 0.
         # Without the WAS_ORPHANED guard, reparse would have queued
         # check_payment_received and bumped it to 133, silently

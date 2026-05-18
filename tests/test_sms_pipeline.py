@@ -107,9 +107,7 @@ from financial_dashboard.services.sms_pipeline import process_sms_row  # noqa: E
 
 
 @pytest.mark.anyio
-async def test_process_sms_row_happy_path_creates_transaction(
-    session, monkeypatch
-):
+async def test_process_sms_row_happy_path_creates_transaction(session, monkeypatch):
     sms = SmsMessage(
         bank="hdfc",
         sender="VK-HDFCBK",
@@ -120,6 +118,7 @@ async def test_process_sms_row_happy_path_creates_transaction(
     await session.flush()
 
     from financial_dashboard.services.linker import build_link_context
+
     link_ctx = await build_link_context(session)
 
     async with session.begin_nested():
@@ -155,6 +154,7 @@ async def test_process_sms_row_naive_received_at_still_parses(session):
     await session.flush()
 
     from financial_dashboard.services.linker import build_link_context
+
     link_ctx = await build_link_context(session)
 
     async with session.begin_nested():
@@ -176,6 +176,7 @@ async def test_process_sms_row_parse_error_marks_row_error(session):
     await session.flush()
 
     from financial_dashboard.services.linker import build_link_context
+
     link_ctx = await build_link_context(session)
 
     async with session.begin_nested():
@@ -199,6 +200,7 @@ async def test_process_sms_row_unsupported_bank_marks_skipped(session):
     await session.flush()
 
     from financial_dashboard.services.linker import build_link_context
+
     link_ctx = await build_link_context(session)
 
     async with session.begin_nested():
@@ -213,6 +215,7 @@ async def test_process_sms_row_declined_bypasses_merge(session, monkeypatch):
     """If a parser ever emits direction='declined', it goes to the
     declined-notification path, not merge_transaction."""
     from bank_sms_parser.models import Money, SmsTransactionAlert
+
     parsed = ParsedSms(
         email_type="hdfc_cc_transaction_declined",
         bank="hdfc",
@@ -225,10 +228,13 @@ async def test_process_sms_row_declined_bypasses_merge(session, monkeypatch):
     def _fake_parse(*args, **kwargs):
         return parsed
 
-    monkeypatch.setattr("financial_dashboard.services.sms_pipeline.parse_sms", _fake_parse)
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms", _fake_parse
+    )
 
     sms = SmsMessage(
-        bank="hdfc", sender="VK-HDFCBK",
+        bank="hdfc",
+        sender="VK-HDFCBK",
         body="<declined body>",
         received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
     )
@@ -236,6 +242,7 @@ async def test_process_sms_row_declined_bypasses_merge(session, monkeypatch):
     await session.flush()
 
     from financial_dashboard.services.linker import build_link_context
+
     link_ctx = await build_link_context(session)
 
     async with session.begin_nested():
@@ -275,10 +282,14 @@ async def test_process_sms_row_cc_payment_received_calls_check_payment_received(
 
     def _fake_parse(*args, **kwargs):
         return parsed
-    monkeypatch.setattr("financial_dashboard.services.sms_pipeline.parse_sms", _fake_parse)
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms", _fake_parse
+    )
 
     sms = SmsMessage(
-        bank="axis", sender="VK-AXISBK",
+        bank="axis",
+        sender="VK-AXISBK",
         body="<axis payment received body>",
         received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
     )
@@ -286,6 +297,7 @@ async def test_process_sms_row_cc_payment_received_calls_check_payment_received(
     await session.flush()
 
     from financial_dashboard.services.linker import build_link_context
+
     link_ctx = await build_link_context(session)
 
     async with session.begin_nested():
@@ -314,26 +326,40 @@ async def test_process_sms_row_cc_payment_amount_match_resolves_account(
     c = Account(bank="indusind", type="credit_card", label="IndusInd C")
     session.add_all([a, b, c])
     await session.flush()
-    session.add_all([
-        StatementUpload(
-            account_id=a.id, bank="indusind", filename="x.pdf",
-            file_path="/tmp/x.pdf", status="imported",
-            due_date="20/05/2026", total_amount_due="1,616.00",
-            payment_status=PaymentStatus.UNPAID,
-        ),
-        StatementUpload(
-            account_id=b.id, bank="indusind", filename="x.pdf",
-            file_path="/tmp/x.pdf", status="imported",
-            due_date="20/05/2026", total_amount_due="133.00",
-            payment_status=PaymentStatus.UNPAID,
-        ),
-        StatementUpload(
-            account_id=c.id, bank="indusind", filename="x.pdf",
-            file_path="/tmp/x.pdf", status="imported",
-            due_date="20/05/2026", total_amount_due="4,661.00",
-            payment_status=PaymentStatus.UNPAID,
-        ),
-    ])
+    session.add_all(
+        [
+            StatementUpload(
+                account_id=a.id,
+                bank="indusind",
+                filename="x.pdf",
+                file_path="/tmp/x.pdf",
+                status="imported",
+                due_date="20/05/2026",
+                total_amount_due="1,616.00",
+                payment_status=PaymentStatus.UNPAID,
+            ),
+            StatementUpload(
+                account_id=b.id,
+                bank="indusind",
+                filename="x.pdf",
+                file_path="/tmp/x.pdf",
+                status="imported",
+                due_date="20/05/2026",
+                total_amount_due="133.00",
+                payment_status=PaymentStatus.UNPAID,
+            ),
+            StatementUpload(
+                account_id=c.id,
+                bank="indusind",
+                filename="x.pdf",
+                file_path="/tmp/x.pdf",
+                status="imported",
+                due_date="20/05/2026",
+                total_amount_due="4,661.00",
+                payment_status=PaymentStatus.UNPAID,
+            ),
+        ]
+    )
     await session.flush()
 
     parsed = ParsedSms(
@@ -348,10 +374,14 @@ async def test_process_sms_row_cc_payment_amount_match_resolves_account(
 
     def _fake_parse(*args, **kwargs):
         return parsed
-    monkeypatch.setattr("financial_dashboard.services.sms_pipeline.parse_sms", _fake_parse)
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms", _fake_parse
+    )
 
     sms = SmsMessage(
-        bank="indusind", sender="VK-INDBNK",
+        bank="indusind",
+        sender="VK-INDBNK",
         body="<indusind payment received body>",
         received_at=datetime.datetime(2026, 5, 17, 13, 12, 35, tzinfo=datetime.UTC),
     )
@@ -359,6 +389,7 @@ async def test_process_sms_row_cc_payment_amount_match_resolves_account(
     await session.flush()
 
     from financial_dashboard.services.linker import build_link_context
+
     link_ctx = await build_link_context(session)
 
     async with session.begin_nested():
@@ -370,9 +401,12 @@ async def test_process_sms_row_cc_payment_amount_match_resolves_account(
     # The Transaction row itself must carry the resolved account_id, so a
     # subsequent notification render shows the correct account label.
     from financial_dashboard.db import Transaction
-    txn = (await session.execute(
-        select(Transaction).where(Transaction.id == outcome.transaction_id)
-    )).scalar_one()
+
+    txn = (
+        await session.execute(
+            select(Transaction).where(Transaction.id == outcome.transaction_id)
+        )
+    ).scalar_one()
     assert txn.account_id == b.id
 
 
@@ -391,20 +425,30 @@ async def test_process_sms_row_cc_payment_no_amount_match_emits_prompt(
     b = Account(bank="indusind", type="credit_card", label="IndusInd B")
     session.add_all([a, b])
     await session.flush()
-    session.add_all([
-        StatementUpload(
-            account_id=a.id, bank="indusind", filename="x.pdf",
-            file_path="/tmp/x.pdf", status="imported",
-            due_date="20/05/2026", total_amount_due="500.00",
-            payment_status=PaymentStatus.UNPAID,
-        ),
-        StatementUpload(
-            account_id=b.id, bank="indusind", filename="x.pdf",
-            file_path="/tmp/x.pdf", status="imported",
-            due_date="20/05/2026", total_amount_due="999.00",
-            payment_status=PaymentStatus.UNPAID,
-        ),
-    ])
+    session.add_all(
+        [
+            StatementUpload(
+                account_id=a.id,
+                bank="indusind",
+                filename="x.pdf",
+                file_path="/tmp/x.pdf",
+                status="imported",
+                due_date="20/05/2026",
+                total_amount_due="500.00",
+                payment_status=PaymentStatus.UNPAID,
+            ),
+            StatementUpload(
+                account_id=b.id,
+                bank="indusind",
+                filename="x.pdf",
+                file_path="/tmp/x.pdf",
+                status="imported",
+                due_date="20/05/2026",
+                total_amount_due="999.00",
+                payment_status=PaymentStatus.UNPAID,
+            ),
+        ]
+    )
     await session.flush()
 
     parsed = ParsedSms(
@@ -419,10 +463,14 @@ async def test_process_sms_row_cc_payment_no_amount_match_emits_prompt(
 
     def _fake_parse(*args, **kwargs):
         return parsed
-    monkeypatch.setattr("financial_dashboard.services.sms_pipeline.parse_sms", _fake_parse)
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms", _fake_parse
+    )
 
     sms = SmsMessage(
-        bank="indusind", sender="VK-INDBNK",
+        bank="indusind",
+        sender="VK-INDBNK",
         body="<indusind payment received body>",
         received_at=datetime.datetime(2026, 5, 17, 13, 12, 35, tzinfo=datetime.UTC),
     )
@@ -430,6 +478,7 @@ async def test_process_sms_row_cc_payment_no_amount_match_emits_prompt(
     await session.flush()
 
     from financial_dashboard.services.linker import build_link_context
+
     link_ctx = await build_link_context(session)
 
     async with session.begin_nested():

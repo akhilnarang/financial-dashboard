@@ -118,9 +118,7 @@ async def test_ambiguous_short_mask_refuses_to_link(session):
 async def test_below_minimum_digits_is_not_matched(session):
     """A mask with fewer than 3 digits is rejected even if it would
     technically suffix-match."""
-    acct = Account(
-        bank="icici", type="bank_account", label="X", account_number="5678"
-    )
+    acct = Account(bank="icici", type="bank_account", label="X", account_number="5678")
     session.add(acct)
     await session.flush()
     ctx = await build_link_context(session)
@@ -226,9 +224,7 @@ async def test_bank_only_fallback_falls_back_to_unfiltered_when_email_type_uninf
     """When the email_type carries no '_cc_' / '_account_' marker, the
     linker keeps the legacy behaviour: link only when the bank has
     exactly one account total."""
-    acct = Account(
-        bank="x-bank", type="bank_account", label="X", account_number="0001"
-    )
+    acct = Account(bank="x-bank", type="bank_account", label="X", account_number="0001")
     session.add(acct)
     await session.flush()
     ctx = await build_link_context(session)

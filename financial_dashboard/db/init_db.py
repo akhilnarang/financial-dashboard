@@ -183,9 +183,7 @@ async def init_db(engine) -> None:
 
         # --- SMS pipeline columns ---
         try:
-            await conn.execute(
-                text("SELECT sms_message_id FROM transactions LIMIT 0")
-            )
+            await conn.execute(text("SELECT sms_message_id FROM transactions LIMIT 0"))
         except Exception:
             await conn.execute(
                 text(
@@ -196,9 +194,7 @@ async def init_db(engine) -> None:
         try:
             await conn.execute(text("SELECT source FROM transactions LIMIT 0"))
         except Exception:
-            await conn.execute(
-                text("ALTER TABLE transactions ADD COLUMN source TEXT")
-            )
+            await conn.execute(text("ALTER TABLE transactions ADD COLUMN source TEXT"))
             # Backfill: every existing transaction was created by the email
             # path (the only path before this spec). Runs only on the same
             # code path that adds the column, so the UPDATE fires once.
@@ -235,9 +231,7 @@ async def init_db(engine) -> None:
                 )
             )
         try:
-            await conn.execute(
-                text("SELECT transaction_id FROM sms_messages LIMIT 0")
-            )
+            await conn.execute(text("SELECT transaction_id FROM sms_messages LIMIT 0"))
         except Exception:
             await conn.execute(
                 text(

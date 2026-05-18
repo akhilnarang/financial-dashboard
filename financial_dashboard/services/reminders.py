@@ -23,7 +23,12 @@ from decimal import Decimal, InvalidOperation
 from sqlalchemy import select
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from financial_dashboard.db import Account, PaymentStatus, StatementUpload, async_session
+from financial_dashboard.db import (
+    Account,
+    PaymentStatus,
+    StatementUpload,
+    async_session,
+)
 from financial_dashboard.services import telegram as telegram_service
 from financial_dashboard.services.settings import (
     get_setting_bool,

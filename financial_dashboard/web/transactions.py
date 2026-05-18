@@ -222,9 +222,7 @@ async def _load_transaction(
     return tuple(row)  # type: ignore[return-value]
 
 
-async def _bank_account_picker(
-    session: AsyncSession, bank: str
-) -> list[dict]:
+async def _bank_account_picker(session: AsyncSession, bank: str) -> list[dict]:
     """Compact JSON-friendly account list for the manual relink picker.
 
     Returns active accounts of ``bank`` ordered by label, each with its
@@ -265,9 +263,7 @@ async def transaction_detail(
         return HTMLResponse("<p>Transaction not found.</p>", 404)
     txn, email, account, sms = loaded
     bank_accounts = (
-        await _bank_account_picker(session, txn.bank)
-        if txn.account_id is None
-        else []
+        await _bank_account_picker(session, txn.bank) if txn.account_id is None else []
     )
     return templates.TemplateResponse(
         request,
@@ -293,9 +289,7 @@ async def transaction_page(
         return HTMLResponse("<p>Transaction not found.</p>", 404)
     txn, email, account, sms = loaded
     bank_accounts = (
-        await _bank_account_picker(session, txn.bank)
-        if txn.account_id is None
-        else []
+        await _bank_account_picker(session, txn.bank) if txn.account_id is None else []
     )
     return templates.TemplateResponse(
         request,

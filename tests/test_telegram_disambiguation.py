@@ -35,7 +35,10 @@ async def test_send_disambiguation_prompt_builds_keyboard():
             },
             chat_id=12345,
         )
-    assert "couldn't auto-match" in sent["text"].lower() or "could not" in sent["text"].lower()
+    assert (
+        "couldn't auto-match" in sent["text"].lower()
+        or "could not" in sent["text"].lower()
+    )
     assert "₹2,500.00" in sent["text"] or "2500" in sent["text"]
     # The keyboard should have one button per candidate + a Skip.
     buttons = sent["markup"].inline_keyboard

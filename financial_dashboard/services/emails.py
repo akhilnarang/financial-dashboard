@@ -74,10 +74,7 @@ def _is_duplicate_transaction_error(exc: IntegrityError) -> bool:
     return (
         "uq_transactions_ref" in message
         or "uq_transaction_dedup" in message
-        or (
-            "UNIQUE constraint failed:" in message
-            and "transactions." in message
-        )
+        or ("UNIQUE constraint failed:" in message and "transactions." in message)
     )
 
 
@@ -153,9 +150,7 @@ def _disambiguate_am_pm(
 
     best: tuple[datetime.timedelta, datetime.time] | None = None
     for cand_time in candidates:
-        cand_dt = datetime.datetime.combine(
-            transaction_date, cand_time, tzinfo=_IST
-        )
+        cand_dt = datetime.datetime.combine(transaction_date, cand_time, tzinfo=_IST)
         delta = cand_dt - received_ist
         # Reject candidates too far after the email arrived — the
         # transaction can't be in the email's future.
@@ -546,6 +541,7 @@ async def handle_polled_email(
                     pending_notifications.append((0, txn_data))
             elif txn_data:
                 from financial_dashboard.services.txn_merge import merge_transaction
+
                 try:
                     outcome, txn_row, diff = await merge_transaction(
                         session, "email", txn_data, email_id=email_row.id
@@ -562,7 +558,10 @@ async def handle_polled_email(
                     stats["skipped"] += 1
                     logger.warning(
                         "Skipping duplicate transaction for email %s (rule=%s, source=%s): %s",
-                        msg_id, rule.id, source_id, exc.orig,
+                        msg_id,
+                        rule.id,
+                        source_id,
+                        exc.orig,
                     )
                 else:
                     email_row.status = "parsed"
@@ -677,7 +676,11 @@ async def handle_polled_email(
             # per-row dispatch path. The bulk-summary path below collapses
             # everything into one message and can't represent diffs.
             if pending_enrichment_notifications:
-                for enrich_txn_id, diff, enrich_info in pending_enrichment_notifications:
+                for (
+                    enrich_txn_id,
+                    diff,
+                    enrich_info,
+                ) in pending_enrichment_notifications:
                     await send_enrichment_notification(
                         enrich_txn_id,
                         diff,

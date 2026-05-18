@@ -136,6 +136,7 @@ def test_should_auto_reconcile_true_for_bill_payment_credit_with_account():
     from financial_dashboard.services.cc_disambiguation import (
         should_auto_reconcile_statement,
     )
+
     assert should_auto_reconcile_statement(_bare_txn()) is True
 
 
@@ -143,6 +144,7 @@ def test_should_auto_reconcile_false_for_debit():
     from financial_dashboard.services.cc_disambiguation import (
         should_auto_reconcile_statement,
     )
+
     assert should_auto_reconcile_statement(_bare_txn(direction="debit")) is False
 
 
@@ -150,6 +152,7 @@ def test_should_auto_reconcile_false_without_account_id():
     from financial_dashboard.services.cc_disambiguation import (
         should_auto_reconcile_statement,
     )
+
     assert should_auto_reconcile_statement(_bare_txn(account_id=None)) is False
 
 
@@ -159,12 +162,15 @@ def test_should_auto_reconcile_false_for_refund_shapes():
     from financial_dashboard.services.cc_disambiguation import (
         should_auto_reconcile_statement,
     )
-    assert should_auto_reconcile_statement(
-        _bare_txn(email_type="icici_cc_reversal")
-    ) is False
-    assert should_auto_reconcile_statement(
-        _bare_txn(email_type="hdfc_cc_refund_alert")
-    ) is False
+
+    assert (
+        should_auto_reconcile_statement(_bare_txn(email_type="icici_cc_reversal"))
+        is False
+    )
+    assert (
+        should_auto_reconcile_statement(_bare_txn(email_type="hdfc_cc_refund_alert"))
+        is False
+    )
 
 
 def test_is_cc_payment_received_email_rejects_unrelated_types():
@@ -201,11 +207,13 @@ async def test_returns_none_when_bank_has_single_cc_account(session):
 async def test_exact_total_match_picks_single_account(session):
     """Three CCs, only one has an open statement of the matching total."""
     a, b, c = await _seed_three_indusind_ccs(session)
-    session.add_all([
-        _stmt(account_id=a, total="1,616.00"),
-        _stmt(account_id=b, total="133.00"),  # ← the match
-        _stmt(account_id=c, total="4,661.00"),
-    ])
+    session.add_all(
+        [
+            _stmt(account_id=a, total="1,616.00"),
+            _stmt(account_id=b, total="133.00"),  # ← the match
+            _stmt(account_id=c, total="4,661.00"),
+        ]
+    )
     await session.flush()
     out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
     assert out == b
@@ -215,11 +223,13 @@ async def test_exact_total_match_picks_single_account(session):
 async def test_no_match_returns_none(session):
     """Three CCs, no open statement total equals the payment amount."""
     a, b, c = await _seed_three_indusind_ccs(session)
-    session.add_all([
-        _stmt(account_id=a, total="1,616.00"),
-        _stmt(account_id=b, total="500.00"),
-        _stmt(account_id=c, total="4,661.00"),
-    ])
+    session.add_all(
+        [
+            _stmt(account_id=a, total="1,616.00"),
+            _stmt(account_id=b, total="500.00"),
+            _stmt(account_id=c, total="4,661.00"),
+        ]
+    )
     await session.flush()
     out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
     assert out is None
@@ -229,11 +239,13 @@ async def test_no_match_returns_none(session):
 async def test_multiple_matches_returns_none(session):
     """Two open statements share the same total — refuse to guess."""
     a, b, c = await _seed_three_indusind_ccs(session)
-    session.add_all([
-        _stmt(account_id=a, total="133.00"),
-        _stmt(account_id=b, total="133.00"),
-        _stmt(account_id=c, total="500.00"),
-    ])
+    session.add_all(
+        [
+            _stmt(account_id=a, total="133.00"),
+            _stmt(account_id=b, total="133.00"),
+            _stmt(account_id=c, total="500.00"),
+        ]
+    )
     await session.flush()
     out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
     assert out is None
@@ -244,10 +256,12 @@ async def test_already_paid_statements_are_excluded(session):
     """A statement marked PAID is no longer a candidate even if its
     total matches the incoming payment amount."""
     a, b, _ = await _seed_three_indusind_ccs(session)
-    session.add_all([
-        _stmt(account_id=a, total="133.00", status=PaymentStatus.PAID),
-        _stmt(account_id=b, total="133.00", status=PaymentStatus.UNPAID),
-    ])
+    session.add_all(
+        [
+            _stmt(account_id=a, total="133.00", status=PaymentStatus.PAID),
+            _stmt(account_id=b, total="133.00", status=PaymentStatus.UNPAID),
+        ]
+    )
     await session.flush()
     out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
     assert out == b
@@ -258,10 +272,12 @@ async def test_statements_without_due_date_are_excluded(session):
     """A statement with no due_date is ineligible for the latest-cycle
     pick — match must come from an upload with a parseable due date."""
     a, b, _ = await _seed_three_indusind_ccs(session)
-    session.add_all([
-        _stmt(account_id=a, total="133.00", due_date=None),
-        _stmt(account_id=b, total="133.00"),
-    ])
+    session.add_all(
+        [
+            _stmt(account_id=a, total="133.00", due_date=None),
+            _stmt(account_id=b, total="133.00"),
+        ]
+    )
     await session.flush()
     out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
     assert out == b
@@ -273,13 +289,15 @@ async def test_only_latest_cycle_per_account_is_considered(session):
     cycle on the same account is already on file with a different
     total — matches the rule in check_payment_received."""
     a, b, _ = await _seed_three_indusind_ccs(session)
-    session.add_all([
-        # Account a: older cycle matches, but newer cycle is different.
-        _stmt(account_id=a, total="133.00", due_date="20/04/2026"),
-        _stmt(account_id=a, total="999.00", due_date="20/05/2026"),
-        # Account b: latest cycle matches.
-        _stmt(account_id=b, total="133.00", due_date="20/05/2026"),
-    ])
+    session.add_all(
+        [
+            # Account a: older cycle matches, but newer cycle is different.
+            _stmt(account_id=a, total="133.00", due_date="20/04/2026"),
+            _stmt(account_id=a, total="999.00", due_date="20/05/2026"),
+            # Account b: latest cycle matches.
+            _stmt(account_id=b, total="133.00", due_date="20/05/2026"),
+        ]
+    )
     await session.flush()
     out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
     assert out == b
@@ -293,19 +311,23 @@ async def test_unparseable_total_amount_due_is_skipped_and_logged(session, caplo
     import logging
 
     a, b, _ = await _seed_three_indusind_ccs(session)
-    session.add_all([
-        _stmt(account_id=a, total="₹133.00"),  # currency-prefixed, unparseable
-        _stmt(account_id=b, total="133.00"),
-    ])
+    session.add_all(
+        [
+            _stmt(account_id=a, total="₹133.00"),  # currency-prefixed, unparseable
+            _stmt(account_id=b, total="133.00"),
+        ]
+    )
     await session.flush()
 
-    with caplog.at_level(logging.WARNING, logger="financial_dashboard.services.cc_disambiguation"):
+    with caplog.at_level(
+        logging.WARNING, logger="financial_dashboard.services.cc_disambiguation"
+    ):
         out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
 
     assert out == b
-    assert any(
-        "not parseable" in rec.message for rec in caplog.records
-    ), f"expected a parseability warning, got: {[r.message for r in caplog.records]}"
+    assert any("not parseable" in rec.message for rec in caplog.records), (
+        f"expected a parseability warning, got: {[r.message for r in caplog.records]}"
+    )
 
 
 @pytest.mark.anyio
@@ -316,11 +338,13 @@ async def test_other_banks_are_not_considered(session):
     other = Account(bank="hdfc", type="credit_card", label="HDFC", active=True)
     session.add(other)
     await session.flush()
-    session.add_all([
-        _stmt(account_id=other.id, total="133.00"),
-        _stmt(account_id=a, total="999.00"),
-        _stmt(account_id=b, total="999.00"),
-    ])
+    session.add_all(
+        [
+            _stmt(account_id=other.id, total="133.00"),
+            _stmt(account_id=a, total="999.00"),
+            _stmt(account_id=b, total="999.00"),
+        ]
+    )
     await session.flush()
     out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
     assert out is None
@@ -424,11 +448,13 @@ async def test_resolver_auto_resolves_when_single_candidate(session):
 async def test_resolver_amount_match_auto_resolves(session):
     """Multi-CC bank, one matching open statement → auto-resolve to it."""
     a, b, c = await _seed_three_indusind_ccs(session)
-    session.add_all([
-        _stmt(account_id=a, total="1,616.00"),
-        _stmt(account_id=b, total="133.00"),  # match
-        _stmt(account_id=c, total="4,661.00"),
-    ])
+    session.add_all(
+        [
+            _stmt(account_id=a, total="1,616.00"),
+            _stmt(account_id=b, total="133.00"),  # match
+            _stmt(account_id=c, total="4,661.00"),
+        ]
+    )
     await session.flush()
     t = await _txn(session, amount=Decimal("133"))
     out = await resolve_cc_payment_account(session, t)
@@ -440,11 +466,13 @@ async def test_resolver_amount_match_auto_resolves(session):
 async def test_resolver_returns_prompt_payload_when_no_amount_match(session):
     """Multi-CC, no amount match → prompt payload, account_id stays None."""
     a, b, c = await _seed_three_indusind_ccs(session)
-    session.add_all([
-        _stmt(account_id=a, total="1,616.00"),
-        _stmt(account_id=b, total="500.00"),
-        _stmt(account_id=c, total="4,661.00"),
-    ])
+    session.add_all(
+        [
+            _stmt(account_id=a, total="1,616.00"),
+            _stmt(account_id=b, total="500.00"),
+            _stmt(account_id=c, total="4,661.00"),
+        ]
+    )
     await session.flush()
     t = await _txn(session, amount=Decimal("133"))
     out = await resolve_cc_payment_account(session, t)

@@ -228,7 +228,10 @@ def _find_card_match(
         logger.warning(
             "Ambiguous card-mask match in bank %r: incoming digits %r matched "
             "%d cards %r — refusing to link.",
-            bank_key, incoming_digits, len(matches), matches,
+            bank_key,
+            incoming_digits,
+            len(matches),
+            matches,
         )
     return None
 
@@ -253,7 +256,10 @@ def _find_account_match(
         logger.warning(
             "Ambiguous account-mask match in bank %r: incoming digits %r matched "
             "%d accounts %r — refusing to link.",
-            bank_key, incoming_digits, len(matches), matches,
+            bank_key,
+            incoming_digits,
+            len(matches),
+            matches,
         )
     return None
 
@@ -308,7 +314,11 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
                 txn.card_id = card_id
                 logger.debug(
                     "txn %s: linked via cards table (mask=%r -> digits=%s, account=%s card=%s)",
-                    txn.id, txn.card_mask, digits, acct_id, card_id,
+                    txn.id,
+                    txn.card_mask,
+                    digits,
+                    acct_id,
+                    card_id,
                 )
                 return True
 
@@ -321,7 +331,10 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
                 txn.account_id = hit
                 logger.debug(
                     "txn %s: linked via accounts table by card_mask (mask=%r -> digits=%s, account=%s)",
-                    txn.id, txn.card_mask, digits, hit,
+                    txn.id,
+                    txn.card_mask,
+                    digits,
+                    hit,
                 )
                 return True
 
@@ -334,7 +347,10 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
                 txn.account_id = hit
                 logger.debug(
                     "txn %s: linked via accounts table by account_mask (mask=%r -> digits=%s, account=%s)",
-                    txn.id, txn.account_mask, digits, hit,
+                    txn.id,
+                    txn.account_mask,
+                    digits,
+                    hit,
                 )
                 return True
 

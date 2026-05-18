@@ -367,10 +367,7 @@ async def send_enrichment_notification(
             amount_str = f"{amount:,.2f}"
             bank = html.escape(str(txn_info.get("bank", "")).upper())
             counterparty = html.escape(str(txn_info.get("counterparty", "") or ""))
-            header = (
-                f"\U0001f504 <b>{bank}</b> #{txn_id} "
-                f"{sign}₹{amount_str}"
-            )
+            header = f"\U0001f504 <b>{bank}</b> #{txn_id} {sign}₹{amount_str}"
             if counterparty:
                 header += f" {counterparty}"
             header += f" — {diff_text} ({badge})"
@@ -404,16 +401,16 @@ async def send_disambiguation_prompt(payload: dict, chat_id: int) -> None:
     buttons = []
     for acct_id in payload["candidate_account_ids"]:
         label = payload["candidate_labels"].get(acct_id, f"Account #{acct_id}")
-        buttons.append([
-            InlineKeyboardButton(
-                label, callback_data=f"cc_pay_pick:{txn_id}:{acct_id}"
-            )
-        ])
-    buttons.append([
-        InlineKeyboardButton(
-            "Skip", callback_data=f"cc_pay_pick:{txn_id}:skip"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    label, callback_data=f"cc_pay_pick:{txn_id}:{acct_id}"
+                )
+            ]
         )
-    ])
+    buttons.append(
+        [InlineKeyboardButton("Skip", callback_data=f"cc_pay_pick:{txn_id}:skip")]
+    )
     await app.bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -440,9 +437,7 @@ async def _handle_cc_pay_pick_callback(update, context) -> None:
         return
 
     if choice == "skip":
-        await query.edit_message_text(
-            f"#{txn_id}: skipped (no statement marked paid)"
-        )
+        await query.edit_message_text(f"#{txn_id}: skipped (no statement marked paid)")
         return
 
     try:
@@ -464,6 +459,4 @@ async def _handle_cc_pay_pick_callback(update, context) -> None:
     except Exception as exc:
         logger.warning("check_payment_received failed for txn %s: %s", txn_id, exc)
 
-    await query.edit_message_text(
-        f"#{txn_id}: applied to account #{account_id}"
-    )
+    await query.edit_message_text(f"#{txn_id}: applied to account #{account_id}")

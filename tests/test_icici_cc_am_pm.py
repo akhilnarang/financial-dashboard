@@ -145,7 +145,9 @@ def test_disambiguate_passes_hour_zero_through_unchanged():
     emits 1..12, never 0). Pass through untouched — do NOT treat it as
     ambiguous and flip it to noon."""
     received = datetime.datetime(2026, 5, 17, 12, 30, 0, tzinfo=datetime.timezone.utc)
-    out = _disambiguate_am_pm(datetime.time(0, 15, 0), datetime.date(2026, 5, 17), received)
+    out = _disambiguate_am_pm(
+        datetime.time(0, 15, 0), datetime.date(2026, 5, 17), received
+    )
     assert out == datetime.time(0, 15, 0)
 
 

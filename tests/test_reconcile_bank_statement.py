@@ -592,7 +592,9 @@ def test_disagreeing_refs_with_fuzzy_date_refused_even_with_substring_evidence()
     # ±1 day candidate (db 200) has a different ref + substring evidence,
     # but ±1 with both-refs-disagree should be refused. Result: db 201
     # matches; db 200 does not.
-    recon = reconcile_bank_statement(parsed, [db_with_ref, db_without_ref], account_id=1)
+    recon = reconcile_bank_statement(
+        parsed, [db_with_ref, db_without_ref], account_id=1
+    )
 
     assert len(recon["matched"]) == 1, recon
     assert recon["matched"][0]["db_txn_id"] == 201

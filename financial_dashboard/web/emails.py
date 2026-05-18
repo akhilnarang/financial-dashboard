@@ -619,9 +619,7 @@ async def reparse_all_failed(
                                 select(Transaction).where(Transaction.email_id == em.id)
                             )
                         ).scalar_one_or_none()
-                        was_orphaned = (
-                            existing is None or existing.account_id is None
-                        )
+                        was_orphaned = existing is None or existing.account_id is None
                         if existing is not None:
                             for key, value in txn_data.items():
                                 setattr(existing, key, value)

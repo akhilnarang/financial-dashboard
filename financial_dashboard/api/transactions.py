@@ -46,9 +46,7 @@ async def update_category(
     return TransactionCategoryResponse(ok=True, category=category)
 
 
-@router.post(
-    "/transactions/{txn_id}/relink", response_model=TransactionRelinkResponse
-)
+@router.post("/transactions/{txn_id}/relink", response_model=TransactionRelinkResponse)
 async def relink(
     txn_id: int,
     payload: TransactionRelinkUpdate,
