@@ -73,9 +73,10 @@
     {% endif %}
     {% if sms %}
     {% set sms_body = (sms.body or "").strip() %}
+    {% set sms_label = (sms_body[:60] ~ ("…" if sms_body|length > 60 else "")) if sms_body else ("SMS #" ~ sms.id) %}
     <div>
         <dt>Linked SMS</dt>
-        <dd class="text-sm"><a href="#" onclick="openDetailModal('/sms/{{ sms.id }}/detail'); return false;" style="cursor: pointer;" title="{{ sms.body }}">{{ sms_body[:60] }}{% if sms_body|length > 60 %}…{% endif %}</a></dd>
+        <dd class="text-sm"><a href="#" onclick="openDetailModal('/sms/{{ sms.id }}/detail'); return false;" style="cursor: pointer;" title="{{ sms.body }}">{{ sms_label }}</a></dd>
     </div>
     {% endif %}
 </dl>
