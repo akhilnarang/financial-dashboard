@@ -120,9 +120,7 @@ async def relink_transaction(
     if account_id is not None:
         account_obj = await session.get(Account, account_id)
         if account_obj is None:
-            raise RelinkError(
-                "account_not_found", f"Account #{account_id} not found."
-            )
+            raise RelinkError("account_not_found", f"Account #{account_id} not found.")
         if account_obj.bank != txn.bank:
             raise RelinkError(
                 "bank_mismatch",
@@ -142,10 +140,19 @@ async def relink_transaction(
     # the statement update commits in its own scope (the existing
     # reminders helper opens its own async_session). Same shape as
     # the email-reparse path.
-    if was_orphaned and should_auto_reconcile_statement(txn):
+    #
+    # `should_auto_reconcile_statement` guarantees `account_id is not
+    # None`, but ty can't narrow through a helper call — re-check
+    # locally so the downstream `int` argument types cleanly.
+    if (
+        was_orphaned
+        and should_auto_reconcile_statement(txn)
+        and txn.account_id is not None
+    ):
+        resolved_account_id = txn.account_id
         try:
             statement_marked_paid = await check_payment_received(
-                txn.id, txn.account_id, txn.amount
+                txn.id, resolved_account_id, txn.amount
             )
         except Exception:  # noqa: BLE001
             # Don't fail the relink just because the statement-marking
@@ -155,7 +162,8 @@ async def relink_transaction(
                 "check_payment_received failed during relink of txn %s "
                 "to account %s; the link was set but no statement was "
                 "auto-marked.",
-                txn.id, txn.account_id,
+                txn.id,
+                resolved_account_id,
             )
             statement_marked_paid = False
 

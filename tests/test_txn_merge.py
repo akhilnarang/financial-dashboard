@@ -140,12 +140,15 @@ async def test_find_match_by_reference_number_hits(session: AsyncSession):
     session.add(existing)
     await session.flush()
 
-    match = await find_match(session, {
-        "bank": "hdfc",
-        "direction": "debit",
-        "amount": Decimal("500"),
-        "reference_number": "IMPS:000000000001",
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "reference_number": "IMPS:000000000001",
+        },
+    )
     assert match is not None
     row, kind = match
     assert row.id == existing.id
@@ -173,12 +176,15 @@ async def test_find_match_by_reference_number_direction_distinguishes(
     session.add_all([debit, credit])
     await session.flush()
 
-    match = await find_match(session, {
-        "bank": "hdfc",
-        "direction": "credit",
-        "amount": Decimal("500"),
-        "reference_number": "IMPS:2",
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "direction": "credit",
+            "amount": Decimal("500"),
+            "reference_number": "IMPS:2",
+        },
+    )
     assert match is not None
     assert match[0].id == credit.id
     assert match[1] == "standard"
@@ -189,12 +195,15 @@ async def test_find_match_empty_reference_treated_as_null(
     session: AsyncSession,
 ):
     # No txn exists with reference_number=""; find_match should not match.
-    match = await find_match(session, {
-        "bank": "hdfc",
-        "direction": "debit",
-        "amount": Decimal("500"),
-        "reference_number": "",
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "reference_number": "",
+        },
+    )
     assert match is None
 
 
@@ -215,15 +224,18 @@ async def test_find_match_fuzzy_window_hits_within_10min(
     await session.flush()
 
     # 5 minutes later — within window
-    match = await find_match(session, {
-        "bank": "hdfc",
-        "direction": "debit",
-        "amount": Decimal("500"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 2),
-        "transaction_time": time(14, 28, 0),
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 2),
+            "transaction_time": time(14, 28, 0),
+        },
+    )
     assert match is not None
     assert match[0].id == existing.id
     assert match[1] == "standard"
@@ -246,15 +258,18 @@ async def test_find_match_fuzzy_window_misses_outside_10min(
     await session.flush()
 
     # 15 minutes later — outside window
-    match = await find_match(session, {
-        "bank": "hdfc",
-        "direction": "debit",
-        "amount": Decimal("500"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 2),
-        "transaction_time": time(14, 38, 0),
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 2),
+            "transaction_time": time(14, 38, 0),
+        },
+    )
     assert match is None
 
 
@@ -278,16 +293,19 @@ async def test_find_match_fuzzy_date_only_requires_counterparty_agreement(
     await session.flush()
 
     # No counterparty on either side → must NOT match.
-    match = await find_match(session, {
-        "bank": "axis",
-        "direction": "credit",
-        "amount": Decimal("15000"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 2),
-        "transaction_time": None,
-        "counterparty": None,
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "axis",
+            "direction": "credit",
+            "amount": Decimal("15000"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 2),
+            "transaction_time": None,
+            "counterparty": None,
+        },
+    )
     assert match is None
 
 
@@ -297,28 +315,41 @@ async def test_find_match_fuzzy_counterparty_tiebreaker(
 ):
     # Two candidates in window; one matches counterparty substring.
     t1 = Transaction(
-        bank="hdfc", email_type="t", direction="debit", amount=Decimal("500"),
-        currency="INR", transaction_date=date(2026, 5, 2),
-        transaction_time=time(14, 23), counterparty="Zomato Online Order"
+        bank="hdfc",
+        email_type="t",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 2),
+        transaction_time=time(14, 23),
+        counterparty="Zomato Online Order",
     )
     t2 = Transaction(
-        bank="hdfc", email_type="t", direction="debit", amount=Decimal("500"),
-        currency="INR", transaction_date=date(2026, 5, 2),
-        transaction_time=time(14, 27), counterparty="Swiggy Instamart"
+        bank="hdfc",
+        email_type="t",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 2),
+        transaction_time=time(14, 27),
+        counterparty="Swiggy Instamart",
     )
     session.add_all([t1, t2])
     await session.flush()
 
-    match = await find_match(session, {
-        "bank": "hdfc",
-        "direction": "debit",
-        "amount": Decimal("500"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 2),
-        "transaction_time": time(14, 25),
-        "counterparty": "ZOMATO",
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 2),
+            "transaction_time": time(14, 25),
+            "counterparty": "ZOMATO",
+        },
+    )
     assert match is not None
     assert match[0].id == t1.id
     assert match[1] == "standard"
@@ -329,25 +360,31 @@ async def test_find_match_fuzzy_currency_must_match(
     session: AsyncSession,
 ):
     existing = Transaction(
-        bank="onecard", email_type="t", direction="debit", amount=Decimal("100"),
-        currency="USD", transaction_date=date(2026, 5, 2),
+        bank="onecard",
+        email_type="t",
+        direction="debit",
+        amount=Decimal("100"),
+        currency="USD",
+        transaction_date=date(2026, 5, 2),
         transaction_time=time(10, 0),
     )
     session.add(existing)
     await session.flush()
 
     # Same amount, INR — must not match.
-    match = await find_match(session, {
-        "bank": "onecard",
-        "direction": "debit",
-        "amount": Decimal("100"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 2),
-        "transaction_time": time(10, 5),
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "onecard",
+            "direction": "debit",
+            "amount": Decimal("100"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 2),
+            "transaction_time": time(10, 5),
+        },
+    )
     assert match is None
-
 
 
 @pytest.mark.anyio
@@ -391,9 +428,7 @@ async def test_merge_transaction_create_path_sets_email_id(
         "currency": "INR",
         "transaction_date": date(2026, 5, 2),
     }
-    outcome, row, _ = await merge_transaction(
-        session, "email", txn_data, email_id=42
-    )
+    outcome, row, _ = await merge_transaction(session, "email", txn_data, email_id=42)
     assert outcome == "created"
     assert row.email_id == 42
     assert row.source == "email"
@@ -402,17 +437,24 @@ async def test_merge_transaction_create_path_sets_email_id(
 @pytest.mark.anyio
 async def test_merge_transaction_enrich_fills_null(session: AsyncSession):
     sms_row = Transaction(
-        bank="hdfc", email_type="hdfc_dc_transaction_alert", direction="debit",
-        amount=Decimal("500"), currency="INR",
-        transaction_date=date(2026, 5, 2), transaction_time=time(14, 23),
-        reference_number="IMPS:1234", source="sms", notified_channel="sms",
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 2),
+        transaction_time=time(14, 23),
+        reference_number="IMPS:1234",
+        source="sms",
+        notified_channel="sms",
         counterparty=None,
     )
     session.add(sms_row)
     await session.flush()
 
     outcome, row, diff = await merge_transaction(
-        session, "email",
+        session,
+        "email",
         {
             "bank": "hdfc",
             "email_type": "hdfc_dc_transaction_alert",
@@ -432,8 +474,8 @@ async def test_merge_transaction_enrich_fills_null(session: AsyncSession):
     assert row.counterparty == "Phone Pe Private Limited"
     assert row.channel == "upi"
     assert row.source == "sms+email"
-    assert row.notified_channel == "sms"     # unchanged
-    assert row.email_id == 99                # filled at enrich time
+    assert row.notified_channel == "sms"  # unchanged
+    assert row.email_id == 99  # filled at enrich time
     assert row.enriched_at is not None
     assert "counterparty" in diff.filled
     assert "channel" in diff.filled
@@ -442,17 +484,24 @@ async def test_merge_transaction_enrich_fills_null(session: AsyncSession):
 @pytest.mark.anyio
 async def test_merge_transaction_email_overrides_sms_value(session: AsyncSession):
     sms_row = Transaction(
-        bank="hdfc", email_type="hdfc_dc_transaction_alert", direction="debit",
-        amount=Decimal("500"), currency="INR",
-        transaction_date=date(2026, 5, 2), transaction_time=time(14, 23),
-        reference_number="IMPS:5678", source="sms", notified_channel="sms",
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 2),
+        transaction_time=time(14, 23),
+        reference_number="IMPS:5678",
+        source="sms",
+        notified_channel="sms",
         counterparty="PZCREDIT0000000",
     )
     session.add(sms_row)
     await session.flush()
 
     outcome, row, diff = await merge_transaction(
-        session, "email",
+        session,
+        "email",
         {
             "bank": "hdfc",
             "email_type": "hdfc_dc_transaction_alert",
@@ -466,7 +515,10 @@ async def test_merge_transaction_email_overrides_sms_value(session: AsyncSession
     )
     assert outcome == "enriched"
     assert row.counterparty == "Phone Pe Private Limited"
-    assert diff.overwritten["counterparty"] == ("PZCREDIT0000000", "Phone Pe Private Limited")
+    assert diff.overwritten["counterparty"] == (
+        "PZCREDIT0000000",
+        "Phone Pe Private Limited",
+    )
 
 
 @pytest.mark.anyio
@@ -474,17 +526,24 @@ async def test_merge_transaction_sms_does_not_override_email_value(
     session: AsyncSession,
 ):
     email_row = Transaction(
-        bank="hdfc", email_type="hdfc_dc_transaction_alert", direction="debit",
-        amount=Decimal("500"), currency="INR",
-        transaction_date=date(2026, 5, 2), transaction_time=time(14, 23),
-        reference_number="IMPS:7777", source="email", notified_channel="email",
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 2),
+        transaction_time=time(14, 23),
+        reference_number="IMPS:7777",
+        source="email",
+        notified_channel="email",
         counterparty="Phone Pe Private Limited",
     )
     session.add(email_row)
     await session.flush()
 
     outcome, row, diff = await merge_transaction(
-        session, "sms",
+        session,
+        "sms",
         {
             "bank": "hdfc",
             "email_type": "hdfc_dc_transaction_alert",
@@ -497,10 +556,10 @@ async def test_merge_transaction_sms_does_not_override_email_value(
         sms_message_id=5,
     )
     assert outcome == "enriched"
-    assert row.counterparty == "Phone Pe Private Limited"   # SMS does NOT overwrite
-    assert row.sms_message_id == 5                          # but FK fills in
+    assert row.counterparty == "Phone Pe Private Limited"  # SMS does NOT overwrite
+    assert row.sms_message_id == 5  # but FK fills in
     assert row.source == "sms+email"
-    assert diff.changed_fields == []                         # silent enrichment
+    assert diff.changed_fields == []  # silent enrichment
 
 
 @pytest.mark.anyio
@@ -508,15 +567,21 @@ async def test_merge_transaction_email_type_is_immutable(
     session: AsyncSession,
 ):
     sms_row = Transaction(
-        bank="hdfc", email_type="hdfc_dc_transaction_alert",
-        direction="debit", amount=Decimal("100"), currency="INR",
-        reference_number="IMPS:X", source="sms", notified_channel="sms",
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",
+        direction="debit",
+        amount=Decimal("100"),
+        currency="INR",
+        reference_number="IMPS:X",
+        source="sms",
+        notified_channel="sms",
     )
     session.add(sms_row)
     await session.flush()
 
     _, row, _ = await merge_transaction(
-        session, "email",
+        session,
+        "email",
         {
             "bank": "hdfc",
             "email_type": "some_other_classification",  # would-be different
@@ -555,16 +620,19 @@ async def test_am_pm_alias_match_recovers_pm_stored_as_am(session: AsyncSession)
     session.add(existing)
     await session.flush()
 
-    match = await find_match(session, {
-        "bank": "icici",
-        "direction": "debit",
-        "amount": Decimal("320000"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 16),
-        "transaction_time": time(22, 33, 30),  # SMS-derived correct time
-        "counterparty": "INDIAN INSTITUT",
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "icici",
+            "direction": "debit",
+            "amount": Decimal("320000"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(22, 33, 30),  # SMS-derived correct time
+            "counterparty": "INDIAN INSTITUT",
+        },
+    )
     assert match is not None
     row, kind = match
     assert row.id == existing.id
@@ -596,16 +664,19 @@ async def test_am_pm_alias_match_recovers_midnight_stored_as_noon(
     session.add(existing)
     await session.flush()
 
-    match = await find_match(session, {
-        "bank": "icici",
-        "direction": "debit",
-        "amount": Decimal("500"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 16),
-        "transaction_time": time(0, 55, 30),  # SMS-derived correct time
-        "counterparty": "LATE NIGHT KITCHEN",
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "icici",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(0, 55, 30),  # SMS-derived correct time
+            "counterparty": "LATE NIGHT KITCHEN",
+        },
+    )
     assert match is not None
     row, kind = match
     assert row.id == existing.id
@@ -632,16 +703,19 @@ async def test_am_pm_alias_match_does_not_fire_for_safe_email_types(
     session.add(existing)
     await session.flush()
 
-    match = await find_match(session, {
-        "bank": "hdfc",
-        "direction": "debit",
-        "amount": Decimal("500"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 16),
-        "transaction_time": time(22, 33, 11),
-        "counterparty": "ZOMATO",
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(22, 33, 11),
+            "counterparty": "ZOMATO",
+        },
+    )
     assert match is None
 
 
@@ -665,16 +739,19 @@ async def test_am_pm_alias_match_requires_counterparty_agreement(
     session.add(existing)
     await session.flush()
 
-    match = await find_match(session, {
-        "bank": "icici",
-        "direction": "debit",
-        "amount": Decimal("500"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 16),
-        "transaction_time": time(22, 30, 0),  # 12h offset
-        "counterparty": "DOMINOS PIZZA",  # different merchant
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "icici",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(22, 30, 0),  # 12h offset
+            "counterparty": "DOMINOS PIZZA",  # different merchant
+        },
+    )
     assert match is None
 
 
@@ -700,16 +777,19 @@ async def test_am_pm_alias_refuses_when_either_side_lacks_counterparty(
     await session.flush()
 
     # Incoming with no counterparty — must NOT match.
-    match = await find_match(session, {
-        "bank": "icici",
-        "direction": "debit",
-        "amount": Decimal("500"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 16),
-        "transaction_time": time(22, 30, 0),
-        "counterparty": None,
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "icici",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(22, 30, 0),
+            "counterparty": None,
+        },
+    )
     assert match is None
 
 
@@ -721,15 +801,21 @@ async def test_am_pm_alias_returns_none_when_multiple_alias_candidates(
     filter (same merchant, same amount, both stored ~12h off). The
     pass must refuse rather than guess."""
     t1 = Transaction(
-        bank="icici", email_type="icici_cc_transaction_alert",
-        direction="debit", amount=Decimal("500"), currency="INR",
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
         transaction_date=date(2026, 5, 16),
         transaction_time=time(10, 30, 0),
         counterparty="STARBUCKS",
     )
     t2 = Transaction(
-        bank="icici", email_type="icici_cc_transaction_alert",
-        direction="debit", amount=Decimal("500"), currency="INR",
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
         transaction_date=date(2026, 5, 16),
         transaction_time=time(10, 32, 0),  # also within the aliased window
         counterparty="STARBUCKS",
@@ -737,17 +823,66 @@ async def test_am_pm_alias_returns_none_when_multiple_alias_candidates(
     session.add_all([t1, t2])
     await session.flush()
 
-    match = await find_match(session, {
-        "bank": "icici",
-        "direction": "debit",
-        "amount": Decimal("500"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 16),
-        "transaction_time": time(22, 30, 30),  # 12h offset from t1
-        "counterparty": "STARBUCKS",
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "icici",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(22, 30, 30),  # 12h offset from t1
+            "counterparty": "STARBUCKS",
+        },
+    )
     assert match is None
+
+
+@pytest.mark.anyio
+async def test_am_pm_alias_plus12h_only_targets_noon_stored_candidates(
+    session: AsyncSession,
+):
+    """The +12h alias direction exists only to recover the
+    midnight-stored-as-noon case (real 00:xx stored as 12:xx). It must
+    NOT match a correctly-stored PM email when an unrelated morning
+    SMS for the same amount/merchant happens to differ by exactly 12h.
+
+    Scenario: a real PM ICICI debit at 15:00:00 was correctly parsed by
+    the post-fix email pipeline (so its stored transaction_time is the
+    truth, 15:00:00). A separate, unrelated SMS at 03:00:00 with the
+    same amount and merchant must NOT trigger the +12h alias and
+    overwrite the PM row's correct time."""
+    real_pm = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(15, 0, 0),  # correctly stored PM
+        counterparty="STARBUCKS",
+    )
+    session.add(real_pm)
+    await session.flush()
+
+    match = await find_match(
+        session,
+        {
+            "bank": "icici",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(3, 0, 0),  # unrelated AM SMS, 12h offset
+            "counterparty": "STARBUCKS",
+        },
+    )
+    assert match is None, (
+        "alias +12h must not match candidates whose stored hour != 12 — "
+        "those are correctly-stored PM rows, not midnight-as-noon bugs"
+    )
 
 
 @pytest.mark.anyio
@@ -769,16 +904,19 @@ async def test_am_pm_alias_does_not_run_when_standard_pass_succeeds(
     session.add(existing)
     await session.flush()
 
-    match = await find_match(session, {
-        "bank": "icici",
-        "direction": "debit",
-        "amount": Decimal("100"),
-        "currency": "INR",
-        "reference_number": None,
-        "transaction_date": date(2026, 5, 16),
-        "transaction_time": time(22, 33, 0),  # within ±10 min
-        "counterparty": "ZEPTO",
-    })
+    match = await find_match(
+        session,
+        {
+            "bank": "icici",
+            "direction": "debit",
+            "amount": Decimal("100"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(22, 33, 0),  # within ±10 min
+            "counterparty": "ZEPTO",
+        },
+    )
     assert match is not None
     row, kind = match
     assert row.id == existing.id
@@ -809,7 +947,8 @@ async def test_merge_transaction_alias_match_overwrites_transaction_time(
     await session.flush()
 
     outcome, row, diff = await merge_transaction(
-        session, "sms",
+        session,
+        "sms",
         {
             "bank": "icici",
             "email_type": "icici_cc_payment_received_alert",  # SMS shape

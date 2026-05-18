@@ -60,7 +60,9 @@ _ENRICHMENT_FIELDS = (
 )
 
 
-def compute_enrichment_diff(existing, incoming: dict, channel: Channel) -> EnrichmentDiff:
+def compute_enrichment_diff(
+    existing, incoming: dict, channel: Channel
+) -> EnrichmentDiff:
     """Pure function. Does NOT mutate.
 
     Conflict rule:
@@ -164,6 +166,7 @@ async def find_match(
         date_lower = date_upper = txn_date
 
     from sqlalchemy import func as sa_func
+
     result = await session.execute(
         select(Transaction).where(
             Transaction.bank == txn_data["bank"],
@@ -185,6 +188,7 @@ async def find_match(
                 return True
             c_dt = datetime.combine(c.transaction_date, c.transaction_time)
             return lower <= c_dt <= upper
+
         candidates = [c for c in candidates if in_window(c)]
 
     incoming_cp = txn_data.get("counterparty")
@@ -196,7 +200,9 @@ async def find_match(
         # day would otherwise silently merge.
         if incoming_time is None or any(c.transaction_time is None for c in candidates):
             filtered = [
-                c for c in candidates if _counterparty_match(c.counterparty, incoming_cp)
+                c
+                for c in candidates
+                if _counterparty_match(c.counterparty, incoming_cp)
             ]
             if len(filtered) == 1:
                 return filtered[0], "standard"
@@ -243,20 +249,31 @@ async def _find_am_pm_alias_match(
 
     Why: ICICI CC transaction-alert emails parsed before the email-side
     AM/PM disambiguator shipped have a transaction_time that may be 12h
-    off in either direction:
+    off, but only in shape-specific directions:
 
-      - hour<12 case: real 22:33 PM stored as 10:33 AM (pre-fix parser
-        treated the 12-hour body time as 24-hour). Recover via the
-        ``incoming - 12h`` window.
-      - hour==12 case: real 00:55 midnight stored as 12:55 noon (the
-        body says "12:55:20" — the pre-fix parser chose 12:55 from
-        the two 12-hour candidates). Recover via the ``incoming + 12h``
-        window.
+      - PM-stored-as-AM (the hour<12 case in `_disambiguate_am_pm`):
+        real 22:33 stored as 10:33. The CANDIDATE'S hour is in 1–11.
+        The INCOMING is the corrected PM time, hour ≥ 12. Recover by
+        shifting incoming by -12h and matching candidates with
+        ``transaction_time.hour < 12``.
+      - midnight-stored-as-noon (the hour==12 case): body says
+        "12:55:20" — both midnight (00:55) and noon (12:55) are valid
+        12-hour readings, and the pre-fix parser defaulted to 12:55.
+        The CANDIDATE'S hour is exactly 12. The INCOMING is the
+        corrected 00:xx time, hour < 12. Recover by shifting incoming
+        by +12h and matching candidates with
+        ``transaction_time.hour == 12``.
 
-    Counterparty must be present on BOTH sides AND match: it's the
-    primary protection against false-merging two genuine same-amount
-    same-card same-day purchases that happen to be exactly 12h apart
-    at the same merchant.
+    These are the ONLY two miscoding shapes the disambiguator
+    produced. A broad ±12h search risks false-merging unrelated
+    same-amount same-merchant transactions that happen to differ by
+    exactly 12h (e.g., a 03:00 AM SMS over a correctly-stored 15:00
+    PM email). The shape-aware filter rules those out.
+
+    Counterparty must be present on BOTH sides AND match — primary
+    protection against false-merging two genuine same-amount same-card
+    same-day purchases that happen to be exactly 12h apart at the same
+    merchant.
 
     Returns the single matching candidate across both alias windows,
     or None on zero / multiple matches (including the counterparty-
@@ -265,22 +282,46 @@ async def _find_am_pm_alias_match(
     if not incoming_cp:
         return None
 
+    # Decide which alias directions are worth searching. Hour ranges
+    # map directly to the two storage bugs.
+    search_minus = incoming_time.hour >= 12  # PM incoming → AM candidate
+    search_plus = incoming_time.hour < 12  # AM incoming → noon candidate
+    if not search_minus and not search_plus:
+        return None  # defensive; the hour predicates are exhaustive
+
     anchor = datetime.combine(txn_date, incoming_time)
 
-    def _window(offset_hours: int) -> tuple[datetime, datetime, object, object]:
+    def _window(offset_hours: int) -> tuple[datetime, datetime]:
         center = anchor + timedelta(hours=offset_hours)
         lo = center - timedelta(minutes=_FUZZY_MATCH_WINDOW_MINUTES)
         hi = center + timedelta(minutes=_FUZZY_MATCH_WINDOW_MINUTES)
-        return lo, hi, lo.date(), hi.date()
+        return lo, hi
 
     from sqlalchemy import and_, or_
     from sqlalchemy import func as sa_func
 
-    minus_lo, minus_hi, minus_date_lo, minus_date_hi = _window(-12)
-    plus_lo, plus_hi, plus_date_lo, plus_date_hi = _window(+12)
+    date_clauses = []
+    minus_lo = minus_hi = plus_lo = plus_hi = None
+    if search_minus:
+        minus_lo, minus_hi = _window(-12)
+        date_clauses.append(
+            and_(
+                Transaction.transaction_date >= minus_lo.date(),
+                Transaction.transaction_date <= minus_hi.date(),
+            )
+        )
+    if search_plus:
+        plus_lo, plus_hi = _window(+12)
+        date_clauses.append(
+            and_(
+                Transaction.transaction_date >= plus_lo.date(),
+                Transaction.transaction_date <= plus_hi.date(),
+            )
+        )
 
-    # One query covering both ±12h date ranges. Per-row window
-    # membership is enforced in Python so the SQL stays simple.
+    # One query covering the active date range(s). Per-row window
+    # membership AND the storage-shape gate (hour<12 vs hour==12) are
+    # enforced in Python so the SQL stays simple.
     result = await session.execute(
         select(Transaction).where(
             Transaction.bank == txn_data["bank"],
@@ -290,25 +331,30 @@ async def _find_am_pm_alias_match(
             Transaction.email_type.in_(AMBIGUOUS_12H_TIME_EMAIL_TYPES),
             Transaction.transaction_time.is_not(None),
             Transaction.transaction_date.is_not(None),
-            or_(
-                and_(
-                    Transaction.transaction_date >= minus_date_lo,
-                    Transaction.transaction_date <= minus_date_hi,
-                ),
-                and_(
-                    Transaction.transaction_date >= plus_date_lo,
-                    Transaction.transaction_date <= plus_date_hi,
-                ),
-            ),
+            or_(*date_clauses),
         )
     )
     rows = list(result.scalars().all())
 
-    def in_either_window(c) -> bool:
+    def matches_minus(c) -> bool:
+        # PM-stored-as-AM: candidate's hour must be in 1..11.
+        if not search_minus or minus_lo is None or minus_hi is None:
+            return False
+        if not (1 <= c.transaction_time.hour < 12):
+            return False
         c_dt = datetime.combine(c.transaction_date, c.transaction_time)
-        return (minus_lo <= c_dt <= minus_hi) or (plus_lo <= c_dt <= plus_hi)
+        return minus_lo <= c_dt <= minus_hi
 
-    candidates = [c for c in rows if in_either_window(c)]
+    def matches_plus(c) -> bool:
+        # midnight-stored-as-noon: candidate's hour must be exactly 12.
+        if not search_plus or plus_lo is None or plus_hi is None:
+            return False
+        if c.transaction_time.hour != 12:
+            return False
+        c_dt = datetime.combine(c.transaction_date, c.transaction_time)
+        return plus_lo <= c_dt <= plus_hi
+
+    candidates = [c for c in rows if matches_minus(c) or matches_plus(c)]
     # Counterparty prerequisite: BOTH sides must have a counterparty
     # AND they must agree. Already gated above that incoming_cp is
     # truthy; here filter candidates whose counterparty matches.
