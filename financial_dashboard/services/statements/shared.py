@@ -1,4 +1,3 @@
-# ty: ignore
 """Statement retry helpers extracted from app routes."""
 
 from __future__ import annotations
@@ -90,13 +89,18 @@ async def retry_cc_statement_upload(
                     hi + timedelta(days=STMT_RECONCILE_DATE_BUFFER_DAYS),
                 )
             )
-        db_txns = (await session.execute(stmt)).scalars().all()
+        db_txns = list((await session.execute(stmt)).scalars().all())
 
         recon = reconcile_statement(parsed, db_txns, account_id)
         await enrich_matched_transactions(recon)
 
         upload = await session.get(StatementUpload, upload_id)
         account = await session.get(Account, account_id)
+        if upload is None or account is None:
+            # The upload was deleted (or its account was) between the
+            # first transaction and this one. Bail; nothing safe to
+            # reconcile against.
+            return False
         upload.status = "parsed"
         upload.bank = parsed.bank
         upload.card_number = parsed.card_number
@@ -169,12 +173,15 @@ async def retry_bank_statement_upload(
                     hi + timedelta(days=STMT_RECONCILE_DATE_BUFFER_DAYS),
                 )
             )
-        db_txns = (await session.execute(stmt)).scalars().all()
+        db_txns = list((await session.execute(stmt)).scalars().all())
 
         recon = reconcile_bank_statement(parsed, db_txns, account_id)
         await enrich_bank_matched_transactions(recon)
 
         upload = await session.get(BankStatementUpload, upload_id)
+        if upload is None:
+            # The upload was deleted between the first txn and this one.
+            return False
         upload.status = "parsed"
         upload.account_number = parsed.account_number
         upload.account_holder_name = parsed.account_holder_name

@@ -1,4 +1,3 @@
-# ty: ignore
 """Payment reminder logic: scheduling, mark-as-paid, and auto-detection.
 
 Payment tracking fields live on StatementUpload directly:
@@ -175,6 +174,8 @@ async def check_and_send_reminders() -> int:
 
             already_sent = set(json.loads(upload.payment_sent_offsets or "[]"))
 
+            if upload.total_amount_due is None:
+                continue
             try:
                 amount_due = parse_cc_amount(upload.total_amount_due)
             except ValueError, InvalidOperation:
@@ -368,6 +369,8 @@ async def check_payment_received(txn_id: int, account_id: int, amount) -> bool:
             return False
         upload = latest[0]
 
+        if upload.total_amount_due is None:
+            return False
         try:
             amount_due = parse_cc_amount(upload.total_amount_due)
         except ValueError, InvalidOperation:

@@ -1,4 +1,3 @@
-# ty: ignore
 """Email body and spool helpers."""
 
 from __future__ import annotations
@@ -106,41 +105,39 @@ def _cleanup_failed_spool() -> None:
             logger.debug("Cleaned up old failed email: %s", path.name)
 
 
-def _extract_html_body(raw_bytes: bytes) -> str | None:
-    """Extract the HTML body from raw email bytes."""
+def _extract_body_by_type(raw_bytes: bytes, content_type: str) -> str | None:
+    """Extract a body of ``content_type`` from raw email bytes.
+
+    ``Message.get_payload(decode=True)`` returns bytes for leaf parts
+    per the documented behavior, but stub annotations widen it to a
+    union (Message | bytes | Any). Guard the decode with an
+    ``isinstance`` so the union is narrowed before ``.decode()``.
+    """
     msg = email_lib.message_from_bytes(raw_bytes)
+
+    def _decode(part) -> str | None:
+        payload = part.get_payload(decode=True)
+        if not isinstance(payload, bytes) or not payload:
+            return None
+        charset = part.get_content_charset() or "utf-8"
+        return payload.decode(charset, errors="replace")
+
     if msg.is_multipart():
         for part in msg.walk():
-            ct = part.get_content_type()
-            if ct == "text/html":
-                payload = part.get_payload(decode=True)
-                if payload:
-                    charset = part.get_content_charset() or "utf-8"
-                    return payload.decode(charset, errors="replace")
-    else:
-        if msg.get_content_type() == "text/html":
-            payload = msg.get_payload(decode=True)
-            if payload:
-                charset = msg.get_content_charset() or "utf-8"
-                return payload.decode(charset, errors="replace")
+            if part.get_content_type() == content_type:
+                decoded = _decode(part)
+                if decoded is not None:
+                    return decoded
+    elif msg.get_content_type() == content_type:
+        return _decode(msg)
     return None
+
+
+def _extract_html_body(raw_bytes: bytes) -> str | None:
+    """Extract the HTML body from raw email bytes."""
+    return _extract_body_by_type(raw_bytes, "text/html")
 
 
 def _extract_text_body(raw_bytes: bytes) -> str | None:
     """Extract the plain-text body from raw email bytes."""
-    msg = email_lib.message_from_bytes(raw_bytes)
-    if msg.is_multipart():
-        for part in msg.walk():
-            ct = part.get_content_type()
-            if ct == "text/plain":
-                payload = part.get_payload(decode=True)
-                if payload:
-                    charset = part.get_content_charset() or "utf-8"
-                    return payload.decode(charset, errors="replace")
-    else:
-        if msg.get_content_type() == "text/plain":
-            payload = msg.get_payload(decode=True)
-            if payload:
-                charset = msg.get_content_charset() or "utf-8"
-                return payload.decode(charset, errors="replace")
-    return None
+    return _extract_body_by_type(raw_bytes, "text/plain")

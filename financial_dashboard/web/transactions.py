@@ -1,4 +1,3 @@
-# ty: ignore
 """Transaction HTML routes."""
 
 from __future__ import annotations
@@ -97,7 +96,7 @@ async def transaction_list(
             pass
 
     count_stmt = select(func.count()).select_from(stmt.subquery())
-    total_count = (await session.execute(count_stmt)).scalar()
+    total_count = (await session.execute(count_stmt)).scalar() or 0
 
     sort_col = SORT_COLUMNS.get(sort, Transaction.transaction_date)
     if order not in ("asc", "desc"):

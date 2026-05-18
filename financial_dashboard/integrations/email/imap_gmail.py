@@ -1,4 +1,3 @@
-# ty: ignore
 """Gmail IMAP provider."""
 
 from __future__ import annotations
@@ -10,6 +9,7 @@ import imaplib
 import logging
 import re
 from collections import defaultdict
+from typing import cast
 
 from financial_dashboard.core.crypto import decrypt_credentials
 from financial_dashboard.integrations.email.base import INITIAL_BACKFILL_DAYS
@@ -111,7 +111,10 @@ def _fetch_gmail_source_sync(
                 criteria_parts.append(f"SINCE {rule_since_str}")
             criteria = " ".join(criteria_parts) if criteria_parts else "ALL"
 
-            typ, data = conn.uid("SEARCH", None, criteria)
+            # stdlib runtime accepts None for the optional CHARSET arg
+            # ("no charset"); the type stub narrows it to str. Cast keeps
+            # the documented IMAP semantics without sprinkling ignores.
+            typ, data = conn.uid("SEARCH", cast(str, None), criteria)
             logger.info(
                 "Gmail: SEARCH for rule %s (bank=%s): criteria=%s -> result=%s count=%s",
                 rule.id,
@@ -154,7 +157,10 @@ def _fetch_gmail_source_sync(
             # Batch metadata fetch in chunks of 500
             for batch_start in range(0, len(uids), 500):
                 batch = uids[batch_start : batch_start + 500]
-                uid_set = b",".join(batch)
+                # IMAP UIDs are ASCII digits; pass as str per the
+                # stdlib stub. (Stdlib runtime accepts bytes too, but
+                # we don't need that here.)
+                uid_set = b",".join(batch).decode("ascii")
                 try:
                     typ, msg_data = conn.uid(
                         "FETCH",
@@ -354,8 +360,9 @@ def _fetch_gmail_single_sync(user: str, password: str, remote_id: str) -> bytes 
         conn = imaplib.IMAP4_SSL("imap.gmail.com")
         conn.login(user, password)
         conn.select('"[Gmail]/All Mail"', readonly=True)
-        # Search by X-GM-MSGID
-        typ, data = conn.uid("SEARCH", None, f"X-GM-MSGID {remote_id}")
+        # Search by X-GM-MSGID. stdlib runtime accepts None for the
+        # optional CHARSET arg; cast to satisfy the stricter stub.
+        typ, data = conn.uid("SEARCH", cast(str, None), f"X-GM-MSGID {remote_id}")
         if typ != "OK" or not data[0]:
             conn.logout()
             return None

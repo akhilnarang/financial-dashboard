@@ -1,4 +1,3 @@
-# ty: ignore
 """Statement HTML routes."""
 
 from __future__ import annotations
@@ -8,7 +7,7 @@ import json
 import logging
 import tempfile
 from datetime import date, datetime, timezone
-from decimal import InvalidOperation
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlencode
@@ -169,10 +168,12 @@ async def statements_list(
         .all()
     )
 
-    cc_banks = (await session.execute(select(StatementUpload.bank).distinct())).all()
-    bank_banks = (
-        await session.execute(select(BankStatementUpload.bank).distinct())
-    ).all()
+    cc_banks = list(
+        (await session.execute(select(StatementUpload.bank).distinct())).all()
+    )
+    bank_banks = list(
+        (await session.execute(select(BankStatementUpload.bank).distinct())).all()
+    )
     banks = sorted({row[0] for row in cc_banks + bank_banks if row[0]})
 
     # Tag each upload with its type so templates can distinguish them
@@ -279,6 +280,7 @@ async def statement_upload(
         .all()
     )
 
+    db_txns = list(db_txns)
     recon = reconcile_statement(parsed, db_txns, account_id)
 
     # Enrich matched DB transactions with statement narrations
@@ -503,7 +505,7 @@ async def statement_payment(
             )
             upload.payment_paid_at = None
             if not was_partial:
-                upload.payment_paid_amount = 0
+                upload.payment_paid_amount = Decimal(0)
             upload.payment_sent_offsets = "[]"
             upload.payment_last_reminded_at = None
             await session.commit()
@@ -616,10 +618,13 @@ async def statement_reprocess(
         .all()
     )
 
+    db_txns = list(db_txns)
     recon = reconcile_statement(parsed, db_txns, account_id)
     await enrich_matched_transactions(recon)
 
     upload = await session.get(StatementUpload, upload_id)
+    if upload is None:
+        return RedirectResponse(url="/statements", status_code=303)
     upload.bank = parsed.bank
     upload.card_number = parsed.card_number
     upload.statement_name = parsed.name
@@ -628,7 +633,7 @@ async def statement_reprocess(
         or upload.total_amount_due != parsed.statement_total_amount_due
     ):
         upload.payment_status = None
-        upload.payment_paid_amount = 0
+        upload.payment_paid_amount = Decimal(0)
         upload.payment_paid_at = None
         upload.payment_sent_offsets = "[]"
         upload.payment_last_reminded_at = None

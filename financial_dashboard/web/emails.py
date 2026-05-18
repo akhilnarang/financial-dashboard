@@ -1,4 +1,3 @@
-# ty: ignore
 """Email HTML routes."""
 
 from __future__ import annotations
@@ -157,9 +156,9 @@ async def email_list(
         "date_to": date_to,
         "q": q,
     }
-    qs_items = {k: v for k, v in filters.items() if v}
+    qs_items: dict[str, str] = {k: v for k, v in filters.items() if v}
     if page_size != 50:
-        qs_items["page_size"] = page_size
+        qs_items["page_size"] = str(page_size)
     base_qs = urlencode(qs_items)
 
     return templates.TemplateResponse(
@@ -449,7 +448,14 @@ async def reparse_email(
                     # If the prior row was already linked, the statement
                     # was already credited; re-firing would double-count
                     # payment_paid_amount on a PARTIALLY_PAID statement.
-                    if was_orphaned and should_auto_reconcile_statement(txn_row):
+                    # The redundant `account_id is not None` is for ty —
+                    # should_auto_reconcile_statement already guarantees
+                    # it at runtime but ty can't narrow helper calls.
+                    if (
+                        was_orphaned
+                        and should_auto_reconcile_statement(txn_row)
+                        and txn_row.account_id is not None
+                    ):
                         pending_payment_check = (
                             txn_row.id,
                             txn_row.account_id,
@@ -643,7 +649,12 @@ async def reparse_all_failed(
                         # fresh insert or an upsert of a previously-
                         # orphaned txn). See the per-email reparse path
                         # for the full rationale.
-                        if was_orphaned and should_auto_reconcile_statement(txn_row):
+                        # The redundant account_id check is for ty.
+                        if (
+                            was_orphaned
+                            and should_auto_reconcile_statement(txn_row)
+                            and txn_row.account_id is not None
+                        ):
                             pending_payment_check = (
                                 txn_row.id,
                                 txn_row.account_id,

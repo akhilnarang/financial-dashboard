@@ -1,4 +1,3 @@
-# ty: ignore
 """Bank statement HTML routes."""
 
 from __future__ import annotations
@@ -115,6 +114,7 @@ async def bank_statement_upload(
         .all()
     )
 
+    db_txns = list(db_txns)
     recon = reconcile_bank_statement(parsed, db_txns, account_id)
     await enrich_matched_transactions(recon)
 

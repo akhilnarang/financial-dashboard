@@ -1,4 +1,3 @@
-# ty: ignore
 """Telegram bot for transaction notifications and note replies.
 
 Sends a notification for each new transaction (post-backfill only).
@@ -12,6 +11,9 @@ import logging
 import re
 from decimal import Decimal
 from typing import Literal
+
+from datetime import timedelta
+from typing import cast
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, RetryAfter
@@ -29,18 +31,25 @@ async def init_telegram(token: str):
     """Initialize the Telegram bot application."""
     global tg_app
     app = Application.builder().token(token).build()
+    # Application.updater is Optional in the PTB type stubs because some
+    # builders (webhook mode, custom updater=None) intentionally produce
+    # an app without one. The standard builder we use here always sets it;
+    # assert so downstream attribute access types cleanly and we get a
+    # loud failure if PTB ever changes the default.
+    updater = app.updater
+    assert updater is not None, "Application.builder().build() returned no updater"
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, _handle_reply))
     app.add_handler(CallbackQueryHandler(_handle_callback))
     try:
         await app.initialize()
         await app.start()
-        await app.updater.start_polling(
+        await updater.start_polling(
             drop_pending_updates=True, allowed_updates=["message", "callback_query"]
         )
     except Exception:
         try:
-            if app.updater.running:
-                await app.updater.stop()
+            if updater.running:
+                await updater.stop()
             if app.running:
                 await app.stop()
             await app.shutdown()
@@ -58,8 +67,9 @@ async def shutdown_telegram():
         app = tg_app
         tg_app = None
         try:
-            if app.updater.running:
-                await app.updater.stop()
+            updater = app.updater
+            if updater is not None and updater.running:
+                await updater.stop()
             if app.running:
                 await app.stop()
             await app.shutdown()
@@ -103,11 +113,15 @@ async def _send_with_retry(app, *, chat_id, text, parse_mode="HTML", attempts=3)
             )
         except RetryAfter as e:
             retry_after = e.retry_after
-            delay = (
-                retry_after.total_seconds()
-                if hasattr(retry_after, "total_seconds")
-                else float(retry_after)
-            )
+            # PTB v22.2+ will switch retry_after from float seconds to
+            # timedelta. The stub already widens the field to `object`,
+            # so handle both shapes explicitly with isinstance.
+            if isinstance(retry_after, timedelta):
+                delay = retry_after.total_seconds()
+            else:
+                # Runtime is a float/int today (pre-v22.2). Cast keeps
+                # ty quiet without silencing.
+                delay = float(cast(float, retry_after))
             await asyncio.sleep(delay + 0.5)
             continue
         except NetworkError as e:

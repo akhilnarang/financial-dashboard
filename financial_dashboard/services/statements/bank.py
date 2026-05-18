@@ -1,4 +1,3 @@
-# ty: ignore
 """Bank account statement PDF parsing and reconciliation.
 
 Parallel to statements.py (which handles CC statements). Provides:
@@ -29,8 +28,13 @@ import tempfile
 from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import TYPE_CHECKING
+
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+
+if TYPE_CHECKING:
+    from bank_statement_parser.models import BankTransaction, ParsedBankStatement
 from financial_dashboard.db import (
     Account,
     BankStatementUpload,
@@ -424,7 +428,9 @@ def _matched_entry(stmt_idx: int, direction: str, txn, found) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> dict:
+def reconcile_bank_statement(
+    parsed: "ParsedBankStatement", db_transactions: list, account_id: int
+) -> dict:
     """Match statement transactions against DB transactions.
 
     Two-pass matching:
@@ -446,13 +452,15 @@ def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> 
 
     Returns a dict with matched, missing lists and balance verification.
     """
-    stmt_txns: list[tuple[str, object]] = [
+    stmt_txns: list[tuple[str, "BankTransaction"]] = [
         (txn.transaction_type, txn) for txn in parsed.transactions or []
     ]
 
     # Pre-parse amount/date once so every pass uses the same normalized form
     # and parse failures land in `missing` immediately.
-    parsed_rows: list[tuple[int, str, object, Decimal | None, date_type | None]] = []
+    parsed_rows: list[
+        tuple[int, str, "BankTransaction", Decimal | None, date_type | None]
+    ] = []
     matched = []
     missing = []
     for stmt_idx, (direction, txn) in enumerate(stmt_txns):
@@ -508,6 +516,20 @@ def reconcile_bank_statement(parsed, db_transactions: list, account_id: int) -> 
     holder_tokens = _holder_name_tokens(parsed.account_holder_name)
     for stmt_idx, direction, txn, amount, txn_date in parsed_rows:
         if stmt_idx in matched_db_ids:
+            continue
+        # Pass 1 already routes unparseable amount/date entries to
+        # `missing` and they wouldn't appear in `parsed_rows`, so a
+        # None here would mean an upstream invariant broke. Route to
+        # `missing` (don't silently drop) and log so the issue is
+        # debuggable rather than disappearing from both buckets.
+        if txn_date is None or amount is None:
+            logger.warning(
+                "Bank reconcile: parsed_rows entry for stmt_idx=%d has "
+                "None amount/date despite pass-1 parse — routing to "
+                "missing.",
+                stmt_idx,
+            )
+            missing.append(_missing_entry(stmt_idx, direction, txn))
             continue
         stmt_ref = txn.reference_number
         for offset in (0, -1, 1):
@@ -923,7 +945,7 @@ async def process_bank_statement_email(
             .all()
         )
 
-    recon = reconcile_bank_statement(parsed, db_txns, account.id)
+    recon = reconcile_bank_statement(parsed, list(db_txns), account.id)
 
     # Save the PDF to disk
     STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,3 @@
-# ty: ignore
 """CC statement PDF parsing and reconciliation for financial-dashboard.
 
 Provides:
@@ -643,7 +642,9 @@ async def process_cc_statement_email_summary(
         match: Account | None = None
         if stmt_last4 := last4_from_card(card_mask):
             async with async_session() as session:
-                match = await _match_account_by_last4(session, cc_accounts, stmt_last4)
+                match = await _match_account_by_last4(
+                    session, list(cc_accounts), stmt_last4
+                )
         if match is None:
             logger.warning(
                 "multiple CC accounts for bank=%s; refusing to auto-pick "
@@ -1088,7 +1089,7 @@ async def process_statement_email(
             .all()
         )
 
-    recon = reconcile_statement(parsed, db_txns, account.id)
+    recon = reconcile_statement(parsed, list(db_txns), account.id)
 
     # Save the PDF to disk
     STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
