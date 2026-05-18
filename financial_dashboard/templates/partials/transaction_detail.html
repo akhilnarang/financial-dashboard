@@ -80,6 +80,32 @@
     {% endif %}
 </dl>
 
+{% if txn.account_id is none %}
+<div id="relink-block" style="margin-top: 1rem; padding: 0.75rem; border: 1px dashed var(--border-light); border-radius: 6px; background: var(--surface-muted);">
+    <label style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.55; display: block; margin-bottom: 0.4rem;">Link this transaction</label>
+    {% if bank_accounts %}
+    <script type="application/json" id="relink-bank-accounts">{{ bank_accounts | tojson }}</script>
+    <div style="display: flex; gap: 0.5rem; align-items: stretch; flex-wrap: wrap;">
+        <select id="relink-account" class="note-area" style="flex: 1 1 12rem; min-width: 0;">
+            <option value="">— pick {{ txn.bank }} account —</option>
+            {% for a in bank_accounts %}
+            <option value="{{ a.id }}">{{ a.label }}</option>
+            {% endfor %}
+        </select>
+        <select id="relink-card" class="note-area" style="flex: 1 1 10rem; min-width: 0;" disabled>
+            <option value="">— no card —</option>
+        </select>
+        <button id="relink-submit" type="button" class="note-area" style="flex: 0 0 auto; cursor: pointer; padding: 0.4rem 1rem;" disabled>Link</button>
+    </div>
+    <div id="relink-status" class="note-status"></div>
+    {% else %}
+    <div class="note-status" style="opacity: 0.8;">
+        No active {{ txn.bank }} accounts. <a href="/accounts">Create or re-enable one.</a>
+    </div>
+    {% endif %}
+</div>
+{% endif %}
+
 <div style="margin-top: 1rem;">
     <label style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.55; display: block; margin-bottom: 0.3rem;">Category</label>
     <input id="txn-category" class="note-area" type="text" placeholder="e.g. Food & Dining" value="{{ txn.category or '' }}">
@@ -135,5 +161,94 @@
 
     wireField('txn-note', 'note-status', 'note', 'note', 'note');
     wireField('txn-category', 'category-status', 'category', 'category', 'category');
+
+    // ----- Manual relink (only present when txn is orphaned). -----
+    function wireRelink() {
+        const dataEl = document.getElementById('relink-bank-accounts');
+        const accountSel = document.getElementById('relink-account');
+        const cardSel = document.getElementById('relink-card');
+        const submit = document.getElementById('relink-submit');
+        const status = document.getElementById('relink-status');
+        if (!dataEl || !accountSel || !cardSel || !submit || !status) return;
+
+        let accountsById;
+        try {
+            const parsed = JSON.parse(dataEl.textContent || '[]');
+            accountsById = Object.fromEntries(parsed.map(a => [String(a.id), a]));
+        } catch (e) {
+            status.textContent = 'Could not parse account list.';
+            return;
+        }
+
+        function rebuildCards() {
+            const acct = accountsById[accountSel.value];
+            cardSel.innerHTML = '<option value="">— no card —</option>';
+            if (!acct || !acct.cards || acct.cards.length === 0) {
+                cardSel.disabled = true;
+                return;
+            }
+            for (const c of acct.cards) {
+                const opt = document.createElement('option');
+                opt.value = c.id;
+                opt.textContent = c.label || c.card_mask || `Card #${c.id}`;
+                cardSel.appendChild(opt);
+            }
+            cardSel.disabled = false;
+        }
+
+        accountSel.addEventListener('change', () => {
+            rebuildCards();
+            submit.disabled = !accountSel.value;
+            status.textContent = '';
+        });
+
+        submit.addEventListener('click', async () => {
+            const body = {
+                account_id: accountSel.value ? parseInt(accountSel.value, 10) : null,
+                card_id: cardSel.value ? parseInt(cardSel.value, 10) : null,
+            };
+            submit.disabled = true;
+            status.textContent = 'Linking...';
+            try {
+                const resp = await fetch(`/api/transactions/${txnId}/relink`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                if (!resp.ok) {
+                    let detail = `HTTP ${resp.status}`;
+                    try {
+                        const j = await resp.json();
+                        if (j && j.detail) detail = j.detail;
+                    } catch (e) { /* leave status text */ }
+                    status.textContent = `Error: ${detail}`;
+                    submit.disabled = false;
+                    return;
+                }
+                const result = await resp.json();
+                const toast = result.statement_marked_paid
+                    ? 'Linked. Statement marked paid.'
+                    : 'Linked.';
+                status.textContent = toast;
+                // Refresh: if this partial is rendered INSIDE the modal
+                // container, re-fetch the detail partial in place. On
+                // the full-page route the partial is outside the modal,
+                // so reload. (#detail-modal-content always exists in
+                // base.html, so check ancestry, not mere presence.)
+                const inModal = !!submit.closest('#detail-modal-content');
+                setTimeout(() => {
+                    if (inModal && typeof window.openDetailModal === 'function') {
+                        window.openDetailModal(`/transactions/${txnId}/detail`);
+                    } else {
+                        window.location.reload();
+                    }
+                }, 600);
+            } catch (e) {
+                status.textContent = `Error: ${e}`;
+                submit.disabled = false;
+            }
+        });
+    }
+    wireRelink();
 })();
 </script>

@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Query, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
@@ -221,6 +222,38 @@ async def _load_transaction(
     return tuple(row)  # type: ignore[return-value]
 
 
+async def _bank_account_picker(
+    session: AsyncSession, bank: str
+) -> list[dict]:
+    """Compact JSON-friendly account list for the manual relink picker.
+
+    Returns active accounts of ``bank`` ordered by label, each with its
+    active cards (id, label, card_mask only — no ORM internals leak
+    into the template). Empty list when the bank has no active
+    accounts, which the template renders as a recovery hint.
+    """
+    result = await session.execute(
+        select(Account)
+        .where(Account.bank == bank, Account.active.is_(True))
+        .order_by(Account.label)
+        .options(selectinload(Account.cards))
+    )
+    accounts = result.scalars().all()
+    return [
+        {
+            "id": a.id,
+            "label": a.label,
+            "type": a.type,
+            "cards": [
+                {"id": c.id, "label": c.label, "card_mask": c.card_mask}
+                for c in a.cards
+                if c.active
+            ],
+        }
+        for a in accounts
+    ]
+
+
 @router.get("/transactions/{txn_id}/detail", response_class=HTMLResponse)
 async def transaction_detail(
     txn_id: int,
@@ -231,10 +264,21 @@ async def transaction_detail(
     if loaded is None:
         return HTMLResponse("<p>Transaction not found.</p>", 404)
     txn, email, account, sms = loaded
+    bank_accounts = (
+        await _bank_account_picker(session, txn.bank)
+        if txn.account_id is None
+        else []
+    )
     return templates.TemplateResponse(
         request,
         "partials/transaction_detail.html",
-        {"txn": txn, "email": email, "account": account, "sms": sms},
+        {
+            "txn": txn,
+            "email": email,
+            "account": account,
+            "sms": sms,
+            "bank_accounts": bank_accounts,
+        },
     )
 
 
@@ -248,6 +292,11 @@ async def transaction_page(
     if loaded is None:
         return HTMLResponse("<p>Transaction not found.</p>", 404)
     txn, email, account, sms = loaded
+    bank_accounts = (
+        await _bank_account_picker(session, txn.bank)
+        if txn.account_id is None
+        else []
+    )
     return templates.TemplateResponse(
         request,
         "transaction_page.html",
@@ -257,5 +306,6 @@ async def transaction_page(
             "email": email,
             "account": account,
             "sms": sms,
+            "bank_accounts": bank_accounts,
         },
     )
