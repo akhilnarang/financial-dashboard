@@ -69,7 +69,13 @@ def compute_enrichment_diff(
     - existing is None, incoming is not None → fill (always).
     - existing is not None, incoming is None → keep (do nothing).
     - existing == incoming → keep (no diff).
-    - existing != incoming AND channel == "email" → overwrite.
+    - existing != incoming AND channel == "email" → overwrite, EXCEPT
+      transaction_time only overwrites when the incoming time is strictly
+      earlier than the existing one. A later timestamp from the second
+      source reflects notification/parsing delay, not a more accurate
+      clock — the bank's underlying event happened at the earliest
+      observation. (The am_pm_alias path in merge_transaction handles the
+      12h-off correction separately by force-overwriting.)
     - existing != incoming AND channel == "sms" → keep (SMS does NOT overwrite email).
     """
     filled: dict[str, object] = {}
@@ -86,9 +92,28 @@ def compute_enrichment_diff(
         elif old_val == new_val:
             continue
         elif channel == "email":
+            if f == "transaction_time" and not _incoming_time_is_earlier(
+                existing, incoming, new_val, old_val
+            ):
+                continue
             overwritten[f] = (old_val, new_val)
         # channel == "sms" with both non-null and unequal: keep existing.
     return EnrichmentDiff(filled=filled, overwritten=overwritten)
+
+
+def _incoming_time_is_earlier(existing, incoming: dict, new_time, old_time) -> bool:
+    """True iff the incoming (date, transaction_time) point is strictly
+    earlier than the existing one. When both sides have transaction_date,
+    compare full datetimes so a cross-midnight pair (23:59 vs 00:01 the
+    next day) is handled correctly; otherwise compare time-of-day alone.
+    """
+    existing_date = getattr(existing, "transaction_date", None)
+    incoming_date = incoming.get("transaction_date") or existing_date
+    if existing_date is not None and incoming_date is not None:
+        return datetime.combine(incoming_date, new_time) < datetime.combine(
+            existing_date, old_time
+        )
+    return new_time < old_time
 
 
 _FUZZY_MATCH_WINDOW_MINUTES = 10

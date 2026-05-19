@@ -106,6 +106,58 @@ def test_compute_diff_incoming_null_never_overwrites_existing():
     assert diff.overwritten == {}
 
 
+def test_compute_diff_email_does_not_overwrite_transaction_time_with_later_value():
+    """Real-world repro: HDFC #7101 -₹10 RFHOSPITAL — the SMS-derived
+    09:30:26 was getting bumped to email-derived 09:30:27. A second-source
+    timestamp that's LATER than the existing one is notification/parse
+    delay, not new evidence about when the transaction happened, so keep
+    the earlier value."""
+    existing = _make_txn(
+        transaction_date=date(2026, 5, 19),
+        transaction_time=time(9, 30, 26),
+    )
+    incoming = {
+        "transaction_date": date(2026, 5, 19),
+        "transaction_time": time(9, 30, 27),
+    }
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.filled == {}
+    assert diff.overwritten == {}
+
+
+def test_compute_diff_email_overwrites_transaction_time_with_earlier_value():
+    """The mirror case: when the second source's time is strictly earlier,
+    it is treated as a more accurate observation and replaces the
+    existing value."""
+    existing = _make_txn(
+        transaction_date=date(2026, 5, 19),
+        transaction_time=time(9, 30, 27),
+    )
+    incoming = {
+        "transaction_date": date(2026, 5, 19),
+        "transaction_time": time(9, 30, 26),
+    }
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.filled == {}
+    assert diff.overwritten == {"transaction_time": (time(9, 30, 27), time(9, 30, 26))}
+
+
+def test_compute_diff_email_transaction_time_handles_midnight_crossing():
+    """When the date differs across midnight, the (date, time) datetime is
+    what's compared — a 23:59 existing should not be overwritten by a
+    00:01 incoming on the following date (later by 2 minutes)."""
+    existing = _make_txn(
+        transaction_date=date(2026, 5, 19),
+        transaction_time=time(23, 59, 0),
+    )
+    incoming = {
+        "transaction_date": date(2026, 5, 20),
+        "transaction_time": time(0, 1, 0),
+    }
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert "transaction_time" not in diff.overwritten
+
+
 def test_compute_diff_ignores_unparticipating_keys():
     existing = _make_txn(counterparty=None)
     # email_type, bank, direction, amount, currency should never enter the diff
