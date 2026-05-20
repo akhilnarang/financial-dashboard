@@ -152,10 +152,16 @@ async def send_transaction_notification(
         return
     try:
         is_declined = txn_info.get("_declined", False)
+        is_provisional = txn_info.get("_provisional", False)
         direction = txn_info.get("direction", "")
         if is_declined:
             direction_emoji = "\U0001f6ab"
             direction_label = "DECLINED"
+        elif is_provisional:
+            # HDFC's no-ref provisional payment-received SMS: payment seen
+            # but not yet settled. No transaction row exists for it.
+            direction_emoji = "⏳"  # hourglass
+            direction_label = "PAYMENT RECEIVED — NOT YET SETTLED"
         elif direction == "debit":
             direction_emoji = "\U0001f534"
             direction_label = "DEBIT"

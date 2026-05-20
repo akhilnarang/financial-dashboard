@@ -98,6 +98,34 @@ def parsed_sms_to_txn_data(parsed: ParsedSms, sms_row: SmsMessage) -> dict | Non
 
 _DECLINED_DIRECTION = "declined"
 
+_HDFC_PAYMENT_RECEIVED_EMAIL_TYPE = "hdfc_cc_payment_received_alert"
+
+
+def _is_hdfc_provisional_payment(txn_data: dict) -> bool:
+    """True for HDFC's provisional CC payment-received SMS — the variant
+    with NO reference number.
+
+    HDFC fires two SMS per CC bill payment: a provisional "PAYMENT ...
+    RECEIVED TOWARDS ..." (no ref) and a settlement "Online Payment ...
+    vide Ref# ... was credited ..." (has ref). Only the settlement should
+    become a ledger row; the provisional is notify-only. Gate on the
+    parser's email_type plus an empty reference_number — robust even if the
+    bank-string casing ever shifts (``parsed.bank`` is lowercase ``hdfc``).
+
+    Also require ``direction == "credit"``: this branch runs ahead of the
+    declined pre-gate, so the guard ensures a (hypothetical) non-credit
+    payment-received shape can't be silently swallowed as notify-only and
+    bypass the declined/merge paths. The current parser only ever emits
+    ``credit`` for this email_type, so this is defense-in-depth.
+    """
+    if (txn_data.get("bank") or "").lower() != "hdfc":
+        return False
+    if txn_data.get("email_type") != _HDFC_PAYMENT_RECEIVED_EMAIL_TYPE:
+        return False
+    if txn_data.get("direction") != "credit":
+        return False
+    return not (txn_data.get("reference_number") or "").strip()
+
 
 async def process_sms_row(
     session,
@@ -152,6 +180,23 @@ async def process_sms_row(
         sms_row.status = "skipped"
         sms_row.parse_error = "non-transaction SMS shape"
         return ProcessSmsOutcome(status="skipped", transaction_id=None)
+
+    # HDFC provisional payment-received pre-gate. HDFC sends two SMS per CC
+    # bill payment; the no-reference "RECEIVED TOWARDS" variant is a
+    # provisional notice. Notify only — do NOT create a Transaction, do NOT
+    # touch outstanding, and do NOT fire the payment-check / disambiguation
+    # hooks (leaving them None here is a correctness requirement, not an
+    # incidental default). The settlement SMS (with a ref) proceeds normally.
+    if _is_hdfc_provisional_payment(txn_data):
+        sms_row.status = "parsed"
+        sms_row.transaction_id = None
+        sms_row.parse_error = None  # clear any stale error from a prior parse
+        primary = {**txn_data, "_provisional": True}
+        return ProcessSmsOutcome(
+            status="parsed",
+            transaction_id=None,
+            primary_notification=primary,
+        )
 
     # 2. Declined-event pre-gate. Declined events never enter merge —
     #    they take the existing declined-notification path. The match

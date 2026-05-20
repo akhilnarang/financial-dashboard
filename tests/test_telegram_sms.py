@@ -100,6 +100,40 @@ async def test_send_transaction_notification_no_source_no_badge():
 
 
 @pytest.mark.anyio
+async def test_provisional_notification_renders_not_yet_settled():
+    """A _provisional payload renders the 'not yet settled' copy and omits
+    the #txn_id suffix (no transaction row exists for a provisional ping)."""
+    from financial_dashboard.services.telegram import send_transaction_notification
+
+    captured = {}
+
+    async def fake_send(app, *, chat_id, text):
+        captured["text"] = text
+
+    with patch("financial_dashboard.services.telegram.tg_app", new=object()):
+        with patch(
+            "financial_dashboard.services.telegram._send_with_retry",
+            new=AsyncMock(side_effect=fake_send),
+        ):
+            await send_transaction_notification(
+                0,  # no txn id
+                {
+                    "_provisional": True,
+                    "direction": "credit",
+                    "amount": Decimal("50000"),
+                    "bank": "hdfc",
+                    "card_mask": "9710",
+                },
+                chat_id=12345,
+                source="sms",
+            )
+    text = captured["text"]
+    assert "not yet settled" in text.lower()
+    assert "#" not in text  # no #txn_id suffix
+    assert "50,000.00" in text
+
+
+@pytest.mark.anyio
 async def test_send_enrichment_notification_renders_diff():
     from financial_dashboard.services.telegram import send_enrichment_notification
 
