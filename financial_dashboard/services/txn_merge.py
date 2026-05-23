@@ -60,6 +60,18 @@ _ENRICHMENT_FIELDS = (
 )
 
 
+_MASK_FIELDS = ("card_mask", "account_mask")
+
+
+def _normalize_mask(s: str | None) -> str:
+    """Reduce a card/account mask to its significant digits so cosmetic
+    format differences between sources — "XX0000" vs "0000", "x0000" vs
+    "0000" — compare equal (same card/account, different masking style)."""
+    if not s:
+        return ""
+    return "".join(ch for ch in s if ch.isdigit())
+
+
 def compute_enrichment_diff(
     existing, incoming: dict, channel: Channel
 ) -> EnrichmentDiff:
@@ -69,6 +81,8 @@ def compute_enrichment_diff(
     - existing is None, incoming is not None → fill (always).
     - existing is not None, incoming is None → keep (do nothing).
     - existing == incoming → keep (no diff).
+    - card_mask/account_mask that normalize to the same digits ("XX0000"
+      vs "0000") → keep (no diff); the format differs, not the card.
     - existing != incoming AND channel == "email" → overwrite, EXCEPT
       transaction_time only overwrites when the incoming time is strictly
       earlier than the existing one. A later timestamp from the second
@@ -90,6 +104,11 @@ def compute_enrichment_diff(
         if old_val is None:
             filled[f] = new_val
         elif old_val == new_val:
+            continue
+        elif f in _MASK_FIELDS and _normalize_mask(old_val) == _normalize_mask(new_val):
+            # Same card/account, only the mask format differs (e.g.
+            # "XX0000" vs "0000"). Not a real enrichment — keep existing,
+            # do not overwrite or notify.
             continue
         elif channel == "email":
             if f == "transaction_time" and not _incoming_time_is_earlier(

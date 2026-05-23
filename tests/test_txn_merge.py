@@ -98,6 +98,30 @@ def test_compute_diff_silent_when_values_match():
     assert diff.changed_fields == []
 
 
+def test_compute_diff_card_mask_format_difference_is_not_enrichment():
+    """A card_mask that differs only in masking style ("XX0000" vs "0000")
+    is the same card — not a real enrichment. Must not overwrite or notify."""
+    existing = _make_txn(card_mask="XX0000")
+    incoming = {"card_mask": "0000"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.changed_fields == []
+
+
+def test_compute_diff_account_mask_format_difference_is_not_enrichment():
+    existing = _make_txn(account_mask="XX000")
+    incoming = {"account_mask": "000"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.changed_fields == []
+
+
+def test_compute_diff_genuinely_different_card_mask_still_overwrites():
+    """Guard the normalization: different last-4 digits is a real change."""
+    existing = _make_txn(card_mask="XX0000")
+    incoming = {"card_mask": "9999"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.overwritten == {"card_mask": ("XX0000", "9999")}
+
+
 def test_compute_diff_incoming_null_never_overwrites_existing():
     existing = _make_txn(counterparty="Phone Pe")
     incoming = {"counterparty": None}
