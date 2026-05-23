@@ -181,6 +181,12 @@ async def process_sms_row(
         sms_row.parse_error = "non-transaction SMS shape"
         return ProcessSmsOutcome(status="skipped", transaction_id=None)
 
+    # Parse succeeded. Clear any stale parse_error from a prior failed
+    # attempt so a now-resolved row (e.g. after a reparse) doesn't keep
+    # showing the old error alongside its parsed/enriched status. Every
+    # success path below (provisional, declined, merge) relies on this.
+    sms_row.parse_error = None
+
     # HDFC provisional payment-received pre-gate. HDFC sends two SMS per CC
     # bill payment; the no-reference "RECEIVED TOWARDS" variant is a
     # provisional notice. Notify only — do NOT create a Transaction, do NOT
@@ -190,7 +196,6 @@ async def process_sms_row(
     if _is_hdfc_provisional_payment(txn_data):
         sms_row.status = "parsed"
         sms_row.transaction_id = None
-        sms_row.parse_error = None  # clear any stale error from a prior parse
         primary = {**txn_data, "_provisional": True}
         return ProcessSmsOutcome(
             status="parsed",

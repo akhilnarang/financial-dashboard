@@ -133,6 +133,34 @@ async def test_process_sms_row_happy_path_creates_transaction(session, monkeypat
 
 
 @pytest.mark.anyio
+async def test_process_sms_row_clears_stale_parse_error_on_success(session):
+    """A row that previously failed (status=error, parse_error set) and is
+    reparsed successfully must clear the stale parse_error — otherwise the
+    resolved row still shows its old error alongside parsed/enriched."""
+    sms = SmsMessage(
+        bank="hdfc",
+        sender="VK-HDFCBK",
+        body="Spent Rs.500 From HDFC Bank Card x1234 At Zomato On 2026-05-02:14:23:00 Bal Rs.1000",
+        received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
+        status="error",
+        parse_error="No parser for bank 'hdfc' could handle this SMS.",
+    )
+    session.add(sms)
+    await session.flush()
+
+    from financial_dashboard.services.linker import build_link_context
+
+    link_ctx = await build_link_context(session)
+
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.status == "parsed"
+    assert sms.status == "parsed"
+    assert sms.parse_error is None
+
+
+@pytest.mark.anyio
 async def test_process_sms_row_naive_received_at_still_parses(session):
     """Regression: SQLite returns naive datetimes for DateTime columns.
     bank-sms-parser rejects naive received_at when it falls back to it
