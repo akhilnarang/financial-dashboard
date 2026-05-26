@@ -13,7 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.schemas.sms import SmsIngestRequest
 from financial_dashboard.services.linker import build_link_context
+from financial_dashboard.services.paisa import rewrite_paisa_journal
 from financial_dashboard.services.settings import (
+    get_ledger_backend,
+    get_paisa_config,
     get_telegram_chat_id,
     should_notify_transactions,
 )
@@ -42,6 +45,7 @@ async def post_sms(
     payload: SmsIngestRequest,
     session: AsyncSession = Depends(get_session),
 ) -> Response:
+    ledger_backend = get_ledger_backend()
     primary: dict | None = None
     enrichment: tuple[int, object, dict] | None = None
     outcome = None
@@ -54,6 +58,15 @@ async def post_sms(
         outcome = await process_sms_row(session, sms_row, link_ctx)
         primary = outcome.primary_notification
         enrichment = outcome.enrichment_notification
+
+    if outcome is not None and outcome.needs_journal_rewrite:
+        try:
+            await rewrite_paisa_journal(get_paisa_config())
+        except Exception as exc:
+            logger.warning("Paisa journal rewrite failed after SMS ingest: %s", exc)
+
+    if ledger_backend == "paisa":
+        return Response(status_code=201)
 
     # Telegram dispatch after commit — `await`ed inline so a slow send is
     # visible to the forwarder but cannot leave the DB in a half-state.

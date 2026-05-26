@@ -536,7 +536,7 @@ async def test_process_sms_row_hdfc_provisional_payment_is_notify_only(
             amount=Money(amount=Decimal("50000"), currency="INR"),
             transaction_date=datetime.date(2026, 5, 17),
             reference_number=None,  # provisional variant
-            card_mask="9710",
+            card_mask="0000",
         ),
     )
     monkeypatch.setattr(
@@ -589,8 +589,8 @@ async def test_process_sms_row_hdfc_settlement_creates_row(session, monkeypatch)
             direction="credit",
             amount=Money(amount=Decimal("50000"), currency="INR"),
             transaction_date=datetime.date(2026, 5, 17),
-            reference_number="137224528Vgr2OD",  # settlement variant
-            card_mask="9710",
+            reference_number="000000000Ref0001",  # settlement variant
+            card_mask="0000",
         ),
     )
     monkeypatch.setattr(
@@ -615,7 +615,7 @@ async def test_process_sms_row_hdfc_settlement_creates_row(session, monkeypatch)
     assert outcome.transaction_id is not None
     rows = (await session.execute(select(Transaction))).scalars().all()
     assert len(rows) == 1
-    assert rows[0].reference_number == "137224528Vgr2OD"
+    assert rows[0].reference_number == "000000000Ref0001"
 
 
 @pytest.mark.anyio
@@ -634,7 +634,7 @@ async def test_process_sms_row_hdfc_payment_order_independent(session, monkeypat
                 amount=Money(amount=Decimal("50000"), currency="INR"),
                 transaction_date=datetime.date(2026, 5, 17),
                 reference_number=None,
-                card_mask="9710",
+                card_mask="0000",
             ),
         )
 
@@ -646,8 +646,8 @@ async def test_process_sms_row_hdfc_payment_order_independent(session, monkeypat
                 direction="credit",
                 amount=Money(amount=Decimal("50000"), currency="INR"),
                 transaction_date=datetime.date(2026, 5, 18),
-                reference_number="137224528Vgr2OD",
-                card_mask="9710",
+                reference_number="000000000Ref0001",
+                card_mask="0000",
             ),
         )
 
@@ -680,7 +680,7 @@ async def test_process_sms_row_hdfc_payment_order_independent(session, monkeypat
 
     rows = (await session.execute(select(Transaction))).scalars().all()
     assert len(rows) == 1
-    assert rows[0].reference_number == "137224528Vgr2OD"
+    assert rows[0].reference_number == "000000000Ref0001"
 
 
 @pytest.mark.anyio
@@ -745,8 +745,8 @@ async def test_process_sms_row_hdfc_payment_settlement_first_then_provisional(
                 direction="credit",
                 amount=Money(amount=Decimal("50000"), currency="INR"),
                 transaction_date=datetime.date(2026, 5, 18),
-                reference_number="137224528Vgr2OD",
-                card_mask="9710",
+                reference_number="000000000Ref0001",
+                card_mask="0000",
             ),
         )
 
@@ -759,7 +759,7 @@ async def test_process_sms_row_hdfc_payment_settlement_first_then_provisional(
                 amount=Money(amount=Decimal("50000"), currency="INR"),
                 transaction_date=datetime.date(2026, 5, 17),
                 reference_number=None,
-                card_mask="9710",
+                card_mask="0000",
             ),
         )
 
@@ -795,7 +795,7 @@ async def test_process_sms_row_hdfc_payment_settlement_first_then_provisional(
     assert outcome.primary_notification.get("_provisional") is True
     rows = (await session.execute(select(Transaction))).scalars().all()
     assert len(rows) == 1
-    assert rows[0].reference_number == "137224528Vgr2OD"
+    assert rows[0].reference_number == "000000000Ref0001"
 
 
 @pytest.mark.anyio
@@ -817,7 +817,7 @@ async def test_process_sms_row_hdfc_payment_received_non_credit_not_gated(
             amount=Money(amount=Decimal("50000"), currency="INR"),
             transaction_date=datetime.date(2026, 5, 17),
             reference_number=None,
-            card_mask="9710",
+            card_mask="0000",
         ),
     )
     monkeypatch.setattr(

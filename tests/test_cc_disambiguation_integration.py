@@ -409,7 +409,7 @@ async def test_cc_reversal_credit_does_not_mark_statement_paid(session_maker):
 
         card = Card(
             account_id=account.id,
-            card_mask="XX2308",
+            card_mask="XX0000",
             label="self",
             is_primary=True,
             active=True,
@@ -443,7 +443,7 @@ async def test_cc_reversal_credit_does_not_mark_statement_paid(session_maker):
         await session.commit()
         email_id = email_row.id
 
-    raw = _icici_reversal_eml("250.00", "2308")
+    raw = _icici_reversal_eml("250.00", "0000")
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",

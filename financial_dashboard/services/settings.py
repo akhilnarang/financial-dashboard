@@ -11,7 +11,8 @@ refreshed on every write.
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Literal, Mapping
 
 from sqlalchemy import select
@@ -30,6 +31,18 @@ class SettingDef:
     label: str
     description: str = ""
     secret: bool = False
+
+
+@dataclass
+class PaisaConfig:
+    ledger_cli: str
+    main_journal_path: str
+    generated_journal_path: str
+    default_expense_account: str
+    default_income_account: str
+    fallback_asset_account: str
+    fallback_liability_account: str
+    account_map: dict[str, str]
 
 
 SETTINGS_REGISTRY: dict[str, SettingDef] = {
@@ -103,6 +116,65 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
         label="Fetch Limit Per Rule",
         description="Max emails to fetch per rule per cycle",
     ),
+    "ledger.backend": SettingDef(
+        default="local",
+        data_type="str",
+        category="Ledger",
+        label="Ledger Backend",
+        description="Use local dashboard ledger or paisa export bridge mode",
+    ),
+    "paisa.ledger_cli": SettingDef(
+        default="ledger",
+        data_type="str",
+        category="Ledger",
+        label="Paisa Ledger CLI",
+        description="v1 supports only `ledger`",
+    ),
+    "paisa.main_journal_path": SettingDef(
+        default="",
+        data_type="str",
+        category="Ledger",
+        label="Paisa Main Journal Path",
+        description="Absolute path to your main Paisa journal file",
+    ),
+    "paisa.generated_journal_path": SettingDef(
+        default="",
+        data_type="str",
+        category="Ledger",
+        label="Paisa Generated Journal Path",
+        description="Output include file path under the main journal directory",
+    ),
+    "paisa.default_expense_account": SettingDef(
+        default="Expenses:Uncategorized",
+        data_type="str",
+        category="Ledger",
+        label="Default Expense Account",
+    ),
+    "paisa.default_income_account": SettingDef(
+        default="Income:Uncategorized",
+        data_type="str",
+        category="Ledger",
+        label="Default Income Account",
+    ),
+    "paisa.fallback_asset_account": SettingDef(
+        default="Assets:Unknown",
+        data_type="str",
+        category="Ledger",
+        label="Fallback Asset Account",
+    ),
+    "paisa.fallback_liability_account": SettingDef(
+        default="Liabilities:Unknown",
+        data_type="str",
+        category="Ledger",
+        label="Fallback Liability Account",
+    ),
+    "paisa.account_map": SettingDef(
+        default="{}",
+        data_type="json",
+        category="Ledger",
+        label="Paisa Account Map",
+        description="Raw JSON object mapping source ids to ledger accounts",
+    ),
 }
 
 _cache: dict[str, str] = {}
@@ -148,6 +220,168 @@ def get_setting_json(key: str, default=None):
         return json.loads(val)
     except json.JSONDecodeError, TypeError:
         return default
+
+
+def get_ledger_backend() -> Literal["local", "paisa"]:
+    value = (get_setting("ledger.backend", "local") or "local").strip().lower()
+    if value == "paisa":
+        return "paisa"
+    return "local"
+
+
+def _get_paisa_config_values(
+    overrides: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for key in SETTINGS_REGISTRY:
+        val = get_setting(key, SETTINGS_REGISTRY[key].default)
+        values[key] = val if val is not None else SETTINGS_REGISTRY[key].default
+    if overrides:
+        for key, value in overrides.items():
+            values[key] = value
+    return values
+
+
+def _parse_paisa_account_map(raw: str, *, strict: bool) -> dict[str, str]:
+    payload = raw.strip() if raw else "{}"
+    if not payload:
+        payload = "{}"
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        if strict:
+            raise ValueError("paisa.account_map must be valid JSON") from exc
+        return {}
+
+    if not isinstance(parsed, dict):
+        if strict:
+            raise ValueError("paisa.account_map must be a JSON object")
+        return {}
+
+    normalized: dict[str, str] = {}
+    for key, value in parsed.items():
+        if strict and (not isinstance(key, str) or not isinstance(value, str)):
+            raise ValueError("paisa.account_map keys and values must be strings")
+        normalized[str(key)] = str(value)
+    return normalized
+
+
+def _is_safe_ledger_account_name(value: str) -> bool:
+    if not value.strip():
+        return False
+    forbidden = (";", "\n", "\r", "\t")
+    return not any(token in value for token in forbidden)
+
+
+def _build_paisa_config(
+    values: Mapping[str, str], *, strict_account_map: bool
+) -> PaisaConfig:
+    return PaisaConfig(
+        ledger_cli=(values.get("paisa.ledger_cli") or "").strip(),
+        main_journal_path=(values.get("paisa.main_journal_path") or "").strip(),
+        generated_journal_path=(
+            values.get("paisa.generated_journal_path") or ""
+        ).strip(),
+        default_expense_account=(
+            values.get("paisa.default_expense_account")
+            or SETTINGS_REGISTRY["paisa.default_expense_account"].default
+        ).strip(),
+        default_income_account=(
+            values.get("paisa.default_income_account")
+            or SETTINGS_REGISTRY["paisa.default_income_account"].default
+        ).strip(),
+        fallback_asset_account=(
+            values.get("paisa.fallback_asset_account")
+            or SETTINGS_REGISTRY["paisa.fallback_asset_account"].default
+        ).strip(),
+        fallback_liability_account=(
+            values.get("paisa.fallback_liability_account")
+            or SETTINGS_REGISTRY["paisa.fallback_liability_account"].default
+        ).strip(),
+        account_map=_parse_paisa_account_map(
+            values.get("paisa.account_map", "{}"),
+            strict=strict_account_map,
+        ),
+    )
+
+
+def validate_paisa_config(
+    values: Mapping[str, str] | None = None,
+) -> PaisaConfig:
+    snapshot = _get_paisa_config_values(values)
+    backend = (snapshot.get("ledger.backend") or "local").strip().lower()
+    backend_value: Literal["local", "paisa"] = (
+        "paisa" if backend == "paisa" else "local"
+    )
+    config = _build_paisa_config(
+        snapshot,
+        strict_account_map=(backend_value == "paisa"),
+    )
+
+    account_fields = {
+        "paisa.default_expense_account": config.default_expense_account,
+        "paisa.default_income_account": config.default_income_account,
+        "paisa.fallback_asset_account": config.fallback_asset_account,
+        "paisa.fallback_liability_account": config.fallback_liability_account,
+    }
+    for field_key, account_name in account_fields.items():
+        if not _is_safe_ledger_account_name(account_name):
+            raise ValueError(
+                f"{field_key} must be a valid ledger account name "
+                "(no semicolons, newlines, carriage returns, or tabs)"
+            )
+
+    if backend_value != "paisa":
+        return config
+
+    for map_key, account_name in config.account_map.items():
+        if not _is_safe_ledger_account_name(account_name):
+            raise ValueError(
+                "paisa.account_map values must be valid ledger account names "
+                f"(invalid key: {map_key})"
+            )
+
+    if config.ledger_cli != "ledger":
+        raise ValueError("paisa.ledger_cli must be 'ledger' when ledger.backend=paisa")
+    if not config.main_journal_path:
+        raise ValueError(
+            "paisa.main_journal_path is required when ledger.backend=paisa"
+        )
+    if not config.generated_journal_path:
+        raise ValueError(
+            "paisa.generated_journal_path is required when ledger.backend=paisa"
+        )
+
+    main_path_raw = Path(config.main_journal_path).expanduser()
+    if not main_path_raw.is_absolute():
+        raise ValueError("paisa.main_journal_path must be an absolute path")
+
+    generated_path_raw = Path(config.generated_journal_path).expanduser()
+    if not generated_path_raw.is_absolute():
+        raise ValueError("paisa.generated_journal_path must be an absolute path")
+
+    main_path = main_path_raw.resolve(strict=False)
+    generated_path = generated_path_raw.resolve(strict=False)
+    if generated_path == main_path:
+        raise ValueError(
+            "paisa.generated_journal_path must not be the main journal file"
+        )
+
+    main_dir = main_path.parent
+    if not generated_path.is_relative_to(main_dir):
+        raise ValueError(
+            "paisa.generated_journal_path must be in the main journal directory or a subdirectory"
+        )
+
+    return replace(
+        config,
+        main_journal_path=str(main_path),
+        generated_journal_path=str(generated_path),
+    )
+
+
+def get_paisa_config() -> PaisaConfig:
+    return validate_paisa_config()
 
 
 def is_telegram_configured() -> bool:
@@ -225,16 +459,31 @@ def parse_form_updates(
                     if not raw:
                         raw = defn.default
                     else:
-                        try:
-                            parts = [
-                                int(x.strip()) for x in raw.split(",") if x.strip()
-                            ]
-                            raw = json.dumps(parts)
-                        except ValueError, TypeError:
-                            errors.append(
-                                f"{defn.label}: must be comma-separated numbers"
-                            )
-                            continue
+                        if key == "telegram.reminder_days_before":
+                            try:
+                                parts = [
+                                    int(x.strip()) for x in raw.split(",") if x.strip()
+                                ]
+                                raw = json.dumps(parts)
+                            except ValueError, TypeError:
+                                errors.append(
+                                    f"{defn.label}: must be comma-separated numbers"
+                                )
+                                continue
+                        else:
+                            try:
+                                parsed = json.loads(raw)
+                            except json.JSONDecodeError:
+                                errors.append(f"{key}: must be valid JSON")
+                                continue
+                            if key == "paisa.account_map" and not isinstance(
+                                parsed, dict
+                            ):
+                                errors.append(
+                                    "paisa.account_map: must be a JSON object"
+                                )
+                                continue
+                            raw = json.dumps(parsed)
                 updates[key] = raw
     return updates, errors
 
@@ -265,6 +514,7 @@ async def load_all_settings() -> dict[str, str]:
     for key, val in db_values.items():
         if key not in merged:
             merged[key] = val
+    validate_paisa_config(merged)
     _cache.clear()
     _cache.update(merged)
     return dict(_cache)
@@ -272,6 +522,8 @@ async def load_all_settings() -> dict[str, str]:
 
 async def save_settings(updates: dict[str, str]) -> set[str]:
     """Bulk upsert. Returns the set of keys whose values actually changed."""
+    validate_paisa_config(_get_paisa_config_values(updates))
+
     fernet = None
     changed: dict[str, str] = {}
 
@@ -305,6 +557,8 @@ async def save_settings(updates: dict[str, str]) -> set[str]:
 
 async def start_services() -> None:
     """Start services based on current settings. Idempotent."""
+    validate_paisa_config()
+
     if is_telegram_configured():
         # function-local: breaks cycle with services.telegram (telegram imports settings at top)
         from financial_dashboard.services import telegram as telegram_service

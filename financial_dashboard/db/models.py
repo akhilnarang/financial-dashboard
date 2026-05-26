@@ -209,6 +209,70 @@ class Setting(Base):
     )
 
 
+class PaisaExport(Base):
+    __tablename__ = "paisa_exports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    email_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("emails.id"), nullable=True
+    )
+    sms_message_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("sms_messages.id"), nullable=True
+    )
+    idempotency_key: Mapped[str] = mapped_column(String, nullable=False)
+    bank: Mapped[str] = mapped_column(String, nullable=False)
+    email_type: Mapped[str | None] = mapped_column(String)
+    direction: Mapped[str] = mapped_column(String, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(
+        Numeric(precision=12, scale=2), nullable=False
+    )
+    currency: Mapped[str | None] = mapped_column(String, default="INR")
+    transaction_date: Mapped[datetime.date | None] = mapped_column(Date)
+    transaction_time: Mapped[datetime.time | None] = mapped_column(Time)
+    counterparty: Mapped[str | None] = mapped_column(String)
+    reference_number: Mapped[str | None] = mapped_column(String)
+    card_mask: Mapped[str | None] = mapped_column(String)
+    account_mask: Mapped[str | None] = mapped_column(String)
+    source_account: Mapped[str | None] = mapped_column(String)
+    counterparty_account: Mapped[str | None] = mapped_column(String)
+    missing_account_mapping: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="exported", server_default="exported"
+    )
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, default=utc_now
+    )
+    updated_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, default=utc_now, onupdate=utc_now
+    )
+    exported_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_paisa_exports_idempotency_key",
+        ),
+        Index(
+            "ix_paisa_exports_bank_direction_amount_currency_date",
+            "bank",
+            "direction",
+            "amount",
+            "currency",
+            "transaction_date",
+        ),
+        Index(
+            "ix_paisa_exports_bank_direction_reference",
+            "bank",
+            "direction",
+            "reference_number",
+        ),
+    )
+
+
 class Transaction(Base):
     __tablename__ = "transactions"
 

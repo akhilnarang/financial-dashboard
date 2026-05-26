@@ -122,7 +122,7 @@ async def test_provisional_notification_renders_not_yet_settled():
                     "direction": "credit",
                     "amount": Decimal("50000"),
                     "bank": "hdfc",
-                    "card_mask": "9710",
+                    "card_mask": "0000",
                 },
                 chat_id=12345,
                 source="sms",
