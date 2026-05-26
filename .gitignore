@@ -21,3 +21,5 @@ data/
 .env
 
 .codex
+/paisa_test.db
+/paisa_test.ledger
