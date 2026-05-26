@@ -42,11 +42,16 @@ from financial_dashboard.schemas.emails import (
     ReparseAllFailedResponse,
     ReparseEmailResponse,
 )
+from financial_dashboard.services import settings as settings_service
 from financial_dashboard.services.cc_disambiguation import (
     resolve_cc_payment_account,
     should_auto_reconcile_statement,
 )
-from financial_dashboard.services.emails import parse_email_by_kind
+from financial_dashboard.services.emails import (
+    is_declined_email_transaction,
+    is_paisa_statement_skip_error,
+    parse_email_by_kind,
+)
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.reminders import check_payment_received
 from financial_dashboard.services.settings import (
@@ -299,6 +304,7 @@ async def reparse_email(
 
     Returns JSON so the caller can update the UI without a full-page redirect.
     """
+    is_paisa_backend = settings_service.get_ledger_backend() == "paisa"
     email_row = await session.get(Email, email_id)
     if not email_row:
         raise HTTPException(status_code=404, detail="Email not found")
@@ -325,9 +331,21 @@ async def reparse_email(
         subject=email_row.subject or "",
         source_id=email_row.source_id,
         log_ref=f"reparse:{email_id}",
+        allow_statement_routing=not is_paisa_backend,
     )
 
     if not txn_data and not stmt_result:
+        if is_paisa_backend and is_paisa_statement_skip_error(error):
+            em = await session.get(Email, email_id)
+            if em:
+                em.status = "skipped"
+                em.error = error
+                await session.commit()
+            return ReparseEmailResponse(
+                message="Email re-parsed and skipped in paisa mode",
+                new_status="skipped",
+                txn_id=None,
+            )
         # Parsing still fails — update error message so it's fresh, but keep
         # status=failed. Re-save the raw bytes to the spool so the next retry
         # doesn't have to hit the provider again until the cleanup cron evicts them.
@@ -346,6 +364,14 @@ async def reparse_email(
     # Close the implicit read transaction opened earlier (from session.get at
     # the top of this handler) so session.begin() below doesn't collide with it.
     await session.rollback()
+
+    txn_id = None
+    duplicate_error: str | None = None
+    pending_payment_check: tuple[int, int, Decimal] | None = None
+    pending_disambiguation: dict | None = None
+    paisa_reparse_error: str | None = None
+    needs_paisa_journal_rewrite = False
+    final_status = "parsed"
 
     async with session.begin():
         em = await session.get(Email, email_id)
@@ -378,11 +404,34 @@ async def reparse_email(
                     email_id,
                 )
 
-        txn_id = None
-        duplicate_error: str | None = None
-        pending_payment_check: tuple[int, int, Decimal] | None = None
-        pending_disambiguation: dict | None = None
-        if txn_data:
+        if txn_data and is_paisa_backend and is_declined_email_transaction(txn_data):
+            em.status = "skipped"
+            em.error = None
+            final_status = "skipped"
+        elif txn_data and is_paisa_backend:
+            from financial_dashboard.services import paisa as paisa_service
+
+            paisa_outcome = await paisa_service.process_paisa_transaction(
+                session,
+                source="email",
+                txn_data=txn_data,
+                email_row=em,
+            )
+            needs_paisa_journal_rewrite = paisa_outcome.needs_journal_rewrite
+            if paisa_outcome.status == "parsed":
+                em.status = "parsed"
+                em.error = None
+                final_status = "parsed"
+            elif paisa_outcome.status == "skipped":
+                em.status = "skipped"
+                em.error = paisa_outcome.error
+                final_status = "skipped"
+            else:
+                em.status = "failed"
+                em.error = paisa_outcome.error or "Paisa export failed"
+                final_status = "failed"
+                paisa_reparse_error = em.error
+        elif txn_data:
             try:
                 async with session.begin_nested():
                     # Upsert: if a transaction is already attached to this
@@ -483,8 +532,25 @@ async def reparse_email(
     if duplicate_error:
         raise HTTPException(status_code=409, detail=duplicate_error)
 
+    if needs_paisa_journal_rewrite:
+        from financial_dashboard.services import paisa as paisa_service
+
+        try:
+            await paisa_service.rewrite_paisa_journal(
+                settings_service.get_paisa_config()
+            )
+        except Exception as exc:
+            logger.warning(
+                "Reparse paisa journal rewrite failed for email %d: %s",
+                email_id,
+                exc,
+            )
+
+    if paisa_reparse_error is not None:
+        raise HTTPException(status_code=422, detail=paisa_reparse_error)
+
     # Send Telegram notification for the new transaction
-    if txn_id and txn_data and should_notify_transactions():
+    if not is_paisa_backend and txn_id and txn_data and should_notify_transactions():
         try:
             await send_transaction_notification(
                 txn_id, txn_data, get_telegram_chat_id()
@@ -497,7 +563,7 @@ async def reparse_email(
     # Mirror the polling pipeline (services/emails.py:513-522): credit
     # transactions against an account may satisfy a pending statement payment.
     # Runs after the Telegram notification so the user sees the txn first.
-    if pending_payment_check:
+    if not is_paisa_backend and pending_payment_check:
         try:
             await check_payment_received(*pending_payment_check)
         except Exception as exc:
@@ -507,7 +573,7 @@ async def reparse_email(
                 exc,
             )
 
-    if pending_disambiguation is not None:
+    if not is_paisa_backend and pending_disambiguation is not None:
         try:
             await send_disambiguation_prompt(
                 pending_disambiguation, get_telegram_chat_id()
@@ -526,8 +592,13 @@ async def reparse_email(
             msg = f"{stmt_kind} statement summary created from email body"
         else:
             msg = f"{stmt_kind} statement re-processed (matched={stmt_result.get('matched', 0)}, imported={stmt_result.get('imported', 0)})"
+    elif is_paisa_backend and txn_data:
+        if final_status == "parsed":
+            msg = "Email re-parsed and exported to paisa"
+        elif final_status == "skipped":
+            msg = "Email re-parsed and skipped in paisa mode"
     logger.info("Reparse of email %d succeeded: %s", email_id, msg)
-    return ReparseEmailResponse(message=msg, new_status="parsed", txn_id=txn_id)
+    return ReparseEmailResponse(message=msg, new_status=final_status, txn_id=txn_id)
 
 
 @router.post("/emails/reparse-all-failed", response_model=ReparseAllFailedResponse)
@@ -537,9 +608,11 @@ async def reparse_all_failed(
     """Re-parse all emails with status='failed', loading raw bytes from the
     spool or re-fetching from the provider when the spool has aged out."""
 
+    is_paisa_backend = settings_service.get_ledger_backend() == "paisa"
     succeeded = 0
     skipped = 0
     still_failed = 0
+    needs_paisa_journal_rewrite = False
 
     rows = (
         await session.execute(
@@ -581,16 +654,25 @@ async def reparse_all_failed(
             subject=email_row.subject or "",
             source_id=email_row.source_id,
             log_ref=f"bulk-reparse:{email_row.id}",
+            allow_statement_routing=not is_paisa_backend,
         )
 
         if not txn_data and not stmt_result:
+            if is_paisa_backend and is_paisa_statement_skip_error(error):
+                async with session.begin():
+                    em = await session.get(Email, email_row.id)
+                    if em:
+                        em.status = "skipped"
+                        em.error = error
+                skipped += 1
+                continue
             # Re-save to spool so the next retry doesn't re-fetch from the
             # provider (cleanup cron will evict after FAILED_SPOOL_MAX_AGE_DAYS).
             _save_failed_email(email_row.provider, email_row.message_id, raw_bytes)
             still_failed += 1
             continue
 
-        was_skipped = False
+        row_status = "parsed"
         pending_payment_check: tuple[int, int, Decimal] | None = None
         pending_disambiguation: dict | None = None
         async with session.begin():
@@ -611,8 +693,49 @@ async def reparse_all_failed(
                         su_id,
                         email_row.id,
                     )
+            elif stmt_result and stmt_result.get("bank_statement_upload_id"):
+                su_id = stmt_result["bank_statement_upload_id"]
+                su = await session.get(BankStatementUpload, su_id)
+                if su:
+                    su.email_id = em.id
+                else:
+                    logger.warning(
+                        "BankStatementUpload %s disappeared during bulk reparse of email %d",
+                        su_id,
+                        email_row.id,
+                    )
 
-            if txn_data:
+            if txn_data and is_paisa_backend:
+                from financial_dashboard.services import paisa as paisa_service
+
+                if is_declined_email_transaction(txn_data):
+                    em.status = "skipped"
+                    em.error = None
+                    row_status = "skipped"
+                else:
+                    paisa_outcome = await paisa_service.process_paisa_transaction(
+                        session,
+                        source="email",
+                        txn_data=txn_data,
+                        email_row=em,
+                    )
+                    needs_paisa_journal_rewrite = (
+                        needs_paisa_journal_rewrite
+                        or paisa_outcome.needs_journal_rewrite
+                    )
+                    if paisa_outcome.status == "parsed":
+                        em.status = "parsed"
+                        em.error = None
+                        row_status = "parsed"
+                    elif paisa_outcome.status == "skipped":
+                        em.status = "skipped"
+                        em.error = paisa_outcome.error
+                        row_status = "skipped"
+                    else:
+                        em.status = "failed"
+                        em.error = paisa_outcome.error or "Paisa export failed"
+                        row_status = "failed"
+            elif txn_data:
                 try:
                     async with session.begin_nested():
                         # Upsert: failed emails reaching the bulk-reparse
@@ -663,7 +786,7 @@ async def reparse_all_failed(
                 except IntegrityError:
                     em.status = "skipped"
                     em.error = "Duplicate transaction skipped"
-                    was_skipped = True
+                    row_status = "skipped"
                 except MultipleResultsFound:
                     # Skip this row but keep the batch going — the
                     # operator can deal with the duplicate manually.
@@ -672,9 +795,9 @@ async def reparse_all_failed(
                         "More than one attached transaction; resolve "
                         "manually before reparsing."
                     )
-                    was_skipped = True
+                    row_status = "skipped"
 
-        if pending_payment_check:
+        if not is_paisa_backend and pending_payment_check:
             try:
                 await check_payment_received(*pending_payment_check)
             except Exception as exc:
@@ -684,7 +807,7 @@ async def reparse_all_failed(
                     exc,
                 )
 
-        if pending_disambiguation is not None:
+        if not is_paisa_backend and pending_disambiguation is not None:
             try:
                 await send_disambiguation_prompt(
                     pending_disambiguation, get_telegram_chat_id()
@@ -696,10 +819,22 @@ async def reparse_all_failed(
                     exc,
                 )
 
-        if was_skipped:
+        if row_status == "parsed":
+            succeeded += 1
+        elif row_status == "skipped":
             skipped += 1
         else:
-            succeeded += 1
+            still_failed += 1
+
+    if needs_paisa_journal_rewrite:
+        from financial_dashboard.services import paisa as paisa_service
+
+        try:
+            await paisa_service.rewrite_paisa_journal(
+                settings_service.get_paisa_config()
+            )
+        except Exception as exc:
+            logger.warning("Bulk reparse paisa journal rewrite failed: %s", exc)
 
     return ReparseAllFailedResponse(
         succeeded=succeeded,

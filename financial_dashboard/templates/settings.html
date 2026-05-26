@@ -79,19 +79,19 @@
 
             {% set conn_fields = [] %}
             {% set toggle_fields = [] %}
-            {% set number_fields = [] %}
+            {% set value_fields = [] %}
             {% for s in items %}
                 {% if s.secret or (s.type == "int" and s.key.endswith("chat_id")) %}
                     {% set _ = conn_fields.append(s) %}
                 {% elif s.type == "bool" %}
                     {% set _ = toggle_fields.append(s) %}
                 {% else %}
-                    {% set _ = number_fields.append(s) %}
+                    {% set _ = value_fields.append(s) %}
                 {% endif %}
             {% endfor %}
 
             {% if conn_fields %}
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; {% if toggle_fields or number_fields %}margin-bottom: 0.75rem;{% endif %}">
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; {% if toggle_fields or value_fields %}margin-bottom: 0.75rem;{% endif %}">
                 {% for s in conn_fields %}
                     {% if s.secret %}
                     <div data-field>
@@ -130,15 +130,33 @@
             </div>
             {% endif %}
 
-            {% if number_fields %}
+            {% if value_fields %}
             <div class="inline-fields" {% if toggle_fields or conn_fields %}style="margin-top: 0.75rem;"{% endif %}>
-                {% for s in number_fields %}
+                {% for s in value_fields %}
                 <label data-field>
                     {{ s.label }}
-                    {% if s.type == "json" %}
+                    {% if s.key == "ledger.backend" %}
+                    <select name="{{ s.key }}">
+                        <option value="local" {% if s.value == "local" %}selected{% endif %}>local</option>
+                        <option value="paisa" {% if s.value == "paisa" %}selected{% endif %}>paisa</option>
+                    </select>
+                    {% elif s.key == "paisa.ledger_cli" %}
+                    <select name="{{ s.key }}">
+                        <option value="ledger" {% if s.value == "ledger" %}selected{% endif %}>ledger</option>
+                    </select>
+                    {% elif s.key == "paisa.account_map" %}
+                    <textarea
+                        name="{{ s.key }}"
+                        rows="6"
+                        style="width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;"
+                        placeholder='{"bank:card:1234": "Liabilities:CreditCard:Bank:1234"}'
+                    >{{ s.value if s.value else '{}' }}</textarea>
+                    {% elif s.key == "telegram.reminder_days_before" %}
                     <input type="text" name="{{ s.key }}" value="{{ s.value|replace('[', '')|replace(']', '')|replace(' ', '') if s.value else '' }}" placeholder="e.g. 7,3,1,0" inputmode="numeric">
-                    {% else %}
+                    {% elif s.type == "int" %}
                     <input type="number" name="{{ s.key }}" value="{{ s.value }}" min="1">
+                    {% else %}
+                    <input type="text" name="{{ s.key }}" value="{{ s.value if s.value else '' }}">
                     {% endif %}
                     {% if s.description %}<small class="text-sm text-muted">{{ s.description }}</small>{% endif %}
                 </label>

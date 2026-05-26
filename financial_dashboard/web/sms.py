@@ -21,7 +21,10 @@ from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
 from financial_dashboard.db import SmsMessage, Transaction, async_session
 from financial_dashboard.services.linker import build_link_context
+from financial_dashboard.services.paisa import rewrite_paisa_journal
 from financial_dashboard.services.settings import (
+    get_ledger_backend,
+    get_paisa_config,
     get_telegram_chat_id,
     should_notify_transactions,
 )
@@ -51,6 +54,7 @@ async def reparse_sms(
     sms_id: int,
     session: AsyncSession = Depends(get_session),
 ) -> ReparseSmsResponse:
+    ledger_backend = get_ledger_backend()
     sms = await session.get(SmsMessage, sms_id)
     if sms is None:
         raise HTTPException(404, "SMS not found")
@@ -67,8 +71,16 @@ async def reparse_sms(
         link_ctx = await build_link_context(session)
         outcome = await process_sms_row(session, sms, link_ctx)
 
+    if outcome.needs_journal_rewrite:
+        try:
+            await rewrite_paisa_journal(get_paisa_config())
+        except Exception as exc:
+            logger.warning(
+                "Reparse paisa journal rewrite failed for SMS %d: %s", sms_id, exc
+            )
+
     # Telegram dispatch (best-effort, post-commit).
-    if should_notify_transactions():
+    if ledger_backend != "paisa" and should_notify_transactions():
         chat_id = get_telegram_chat_id()
         if outcome.primary_notification is not None:
             try:
@@ -91,7 +103,7 @@ async def reparse_sms(
 
     # CC payment marking — same hooks as POST /api/sms. A reparse of a
     # CC-payment-received SMS should still mark the statement paid.
-    if outcome.pending_payment_check is not None:
+    if ledger_backend != "paisa" and outcome.pending_payment_check is not None:
         from financial_dashboard.services.reminders import check_payment_received
 
         try:
@@ -102,7 +114,7 @@ async def reparse_sms(
                 exc,
             )
 
-    if outcome.pending_disambiguation is not None:
+    if ledger_backend != "paisa" and outcome.pending_disambiguation is not None:
         from financial_dashboard.services.telegram import (
             send_disambiguation_prompt,
         )
@@ -145,6 +157,7 @@ class ReparseAllSmsResponse(BaseModel):
 async def reparse_all_failed_sms(
     session: AsyncSession = Depends(get_session),
 ) -> ReparseAllSmsResponse:
+    ledger_backend = get_ledger_backend()
     # 1. Read row IDs only.
     ids = (
         (
@@ -161,13 +174,25 @@ async def reparse_all_failed_sms(
     async with async_session() as s:
         link_ctx = await build_link_context(s)
 
-    # Lazy-imported here to avoid a top-level cycle.
-    from financial_dashboard.services.reminders import check_payment_received
-    from financial_dashboard.services.telegram import send_disambiguation_prompt
+    check_payment_received = None
+    send_disambiguation_prompt = None
+    if ledger_backend != "paisa":
+        # Lazy-imported here to avoid a top-level cycle.
+        from financial_dashboard.services.reminders import (
+            check_payment_received as _check,
+        )
+        from financial_dashboard.services.telegram import (
+            send_disambiguation_prompt as _prompt,
+        )
+
+        check_payment_received = _check
+        send_disambiguation_prompt = _prompt
 
     counts = {"processed": 0, "enriched": 0, "still_error": 0, "skipped": 0}
     chat_id_for_dispatch = (
-        get_telegram_chat_id() if should_notify_transactions() else None
+        get_telegram_chat_id()
+        if ledger_backend != "paisa" and should_notify_transactions()
+        else None
     )
     for sms_id in ids:
         try:
@@ -188,6 +213,16 @@ async def reparse_all_failed_sms(
                     counts["still_error"] += 1
                 case "skipped":
                     counts["skipped"] += 1
+
+            if outcome.needs_journal_rewrite:
+                try:
+                    await rewrite_paisa_journal(get_paisa_config())
+                except Exception as exc:
+                    logger.warning(
+                        "Bulk reparse paisa journal rewrite failed for SMS %d: %s",
+                        sms_id,
+                        exc,
+                    )
 
             # Telegram primary + enrichment notifications fire on reparse
             # too, matching the single-reparse path. Best-effort; one row's
@@ -225,7 +260,10 @@ async def reparse_all_failed_sms(
                         )
 
             # CC payment marking + disambiguation also still fire on reparse.
-            if outcome.pending_payment_check is not None:
+            if (
+                check_payment_received is not None
+                and outcome.pending_payment_check is not None
+            ):
                 try:
                     await check_payment_received(*outcome.pending_payment_check)
                 except Exception as exc:
@@ -235,8 +273,9 @@ async def reparse_all_failed_sms(
                         exc,
                     )
             if (
-                outcome.pending_disambiguation is not None
+                send_disambiguation_prompt is not None
                 and chat_id_for_dispatch is not None
+                and outcome.pending_disambiguation is not None
             ):
                 try:
                     await send_disambiguation_prompt(

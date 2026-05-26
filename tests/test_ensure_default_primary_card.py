@@ -44,7 +44,7 @@ async def test_seeds_primary_card_for_new_credit_card_account(session_factory):
         bank="hdfc",
         label="HDFC Swiggy CC",
         type="credit_card",
-        account_number="0264",
+        account_number="0000",
     )
     async with session_factory() as session:
         account = await session.get(Account, account.id)
@@ -59,7 +59,7 @@ async def test_seeds_primary_card_for_new_credit_card_account(session_factory):
             .all()
         )
     assert len(cards) == 1
-    assert cards[0].card_mask == "0264"
+    assert cards[0].card_mask == "0000"
     assert cards[0].is_primary is True
     assert cards[0].label == "self"
     assert cards[0].active is True
@@ -72,12 +72,12 @@ async def test_skips_when_account_already_has_cards(session_factory):
         bank="icici",
         label="ICICI RubyX",
         type="credit_card",
-        account_number="1003",
+        account_number="0000",
     )
     async with session_factory() as session:
         session.add(
             Card(
-                account_id=account.id, card_mask="XX1003", label="Amex", is_primary=True
+                account_id=account.id, card_mask="XX0000", label="Amex", is_primary=True
             )
         )
         await session.commit()
@@ -95,7 +95,7 @@ async def test_skips_when_account_already_has_cards(session_factory):
             .all()
         )
     assert len(cards) == 1
-    assert cards[0].card_mask == "XX1003"
+    assert cards[0].card_mask == "XX0000"
 
 
 @pytest.mark.anyio
@@ -105,7 +105,7 @@ async def test_skips_bank_account_type(session_factory):
         bank="hdfc",
         label="HDFC Savings",
         type="bank_account",
-        account_number="00391000107703",
+        account_number="00000000000000",
     )
     async with session_factory() as session:
         account = await session.get(Account, account.id)

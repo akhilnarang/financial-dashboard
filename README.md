@@ -41,6 +41,69 @@ Once running:
 | `TELEGRAM_BOT_TOKEN` | (optional) | Telegram bot token for real-time transaction notifications |
 | `TELEGRAM_CHAT_ID` | (optional) | Telegram chat ID to send notifications to |
 
+## Ledger Backend Modes
+
+Use `ledger.backend` to choose how parsed SMS/email transaction alerts are consumed:
+
+- `local` (default): existing dashboard-owned ledger. Alerts create/merge local `transactions` rows and continue through normal dashboard flows.
+- `paisa`: ingestion bridge mode. Alerts are deduplicated into Paisa exports and written to a generated Ledger include journal. New alerts do **not** create local `transactions` rows.
+
+### Paisa Mode (v1) Setup
+
+Paisa mode uses these settings (`/settings`, category: `Ledger`):
+
+- `ledger.backend` (default: `local`) -> set to `paisa` to enable bridge mode.
+- `paisa.ledger_cli` (default: `ledger`) -> must be exactly `ledger` in v1. `hledger` and `beancount` are not supported by the current renderer and raise a config error.
+- `paisa.main_journal_path` (default: empty) -> required absolute path to your main Paisa journal file.
+- `paisa.generated_journal_path` (default: empty) -> required absolute path to the generated include file. It must be inside the main journal directory (or one of its subdirectories) and must not equal `paisa.main_journal_path`.
+- `paisa.default_expense_account` (default: `Expenses:Uncategorized`)
+- `paisa.default_income_account` (default: `Income:Uncategorized`)
+- `paisa.fallback_asset_account` (default: `Assets:Unknown`)
+- `paisa.fallback_liability_account` (default: `Liabilities:Unknown`)
+- `paisa.account_map` (default: `{}`) -> JSON object mapping stable source IDs to Ledger account names.
+
+Example include setup:
+
+```ledger
+# main journal: /home/you/finance/main.ledger
+# generated include: /home/you/finance/imports/financial-dashboard.ledger
+include imports/financial-dashboard.ledger
+```
+
+The generated file is rewritten from exported rows in deterministic order (`transaction_date`, `transaction_time`, `id`) whenever a new/export-enriched alert is processed.
+
+### Paisa Account Mapping
+
+`paisa.account_map` keys are stable source IDs derived from parsed bank + mask digits:
+
+- `{bank}:card:{mask_digits}`
+- `{bank}:account:{mask_digits}`
+
+Example:
+
+```json
+{
+  "hdfc:card:1234": "Liabilities:CreditCard:HDFC:1234",
+  "hdfc:account:5678": "Assets:Bank:HDFC:5678"
+}
+```
+
+If a source key is unmapped, exports still proceed:
+
+- Counterparty side uses `paisa.default_expense_account` for debits and `paisa.default_income_account` for credits.
+- Source side falls back to `paisa.fallback_liability_account` (card sources) or `paisa.fallback_asset_account` (account/no-mask sources).
+- A `missing-map ...` comment is added to the journal entry so you can find gaps quickly (for example, `grep "missing-map"`).
+
+### Paisa Mode Tradeoffs
+
+Paisa mode is intentionally ingestion-only in v1:
+
+- No new local transaction entries for parsed SMS/email alerts (so dashboard transaction pages do not receive new rows from those alerts).
+- No local statement import/reconciliation pipeline for email statements, and statement emails are explicitly not imported in paisa mode.
+- No local CC payment tracking/disambiguation hooks.
+- No Telegram transaction/enrichment notifications for new ingested alerts in paisa mode.
+- No Telegram reply workflow for transaction note/category updates from those alerts.
+
 ## Key Features
 
 ### Email Fetching
@@ -66,13 +129,13 @@ Once running:
 
 ### Account and Card Management
 - **Accounts** represent bank accounts, savings accounts, or credit cards. Each has a bank, label, type, and optional account number (last-4 or full number).
-- **Cards** are physical cards linked to an account. An account can have multiple cards (primary + addon cards). Each card has a `card_mask` (e.g. `XX2001`).
+- **Cards** are physical cards linked to an account. An account can have multiple cards (primary + addon cards). Each card has a `card_mask` (e.g. `XX1234`).
 - **Addon card support**: Multiple cards can be linked to a single credit card account (e.g. primary + spouse addon). The linker resolves transactions to the correct card and parent account.
 
 ### Transaction-to-Account Linking (`services/linker.py`)
 Every transaction is auto-linked to an Account (and optionally a Card) using a four-level lookup cascade:
 
-1. **card_mask -> cards table** — sets both `card_id` and `account_id`. Handles all mask formats (`XX2001`, `xx0298`, `XXXXXXX8669`, `4611 XXXX XXXX 2002`, `0567`, etc.) by extracting the last-4 digits.
+1. **card_mask -> cards table** — sets both `card_id` and `account_id`. Handles all mask formats (`XX1234`, `xx5678`, `XXXXXXX1234`, `0000 XXXX XXXX 1234`, `1234`, etc.) by extracting the last-4 digits.
 2. **card_mask -> accounts table** — fallback for cards stored as Account rows (e.g. debit cards with `account_number` = last-4).
 3. **account_mask -> accounts table** — for savings/current account masks.
 4. **bank-only fallback** — links to the sole account for a bank, but only when exactly one account exists (avoids silent misattribution when a bank has both savings and CC accounts).
@@ -156,6 +219,8 @@ scripts/
 | `Card` | `cards` | Physical payment card linked to an account (supports addon cards) |
 | `StatementUpload` | `statement_uploads` | CC statement PDF upload with reconciliation results stored as JSON |
 | `BankStatementUpload` | `bank_statement_uploads` | Bank statement PDF upload with reconciliation results stored as JSON |
+| `SmsMessage` | `sms_messages` | Incoming SMS alert with parse status and optional linked transaction |
+| `PaisaExport` | `paisa_exports` | Paisa-mode export log for idempotent cross-channel dedup and journal regeneration |
 | `Setting` | `settings` | Small key/value store for app-level settings |
 
 ### Schema Diagram
@@ -279,6 +344,46 @@ erDiagram
         datetime updated_at
     }
 
+    SMS_MESSAGES {
+        int id PK
+        string bank
+        string sender
+        text body
+        datetime received_at
+        datetime created_at
+        string status
+        int transaction_id FK
+        text parse_error
+        datetime parsed_at
+    }
+
+    PAISA_EXPORTS {
+        int id PK
+        string source
+        int email_id FK
+        int sms_message_id FK
+        string idempotency_key UNIQUE
+        string bank
+        string email_type
+        string direction
+        decimal amount
+        string currency
+        date transaction_date
+        time transaction_time
+        string counterparty
+        string reference_number
+        string card_mask
+        string account_mask
+        string source_account
+        string counterparty_account
+        bool missing_account_mapping
+        string status
+        text error
+        datetime created_at
+        datetime updated_at
+        datetime exported_at
+    }
+
     TRANSACTIONS {
         int id PK
         int email_id FK
@@ -314,6 +419,10 @@ erDiagram
     ACCOUNTS ||--o{ BANK_STATEMENT_UPLOADS : owns
     EMAILS ||--o{ BANK_STATEMENT_UPLOADS : originates
     EMAILS ||--o{ TRANSACTIONS : produces
+    EMAILS ||--o{ PAISA_EXPORTS : produces
+    SMS_MESSAGES ||--o{ PAISA_EXPORTS : produces
+    SMS_MESSAGES ||--o{ TRANSACTIONS : source_sms
+    TRANSACTIONS ||--o{ SMS_MESSAGES : linked_from
     ACCOUNTS ||--o{ TRANSACTIONS : linked_account
     CARDS ||--o{ TRANSACTIONS : linked_card
     STATEMENT_UPLOADS ||--o{ TRANSACTIONS : imported_from_cc_statement
@@ -330,6 +439,8 @@ Relationship notes:
 - `(source_id, remote_id)` is unique on `emails` (provider-scoped deduplication).
 - `transactions` has a partial unique index on `(bank, reference_number)` where `reference_number IS NOT NULL` (deduplicates transactions with known UTR/UPI reference numbers).
 - `(account_id, card_mask)` is unique on `cards`.
+- `paisa_exports.idempotency_key` is unique.
+- `paisa_exports` has lookup indexes on `(bank, direction, amount, currency, transaction_date)` and `(bank, direction, reference_number)`.
 
 ### Schema Migrations
 There is no Alembic. Migrations are handled inline in `init_db()` via `try/except ALTER TABLE` blocks. A one-time migration removes a legacy `uq_transaction_dedup` constraint that was replaced by the partial index.

@@ -76,7 +76,7 @@ async def _seed(maker, *, orphan: bool = True):
         await session.flush()
         card = Card(
             account_id=account.id,
-            card_mask="5785",
+            card_mask="0000",
             label="Primary",
             is_primary=True,
             active=True,

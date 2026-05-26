@@ -106,7 +106,7 @@ async def _seed(
             bank="equitas",
             label="Equitas Test CC",
             type="credit_card",
-            account_number="6530XXXXXXXX9999",
+            account_number="0000XXXXXXXX9999",
             active=True,
         )
         session.add(account)
@@ -114,7 +114,7 @@ async def _seed(
 
         card = Card(
             account_id=account.id,
-            card_mask="6530XXXXXXXX9999",
+            card_mask="0000XXXXXXXX9999",
             label="self",
             is_primary=True,
             active=True,

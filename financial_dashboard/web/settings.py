@@ -64,7 +64,19 @@ async def save_settings_route(
             status_code=422,
         )
 
-    changed_keys = await save_settings(updates)
+    try:
+        changed_keys = await save_settings(updates)
+    except ValueError as exc:
+        return templates.TemplateResponse(
+            request,
+            "settings.html",
+            {
+                "active_page": "settings",
+                "grouped_settings": get_grouped_settings(),
+                "errors": [str(exc)],
+            },
+            status_code=422,
+        )
 
     telegram_restart_keys = {
         "telegram.bot_token",

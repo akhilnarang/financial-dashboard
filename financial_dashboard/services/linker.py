@@ -290,7 +290,7 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
        only.
 
     3. account_mask -> accounts table
-       Savings / current account masks like "xx0298".
+       Savings / current account masks like "xx5678".
 
     4. bank-only
        When neither mask is present and the bank has exactly one account

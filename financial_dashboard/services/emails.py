@@ -37,6 +37,7 @@ from financial_dashboard.services.cc_disambiguation import (
 )
 from financial_dashboard.services.linker import link_transaction
 from financial_dashboard.services.reminders import check_payment_received
+from financial_dashboard.services import settings as settings_service
 from financial_dashboard.services.settings import (
     get_setting_int,
     get_telegram_chat_id,
@@ -99,6 +100,21 @@ _RECEIVED_AT_FUTURE_TOLERANCE = datetime.timedelta(minutes=5)
 # at which point the data is unrecoverable from the email alone and we
 # leave the parsed time as-is.
 _RECEIVED_AT_PAST_LIMIT = datetime.timedelta(hours=12)
+_DECLINED_EMAIL_TYPES = {"sbi_cc_transaction_declined"}
+
+
+def is_declined_email_transaction(txn_data: dict | None) -> bool:
+    if not txn_data:
+        return False
+    if txn_data.get("direction") == "declined":
+        return True
+    return txn_data.get("email_type") in _DECLINED_EMAIL_TYPES
+
+
+def is_paisa_statement_skip_error(error: str | None) -> bool:
+    if not error:
+        return False
+    return error.startswith("Statement")
 
 
 def _disambiguate_am_pm(
@@ -315,6 +331,7 @@ async def parse_email_by_kind(
     subject: str,
     source_id: int | None,
     log_ref: str,
+    allow_statement_routing: bool = True,
 ) -> EmailDispatchResult:
     """Run txn and/or statement pipelines based on the rule's email_kind.
 
@@ -346,6 +363,30 @@ async def parse_email_by_kind(
         error: str | None = None
     else:
         error = raw_error
+
+    if not allow_statement_routing:
+        if parsed_email is not None and parsed_email.statement is not None:
+            return EmailDispatchResult(
+                "Statement emails are not supported when ledger.backend=paisa",
+                None,
+                password_hint,
+                None,
+            )
+        if is_statement_rule:
+            return EmailDispatchResult(
+                "Statement email rules are disabled when ledger.backend=paisa",
+                None,
+                password_hint,
+                None,
+            )
+        if is_untyped_rule and not txn_data:
+            return EmailDispatchResult(
+                "Statement emails are not imported when ledger.backend=paisa",
+                None,
+                password_hint,
+                None,
+            )
+        return EmailDispatchResult(error, txn_data, password_hint, None)
 
     # Email-summary statements take precedence over PDF parsing: if the body
     # already carries a ``StatementSummary``, we persist from that and never
@@ -443,6 +484,8 @@ async def handle_polled_email(
 ) -> None:
     metadata = _extract_message_metadata(raw_bytes)
     received_at = _parse_email_date(raw_bytes)
+    ledger_backend = settings_service.get_ledger_backend()
+    is_paisa_backend = ledger_backend == "paisa"
 
     email_kind = rule.email_kind
     subject = metadata.get("subject", "")
@@ -453,6 +496,7 @@ async def handle_polled_email(
         subject=subject,
         source_id=source_id,
         log_ref=msg_id,
+        allow_statement_routing=not is_paisa_backend,
     )
 
     if stmt_result:
@@ -473,7 +517,7 @@ async def handle_polled_email(
                 stmt_result.get("matched", 0),
                 stmt_result.get("imported", 0),
             )
-    elif error:
+    elif error and not (is_paisa_backend and is_paisa_statement_skip_error(error)):
         try:
             _save_failed_email(provider, msg_id, raw_bytes)
         except Exception as save_err:
@@ -483,14 +527,24 @@ async def handle_polled_email(
     pending_enrichment_notifications: list[tuple[int, object, dict]] = []
     pending_payment_checks: list[tuple[int, int, object]] = []
     pending_disambiguations: list[dict] = []
+    needs_paisa_journal_rewrite = False
 
     async with async_session() as session:
         async with session.begin():
             if stmt_result:
                 initial_status = "parsed"
             else:
+                is_statement_skip = is_paisa_backend and is_paisa_statement_skip_error(
+                    error
+                )
                 initial_status = (
-                    "pending" if txn_data else ("failed" if error else "skipped")
+                    "pending"
+                    if txn_data
+                    else (
+                        "skipped"
+                        if is_statement_skip
+                        else ("failed" if error else "skipped")
+                    )
                 )
             email_row = Email(
                 provider=provider,
@@ -530,15 +584,35 @@ async def handle_polled_email(
                         msg_id,
                     )
 
-            skip_txn_types = {"sbi_cc_transaction_declined"}
-
-            if txn_data and txn_data.get("email_type") in skip_txn_types:
-                email_row.status = "parsed"
+            if txn_data and is_declined_email_transaction(txn_data):
+                email_row.status = "skipped" if is_paisa_backend else "parsed"
                 email_row.error = None
-                stats["parsed"] += 1
-                if should_notify:
+                stats["skipped" if is_paisa_backend else "parsed"] += 1
+                if should_notify and not is_paisa_backend:
                     txn_data["_declined"] = True
                     pending_notifications.append((0, txn_data))
+            elif txn_data and is_paisa_backend:
+                from financial_dashboard.services import paisa as paisa_service
+
+                paisa_outcome = await paisa_service.process_paisa_transaction(
+                    session,
+                    source="email",
+                    txn_data=txn_data,
+                    email_row=email_row,
+                )
+                needs_paisa_journal_rewrite = paisa_outcome.needs_journal_rewrite
+                if paisa_outcome.status == "parsed":
+                    email_row.status = "parsed"
+                    email_row.error = None
+                    stats["parsed"] += 1
+                elif paisa_outcome.status == "skipped":
+                    email_row.status = "skipped"
+                    email_row.error = paisa_outcome.error
+                    stats["skipped"] += 1
+                else:
+                    email_row.status = "failed"
+                    email_row.error = paisa_outcome.error or "Paisa export failed"
+                    stats["failed"] += 1
             elif txn_data:
                 from financial_dashboard.services.txn_merge import merge_transaction
 
@@ -667,9 +741,24 @@ async def handle_polled_email(
                             )
                         )
             elif error:
-                stats["failed"] += 1
+                if is_paisa_backend and is_paisa_statement_skip_error(error):
+                    email_row.status = "skipped"
+                    email_row.error = error
+                    stats["skipped"] += 1
+                else:
+                    stats["failed"] += 1
             else:
                 stats["skipped"] += 1
+
+    if needs_paisa_journal_rewrite:
+        from financial_dashboard.services import paisa as paisa_service
+
+        try:
+            await paisa_service.rewrite_paisa_journal(
+                settings_service.get_paisa_config()
+            )
+        except Exception as exc:
+            logger.warning("Paisa journal rewrite failed after email poll: %s", exc)
 
     if pending_notifications:
         chat_id = get_telegram_chat_id()

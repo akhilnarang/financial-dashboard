@@ -131,7 +131,7 @@ def test_compute_diff_incoming_null_never_overwrites_existing():
 
 
 def test_compute_diff_email_does_not_overwrite_transaction_time_with_later_value():
-    """Real-world repro: HDFC #7101 -₹10 RFHOSPITAL — the SMS-derived
+    """Real-world repro: HDFC #0000 -₹10 RFHOSPITAL — the SMS-derived
     09:30:26 was getting bumped to email-derived 09:30:27. A second-source
     timestamp that's LATER than the existing one is notification/parse
     delay, not new evidence about when the transaction happened, so keep

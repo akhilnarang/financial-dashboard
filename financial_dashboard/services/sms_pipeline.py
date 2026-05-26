@@ -21,6 +21,7 @@ from bank_sms_parser.models import ParsedSms
 
 from financial_dashboard.db import SmsMessage
 from financial_dashboard.services.linker import LinkContext, link_transaction
+from financial_dashboard.services.settings import get_ledger_backend
 from financial_dashboard.services.txn_merge import merge_transaction
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class ProcessSmsOutcome:
     """{txn_id, candidate_account_ids, amount, bank} — fires the Telegram
     inline-keyboard prompt when account_id couldn't be resolved (the user
     has more than one CC for this bank registered)."""
+    needs_journal_rewrite: bool = False
 
 
 def parsed_sms_to_txn_data(parsed: ParsedSms, sms_row: SmsMessage) -> dict | None:
@@ -186,6 +188,7 @@ async def process_sms_row(
     # showing the old error alongside its parsed/enriched status. Every
     # success path below (provisional, declined, merge) relies on this.
     sms_row.parse_error = None
+    ledger_backend = get_ledger_backend()
 
     # HDFC provisional payment-received pre-gate. HDFC sends two SMS per CC
     # bill payment; the no-reference "RECEIVED TOWARDS" variant is a
@@ -194,6 +197,11 @@ async def process_sms_row(
     # hooks (leaving them None here is a correctness requirement, not an
     # incidental default). The settlement SMS (with a ref) proceeds normally.
     if _is_hdfc_provisional_payment(txn_data):
+        if ledger_backend == "paisa":
+            sms_row.status = "skipped"
+            sms_row.transaction_id = None
+            return ProcessSmsOutcome(status="skipped", transaction_id=None)
+
         sms_row.status = "parsed"
         sms_row.transaction_id = None
         primary = {**txn_data, "_provisional": True}
@@ -208,12 +216,41 @@ async def process_sms_row(
     #    key includes `direction`, so a correctly-parsed declined event
     #    wouldn't pair with a debit anyway; this is defense-in-depth.
     if txn_data["direction"] == _DECLINED_DIRECTION:
+        if ledger_backend == "paisa":
+            sms_row.status = "skipped"
+            sms_row.transaction_id = None
+            return ProcessSmsOutcome(status="skipped", transaction_id=None)
+
         sms_row.status = "parsed"
         primary = {**txn_data, "_declined": True}
         return ProcessSmsOutcome(
             status="parsed",
             transaction_id=None,
             primary_notification=primary,
+        )
+
+    if ledger_backend == "paisa":
+        from financial_dashboard.services import paisa as paisa_service
+
+        # SQLAlchemy issues an autoflush when entering nested SAVEPOINT
+        # scopes. Flush row-state updates first so the Paisa helper's own
+        # nested transaction doesn't need to autoflush this SmsMessage again.
+        await session.flush()
+        paisa_outcome = await paisa_service.process_paisa_transaction(
+            session,
+            source="sms",
+            txn_data=txn_data,
+            sms_row=sms_row,
+        )
+
+        mapped_status: Literal["parsed", "skipped", "error"] = paisa_outcome.status
+        sms_row.status = mapped_status
+        sms_row.transaction_id = None
+        sms_row.parse_error = paisa_outcome.error if mapped_status == "error" else None
+        return ProcessSmsOutcome(
+            status=mapped_status,
+            transaction_id=None,
+            needs_journal_rewrite=paisa_outcome.needs_journal_rewrite,
         )
 
     # 3. Merge.

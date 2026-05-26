@@ -53,8 +53,8 @@ async def session_factory(monkeypatch, tmp_path):
 
 def _default_summary() -> StatementSummary:
     return StatementSummary(
-        total_amount_due=Money(amount=Decimal("12899.94")),
-        minimum_amount_due=Money(amount=Decimal("371.94")),
+        total_amount_due=Money(amount=Decimal("10000.00")),
+        minimum_amount_due=Money(amount=Decimal("500.00")),
         due_date=date(2026, 5, 5),
         card_mask="1234",
     )
@@ -129,8 +129,8 @@ async def test_summary_creates_statement_upload_with_correct_fields(
         assert upload.status == "parsed"
         assert upload.card_number == "1234"
         assert upload.due_date == "05/05/2026"
-        assert upload.total_amount_due == "12,899.94"
-        assert upload.minimum_amount_due == "371.94"
+        assert upload.total_amount_due == "10,000.00"
+        assert upload.minimum_amount_due == "500.00"
         assert upload.parsed_txn_count == 0
         assert upload.matched_count == 0
         assert upload.missing_count == 0
@@ -736,7 +736,7 @@ async def test_retry_cc_statement_upload_skips_email_summary(
             source_kind="email_summary",
             status="parsed",
             due_date="05/05/2026",
-            total_amount_due="12,899.94",
+            total_amount_due="10,000.00",
         )
         session.add(upload)
         await session.commit()
