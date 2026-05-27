@@ -1,7 +1,5 @@
 """Statement date helpers."""
 
-from __future__ import annotations
-
 from datetime import date
 
 from financial_dashboard.core.dates import parse_date

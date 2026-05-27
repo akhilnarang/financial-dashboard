@@ -28,8 +28,6 @@ Public API:
   amount-match step independently.
 """
 
-from __future__ import annotations
-
 import logging
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation

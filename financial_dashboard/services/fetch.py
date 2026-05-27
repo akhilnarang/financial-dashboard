@@ -1,7 +1,5 @@
 """Fetch orchestration service stored on app.state."""
 
-from __future__ import annotations
-
 import asyncio
 import logging
 

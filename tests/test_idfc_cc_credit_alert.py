@@ -1,7 +1,5 @@
 """Regression coverage for IDFC credit-card payment received alerts."""
 
-from __future__ import annotations
-
 from decimal import Decimal
 from email.message import EmailMessage
 

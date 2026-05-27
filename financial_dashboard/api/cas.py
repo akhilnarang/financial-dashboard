@@ -1,7 +1,5 @@
 """CAS JSON endpoints."""
 
-from __future__ import annotations
-
 import datetime
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile

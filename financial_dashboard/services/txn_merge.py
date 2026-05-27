@@ -7,8 +7,6 @@ an existing one. Caller owns the transaction boundary — this module
 does NOT commit and does NOT fire Telegram.
 """
 
-from __future__ import annotations
-
 import datetime as _dt
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta

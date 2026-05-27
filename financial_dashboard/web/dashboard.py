@@ -1,7 +1,5 @@
 """Dashboard HTML routes."""
 
-from __future__ import annotations
-
 import logging
 from datetime import date, datetime
 from decimal import Decimal

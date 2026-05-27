@@ -12,8 +12,6 @@ DB-Transaction-like objects, so we use a lightweight stub instead of a
 real DB.
 """
 
-from __future__ import annotations
-
 import datetime
 from dataclasses import dataclass
 from decimal import Decimal

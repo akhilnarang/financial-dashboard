@@ -1,7 +1,5 @@
 """Net-worth aggregation over balance snapshots."""
 
-from __future__ import annotations
-
 import datetime
 from collections import defaultdict
 from decimal import Decimal

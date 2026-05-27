@@ -10,8 +10,6 @@ so the tests run against the real parser contract. They exercise:
 - Idempotency of the ``init_db`` migration
 """
 
-from __future__ import annotations
-
 from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace

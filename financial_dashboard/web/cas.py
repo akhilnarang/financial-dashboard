@@ -1,7 +1,5 @@
 """CAS upload routes."""
 
-from __future__ import annotations
-
 import datetime
 from urllib.parse import urlencode
 

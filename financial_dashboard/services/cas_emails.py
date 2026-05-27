@@ -1,7 +1,5 @@
 """CAS email auto-fetch: rule management + per-email handler."""
 
-from __future__ import annotations
-
 import datetime
 import logging
 from pathlib import Path

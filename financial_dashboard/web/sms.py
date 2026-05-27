@@ -1,7 +1,5 @@
 """Web routes for /sms (HTML pages + JSON reparse endpoints)."""
 
-from __future__ import annotations
-
 import logging
 from datetime import date as _date, datetime as _datetime
 from typing import TYPE_CHECKING, Annotated, Literal, cast

@@ -1,7 +1,5 @@
 """Rule matching helpers."""
 
-from __future__ import annotations
-
 from email import utils as email_utils
 
 from financial_dashboard.db import FetchRule

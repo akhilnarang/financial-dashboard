@@ -5,8 +5,6 @@ ICICI's icici_cc_transaction_alert emails emit transaction time on a
 The dashboard infers the half-of-day from the email's Date header.
 """
 
-from __future__ import annotations
-
 import datetime
 from email.message import EmailMessage
 

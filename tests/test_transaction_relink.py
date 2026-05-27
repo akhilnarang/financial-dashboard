@@ -9,8 +9,6 @@ transaction is a CC bill-payment credit, so the matching statement
 auto-marks paid in one click.
 """
 
-from __future__ import annotations
-
 import datetime
 from decimal import Decimal
 

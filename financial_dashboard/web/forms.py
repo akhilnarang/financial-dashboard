@@ -1,7 +1,5 @@
 """Shared web form helpers."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 from financial_dashboard.core.uploads import STATEMENTS_DIR

@@ -6,8 +6,6 @@ is SQLite-specific (the dashboard is SQLite-only via aiosqlite); porting to
 another backend would require a dialect-aware upsert.
 """
 
-from __future__ import annotations
-
 import datetime
 import json
 from decimal import Decimal

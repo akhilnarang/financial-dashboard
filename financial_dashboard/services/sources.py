@@ -1,7 +1,5 @@
 """Email source service helpers."""
 
-from __future__ import annotations
-
 import asyncio
 import imaplib
 import json

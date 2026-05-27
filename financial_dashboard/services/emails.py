@@ -1,7 +1,5 @@
 """Email processing helpers."""
 
-from __future__ import annotations
-
 import datetime
 import logging
 from decimal import Decimal

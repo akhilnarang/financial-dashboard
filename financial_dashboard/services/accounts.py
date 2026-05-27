@@ -1,7 +1,5 @@
 """Account service helpers."""
 
-from __future__ import annotations
-
 import logging
 
 from sqlalchemy import func, select

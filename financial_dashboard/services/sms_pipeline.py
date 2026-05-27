@@ -6,8 +6,6 @@ the reparse endpoints. Caller owns the outer transaction — this module
 does NOT commit and does NOT fire Telegram.
 """
 
-from __future__ import annotations
-
 import datetime
 import logging
 from dataclasses import dataclass

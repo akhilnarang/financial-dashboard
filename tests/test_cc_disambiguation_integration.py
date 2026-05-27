@@ -9,8 +9,6 @@ must route the txn to that account and bump the statement's
 ``payment_paid_amount`` / ``payment_status``.
 """
 
-from __future__ import annotations
-
 import datetime
 from decimal import Decimal
 from email.message import EmailMessage

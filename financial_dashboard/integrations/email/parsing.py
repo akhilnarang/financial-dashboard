@@ -1,7 +1,5 @@
 """Email parsing helpers."""
 
-from __future__ import annotations
-
 import datetime
 import email as email_lib
 import email.utils

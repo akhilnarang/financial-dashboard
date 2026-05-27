@@ -1,7 +1,5 @@
 """Account HTML routes."""
 
-from __future__ import annotations
-
 import logging
 from typing import Annotated
 

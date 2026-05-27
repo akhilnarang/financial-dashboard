@@ -1,7 +1,5 @@
 """Source HTML routes."""
 
-from __future__ import annotations
-
 import logging
 
 from fastapi import APIRouter, Depends, Form, Request as FastAPIRequest

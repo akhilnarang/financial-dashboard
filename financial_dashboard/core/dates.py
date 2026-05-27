@@ -1,7 +1,5 @@
 """Shared date parsing helpers backed by python-dateutil."""
 
-from __future__ import annotations
-
 from datetime import date, datetime
 
 from dateutil import parser

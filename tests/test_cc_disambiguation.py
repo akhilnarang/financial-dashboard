@@ -4,8 +4,6 @@ Covers ``find_cc_account_by_total_due`` and ``is_cc_payment_received_email``
 from financial_dashboard.services.cc_disambiguation.
 """
 
-from __future__ import annotations
-
 from decimal import Decimal
 
 import pytest

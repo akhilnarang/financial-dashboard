@@ -1,7 +1,5 @@
 """Application factory for financial-dashboard."""
 
-from __future__ import annotations
-
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path

@@ -8,8 +8,6 @@ needs them but importing from services/emails.py would create a
 cross-pipeline import.
 """
 
-from __future__ import annotations
-
 # Email types whose body emits transaction time in 12-hour format with
 # stripped AM/PM. The email-side disambiguator (services/emails.py
 # _disambiguate_am_pm) corrects these at parse time using the email's

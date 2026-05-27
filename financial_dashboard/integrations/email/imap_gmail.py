@@ -1,7 +1,5 @@
 """Gmail IMAP provider."""
 
-from __future__ import annotations
-
 import asyncio
 import datetime
 import email as email_lib

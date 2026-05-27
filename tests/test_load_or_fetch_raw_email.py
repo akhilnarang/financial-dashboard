@@ -2,8 +2,6 @@
 by every reparse path. Spool preferred; provider is the fallback when the
 spool file has been evicted by the cleanup cron."""
 
-from __future__ import annotations
-
 from unittest.mock import patch
 
 import pytest

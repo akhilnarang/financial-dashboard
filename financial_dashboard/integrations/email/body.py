@@ -1,7 +1,5 @@
 """Email body and spool helpers."""
 
-from __future__ import annotations
-
 import asyncio
 import email as email_lib
 import logging
