@@ -9,6 +9,8 @@ Two entry points:
   that the dedup constraint then blocks from ever being re-POSTed.
 """
 
+from typing import NamedTuple
+
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,9 +19,14 @@ from financial_dashboard.db import SmsMessage
 from financial_dashboard.schemas.sms import SmsIngestRequest
 
 
+class SmsIngestResult(NamedTuple):
+    message: SmsMessage
+    stored: bool
+
+
 async def _ingest_sms_no_commit(
     session: AsyncSession, payload: SmsIngestRequest
-) -> tuple[SmsMessage, bool]:
+) -> SmsIngestResult:
     """Insert (or detect duplicate) without committing the outer txn.
 
     Uses ``session.begin_nested()`` for the conflict-recovery so an
@@ -47,13 +54,13 @@ async def _ingest_sms_no_commit(
             raise RuntimeError(
                 "_ingest_sms_no_commit: IntegrityError but no matching row"
             )
-        return existing, False
-    return row, True
+        return SmsIngestResult(existing, False)
+    return SmsIngestResult(row, True)
 
 
 async def ingest_sms(
     session: AsyncSession, payload: SmsIngestRequest
-) -> tuple[SmsMessage, bool]:
+) -> SmsIngestResult:
     """Persist an SMS payload (commits its own transaction)."""
     async with session.begin():
         return await _ingest_sms_no_commit(session, payload)

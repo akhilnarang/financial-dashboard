@@ -24,6 +24,11 @@ class CasSender(NamedTuple):
     bank: str
 
 
+class CasEmailProcessResult(NamedTuple):
+    upload_result: dict | None
+    error: str | None
+
+
 CAS_SENDERS: tuple[CasSender, ...] = (
     CasSender("NSDL-CAS@nsdl.co.in", "cas_nsdl"),
     CasSender("eCAS@cdslstatement.com", "cas_cdsl"),
@@ -126,20 +131,24 @@ async def process_cas_email(
     *,
     source_id: int | None,
     log_ref: str,
-) -> tuple[dict | None, str | None]:
-    """Parse + ingest a CAS email. Returns (result, error_message)."""
+) -> CasEmailProcessResult:
+    """Parse + ingest a CAS email.
+
+    Returns a ``CasEmailProcessResult`` NamedTuple of (upload_result,
+    error_message); positional unpacking is still supported.
+    """
     from financial_dashboard.services.statements.cc import extract_pdf_from_email
 
     pan = _cas_pan()
     if not pan:
         logger.warning("CAS email %s arrived but cas_pan is not set", log_ref)
-        return None, "CAS PAN not configured"
+        return CasEmailProcessResult(None, "CAS PAN not configured")
 
     attachments = extract_pdf_from_email(raw_bytes) or []
     pdfs = [(name, data) for name, data in attachments if data]
     if not pdfs:
         logger.warning("CAS email %s has no PDF attachment", log_ref)
-        return None, "no PDF attachment"
+        return CasEmailProcessResult(None, "no PDF attachment")
     if len(pdfs) > 1:
         logger.info(
             "CAS email %s has %d PDFs; ingesting first only (%s)",
@@ -160,13 +169,13 @@ async def process_cas_email(
     except (CasIngestError, ValueError) as exc:
         logger.warning("CAS ingest failed for %s: %s", log_ref, exc)
         file_path.unlink(missing_ok=True)
-        return None, str(exc)
+        return CasEmailProcessResult(None, str(exc))
     except Exception as exc:
         logger.exception("CAS ingest crashed for %s", log_ref)
         file_path.unlink(missing_ok=True)
-        return None, f"unexpected {type(exc).__name__}: {exc}"
+        return CasEmailProcessResult(None, f"unexpected {type(exc).__name__}: {exc}")
 
-    return {"cas_upload_id": upload.id}, None
+    return CasEmailProcessResult({"cas_upload_id": upload.id}, None)
 
 
 async def link_cas_upload_email(

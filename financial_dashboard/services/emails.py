@@ -166,30 +166,38 @@ def _disambiguate_am_pm(
     return best[1] if best is not None else parsed_time
 
 
-def _process_email_full(
-    bank: str, raw_bytes: bytes
-) -> tuple[str | None, dict | None, str | None, ParsedEmail | None]:
+class ProcessedEmailParse(NamedTuple):
+    error: str | None
+    txn_data: dict | None
+    password_hint: str | None
+    parsed_email: ParsedEmail | None
+
+
+def _process_email_full(bank: str, raw_bytes: bytes) -> ProcessedEmailParse:
     """Parse raw email bytes.
 
-    Returns ``(error, txn_dict, password_hint, parsed_email)`` — ``parsed_email``
-    is the raw ``ParsedEmail`` (or None if parsing failed), so callers can read
-    ``parsed.statement`` for summary-only emails.
+    Returns a ``ProcessedEmailParse`` NamedTuple of (error, txn_data,
+    password_hint, parsed_email). ``parsed_email`` is the raw ``ParsedEmail``
+    (or None if parsing failed), so callers can read ``parsed.statement``
+    for summary-only emails. Positional unpacking is still supported.
     """
     html = _extract_html_body(raw_bytes)
     if not html:
         html = _extract_text_body(raw_bytes)
     if not html:
-        return "No HTML or text body found in email", None, None, None
+        return ProcessedEmailParse(
+            "No HTML or text body found in email", None, None, None
+        )
 
     try:
         parsed = parse_email(bank, html)
     except (ParseError, UnsupportedEmailTypeError) as e:
-        return str(e), None, None, None
+        return ProcessedEmailParse(str(e), None, None, None)
 
     password_hint = parsed.password_hint
 
     if (txn := parsed.transaction) is None:
-        return None, None, password_hint, parsed
+        return ProcessedEmailParse(None, None, password_hint, parsed)
 
     transaction_date = txn.transaction_date
     received_at = _parse_email_date(raw_bytes)
@@ -205,7 +213,7 @@ def _process_email_full(
             transaction_time, transaction_date, received_at
         )
 
-    return (
+    return ProcessedEmailParse(
         None,
         {
             "bank": parsed.bank,

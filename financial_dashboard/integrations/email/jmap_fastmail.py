@@ -12,6 +12,8 @@ from financial_dashboard.core.crypto import decrypt_credentials
 from financial_dashboard.integrations.email.base import (
     INITIAL_BACKFILL_DAYS,
     JMAP_SESSION_URL,
+    FetchedEmail,
+    FetchSourceResult,
 )
 from financial_dashboard.services.rules import (
     _format_jmap_from_field,
@@ -77,18 +79,17 @@ def _fetch_fastmail_source_sync(
     source_id: int,
     existing_remote_ids: set[str],
     last_synced_at: datetime.datetime | None = None,
-) -> tuple[dict[int, list[tuple]], bool, set[int]]:
+) -> FetchSourceResult:
     """Fetch emails from Fastmail via JMAP for all rules on one source.
 
     Establishes the JMAP session once, resolves mailbox IDs once, runs all
-    rules' queries on the shared session. Returns
-    ``(results_by_rule, fetch_ok, backfill_ready_rule_ids)``.
+    rules' queries on the shared session. Returns a ``FetchSourceResult``.
     """
-    results_by_rule: dict[int, list[tuple]] = {r.id: [] for r in rules}
+    results_by_rule: dict[int, list[FetchedEmail]] = {r.id: [] for r in rules}
 
     if not token:
         logger.warning("Fastmail token missing for source %s", source_id)
-        return results_by_rule, False, set()
+        return FetchSourceResult(results_by_rule, False, set())
 
     try:
         logger.info("Fastmail: Starting fetch for source %s", source_id)
@@ -257,7 +258,13 @@ def _fetch_fastmail_source_sync(
                 req = Request(blob_url, headers={"Authorization": f"Bearer {token}"})
                 with urlopen(req) as resp:
                     raw = resp.read()
-                results_by_rule[rule.id].append((msg_id, remote_id, raw))
+                results_by_rule[rule.id].append(
+                    FetchedEmail(
+                        msg_id=msg_id,
+                        remote_id=remote_id,
+                        raw_bytes=raw,
+                    )
+                )
 
         # Build backfill-ready set: rules that got results or had
         # genuinely zero candidates.
@@ -270,10 +277,10 @@ def _fetch_fastmail_source_sync(
             elif not rule_candidates.get(rule.id):
                 # JMAP query returned zero candidates — genuinely empty
                 backfill_ready.add(rule.id)
-        return results_by_rule, True, backfill_ready
+        return FetchSourceResult(results_by_rule, True, backfill_ready)
     except Exception as e:
         logger.error("Fastmail JMAP error for source %s: %s", source_id, e)
-        return results_by_rule, False, set()
+        return FetchSourceResult(results_by_rule, False, set())
 
 
 def _fetch_fastmail_single_sync(token: str, remote_id: str) -> bytes | None:
@@ -324,7 +331,7 @@ class FastmailProvider:
         *,
         fetch_limit: int,
         existing_remote_ids: set[str],
-    ):
+    ) -> FetchSourceResult:
         creds = decrypt_credentials(source.credentials)
         return await asyncio.to_thread(
             _fetch_fastmail_source_sync,

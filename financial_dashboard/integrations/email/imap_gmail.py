@@ -12,7 +12,11 @@ from collections import defaultdict
 from typing import cast
 
 from financial_dashboard.core.crypto import decrypt_credentials
-from financial_dashboard.integrations.email.base import INITIAL_BACKFILL_DAYS
+from financial_dashboard.integrations.email.base import (
+    INITIAL_BACKFILL_DAYS,
+    FetchedEmail,
+    FetchSourceResult,
+)
 from financial_dashboard.integrations.email.parsing import (
     _decode_header_value,
     _extract_message_metadata,
@@ -43,22 +47,22 @@ def _fetch_gmail_source_sync(
     source_id: int,
     existing_remote_ids: set[str],
     last_synced_at: datetime.datetime | None = None,
-) -> tuple[dict[int, list[tuple]], bool, set[int]]:
+) -> FetchSourceResult:
     """Fetch emails from Gmail via IMAP for all rules on one source.
 
     Opens a single IMAP connection, runs SEARCH for each rule, deduplicates
     by X-GM-MSGID, does a two-phase fetch (metadata then RFC822), and returns
-    ``(results_by_rule, fetch_ok, backfill_ready_rule_ids)`` where
-    *backfill_ready_rule_ids* is the set of rule IDs whose Phase-0 SEARCH
-    completed (even if it returned zero results).  A rule whose search was
-    skipped due to an IMAP error should **not** appear in this set, so the
-    caller knows not to mark its backfill as complete.
+    a ``FetchSourceResult`` whose ``backfill_ready_rule_ids`` is the set of
+    rule IDs whose Phase-0 SEARCH completed (even if it returned zero
+    results). A rule whose search was skipped due to an IMAP error should
+    **not** appear in this set, so the caller knows not to mark its backfill
+    as complete.
     """
     if not user or not password:
         logger.warning("Gmail credentials missing for source %s", source_id)
-        return {}, False, set()
+        return FetchSourceResult({}, False, set())
 
-    results_by_rule: dict[int, list[tuple]] = {r.id: [] for r in rules}
+    results_by_rule: dict[int, list[FetchedEmail]] = {r.id: [] for r in rules}
     # Track rule IDs whose Phase-0 SEARCH completed successfully (OK
     # response, even if zero results).  Only these should be candidates
     # for marking backfill complete.
@@ -136,7 +140,7 @@ def _fetch_gmail_source_sync(
                 uid_to_rules.setdefault((folder, uid), []).append(rule)
 
         if not uid_to_rules:
-            return results_by_rule, True, backfill_searched_rule_ids
+            return FetchSourceResult(results_by_rule, True, backfill_searched_rule_ids)
 
         # Phase 1: batch metadata fetch to get X-GM-MSGID + headers
         # Group UIDs by folder for metadata fetch
@@ -262,7 +266,7 @@ def _fetch_gmail_source_sync(
                 for r in uid_to_rules[key]:
                     if r.initial_backfill_done_at is None:
                         backfill_searched_rule_ids.add(r.id)
-            return results_by_rule, True, backfill_searched_rule_ids
+            return FetchSourceResult(results_by_rule, True, backfill_searched_rule_ids)
 
         # Apply per-rule fetch limit (scale by number of rules)
         source_limit = fetch_limit * len(rules) if fetch_limit > 0 else 0
@@ -333,7 +337,13 @@ def _fetch_gmail_source_sync(
                             rule.id,
                         )
                         continue
-                    results_by_rule[rule.id].append((msg_id, remote_id, raw_bytes))
+                    results_by_rule[rule.id].append(
+                        FetchedEmail(
+                            msg_id=msg_id,
+                            remote_id=remote_id,
+                            raw_bytes=raw_bytes,
+                        )
+                    )
 
         # Mark backfill search complete for rules that actually got results
         # through the entire pipeline.  Rules whose SEARCH found UIDs but
@@ -343,10 +353,10 @@ def _fetch_gmail_source_sync(
             if results:
                 backfill_searched_rule_ids.add(rid)
 
-        return results_by_rule, True, backfill_searched_rule_ids
+        return FetchSourceResult(results_by_rule, True, backfill_searched_rule_ids)
     except imaplib.IMAP4.error as e:
         logger.error("Gmail IMAP error for source %s: %s", source_id, e)
-        return results_by_rule, False, set()
+        return FetchSourceResult(results_by_rule, False, set())
     finally:
         try:
             conn.logout()
@@ -385,7 +395,7 @@ class GmailProvider:
         *,
         fetch_limit: int,
         existing_remote_ids: set[str],
-    ):
+    ) -> FetchSourceResult:
         creds = decrypt_credentials(source.credentials)
         return await asyncio.to_thread(
             _fetch_gmail_source_sync,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 from financial_dashboard.db import EmailSource
 
@@ -11,6 +11,18 @@ INITIAL_BACKFILL_DAYS = 90
 JMAP_SESSION_URL = "https://api.fastmail.com/jmap/session"
 FAILED_SPOOL_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "failed"
 FAILED_SPOOL_MAX_AGE_DAYS = 7
+
+
+class FetchedEmail(NamedTuple):
+    msg_id: str
+    remote_id: str
+    raw_bytes: bytes
+
+
+class FetchSourceResult(NamedTuple):
+    results_by_rule: dict[int, list[FetchedEmail]]
+    fetch_ok: bool
+    backfill_ready_rule_ids: set[int]
 
 
 class EmailProvider(Protocol):
@@ -21,7 +33,7 @@ class EmailProvider(Protocol):
         *,
         fetch_limit: int,
         existing_remote_ids: set[str],
-    ) -> tuple[dict[int, list[tuple]], bool, set[int]]: ...
+    ) -> FetchSourceResult: ...
 
     async def fetch_single(
         self, source: EmailSource, remote_id: str

@@ -12,7 +12,7 @@ from __future__ import annotations
 import datetime as _dt
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -40,6 +40,12 @@ class EnrichmentDiff:
     @property
     def changed_fields(self) -> list[str]:
         return list(self.filled.keys()) + list(self.overwritten.keys())
+
+
+class MergeTransactionResult(NamedTuple):
+    outcome: MergeOutcome
+    transaction: Transaction
+    diff: EnrichmentDiff
 
 
 # Fields considered for enrichment. Match key fields (bank, direction,
@@ -427,12 +433,13 @@ async def merge_transaction(
     *,
     sms_message_id: int | None = None,
     email_id: int | None = None,
-) -> tuple[MergeOutcome, Transaction, EnrichmentDiff]:
+) -> MergeTransactionResult:
     """Match against existing rows; insert or enrich accordingly.
 
     Caller owns the transaction boundary. This function does NOT commit
-    and does NOT fire Telegram. Returns (outcome, row, diff); when
-    outcome=="created" the diff is empty.
+    and does NOT fire Telegram. Returns a ``MergeTransactionResult``
+    (NamedTuple of outcome, transaction, diff); when outcome=="created"
+    the diff is empty.
     """
     match_result = await find_match(session, txn_data)
     if match_result is None:
@@ -455,7 +462,7 @@ async def merge_transaction(
                 # Constraint hit we didn't model; surface it.
                 raise
         else:
-            return "created", row, EnrichmentDiff()
+            return MergeTransactionResult("created", row, EnrichmentDiff())
 
     match, match_kind = match_result
 
@@ -488,4 +495,4 @@ async def merge_transaction(
     match.enriched_at = _dt.datetime.now(_dt.UTC)
 
     await session.flush()
-    return "enriched", match, diff
+    return MergeTransactionResult("enriched", match, diff)

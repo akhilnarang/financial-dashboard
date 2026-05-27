@@ -40,6 +40,7 @@ import tempfile
 from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import NamedTuple
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.db import (
@@ -781,10 +782,15 @@ async def _match_account_by_last4(
     return None
 
 
-def extract_pdf_from_email(raw_bytes: bytes) -> list[tuple[str, bytes]]:
+class PdfAttachment(NamedTuple):
+    filename: str
+    content: bytes
+
+
+def extract_pdf_from_email(raw_bytes: bytes) -> list[PdfAttachment]:
     """Extract PDF attachments from raw RFC822 email bytes."""
     msg = email_lib.message_from_bytes(raw_bytes)
-    pdfs: list[tuple[str, bytes]] = []
+    pdfs: list[PdfAttachment] = []
     if msg.is_multipart():
         for part in msg.walk():
             ct = part.get_content_type()
@@ -801,7 +807,7 @@ def extract_pdf_from_email(raw_bytes: bytes) -> list[tuple[str, bytes]]:
                 continue
             pdf_bytes = part.get_payload(decode=True)
             if isinstance(pdf_bytes, bytes) and pdf_bytes:
-                pdfs.append((filename or "statement.pdf", pdf_bytes))
+                pdfs.append(PdfAttachment(filename or "statement.pdf", pdf_bytes))
     return pdfs
 
 
