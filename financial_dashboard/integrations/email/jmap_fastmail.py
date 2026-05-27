@@ -141,7 +141,7 @@ def _fetch_fastmail_source_sync(
                 jmap_filter["subject"] = rule.subject
             # For rules that haven't completed initial backfill, cap the
             # historical scan at 3 months rather than a full-history search.
-            needs_backfill = getattr(rule, "initial_backfill_done_at", None) is None
+            needs_backfill = rule.initial_backfill_done_at is None
             if needs_backfill:
                 backfill_after = (
                     datetime.datetime.now(datetime.timezone.utc)
@@ -263,7 +263,7 @@ def _fetch_fastmail_source_sync(
         # genuinely zero candidates.
         backfill_ready: set[int] = set()
         for rule in rules:
-            if getattr(rule, "initial_backfill_done_at", None) is not None:
+            if rule.initial_backfill_done_at is not None:
                 continue  # already backfilled, skip
             if results_by_rule.get(rule.id):
                 backfill_ready.add(rule.id)

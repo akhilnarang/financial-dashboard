@@ -320,7 +320,7 @@ async def reparse_email(
 
     error, txn_data, password_hint, stmt_result = await parse_email_by_kind(
         bank=rule.bank,
-        email_kind=getattr(rule, "email_kind", None),
+        email_kind=rule.email_kind,
         raw_bytes=raw_bytes,
         subject=email_row.subject or "",
         source_id=email_row.source_id,
@@ -576,7 +576,7 @@ async def reparse_all_failed(
 
         error, txn_data, _, stmt_result = await parse_email_by_kind(
             bank=rule.bank,
-            email_kind=getattr(rule, "email_kind", None),
+            email_kind=rule.email_kind,
             raw_bytes=raw_bytes,
             subject=email_row.subject or "",
             source_id=email_row.source_id,

@@ -86,7 +86,7 @@ def _fetch_gmail_source_sync(
 
             # For rules that haven't completed their initial backfill, cap the
             # historical scan at 3 months rather than a full-history search.
-            needs_backfill = getattr(rule, "initial_backfill_done_at", None) is None
+            needs_backfill = rule.initial_backfill_done_at is None
             if needs_backfill:
                 backfill_since = datetime.datetime.now(
                     datetime.timezone.utc
@@ -260,7 +260,7 @@ def _fetch_gmail_source_sync(
             # persisted from a prior run).
             for key in uid_to_rules:
                 for r in uid_to_rules[key]:
-                    if getattr(r, "initial_backfill_done_at", None) is None:
+                    if r.initial_backfill_done_at is None:
                         backfill_searched_rule_ids.add(r.id)
             return results_by_rule, True, backfill_searched_rule_ids
 

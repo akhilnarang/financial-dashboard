@@ -171,7 +171,7 @@ async def poll_all(*, poll_lock: asyncio.Lock, poll_status: dict) -> dict:
                     new_emails = results_by_rule.get(rule.id, [])
                     should_notify = (
                         should_notify_transactions()
-                        and getattr(rule, "initial_backfill_done_at", None) is not None
+                        and rule.initial_backfill_done_at is not None
                     )
                     total_emails = len(new_emails)
                     for email_idx, (msg_id, remote_id, raw_bytes) in enumerate(
@@ -204,7 +204,7 @@ async def poll_all(*, poll_lock: asyncio.Lock, poll_status: dict) -> dict:
                         for rule in source_rules:
                             if rule.id not in backfill_ready_rule_ids:
                                 continue
-                            if getattr(rule, "initial_backfill_done_at", None) is None:
+                            if rule.initial_backfill_done_at is None:
                                 db_rule = await session.get(FetchRule, rule.id)
                                 if db_rule:
                                     db_rule.initial_backfill_done_at = (
@@ -225,10 +225,7 @@ async def poll_all(*, poll_lock: asyncio.Lock, poll_status: dict) -> dict:
                         # Attempt-based CAS cooldown stamp: only if the fetch actually
                         # succeeded. A transient IMAP failure shouldn't lock out CAS
                         # polling for 24h.
-                        if fetch_ok and any(
-                            getattr(rule, "auto_managed", False)
-                            for rule in source_rules
-                        ):
+                        if fetch_ok and any(rule.auto_managed for rule in source_rules):
                             src.cas_last_polled_at = datetime.datetime.now(datetime.UTC)
                         await session.commit()
 
