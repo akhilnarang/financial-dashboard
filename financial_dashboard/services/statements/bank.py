@@ -47,6 +47,7 @@ from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
 from financial_dashboard.integrations.parsers import parse_bank_statement_pdf
 from financial_dashboard.services.linker import build_link_context, link_transaction
+from financial_dashboard.services.snapshots import emit_bank_snapshot
 from financial_dashboard.services.settings import (
     get_setting_int,
     get_telegram_chat_id,
@@ -899,6 +900,7 @@ async def process_bank_statement_email(
                     ):
                         account_row.statement_password_hint = password_hint
                     session.add(upload)
+                    await emit_bank_snapshot(session, upload)
                     await session.commit()
                     logger.info(
                         "Encrypted bank statement saved for manual password entry: %s",
@@ -1088,6 +1090,7 @@ async def process_bank_statement_email(
                 f"Skipped {', '.join(details)} row(s) during auto-import; "
                 "see reconciliation details."
             )
+        await emit_bank_snapshot(session, upload)
         await session.commit()
         upload_id = upload.id
 

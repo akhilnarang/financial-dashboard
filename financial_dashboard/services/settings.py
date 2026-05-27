@@ -103,6 +103,22 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
         label="Fetch Limit Per Rule",
         description="Max emails to fetch per rule per cycle",
     ),
+    "cas_auto_fetch_enabled": SettingDef(
+        default="false",
+        data_type="bool",
+        category="Net Worth",
+        label="Auto-fetch CAS emails",
+        description="Poll NSDL-CAS@nsdl.co.in and eCAS@cdslstatement.com daily "
+        "and ingest depository CAS PDFs into Net Worth. Requires PAN below.",
+    ),
+    "cas_pan": SettingDef(
+        default="",
+        data_type="str",
+        category="Net Worth",
+        label="CAS PAN",
+        description="PAN used to decrypt the CAS PDFs (stored encrypted)",
+        secret=True,
+    ),
 }
 
 _cache: dict[str, str] = {}

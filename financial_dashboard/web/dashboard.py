@@ -21,6 +21,7 @@ from financial_dashboard.db import (
     StatementUpload,
     Transaction,
 )
+from financial_dashboard.services.networth import current_networth
 from financial_dashboard.services.statements.cc import parse_cc_amount, parse_cc_date
 
 logging.basicConfig(
@@ -195,11 +196,14 @@ async def dashboard(
         },
     }
 
+    networth_summary = await current_networth(session, today=today)
+
     return templates.TemplateResponse(
         request,
         "dashboard.html",
         {
             "active_page": "dashboard",
+            "networth_summary": networth_summary,
             "poll_status": (
                 fetch_service.get_poll_status()
                 if fetch_service

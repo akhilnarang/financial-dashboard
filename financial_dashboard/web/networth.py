@@ -1,0 +1,103 @@
+"""Net-worth HTML routes."""
+
+from __future__ import annotations
+
+import datetime
+from decimal import Decimal
+
+from fastapi import APIRouter, Depends, Form, Request as FastAPIRequest
+from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from financial_dashboard.core.deps import get_session
+from financial_dashboard.core.templating import get_templates
+from financial_dashboard.db.models import ManualItem
+from financial_dashboard.services.manual_items import (
+    create_item,
+    deactivate,
+    update_value,
+)
+from financial_dashboard.services.networth import current_networth
+
+templates = get_templates()
+router = APIRouter()
+
+
+@router.get("/networth", response_class=HTMLResponse)
+async def networth_index(
+    request: FastAPIRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    summary = await current_networth(session)
+    return templates.TemplateResponse(
+        request,
+        "networth/index.html",
+        {"active_page": "networth", "summary": summary},
+    )
+
+
+@router.get("/networth/manual", response_class=HTMLResponse)
+async def manual_items_index(
+    request: FastAPIRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    items = (
+        (
+            await session.execute(
+                select(ManualItem).order_by(ManualItem.active.desc(), ManualItem.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return templates.TemplateResponse(
+        request,
+        "networth/manual.html",
+        {"active_page": "networth", "items": items},
+    )
+
+
+@router.post("/networth/manual")
+async def manual_item_create(
+    name: str = Form(...),
+    kind: str = Form(...),
+    category: str = Form("other"),
+    value: Decimal = Form(...),
+    as_of_date: datetime.date = Form(...),
+    notes: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+):
+    await create_item(
+        session,
+        name=name,
+        kind=kind,
+        category=category,
+        value=value,
+        as_of_date=as_of_date,
+        notes=notes,
+    )
+    await session.commit()
+    return RedirectResponse(url="/networth/manual", status_code=303)
+
+
+@router.post("/networth/manual/{item_id}/value")
+async def manual_item_update_value(
+    item_id: int,
+    value: Decimal = Form(...),
+    as_of_date: datetime.date = Form(...),
+    session: AsyncSession = Depends(get_session),
+):
+    await update_value(session, item_id=item_id, value=value, as_of_date=as_of_date)
+    await session.commit()
+    return RedirectResponse(url="/networth/manual", status_code=303)
+
+
+@router.post("/networth/manual/{item_id}/deactivate")
+async def manual_item_deactivate(
+    item_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    await deactivate(session, item_id=item_id)
+    await session.commit()
+    return RedirectResponse(url="/networth/manual", status_code=303)

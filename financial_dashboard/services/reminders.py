@@ -28,6 +28,7 @@ from financial_dashboard.db import (
     StatementUpload,
     async_session,
 )
+from financial_dashboard.services.snapshots import emit_cc_snapshot
 from financial_dashboard.services import telegram as telegram_service
 from financial_dashboard.services.settings import (
     get_setting_bool,
@@ -102,6 +103,7 @@ async def init_payment_tracking(statement_upload_id: int) -> bool:
             else:
                 upload.payment_status = PaymentStatus.UNPAID
 
+            await emit_cc_snapshot(session, upload)
             await session.commit()
             logger.info(
                 "Payment tracking initialized for statement #%s: due=%s status=%s",
@@ -184,6 +186,7 @@ async def check_and_send_reminders() -> int:
             # Nothing owed — auto-mark as paid and skip
             if amount_due <= 0:
                 upload.payment_status = PaymentStatus.PAID
+                await emit_cc_snapshot(session, upload)
                 continue
 
             days_until_due = (due - today).days  # positive = future, negative = overdue
@@ -319,6 +322,7 @@ async def handle_mark_paid_callback(update, context) -> None:
                 upload.payment_paid_amount = parse_cc_amount(upload.total_amount_due)
             except ValueError, InvalidOperation:
                 pass
+        await emit_cc_snapshot(session, upload)
         await session.commit()
 
     await query.answer("Marked as paid!")
@@ -407,6 +411,7 @@ async def check_payment_received(txn_id: int, account_id: int, amount) -> bool:
                 get_telegram_chat_id(),
             )
 
+        await emit_cc_snapshot(session, upload)
         await session.commit()
 
     return fully_paid

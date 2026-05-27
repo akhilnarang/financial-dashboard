@@ -18,6 +18,7 @@ from financial_dashboard.db import (
     async_session,
 )
 from financial_dashboard.services.linker import build_link_context, link_transaction
+from financial_dashboard.services.snapshots import emit_bank_snapshot, emit_cc_snapshot
 from financial_dashboard.services.statements.dates import (
     bank_stmt_date_range,
     cc_stmt_date_range,
@@ -126,6 +127,7 @@ async def retry_cc_statement_upload(
             upload.status = "imported"
         elif imported > 0:
             upload.status = "partial_import"
+        await emit_cc_snapshot(session, upload)
         await session.commit()
 
     # function-local: breaks cycle with services.reminders (reminders imports services.statements at top)
@@ -239,6 +241,7 @@ async def retry_bank_statement_upload(
             upload.status = "imported"
         elif imported > 0:
             upload.status = "partial_import"
+        await emit_bank_snapshot(session, upload)
         await session.commit()
 
     return True

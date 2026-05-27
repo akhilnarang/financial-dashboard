@@ -2,18 +2,9 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
-STATEMENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "statements"
-_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def _safe_upload_filename(filename: str | None) -> str:
-    """Strip any path components and restrict to a safe character set."""
-    base = Path(filename or "statement.pdf").name or "statement.pdf"
-    cleaned = _SAFE_FILENAME_RE.sub("_", base).strip("._") or "statement.pdf"
-    return cleaned[:120]
+from financial_dashboard.core.uploads import STATEMENTS_DIR
 
 
 def _unlink_statement_file(path_str: str | None) -> None:

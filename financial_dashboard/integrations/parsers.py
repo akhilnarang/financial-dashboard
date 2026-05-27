@@ -6,6 +6,7 @@ exceptions) lives in the sibling packages or in the statement services.
 """
 
 from pathlib import Path
+from importlib import import_module
 
 from bank_statement_parser.extractor import extract_raw_pdf as _extract_bank_pdf
 from bank_statement_parser.parsers.factory import (
@@ -29,3 +30,14 @@ def parse_bank_statement_pdf(pdf_path: Path, bank: str, password: str | None = N
     )
     parser = _get_bank_statement_parser(bank)
     return parser.parse(raw_data)
+
+
+def parse_cas_pdf(pdf_path: Path, password: str | None = None):
+    extractor = import_module("cas_parser.extractor")
+    factory = import_module("cas_parser.parsers.factory")
+
+    candidates = None
+    if password:
+        candidates = list(dict.fromkeys([password, password.upper()]))
+    raw_data = extractor.extract_raw_pdf(pdf_path, passwords=candidates)
+    return factory.get_parser(factory.detect_source(raw_data)).parse(raw_data)

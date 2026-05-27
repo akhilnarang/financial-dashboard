@@ -69,7 +69,15 @@ async def poll_all(*, poll_lock: asyncio.Lock, poll_status: dict) -> dict:
             except Exception as exc:
                 logger.warning("Failed spool cleanup error: %s", exc)
 
+            # function-local: avoid cycle (services.cas_emails -> db.models -> services)
+            from financial_dashboard.services.cas_emails import (
+                ensure_cas_fetch_rules,
+            )
+
             async with async_session() as session:
+                await ensure_cas_fetch_rules(session)
+                await session.commit()
+
                 rules = (
                     (
                         await session.execute(
@@ -214,6 +222,14 @@ async def poll_all(*, poll_lock: asyncio.Lock, poll_status: dict) -> dict:
                             src.last_error = (
                                 f"Fetch failed for {source.provider} source {source_id}"
                             )
+                        # Attempt-based CAS cooldown stamp: only if the fetch actually
+                        # succeeded. A transient IMAP failure shouldn't lock out CAS
+                        # polling for 24h.
+                        if fetch_ok and any(
+                            getattr(rule, "auto_managed", False)
+                            for rule in source_rules
+                        ):
+                            src.cas_last_polled_at = datetime.datetime.now(datetime.UTC)
                         await session.commit()
 
             logger.info("Poll complete: %s", stats)

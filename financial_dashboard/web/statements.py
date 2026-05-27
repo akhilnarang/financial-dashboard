@@ -51,6 +51,7 @@ from financial_dashboard.services.accounts import (
     retry_password_required_statements as accounts_retry_password_required_statements,
 )
 from financial_dashboard.services.reminders import init_payment_tracking
+from financial_dashboard.services.snapshots import emit_cc_snapshot
 from financial_dashboard.services.statements.bank import process_bank_statement_email
 from financial_dashboard.services.statements.cc import (
     _parse_pdf_bytes_sync,
@@ -69,11 +70,8 @@ from financial_dashboard.services.statements.shared import (
     retry_bank_statement_upload,
     retry_cc_statement_upload,
 )
-from financial_dashboard.web.forms import (
-    STATEMENTS_DIR,
-    _safe_upload_filename,
-    _unlink_statement_file,
-)
+from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
+from financial_dashboard.web.forms import _unlink_statement_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -243,7 +241,7 @@ async def statement_upload(
     # Save PDF to disk
     STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    safe_name = _safe_upload_filename(file.filename)
+    safe_name = safe_upload_filename(file.filename)
     file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
     content = await file.read()
     file_path.write_bytes(content)
@@ -265,6 +263,7 @@ async def statement_upload(
             error=error_msg,
         )
         session.add(upload)
+        await emit_cc_snapshot(session, upload)
         await session.commit()
         upload_id = upload.id
         return RedirectResponse(url=f"/statements/{upload_id}", status_code=303)
@@ -314,6 +313,7 @@ async def statement_upload(
     upload.reconciliation_data = reconciliation_to_json(recon)
     if upload.missing_count == 0:
         upload.status = "imported"
+    await emit_cc_snapshot(session, upload)
     await session.commit()
     upload_id = upload.id
 
@@ -496,6 +496,7 @@ async def statement_payment(
                     )
                 except ValueError, InvalidOperation:
                     pass
+            await emit_cc_snapshot(session, upload)
             await session.commit()
     elif action == "mark_unpaid":
         if upload.payment_status is not None:
@@ -508,6 +509,7 @@ async def statement_payment(
                 upload.payment_paid_amount = Decimal(0)
             upload.payment_sent_offsets = "[]"
             upload.payment_last_reminded_at = None
+            await emit_cc_snapshot(session, upload)
             await session.commit()
 
     return RedirectResponse(url="/statements", status_code=303)
@@ -654,6 +656,7 @@ async def statement_reprocess(
         upload.status = "imported"
     elif newly_imported > 0:
         upload.status = "partial_import"
+    await emit_cc_snapshot(session, upload)
     await session.commit()
 
     await init_payment_tracking(upload_id)

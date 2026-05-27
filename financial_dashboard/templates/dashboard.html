@@ -34,6 +34,21 @@
 
 <p class="text-sm text-muted" style="margin-top: 0.25rem;">{{ ops_stats.total_emails }} emails processed &middot; {{ ops_stats.active_rules }} active rules</p>
 
+<section style="margin-bottom: 1.5rem;">
+    <a href="/networth" style="text-decoration: none; color: inherit;">
+        <article class="card" style="display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap;">
+            <div>
+                <h3 style="margin: 0; font-size: 1.05rem;">Net Worth</h3>
+                <p class="text-sm text-muted" style="margin: 0.15rem 0 0;">As of {{ networth_summary.as_of.strftime("%d %b %Y") }}{% if networth_summary.has_stale %} &middot; some balances stale{% endif %}</p>
+            </div>
+            <div style="display: flex; gap: 1.25rem; align-items: baseline; flex-wrap: wrap;">
+                <span class="amt" style="font-size: 1.25rem; font-weight: 700;">{{ networth_summary.net_worth|inr_compact }}</span>
+                <span class="text-sm text-muted">assets {{ networth_summary.total_assets|inr_compact }} &middot; liabilities {{ networth_summary.total_liabilities|inr_compact }}</span>
+            </div>
+        </article>
+    </a>
+</section>
+
 <section class="cc-section" style="margin-bottom: 1.5rem;">
     {% macro cc_row(row, is_paid=False) %}
     <tr onclick="window.location.href='{{ row.statement_url }}'" style="cursor: pointer;">

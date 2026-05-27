@@ -90,6 +90,20 @@ wheels = [
 ]
 
 [[package]]
+name = "cas-parser"
+version = "0.1.0"
+source = { git = "https://github.com/akhilnarang/cas-parser#692066e9a0ff1fb30412d1955ad2db5ca986fd1a" }
+dependencies = [
+    { name = "pdfplumber" },
+    { name = "pydantic" },
+    { name = "pymupdf" },
+    { name = "pypdf" },
+    { name = "python-dateutil" },
+    { name = "rich" },
+    { name = "typer" },
+]
+
+[[package]]
 name = "cc-parser"
 version = "0.1.0"
 source = { git = "https://github.com/akhilnarang/cc-parser#fcbd382d783e94bc957174ef075840e32e1657cd" }
@@ -409,6 +423,7 @@ dependencies = [
     { name = "bank-email-parser" },
     { name = "bank-sms-parser" },
     { name = "bank-statement-parser" },
+    { name = "cas-parser" },
     { name = "cc-parser" },
     { name = "cryptography" },
     { name = "fastapi", extra = ["standard"] },
@@ -435,6 +450,7 @@ requires-dist = [
     { name = "bank-email-parser", git = "https://github.com/akhilnarang/bank-email-parser" },
     { name = "bank-sms-parser", git = "https://github.com/akhilnarang/bank-sms-parser" },
     { name = "bank-statement-parser", git = "https://github.com/akhilnarang/bank-statement-parser" },
+    { name = "cas-parser", git = "https://github.com/akhilnarang/cas-parser" },
     { name = "cc-parser", git = "https://github.com/akhilnarang/cc-parser" },
     { name = "cryptography", specifier = ">=44.0,<47" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.135,<1" },

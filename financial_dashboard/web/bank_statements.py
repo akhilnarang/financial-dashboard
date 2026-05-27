@@ -30,6 +30,7 @@ from financial_dashboard.services.accounts import (
     retry_password_required_statements as accounts_retry_password_required_statements,
 )
 from financial_dashboard.services.linker import build_link_context, link_transaction
+from financial_dashboard.services.snapshots import emit_bank_snapshot
 from financial_dashboard.services.statements.bank import (
     _last4,
     _parse_amount,
@@ -44,11 +45,8 @@ from financial_dashboard.services.statements.shared import (
     retry_bank_statement_upload,
     retry_cc_statement_upload,
 )
-from financial_dashboard.web.forms import (
-    STATEMENTS_DIR,
-    _safe_upload_filename,
-    _unlink_statement_file,
-)
+from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
+from financial_dashboard.web.forms import _unlink_statement_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,7 +75,7 @@ async def bank_statement_upload(
     # Save PDF to disk
     STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    safe_name = _safe_upload_filename(file.filename)
+    safe_name = safe_upload_filename(file.filename)
     file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
     content = await file.read()
     file_path.write_bytes(content)
@@ -99,6 +97,7 @@ async def bank_statement_upload(
             error=error_msg,
         )
         session.add(upload)
+        await emit_bank_snapshot(session, upload)
         await session.commit()
         upload_id = upload.id
         return RedirectResponse(url=f"/statements/bank/{upload_id}", status_code=303)
@@ -178,6 +177,7 @@ async def bank_statement_upload(
         upload.status = "imported"
     elif imported > 0:
         upload.status = "partial_import"
+    await emit_bank_snapshot(session, upload)
     await session.commit()
     upload_id = upload.id
 

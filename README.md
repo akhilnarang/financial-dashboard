@@ -156,6 +156,10 @@ scripts/
 | `Card` | `cards` | Physical payment card linked to an account (supports addon cards) |
 | `StatementUpload` | `statement_uploads` | CC statement PDF upload with reconciliation results stored as JSON |
 | `BankStatementUpload` | `bank_statement_uploads` | Bank statement PDF upload with reconciliation results stored as JSON |
+| `CasUpload` | `cas_uploads` | Imported depository CAS portfolio statement and reconciliation metadata |
+| `BalanceSnapshot` | `balance_snapshots` | Point-in-time asset/liability value emitted by bank, CC, CAS, or manual sources |
+| `SnapshotHolding` | `snapshot_holdings` | Asset-class breakdown rows for investment snapshots |
+| `ManualItem` | `manual_items` | User-maintained asset/liability sources such as property, cash, or loans |
 | `Setting` | `settings` | Small key/value store for app-level settings |
 
 ### Schema Diagram
@@ -273,6 +277,53 @@ erDiagram
         datetime created_at
     }
 
+    CAS_UPLOADS {
+        int id PK
+        int email_id FK
+        string portfolio_key
+        string depository_source
+        string investor_name
+        date statement_date
+        decimal grand_total
+        bool portfolio_ok
+        decimal portfolio_delta
+        text raw_holdings_json
+        datetime created_at
+    }
+
+    MANUAL_ITEMS {
+        int id PK
+        string name
+        string kind
+        string category
+        bool active
+        text notes
+        datetime created_at
+    }
+
+    BALANCE_SNAPSHOTS {
+        int id PK
+        int account_id FK
+        int cas_upload_id FK
+        int manual_item_id FK
+        string portfolio_key
+        string kind
+        string category
+        date as_of_date
+        decimal value
+        string source
+        string currency
+        datetime created_at
+    }
+
+    SNAPSHOT_HOLDINGS {
+        int id PK
+        int snapshot_id FK
+        string asset_class
+        string label
+        decimal value
+    }
+
     SETTINGS {
         string key PK
         text value
@@ -313,6 +364,11 @@ erDiagram
     EMAILS ||--o{ STATEMENT_UPLOADS : originates
     ACCOUNTS ||--o{ BANK_STATEMENT_UPLOADS : owns
     EMAILS ||--o{ BANK_STATEMENT_UPLOADS : originates
+    EMAILS ||--o{ CAS_UPLOADS : originates
+    ACCOUNTS ||--o{ BALANCE_SNAPSHOTS : emits
+    CAS_UPLOADS ||--o{ BALANCE_SNAPSHOTS : emits
+    MANUAL_ITEMS ||--o{ BALANCE_SNAPSHOTS : emits
+    BALANCE_SNAPSHOTS ||--o{ SNAPSHOT_HOLDINGS : breaks_down
     EMAILS ||--o{ TRANSACTIONS : produces
     ACCOUNTS ||--o{ TRANSACTIONS : linked_account
     CARDS ||--o{ TRANSACTIONS : linked_card
@@ -322,6 +378,7 @@ erDiagram
 
 Relationship notes:
 - `transactions.account_id` and `transactions.card_id` are the canonical account/card links after the linker runs; `card_mask` and `account_mask` remain as parser-derived denormalized hints.
+- `balance_snapshots.portfolio_key` is a CAS forward-fill key for investment rows, not a foreign key. Parser/linker hints such as `card_mask` and `account_mask` remain denormalized text.
 - `settings` is intentionally standalone and has no foreign-key links.
 - Several foreign keys are nullable (`fetch_rules.source_id`, `emails.source_id`, `emails.rule_id`, and the upload/transaction linkage columns), so rows can exist before the related record is known.
 
@@ -330,6 +387,9 @@ Relationship notes:
 - `(source_id, remote_id)` is unique on `emails` (provider-scoped deduplication).
 - `transactions` has a partial unique index on `(bank, reference_number)` where `reference_number IS NOT NULL` (deduplicates transactions with known UTR/UPI reference numbers).
 - `(account_id, card_mask)` is unique on `cards`.
+- `balance_snapshots` has a check constraint requiring exactly one source foreign key among `account_id`, `cas_upload_id`, and `manual_item_id`.
+- `balance_snapshots` has SQLite partial unique indexes for account, investment, and manual snapshot upserts: `(account_id, category, as_of_date)`, `(portfolio_key, category, as_of_date)`, and `(manual_item_id, as_of_date)`.
+- `(portfolio_key, statement_date)` is unique on `cas_uploads` so re-importing the same CAS period replaces the prior upload.
 
 ### Schema Migrations
 There is no Alembic. Migrations are handled inline in `init_db()` via `try/except ALTER TABLE` blocks. A one-time migration removes a legacy `uq_transaction_dedup` constraint that was replaced by the partial index.

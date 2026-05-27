@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -42,6 +43,7 @@ class EmailSource(Base):
     sync_cursor: Mapped[str | None] = mapped_column(String)
     last_synced_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
     last_error: Mapped[str | None] = mapped_column(String)
+    cas_last_polled_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
 
 
 class Account(Base):
@@ -94,8 +96,21 @@ class FetchRule(Base):
     email_kind: Mapped[str | None] = mapped_column(String)
     enabled: Mapped[bool | None] = mapped_column(Boolean, default=True)
     initial_backfill_done_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    auto_managed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
 
     source: Mapped["EmailSource | None"] = relationship(lazy="joined")
+
+    __table_args__ = (
+        Index(
+            "uq_fetch_rule_auto_managed",
+            "source_id",
+            "sender",
+            unique=True,
+            sqlite_where=text("auto_managed = 1"),
+        ),
+    )
 
 
 class Email(Base):
@@ -197,6 +212,123 @@ class BankStatementUpload(Base):
     )
 
     account: Mapped["Account"] = relationship(lazy="joined")
+
+
+class CasUpload(Base):
+    __tablename__ = "cas_uploads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("emails.id"), nullable=True
+    )
+    portfolio_key: Mapped[str] = mapped_column(String, nullable=False)
+    depository_source: Mapped[str] = mapped_column(String, nullable=False)
+    investor_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    statement_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
+    grand_total: Mapped[Decimal] = mapped_column(Numeric(16, 2), nullable=False)
+    portfolio_ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    portfolio_delta: Mapped[Decimal | None] = mapped_column(
+        Numeric(16, 2), nullable=True
+    )
+    raw_holdings_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utc_now)
+
+    __table_args__ = (
+        Index("uq_cas_portfolio_date", "portfolio_key", "statement_date", unique=True),
+    )
+
+
+class ManualItem(Base):
+    __tablename__ = "manual_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    category: Mapped[str] = mapped_column(String, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utc_now)
+
+
+class BalanceSnapshot(Base):
+    __tablename__ = "balance_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("accounts.id"), nullable=True
+    )
+    cas_upload_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("cas_uploads.id"), nullable=True
+    )
+    manual_item_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("manual_items.id"), nullable=True
+    )
+    portfolio_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    category: Mapped[str] = mapped_column(String, nullable=False)
+    as_of_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
+    value: Mapped[Decimal] = mapped_column(Numeric(16, 2), nullable=False)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), default="INR", nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utc_now)
+
+    account: Mapped["Account | None"] = relationship(lazy="joined")
+    cas_upload: Mapped["CasUpload | None"] = relationship(lazy="joined")
+    manual_item: Mapped["ManualItem | None"] = relationship(lazy="joined")
+    # ORM-level cascade only — protects future `session.delete(snapshot)`
+    # callers from orphaning holdings. DB-level ON DELETE CASCADE would be
+    # a no-op on this SQLite deployment since PRAGMA foreign_keys is not
+    # enabled. The current cas_ingestion delete path uses Core delete() and
+    # bypasses this cascade, so its manual delete chain (holdings →
+    # snapshots → upload) stays load-bearing.
+    holdings: Mapped[list["SnapshotHolding"]] = relationship(
+        back_populates="snapshot", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "(account_id IS NOT NULL) + (cas_upload_id IS NOT NULL) + "
+            "(manual_item_id IS NOT NULL) = 1",
+            name="ck_balance_snapshot_exactly_one_source",
+        ),
+        Index(
+            "uq_snap_account",
+            "account_id",
+            "category",
+            "as_of_date",
+            unique=True,
+            sqlite_where=text("account_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_snap_investment",
+            "portfolio_key",
+            "category",
+            "as_of_date",
+            unique=True,
+            sqlite_where=text("portfolio_key IS NOT NULL"),
+        ),
+        Index(
+            "uq_snap_manual",
+            "manual_item_id",
+            "as_of_date",
+            unique=True,
+            sqlite_where=text("manual_item_id IS NOT NULL"),
+        ),
+    )
+
+
+class SnapshotHolding(Base):
+    __tablename__ = "snapshot_holdings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    snapshot_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("balance_snapshots.id"), nullable=False
+    )
+    asset_class: Mapped[str] = mapped_column(String, nullable=False)
+    label: Mapped[str] = mapped_column(String, nullable=False)
+    value: Mapped[Decimal] = mapped_column(Numeric(16, 2), nullable=False)
+
+    snapshot: Mapped["BalanceSnapshot"] = relationship(back_populates="holdings")
 
 
 class Setting(Base):

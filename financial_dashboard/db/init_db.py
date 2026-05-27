@@ -251,6 +251,29 @@ async def init_db(engine) -> None:
             await conn.execute(
                 text("ALTER TABLE sms_messages ADD COLUMN parsed_at DATETIME")
             )
+        try:
+            await conn.execute(
+                text("SELECT cas_last_polled_at FROM email_sources LIMIT 0")
+            )
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE email_sources ADD COLUMN cas_last_polled_at DATETIME")
+            )
+        try:
+            await conn.execute(text("SELECT auto_managed FROM fetch_rules LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE fetch_rules ADD COLUMN auto_managed BOOLEAN "
+                    "NOT NULL DEFAULT 0"
+                )
+            )
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_fetch_rule_auto_managed "
+                "ON fetch_rules (source_id, sender) WHERE auto_managed = 1"
+            )
+        )
 
     # function-local: breaks cycle with services.settings (settings imports db at top)
     from financial_dashboard.services.settings import load_all_settings

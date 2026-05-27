@@ -320,6 +320,34 @@ async def parse_email_by_kind(
 
     Exactly one of ``txn_data`` or ``stmt_result`` is populated on success.
     """
+    # CAS emails short-circuit: the bank/CC HTML parser doesn't apply, and we
+    # don't want statement-fallback routing to run on them.
+    if email_kind == EmailKind.CAS_STATEMENT:
+        from financial_dashboard.services.cas_emails import process_cas_email
+
+        cas_result: dict | None = None
+        cas_error: str | None = None
+        async with async_session() as cas_session:
+            try:
+                cas_result, cas_error = await process_cas_email(
+                    cas_session, raw_bytes, source_id=source_id, log_ref=log_ref
+                )
+            except Exception as exc:
+                # ingest_cas_payload does delete-then-insert; a mid-flow
+                # failure that escaped process_cas_email would otherwise commit
+                # the deletes with no replacement. Match bank/CC behaviour:
+                # log + return an error, don't crash the poll cycle.
+                logger.exception("CAS dispatch crashed for %s", log_ref)
+                await cas_session.rollback()
+                cas_error = f"unexpected {type(exc).__name__}: {exc}"
+            else:
+                if cas_result is not None:
+                    await cas_session.commit()
+                else:
+                    # Caught error inside process_cas_email — same rollback story.
+                    await cas_session.rollback()
+        return EmailDispatchResult(cas_error, None, None, cas_result)
+
     # Always run the HTML parser — statement-kind emails still carry a
     # ``password_hint`` and may carry a full ``StatementSummary`` in the body
     # that the statement pipeline needs. For statement routing we discard the
@@ -458,7 +486,12 @@ async def handle_polled_email(
     if stmt_result:
         error = None
         stats["parsed"] += 1
-        stmt_type = "bank" if stmt_result.get("bank_statement_upload_id") else "CC"
+        if stmt_result.get("bank_statement_upload_id"):
+            stmt_type = "bank"
+        elif stmt_result.get("cas_upload_id"):
+            stmt_type = "CAS"
+        else:
+            stmt_type = "CC"
         if stmt_result.get("summary_only"):
             logger.info(
                 "Processed %s statement summary (email-only) from %s",
@@ -529,6 +562,14 @@ async def handle_polled_email(
                         su_id,
                         msg_id,
                     )
+            elif stmt_result and stmt_result.get("cas_upload_id"):
+                from financial_dashboard.services.cas_emails import (
+                    link_cas_upload_email,
+                )
+
+                await link_cas_upload_email(
+                    session, stmt_result["cas_upload_id"], email_row.id
+                )
 
             skip_txn_types = {"sbi_cc_transaction_declined"}
 

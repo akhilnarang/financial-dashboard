@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Upload CAS - Ledger{% endblock %}
+{% block content %}
+
+<div class="section-header">
+    <h2>Upload CAS</h2>
+    <a href="/networth">Back to Net Worth</a>
+</div>
+
+{% if error %}
+<article class="card">
+    <p class="amt-debit" style="margin: 0;">{{ error }}</p>
+</article>
+{% endif %}
+
+<form method="post" action="/cas/upload" enctype="multipart/form-data" class="filter-bar">
+    <label data-field>
+        CAS PDF
+        <input type="file" name="file" accept="application/pdf" required>
+    </label>
+    <label data-field>
+        PAN / password
+        <input type="password" name="password" autocomplete="off">
+    </label>
+    <label data-field style="display: flex; align-items: center; gap: 0.5rem;">
+        <input type="checkbox" name="force_replace" value="true">
+        Replace existing CAS for the same PAN + period (override NSDL preference)
+    </label>
+    <button type="submit">Upload</button>
+</form>
+
+{% endblock %}

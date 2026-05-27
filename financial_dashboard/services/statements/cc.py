@@ -56,6 +56,7 @@ from bank_email_parser.models import Money, ParsedEmail
 
 from financial_dashboard.integrations.parsers import parse_cc_statement_pdf
 from financial_dashboard.services.linker import build_link_context, link_transaction
+from financial_dashboard.services.snapshots import emit_cc_snapshot
 from financial_dashboard.services.statements.hint import extract_password_hint
 from financial_dashboard.services.settings import (
     get_setting_int,
@@ -679,6 +680,13 @@ async def process_cc_statement_email_summary(
             existing.minimum_amount_due = min_str
             if email_id is not None:
                 existing.email_id = email_id
+            # Only emit here when init_payment_tracking won't (no due_date
+            # → no payment status set → no follow-up emit). When due_date
+            # is present, init_payment_tracking handles the emit with the
+            # correct payment_status — avoids a 'wrong intermediate value'
+            # window between the two commits.
+            if not existing.due_date:
+                await emit_cc_snapshot(session, existing)
             await session.commit()
             upload_id = existing.id
         else:
@@ -701,6 +709,13 @@ async def process_cc_statement_email_summary(
                 reconciliation_data=None,
             )
             session.add(upload)
+            # Only emit here when init_payment_tracking won't (no due_date
+            # → no payment status set → no follow-up emit). When due_date
+            # is present, init_payment_tracking handles the emit with the
+            # correct payment_status — avoids a 'wrong intermediate value'
+            # window between the two commits.
+            if not upload.due_date:
+                await emit_cc_snapshot(session, upload)
             await session.commit()
             upload_id = upload.id
     # function-local: breaks cycle with services.reminders (reminders imports services.statements at top)
@@ -1058,6 +1073,7 @@ async def process_statement_email(
                 ):
                     account_row.statement_password_hint = password_hint
                 session.add(upload)
+                await emit_cc_snapshot(session, upload)
                 await session.commit()
                 logger.info(
                     "Encrypted CC statement saved for manual password entry: %s",
@@ -1152,6 +1168,7 @@ async def process_statement_email(
             upload.status = "imported"  # all matched or all imported
         elif imported_rows:
             upload.status = "partial_import"
+        await emit_cc_snapshot(session, upload)
         await session.commit()
 
         if imported_txns and should_notify_transactions():
