@@ -14,9 +14,7 @@
 </div>
 
 {% if summary.has_stale %}
-<article class="card" style="border-color: var(--clr-pending-fg);">
-    <p style="margin: 0;">Some balances are stale. They are still included until a newer snapshot arrives.</p>
-</article>
+<p class="text-sm text-muted" style="margin: 0 0 1rem;"><span class="badge badge-pending">stale</span> Some balances haven&rsquo;t been refreshed in a while &mdash; still included; the per-row badges below show which.</p>
 {% endif %}
 
 <section class="stats-grid">

@@ -52,7 +52,11 @@ async def manual_items_index(
     return templates.TemplateResponse(
         request,
         "networth/manual.html",
-        {"active_page": "networth", "items": items},
+        {
+            "active_page": "networth",
+            "items": items,
+            "today_iso": datetime.date.today().isoformat(),
+        },
     )
 
 
