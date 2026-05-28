@@ -102,6 +102,14 @@ async def ensure_cas_fetch_rules(session: AsyncSession) -> None:
         for sender in CAS_SENDERS:
             rule = existing_by_key.get((source.id, sender.address))
             if rule is None:
+                # initial_backfill_done_at left None so the provider runs its
+                # standard 3-month backscan on first poll — important for CAS
+                # since source.last_synced_at is already recent from existing
+                # transactional polls, so without backfill we'd miss the most
+                # recent monthly CAS statement that arrived before the toggle
+                # was turned on. After a successful first fetch, the orchestrator
+                # stamps initial_backfill_done_at and future polls fall back to
+                # incremental source.last_synced_at filtering.
                 rule = FetchRule(
                     provider=source.provider,
                     source_id=source.id,
@@ -110,7 +118,6 @@ async def ensure_cas_fetch_rules(session: AsyncSession) -> None:
                     email_kind=EmailKind.CAS_STATEMENT.value,
                     enabled=not on_cooldown,
                     auto_managed=True,
-                    initial_backfill_done_at=now,
                 )
                 session.add(rule)
                 logger.info(
