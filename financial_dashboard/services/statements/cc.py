@@ -795,10 +795,10 @@ def extract_pdf_from_email(raw_bytes: bytes) -> list[PdfAttachment]:
         for part in msg.walk():
             ct = part.get_content_type()
             filename = part.get_filename() or ""
-            # Match application/pdf OR octet-stream with .pdf filename
-            is_pdf = ct == "application/pdf" or (
-                ct == "application/octet-stream" and filename.lower().endswith(".pdf")
-            )
+            # Trust the .pdf extension regardless of MIME type — CDSL CAS
+            # emails (eCAS@cdslstatement.com) mislabel the PDF as text/plain
+            # while still attaching real PDF bytes with a .pdf filename.
+            is_pdf = ct == "application/pdf" or filename.lower().endswith(".pdf")
             if not is_pdf:
                 continue
             # Skip known non-statement PDFs (MITC, T&C docs)

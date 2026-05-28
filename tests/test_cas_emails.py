@@ -617,3 +617,39 @@ async def test_process_cas_email_surfaces_specific_ingest_error(
     assert result is None
     assert error is not None
     assert "grand_total" in error
+
+
+def test_extract_pdf_handles_text_plain_attachment_with_pdf_filename():
+    """CDSL CAS emails (eCAS@cdslstatement.com) attach the PDF as
+    Content-Type: text/plain with a `.pdf` filename. Our extractor must
+    trust the filename and not just the MIME type — otherwise the CAS
+    auto-fetch path drops these emails with `no PDF attachment` even
+    though the bytes are a real PDF."""
+    import base64
+    from email.mime.base import MIMEBase
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    from financial_dashboard.services.statements.cc import extract_pdf_from_email
+
+    fake_pdf = b"%PDF-1.4\nfake content\n%%EOF\n"
+
+    msg = MIMEMultipart()
+    msg["Subject"] = "CDSL CAS for APR2026"
+    msg["From"] = "eCAS@cdslstatement.com"
+    msg.attach(MIMEText("Please find your CAS attached.", "html"))
+
+    # Mimic the CDSL shape: text/plain content-type, attachment disposition,
+    # .pdf filename, base64-encoded PDF bytes.
+    attachment = MIMEBase("text", "plain")
+    attachment.set_payload(base64.b64encode(fake_pdf).decode("ascii"))
+    attachment.add_header("Content-Transfer-Encoding", "base64")
+    attachment.add_header(
+        "Content-Disposition", "attachment", filename="APR2026_AA03378886_TXN.pdf"
+    )
+    msg.attach(attachment)
+
+    pdfs = extract_pdf_from_email(msg.as_bytes())
+    assert len(pdfs) == 1
+    assert pdfs[0].filename == "APR2026_AA03378886_TXN.pdf"
+    assert pdfs[0].content == fake_pdf
