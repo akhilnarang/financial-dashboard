@@ -54,20 +54,30 @@
                     <th>Name</th>
                     <th>Kind</th>
                     <th>Category</th>
-                    <th>Value Update</th>
+                    <th>Current</th>
+                    <th>Update</th>
                     <th></th>
                 </tr>
             </thead>
             <tbody>
                 {% for item in items %}
+                {% set latest = latest_by_item.get(item.id) %}
                 <tr>
                     <td>{{ item.name }}{% if not item.active %} <span class="badge">inactive</span>{% endif %}</td>
                     <td>{{ item.kind }}</td>
                     <td>{{ item.category.replace("_", " ") }}</td>
+                    <td class="amt">
+                        {% if latest %}
+                            {{ latest.value|inr_compact }}
+                            <span class="text-sm text-muted" style="display: block; font-weight: normal;">as of {{ latest.as_of_date.strftime("%d %b %Y") }}</span>
+                        {% else %}
+                            <span class="text-sm text-muted">&mdash;</span>
+                        {% endif %}
+                    </td>
                     <td>
                         {% if item.active %}
                         <form method="post" action="/networth/manual/{{ item.id }}/value" style="display: flex; gap: 0.4rem; align-items: center;">
-                            <input type="number" step="0.01" name="value" required style="width: 9rem;">
+                            <input type="number" step="0.01" name="value" required style="width: 9rem;" placeholder="{{ latest.value if latest else '' }}">
                             <input type="date" name="as_of_date" required value="{{ today_iso }}">
                             <button type="submit">Update</button>
                         </form>

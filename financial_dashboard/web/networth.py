@@ -8,9 +8,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import func
+
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
-from financial_dashboard.db.models import ManualItem
+from financial_dashboard.db.models import BalanceSnapshot, ManualItem
 from financial_dashboard.services.manual_items import (
     create_item,
     deactivate,
@@ -49,12 +51,41 @@ async def manual_items_index(
         .scalars()
         .all()
     )
+
+    # Latest snapshot per manual_item (current value + as-of date for the table).
+    latest_subq = (
+        select(
+            BalanceSnapshot.manual_item_id,
+            func.max(BalanceSnapshot.as_of_date).label("max_date"),
+        )
+        .where(BalanceSnapshot.manual_item_id.is_not(None))
+        .group_by(BalanceSnapshot.manual_item_id)
+        .subquery()
+    )
+    latest_rows = (
+        (
+            await session.execute(
+                select(BalanceSnapshot).join(
+                    latest_subq,
+                    (BalanceSnapshot.manual_item_id == latest_subq.c.manual_item_id)
+                    & (BalanceSnapshot.as_of_date == latest_subq.c.max_date),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    latest_by_item: dict[int, BalanceSnapshot] = {
+        s.manual_item_id: s for s in latest_rows if s.manual_item_id is not None
+    }
+
     return templates.TemplateResponse(
         request,
         "networth/manual.html",
         {
             "active_page": "networth",
             "items": items,
+            "latest_by_item": latest_by_item,
             "today_iso": datetime.date.today().isoformat(),
         },
     )
