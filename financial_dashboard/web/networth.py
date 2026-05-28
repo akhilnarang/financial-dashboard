@@ -5,10 +5,8 @@ from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Form, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from sqlalchemy import func
 
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
@@ -65,11 +63,16 @@ async def manual_items_index(
     latest_rows = (
         (
             await session.execute(
-                select(BalanceSnapshot).join(
+                select(BalanceSnapshot)
+                .join(
                     latest_subq,
                     (BalanceSnapshot.manual_item_id == latest_subq.c.manual_item_id)
                     & (BalanceSnapshot.as_of_date == latest_subq.c.max_date),
                 )
+                # Deterministic tiebreak when an item has >1 snapshot on the
+                # same as_of_date: ascending id means the highest id (most
+                # recently inserted) wins the dict-comprehension last-write.
+                .order_by(BalanceSnapshot.id)
             )
         )
         .scalars()

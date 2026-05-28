@@ -76,7 +76,10 @@ def _normalize_mask(s: str | None) -> str:
     return "".join(ch for ch in s if ch.isdigit())
 
 
-def _is_information_downgrade(field: str, old_val: str, new_val: str) -> bool:
+def _is_information_downgrade(field: str, old_val: object, new_val: object) -> bool:
+    # Only the three string-valued fields below can degrade; every other
+    # field short-circuits to False without touching old_val/new_val, so the
+    # `object` annotation is honest about what callers actually pass.
     if field == "counterparty":
         old_norm = _normalize_counterparty(old_val)
         new_norm = _normalize_counterparty(new_val)
@@ -86,6 +89,9 @@ def _is_information_downgrade(field: str, old_val: str, new_val: str) -> bool:
         new_digits = _normalize_mask(new_val)
         return len(new_digits) < len(old_digits) and old_digits.endswith(new_digits)
     if field == "raw_description":
+        # Substring check is case-sensitive here (no .lower()), unlike the
+        # counterparty path: a pure case flip is treated as a real change,
+        # not a downgrade, since we can't tell which casing is more correct.
         old_stripped = old_val.strip()
         new_stripped = new_val.strip()
         return (

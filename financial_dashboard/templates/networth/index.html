@@ -226,6 +226,7 @@
             `<span>net change: <strong>${deltaStr}</strong> &middot; ${points.length} months &middot; <span class="text-sm text-muted">hover to inspect</span></span>`;
 
         const showHover = (clientX, clientY) => {
+            if (!coords.length) return;   // render() bailed before laying out points
             const ctm = svg.getScreenCTM();
             if (!ctm) return;
             // getScreenCTM is always invertible for a rendered SVG in
