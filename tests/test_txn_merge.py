@@ -1045,3 +1045,44 @@ async def test_merge_transaction_alias_match_overwrites_transaction_time(
     assert row.transaction_time == time(22, 33, 30)
     assert "transaction_time" in diff.overwritten
     assert diff.overwritten["transaction_time"] == (time(10, 33, 11), time(22, 33, 30))
+
+
+def test_email_enrichment_counterparty_no_downgrade():
+    existing = _make_txn(counterparty="alicetest0000@upi")
+    incoming = {"counterparty": "test0000@upi"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert "counterparty" not in diff.overwritten
+
+
+def test_email_enrichment_counterparty_upgrade_allowed():
+    existing = _make_txn(counterparty="test0000@upi")
+    incoming = {"counterparty": "alicetest0000@upi"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.overwritten["counterparty"] == (
+        "test0000@upi",
+        "alicetest0000@upi",
+    )
+
+
+def test_email_enrichment_mask_upgrade_allowed():
+    existing = _make_txn(account_mask="XX0000")
+    incoming = {"account_mask": "99XXXXXX0000"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.overwritten["account_mask"] == ("XX0000", "99XXXXXX0000")
+
+
+def test_email_enrichment_mask_no_downgrade():
+    existing = _make_txn(account_mask="99XXXXXX0000")
+    incoming = {"account_mask": "XX0000"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert "account_mask" not in diff.overwritten
+
+
+def test_email_enrichment_unrelated_counterparty_still_overwrites():
+    existing = _make_txn(counterparty="PZCREDIT123")
+    incoming = {"counterparty": "Phone Pe Private Limited"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.overwritten["counterparty"] == (
+        "PZCREDIT123",
+        "Phone Pe Private Limited",
+    )

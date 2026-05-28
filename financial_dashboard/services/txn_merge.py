@@ -76,6 +76,26 @@ def _normalize_mask(s: str | None) -> str:
     return "".join(ch for ch in s if ch.isdigit())
 
 
+def _is_information_downgrade(field: str, old_val: str, new_val: str) -> bool:
+    if field == "counterparty":
+        old_norm = _normalize_counterparty(old_val)
+        new_norm = _normalize_counterparty(new_val)
+        return bool(new_norm) and new_norm in old_norm and new_norm != old_norm
+    if field in _MASK_FIELDS:
+        old_digits = _normalize_mask(old_val)
+        new_digits = _normalize_mask(new_val)
+        return len(new_digits) < len(old_digits) and old_digits.endswith(new_digits)
+    if field == "raw_description":
+        old_stripped = old_val.strip()
+        new_stripped = new_val.strip()
+        return (
+            bool(new_stripped)
+            and new_stripped in old_stripped
+            and new_stripped != old_stripped
+        )
+    return False
+
+
 def compute_enrichment_diff(
     existing, incoming: dict, channel: Channel
 ) -> EnrichmentDiff:
@@ -118,6 +138,8 @@ def compute_enrichment_diff(
             if f == "transaction_time" and not _incoming_time_is_earlier(
                 existing, incoming, new_val, old_val
             ):
+                continue
+            if _is_information_downgrade(f, old_val, new_val):
                 continue
             overwritten[f] = (old_val, new_val)
         # channel == "sms" with both non-null and unequal: keep existing.
