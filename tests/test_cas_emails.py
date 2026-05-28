@@ -139,6 +139,36 @@ async def test_ensure_disables_rules_for_inactive_sources(session):
     assert rule.enabled is False
 
 
+async def test_per_source_cooldown_handles_naive_timestamps(session):
+    """SQLite's DATETIME column drops tzinfo on read-back, so a UTC-aware
+    write surfaces as naive on the next session. ensure_cas_fetch_rules must
+    tolerate that, or the cooldown comparison raises
+    `can't subtract offset-naive and offset-aware datetimes` and crashes
+    the whole poll loop."""
+    src = await _source(session)
+    # Simulate the SQLite read-back: a naive datetime, value within cooldown.
+    src.cas_last_polled_at = dt.datetime.utcnow() - dt.timedelta(hours=2)
+    await session.flush()
+
+    _set_cas_cache(enabled=True, pan="ABCDE1234F")
+    await cas_emails.ensure_cas_fetch_rules(session)
+    await session.flush()
+
+    from sqlalchemy import select
+
+    rules = (
+        (
+            await session.execute(
+                select(FetchRule).where(FetchRule.auto_managed.is_(True))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rules) == 2
+    assert all(rule.enabled is False for rule in rules)
+
+
 async def test_per_source_cooldown_disables_within_24h(session):
     src = await _source(session)
     src.cas_last_polled_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=2)

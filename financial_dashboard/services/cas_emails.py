@@ -95,10 +95,14 @@ async def ensure_cas_fetch_rules(session: AsyncSession) -> None:
             )
 
     for source in sources:
-        on_cooldown = (
-            source.cas_last_polled_at is not None
-            and (now - source.cas_last_polled_at) < CAS_COOLDOWN
-        )
+        # SQLite's DATETIME column strips tzinfo on read-back, so a value
+        # we wrote as UTC-aware comes back naive. Normalize to UTC before
+        # the subtraction to avoid `can't subtract offset-naive and
+        # offset-aware datetimes`.
+        last_polled = source.cas_last_polled_at
+        if last_polled is not None and last_polled.tzinfo is None:
+            last_polled = last_polled.replace(tzinfo=datetime.UTC)
+        on_cooldown = last_polled is not None and (now - last_polled) < CAS_COOLDOWN
         for sender in CAS_SENDERS:
             rule = existing_by_key.get((source.id, sender.address))
             if rule is None:
