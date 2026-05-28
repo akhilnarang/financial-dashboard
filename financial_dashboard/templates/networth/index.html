@@ -90,7 +90,6 @@
                 {% for holding in summary.investment_breakdown %}
                 <tr>
                     <td>{{ holding.label }}</td>
-                    <td class="text-sm text-muted">{{ holding.asset_class }}</td>
                     <td class="amt" style="text-align: right;">{{ holding.value|inr_compact }}</td>
                 </tr>
                 {% endfor %}

@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="Email Fetcher",
+        title="Ledger",
         lifespan=lifespan,
         dependencies=[Depends(verify_credentials)],
     )
