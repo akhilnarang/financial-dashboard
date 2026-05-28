@@ -19,6 +19,8 @@ financial_dashboard/
     settings.py
     polling.py
     forms.py
+    networth.py           /networth + /networth/manual
+    cas.py                /cas/upload
   services/
     accounts.py
     emails.py
@@ -30,6 +32,11 @@ financial_dashboard/
     sources.py
     telegram.py
     transactions.py
+    networth.py           current_networth + monthly_trend (forward-fill)
+    snapshots.py          balance_snapshot upsert + emit helpers
+    cas_ingestion.py      ingest_cas_payload (idempotent, NSDL-canonical)
+    cas_emails.py         auto-fetch CAS emails via ensure_cas_fetch_rules
+    manual_items.py
     statements/
       __init__.py
       cc.py
@@ -76,6 +83,28 @@ uv run pytest -q
 - Background tasks (fetch polling, Telegram handlers, reminders) open their own session with `async with async_session() as session:` and pass it onward where applicable.
 - Do not add `async_session_factory` fallback parameters.
 
+## Style conventions
+
+- **No `from __future__ import annotations`.** Python 3.14 + PEP 649
+  makes lazy annotation evaluation the default, so the future import is
+  a no-op. Don't add it to new files; existing files have it stripped.
+- **Multi-value returns use `typing.NamedTuple`**, not anonymous
+  tuples and not frozen dataclasses (for the typical 2–4-field case).
+  NamedTuple keeps positional unpacking (`a, b = func()` and `result[0]`)
+  working at every call site while giving named attribute access
+  (`result.field`) for readability. Reserve `@dataclass(frozen=True)`
+  for value objects with methods or many fields; reserve `BaseModel`
+  for things that cross an API boundary (already the convention in
+  `schemas/`). Examples in the repo: `CasEmailProcessResult`,
+  `FetchSourceResult`, `MergeTransactionResult`, `ProcessedEmailParse`,
+  `PdfAttachment`, `SmsIngestResult`, `RawEmailLoadResult`.
+- **No defensive `getattr(obj, "attr", default)`** for ORM columns or
+  any attribute that is always present on the typed object. Use direct
+  attribute access; let attribute errors surface. The only legitimate
+  uses are: `request.app.state.<attr>` (state attrs may be unset before
+  startup), dynamic-name `getattr(obj, field_name_variable)`, and
+  module-level `def __getattr__` for lazy imports.
+
 ## Compatibility rules
 
 - Preserve current HTTP routes, JSON response shapes, template behavior, parser-derived `email_type` values, and script entrypoints unless a task explicitly allows a breaking change.
@@ -96,10 +125,11 @@ uv run pytest -q
 that CI, deploys, and reviewers see.
 
 When you're actively developing a change that spans this repo and a
-sibling (`bank-email-parser`, `bank-statement-parser`, `cc-parser`), you can
-**temporarily** swap those git sources for local path sources so edits in
-the sibling are picked up immediately — no reinstall, no version bump, no
-lockfile churn. The siblings live at `../<name>` relative to this repo.
+sibling (`bank-email-parser`, `bank-statement-parser`, `cc-parser`,
+`cas-parser`), you can **temporarily** swap those git sources for local
+path sources so edits in the sibling are picked up immediately — no
+reinstall, no version bump, no lockfile churn. The siblings live at
+`../<name>` relative to this repo.
 
 Temporary dev-only block (do NOT commit this):
 
@@ -108,6 +138,7 @@ Temporary dev-only block (do NOT commit this):
 bank-email-parser = { path = "../bank-email-parser", editable = true }
 bank-statement-parser = { path = "../bank-statement-parser", editable = true }
 cc-parser = { path = "../cc-parser", editable = true }
+cas-parser = { path = "../cas-parser", editable = true }
 ```
 
 Rules:
@@ -118,11 +149,8 @@ Rules:
   Deploys run off these git sources; path sources would break CI.
 - **Never commit path sources.** If `git diff pyproject.toml uv.lock` shows
   path entries or a stale lockfile, fix that before pushing.
-- **During dev with path sources**, direct attribute access works and `ty`
-  sees the new sibling shape — no `getattr` scaffolding needed.
 - Sibling repo SHAs pinned by the committed lockfile can be inspected in
-  `uv.lock` under the relevant
-  `[[package]]` block.
+  `uv.lock` under the relevant `[[package]]` block.
 
 ## Quality gates
 
