@@ -92,7 +92,7 @@ wheels = [
 [[package]]
 name = "cas-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/cas-parser#692066e9a0ff1fb30412d1955ad2db5ca986fd1a" }
+source = { git = "https://github.com/akhilnarang/cas-parser#a2d3d37b10387877e2bf43cfcf3af13b4b0d81e3" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },
