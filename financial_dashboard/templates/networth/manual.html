@@ -7,6 +7,12 @@
     <a href="/networth">Back to Net Worth</a>
 </div>
 
+{% if error %}
+<article class="card" style="margin-bottom: 1.5rem; border-left: 3px solid var(--clr-debit);">
+    <strong>Could not save:</strong> {{ error }}
+</article>
+{% endif %}
+
 <form method="post" action="/networth/manual" class="filter-bar">
     <label data-field>
         Name
@@ -93,6 +99,43 @@
                         {% endif %}
                     </td>
                 </tr>
+                {% set history = history_by_item.get(item.id, []) %}
+                {% if history %}
+                <tr>
+                    <td colspan="6" style="padding-top: 0;">
+                        <details>
+                            <summary class="text-sm text-muted">History ({{ history|length }})</summary>
+                            <table style="margin-top: 0.5rem;">
+                                <tbody>
+                                {% for snap in history %}
+                                    <tr>
+                                        <td>{{ snap.as_of_date.strftime("%d %b %Y") }}</td>
+                                        <td class="amt">{{ snap.value|inr_compact }}</td>
+                                        {% if item.active %}
+                                        <td>
+                                            <form method="post" action="/networth/manual/snapshot/{{ snap.id }}/edit" style="display: flex; gap: 0.4rem; align-items: center;">
+                                                <input type="number" step="0.01" name="value" required style="width: 9rem;" value="{{ snap.value }}">
+                                                <input type="date" name="as_of_date" required value="{{ snap.as_of_date.isoformat() }}">
+                                                <button type="submit">Save</button>
+                                            </form>
+                                        </td>
+                                        <td>
+                                            <form method="post" action="/networth/manual/snapshot/{{ snap.id }}/delete" onsubmit="return confirm('Delete this entry?');" style="display: inline;">
+                                                <button type="submit" class="btn-link danger">Delete</button>
+                                            </form>
+                                        </td>
+                                        {% else %}
+                                        <td class="text-sm text-muted">&mdash;</td>
+                                        <td></td>
+                                        {% endif %}
+                                    </tr>
+                                {% endfor %}
+                                </tbody>
+                            </table>
+                        </details>
+                    </td>
+                </tr>
+                {% endif %}
                 {% endfor %}
             </tbody>
         </table>
