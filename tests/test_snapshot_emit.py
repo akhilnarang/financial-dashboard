@@ -68,7 +68,8 @@ async def test_emit_cc_snapshot_matches_dashboard_outstanding_logic(session):
     assert await emit_cc_snapshot(session, upload) is True
     snapshot = (await session.execute(select(BalanceSnapshot))).scalar_one()
     assert snapshot.category == SnapshotCategory.cc_outstanding.value
-    assert snapshot.as_of_date == dt.date(2026, 4, 30)
+    # Dated by statement generation (created_at), not latest txn (30/04).
+    assert snapshot.as_of_date == dt.date(2026, 5, 10)
     assert snapshot.value == Decimal("7500.00")
 
 

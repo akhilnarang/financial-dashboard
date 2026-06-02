@@ -7,7 +7,6 @@ another backend would require a dialect-aware upsert.
 """
 
 import datetime
-import json
 from decimal import Decimal
 from enum import StrEnum
 
@@ -113,35 +112,6 @@ async def emit_bank_snapshot(session: AsyncSession, upload) -> bool:
     return True
 
 
-def _cc_statement_date(upload) -> datetime.date:
-    from financial_dashboard.services.statements.cc import parse_cc_date
-
-    dates: list[datetime.date] = []
-    if upload.reconciliation_data:
-        try:
-            recon = json.loads(upload.reconciliation_data)
-        except json.JSONDecodeError:
-            recon = {}
-        for key in ("matched", "missing"):
-            for entry in recon.get(key) or []:
-                if date_text := entry.get("date"):
-                    try:
-                        dates.append(parse_cc_date(date_text))
-                    except Exception:
-                        pass
-        for pair in recon.get("adjustment_pairs") or []:
-            for key in ("debit_date", "credit_date"):
-                if date_text := pair.get(key):
-                    try:
-                        dates.append(parse_cc_date(date_text))
-                    except Exception:
-                        pass
-    if dates:
-        return max(dates)
-    created_at = upload.created_at or datetime.datetime.now(datetime.UTC)
-    return created_at.date()
-
-
 async def emit_cc_snapshot(session: AsyncSession, upload) -> bool:
     from financial_dashboard.db.enums import PaymentStatus
     from financial_dashboard.services.statements.cc import parse_cc_amount
@@ -160,12 +130,15 @@ async def emit_cc_snapshot(session: AsyncSession, upload) -> bool:
     else:
         value = max(amount_due - paid_amount, Decimal("0.00"))
 
+    # Statement generation date, not latest txn-in-statement (which read stale).
+    created_at = upload.created_at or datetime.datetime.now(datetime.UTC)
+
     await upsert_account_snapshot(
         session,
         account_id=upload.account_id,
         kind=SnapshotKind.liability,
         category=SnapshotCategory.cc_outstanding,
-        as_of_date=_cc_statement_date(upload),
+        as_of_date=created_at.date(),
         value=value,
         source=SnapshotSource.cc_statement,
     )
