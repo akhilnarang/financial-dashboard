@@ -47,6 +47,7 @@ from financial_dashboard.services.cc_disambiguation import (
 from financial_dashboard.services.emails import parse_email_by_kind
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.reminders import check_payment_received
+from financial_dashboard.services.txn_merge import find_match, merge_transaction
 from financial_dashboard.services.settings import (
     get_telegram_chat_id,
     should_notify_transactions,
@@ -395,6 +396,24 @@ async def reparse_email(
                             select(Transaction).where(Transaction.email_id == em.id)
                         )
                     ).scalar_one_or_none()
+                    cross_channel = None
+                    if existing is None:
+                        # No row attached to this email yet. The same event
+                        # may already exist from another channel (e.g. an
+                        # SMS), so consult the cross-channel matcher before
+                        # inserting — otherwise a reparse double-counts it.
+                        # The live ingest path dedups via merge_transaction;
+                        # route the match through it so the email enriches
+                        # the existing row (fill-don't-clobber, guarded
+                        # email_id, source='sms+email') instead of a blind
+                        # overwrite. Only adopt rows not already claimed by
+                        # another email, so we never steal a link.
+                        match_result = await find_match(session, txn_data)
+                        if (
+                            match_result is not None
+                            and match_result[0].email_id is None
+                        ):
+                            cross_channel = match_result[0]
                     # `was_orphaned` distinguishes "fix a historical
                     # unlinked row" (account_id was None → the original
                     # parse never fired check_payment_received, so
@@ -402,8 +421,23 @@ async def reparse_email(
                     # already-processed payment" (account_id was set →
                     # the statement was already credited, so firing
                     # again would double-count).
-                    was_orphaned = existing is None or existing.account_id is None
-                    if existing is not None:
+                    was_orphaned = (
+                        (existing is None and cross_channel is None)
+                        or (existing is not None and existing.account_id is None)
+                        or (cross_channel is not None and cross_channel.account_id is None)
+                    )
+                    if cross_channel is not None:
+                        # Enrich the matched cross-channel row via the
+                        # canonical merger: it attaches the email (guarded
+                        # email_id), sets source='sms+email', and applies
+                        # downgrade-safe field merges (so a richer SMS value
+                        # like an in-body time is not clobbered by the
+                        # email's null). It does NOT clear FKs, so an
+                        # already-linked row keeps its account.
+                        _, txn_row, _ = await merge_transaction(
+                            session, "email", txn_data, email_id=em.id
+                        )
+                    elif existing is not None:
                         for key, value in txn_data.items():
                             setattr(existing, key, value)
                         existing.account_id = None
@@ -413,9 +447,14 @@ async def reparse_email(
                         txn_row = Transaction(email_id=em.id, **txn_data)
                         session.add(txn_row)
                     await session.flush()
-                    _link_ctx = await build_link_context(session)
-                    link_transaction(_link_ctx, txn_row)
-                    await session.flush()
+                    if txn_row.account_id is None:
+                        # Run the linker for fresh inserts, own-orphan
+                        # upserts (FKs just cleared), and cross-channel
+                        # rows that arrived unlinked. An already-linked
+                        # cross-channel row is left untouched.
+                        _link_ctx = await build_link_context(session)
+                        link_transaction(_link_ctx, txn_row)
+                        await session.flush()
                     # Maskless CC bill-payment: try amount-match against
                     # open statements; else queue a Telegram prompt.
                     pending_disambiguation = await resolve_cc_payment_account(
