@@ -47,8 +47,12 @@ class ReparseSmsResponse(BaseModel):
 @router.post("/sms/{sms_id}/reparse", response_model=ReparseSmsResponse)
 async def reparse_sms(
     sms_id: int,
+    force_new: Annotated[bool, Query()] = False,
     session: AsyncSession = Depends(get_session),
 ) -> ReparseSmsResponse:
+    """Reparse one SMS. ``force_new=true`` is the manual confirmation that a
+    ``[dup-defer]`` row is a genuine separate transaction: it bypasses the
+    duplicate matcher and forces a new row (idempotent if already linked)."""
     sms = await session.get(SmsMessage, sms_id)
     if sms is None:
         raise HTTPException(404, "SMS not found")
@@ -63,7 +67,7 @@ async def reparse_sms(
         if sms is None:
             raise HTTPException(500, "SMS disappeared")
         link_ctx = await build_link_context(session)
-        outcome = await process_sms_row(session, sms, link_ctx)
+        outcome = await process_sms_row(session, sms, link_ctx, force_new=force_new)
 
     # Telegram dispatch (best-effort, post-commit).
     if should_notify_transactions():

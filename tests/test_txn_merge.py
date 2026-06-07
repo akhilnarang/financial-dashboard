@@ -226,10 +226,9 @@ async def test_find_match_by_reference_number_hits(session: AsyncSession):
             "reference_number": "IMPS:000000000001",
         },
     )
-    assert match is not None
-    row, kind = match
-    assert row.id == existing.id
-    assert kind == "standard"
+    assert match.action == "match"
+    assert match.transaction.id == existing.id
+    assert match.kind == "standard"
 
 
 @pytest.mark.anyio
@@ -262,9 +261,9 @@ async def test_find_match_by_reference_number_direction_distinguishes(
             "reference_number": "IMPS:2",
         },
     )
-    assert match is not None
-    assert match[0].id == credit.id
-    assert match[1] == "standard"
+    assert match.action == "match"
+    assert match.transaction.id == credit.id
+    assert match.kind == "standard"
 
 
 @pytest.mark.anyio
@@ -281,7 +280,7 @@ async def test_find_match_empty_reference_treated_as_null(
             "reference_number": "",
         },
     )
-    assert match is None
+    assert match.action == "insert"
 
 
 @pytest.mark.anyio
@@ -313,9 +312,9 @@ async def test_find_match_fuzzy_window_hits_within_10min(
             "transaction_time": time(14, 28, 0),
         },
     )
-    assert match is not None
-    assert match[0].id == existing.id
-    assert match[1] == "standard"
+    assert match.action == "match"
+    assert match.transaction.id == existing.id
+    assert match.kind == "standard"
 
 
 @pytest.mark.anyio
@@ -347,7 +346,7 @@ async def test_find_match_fuzzy_window_misses_outside_10min(
             "transaction_time": time(14, 38, 0),
         },
     )
-    assert match is None
+    assert match.action == "insert"
 
 
 @pytest.mark.anyio
@@ -383,7 +382,7 @@ async def test_find_match_fuzzy_date_only_requires_counterparty_agreement(
             "counterparty": None,
         },
     )
-    assert match is None
+    assert match.action == "insert"
 
 
 @pytest.mark.anyio
@@ -427,9 +426,9 @@ async def test_find_match_fuzzy_counterparty_tiebreaker(
             "counterparty": "ZOMATO",
         },
     )
-    assert match is not None
-    assert match[0].id == t1.id
-    assert match[1] == "standard"
+    assert match.action == "match"
+    assert match.transaction.id == t1.id
+    assert match.kind == "standard"
 
 
 @pytest.mark.anyio
@@ -461,7 +460,7 @@ async def test_find_match_fuzzy_currency_must_match(
             "transaction_time": time(10, 5),
         },
     )
-    assert match is None
+    assert match.action == "insert"
 
 
 @pytest.mark.anyio
@@ -710,10 +709,9 @@ async def test_am_pm_alias_match_recovers_pm_stored_as_am(session: AsyncSession)
             "counterparty": "INDIAN INSTITUT",
         },
     )
-    assert match is not None
-    row, kind = match
-    assert row.id == existing.id
-    assert kind == "am_pm_alias"
+    assert match.action == "match"
+    assert match.transaction.id == existing.id
+    assert match.kind == "am_pm_alias"
 
 
 @pytest.mark.anyio
@@ -754,10 +752,9 @@ async def test_am_pm_alias_match_recovers_midnight_stored_as_noon(
             "counterparty": "LATE NIGHT KITCHEN",
         },
     )
-    assert match is not None
-    row, kind = match
-    assert row.id == existing.id
-    assert kind == "am_pm_alias"
+    assert match.action == "match"
+    assert match.transaction.id == existing.id
+    assert match.kind == "am_pm_alias"
 
 
 @pytest.mark.anyio
@@ -793,7 +790,7 @@ async def test_am_pm_alias_match_does_not_fire_for_safe_email_types(
             "counterparty": "ZOMATO",
         },
     )
-    assert match is None
+    assert match.action == "insert"
 
 
 @pytest.mark.anyio
@@ -829,7 +826,7 @@ async def test_am_pm_alias_match_requires_counterparty_agreement(
             "counterparty": "DOMINOS PIZZA",  # different merchant
         },
     )
-    assert match is None
+    assert match.action == "insert"
 
 
 @pytest.mark.anyio
@@ -867,7 +864,7 @@ async def test_am_pm_alias_refuses_when_either_side_lacks_counterparty(
             "counterparty": None,
         },
     )
-    assert match is None
+    assert match.action == "insert"
 
 
 @pytest.mark.anyio
@@ -913,7 +910,7 @@ async def test_am_pm_alias_returns_none_when_multiple_alias_candidates(
             "counterparty": "STARBUCKS",
         },
     )
-    assert match is None
+    assert match.action == "insert"
 
 
 @pytest.mark.anyio
@@ -956,7 +953,7 @@ async def test_am_pm_alias_plus12h_only_targets_noon_stored_candidates(
             "counterparty": "STARBUCKS",
         },
     )
-    assert match is None, (
+    assert match.action == "insert", (
         "alias +12h must not match candidates whose stored hour != 12 — "
         "those are correctly-stored PM rows, not midnight-as-noon bugs"
     )
@@ -994,10 +991,9 @@ async def test_am_pm_alias_does_not_run_when_standard_pass_succeeds(
             "counterparty": "ZEPTO",
         },
     )
-    assert match is not None
-    row, kind = match
-    assert row.id == existing.id
-    assert kind == "standard"  # not am_pm_alias
+    assert match.action == "match"
+    assert match.transaction.id == existing.id
+    assert match.kind == "standard"  # not am_pm_alias
 
 
 @pytest.mark.anyio
@@ -1217,7 +1213,9 @@ async def test_card_mask_fallback_refuses_two_same_card_payments(
     session: AsyncSession,
 ):
     # Two genuine same-card same-amount payments on one day are ambiguous;
-    # an arriving email must not merge into either (unique-candidate rule).
+    # an arriving email must not merge into either. These payment alerts
+    # carry no balance, so the email hits balance-less multiplicity →
+    # DEFER (skip for manual resolution) rather than guess a merge.
     await merge_transaction(
         session, "sms", _icici_payment_sms(transaction_time=time(10, 0, 0))
     )
@@ -1225,9 +1223,9 @@ async def test_card_mask_fallback_refuses_two_same_card_payments(
         session, "sms", _icici_payment_sms(transaction_time=time(17, 58, 10))
     )
     outcome, _row, _ = await merge_transaction(session, "email", _icici_payment_email())
-    assert outcome == "created"
+    assert outcome == "deferred"
     rows = (await session.execute(select(Transaction))).scalars().all()
-    assert len(rows) == 3
+    assert len(rows) == 2
 
 
 @pytest.mark.anyio
@@ -1242,3 +1240,307 @@ async def test_card_mask_fallback_refuses_different_card(session: AsyncSession):
     assert outcome == "created"
     rows = (await session.execute(select(Transaction))).scalars().all()
     assert len(rows) == 2
+
+
+# ---------------------------------------------------------------------------
+# Balance-based de-merge. Balance is the event identity:
+# a different *known* balance means a distinct event and must split.
+# ---------------------------------------------------------------------------
+
+
+def _quantize(value):
+    return None if value is None else Decimal(str(value)).quantize(Decimal("0.01"))
+
+
+def _icici_spend_sms(
+    *,
+    amount="5000",
+    balance,
+    transaction_time,
+    counterparty="TESTMERCHANT",
+    card_mask="XX1234",
+    transaction_date=date(2026, 6, 7),
+):
+    """An ICICI CC spend alert as it reaches merge_transaction from the SMS
+    pipeline: no reference_number, carries an available-limit balance."""
+    return {
+        "bank": "icici",
+        "email_type": "icici_cc_transaction_alert",
+        "direction": "debit",
+        "amount": Decimal(amount),
+        "currency": "INR",
+        "transaction_date": transaction_date,
+        "transaction_time": transaction_time,
+        "counterparty": counterparty,
+        "card_mask": card_mask,
+        "account_mask": None,
+        "reference_number": None,
+        "channel": "card",
+        "balance": Decimal(balance) if balance is not None else None,
+        "raw_description": None,
+    }
+
+
+@pytest.mark.anyio
+async def test_two_distinct_charges_different_balance_split(session: AsyncSession):
+    """The de-merge bug: two distinct ₹5,000 charges ~30s apart, SMS-only,
+    identical on every old match field but with different available limits,
+    must produce TWO rows — not silently collapse into one."""
+    o1, _r1, _ = await merge_transaction(
+        session,
+        "sms",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
+        sms_message_id=389,
+    )
+    o2, _r2, _ = await merge_transaction(
+        session,
+        "sms",
+        _icici_spend_sms(balance="95000.00", transaction_time=time(21, 36, 55)),
+        sms_message_id=390,
+    )
+    assert o1 == "created"
+    assert o2 == "created"
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 2
+
+
+@pytest.mark.anyio
+async def test_clean_cross_channel_pair_equal_balance_merges(session: AsyncSession):
+    """One real charge, SMS then email, identical balance → one row.
+    Balance equality is positive same-event confirmation."""
+    o1, r1, _ = await merge_transaction(
+        session,
+        "sms",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
+        sms_message_id=389,
+    )
+    o2, r2, _ = await merge_transaction(
+        session,
+        "email",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 12)),
+        email_id=3320,
+    )
+    assert o1 == "created"
+    assert o2 == "enriched"
+    assert r2.id == r1.id
+    assert r2.source == "sms+email"
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.anyio
+async def test_bank_duplicate_equal_balance_same_channel_dedups(session: AsyncSession):
+    """A bank re-sends an identical SMS (same balance) for one charge. Equal
+    balance proves same event even though the SMS slot is already filled →
+    enrich (dedup), no second row."""
+    o1, r1, _ = await merge_transaction(
+        session,
+        "sms",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
+        sms_message_id=389,
+    )
+    o2, r2, diff = await merge_transaction(
+        session,
+        "sms",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
+        sms_message_id=395,
+    )
+    assert o1 == "created"
+    assert o2 == "enriched"
+    assert r2.id == r1.id
+    # No-op duplicate: nothing changed, so enriched_at must stay None.
+    assert diff.changed_fields == []
+    assert r2.enriched_at is None
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.anyio
+async def test_incoming_balance_vs_balanceless_candidate_defers(session: AsyncSession):
+    """Incoming carries a balance but the lone candidate has none — a
+    presence mismatch. Don't blind-merge; DEFER."""
+    await merge_transaction(
+        session,
+        "sms",
+        _icici_spend_sms(balance=None, transaction_time=time(21, 36, 27)),
+        sms_message_id=389,
+    )
+    outcome, txn, _ = await merge_transaction(
+        session,
+        "email",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 12)),
+        email_id=3320,
+    )
+    assert outcome == "deferred"
+    assert txn is None
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.anyio
+async def test_three_identical_charges_distinct_balances_three_rows(
+    session: AsyncSession,
+):
+    """Three back-to-back identical-amount charges, each a distinct balance,
+    produce three rows."""
+    for i, bal in enumerate(("100000.00", "95000.00", "90000.00")):
+        outcome, _r, _ = await merge_transaction(
+            session,
+            "sms",
+            _icici_spend_sms(balance=bal, transaction_time=time(21, 36, 27 + i)),
+            sms_message_id=400 + i,
+        )
+        assert outcome == "created"
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 3
+
+
+@pytest.mark.anyio
+async def test_worked_trace_all_four_notifications_pair_by_balance(
+    session: AsyncSession,
+):
+    """Two distinct ₹5,000 charges, each reported by SMS + email. All four
+    notifications converge to exactly two rows, each paired by balance into
+    an sms+email row."""
+    # SMS1 (charge A), SMS2 (charge B), Email1 (A), Email2 (B).
+    await merge_transaction(
+        session, "sms",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
+        sms_message_id=389,
+    )
+    await merge_transaction(
+        session, "sms",
+        _icici_spend_sms(balance="95000.00", transaction_time=time(21, 36, 55)),
+        sms_message_id=390,
+    )
+    await merge_transaction(
+        session, "email",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 12)),
+        email_id=3320,
+    )
+    await merge_transaction(
+        session, "email",
+        _icici_spend_sms(balance="95000.00", transaction_time=time(21, 36, 40)),
+        email_id=3321,
+    )
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 2
+    assert all(r.source == "sms+email" for r in rows)
+    assert {_quantize(r.balance) for r in rows} == {
+        Decimal("100000.00"),
+        Decimal("95000.00"),
+    }
+
+
+@pytest.mark.anyio
+async def test_am_pm_alias_with_differing_balance_inserts(session: AsyncSession):
+    """An alias-window candidate that would normally merge, but the two
+    balances differ → a distinct event → INSERT, not merge."""
+    existing = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(10, 33, 11),  # PM-stored-as-AM shape
+        counterparty="STARBUCKS",
+        balance=Decimal("1000.00"),
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(
+        session,
+        {
+            "bank": "icici",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(22, 33, 30),
+            "counterparty": "STARBUCKS",
+            "balance": Decimal("500.00"),  # differs from candidate
+        },
+    )
+    assert match.action == "insert"
+
+
+@pytest.mark.anyio
+async def test_am_pm_alias_balanceless_candidate_still_matches(session: AsyncSession):
+    """A pre-AM/PM-fix row may have balance=None. An alias hit must still
+    MATCH it (treat None as merge, not presence-mismatch defer)."""
+    existing = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 16),
+        transaction_time=time(10, 33, 11),
+        counterparty="STARBUCKS",
+        balance=None,
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(
+        session,
+        {
+            "bank": "icici",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": date(2026, 5, 16),
+            "transaction_time": time(22, 33, 30),
+            "counterparty": "STARBUCKS",
+            "balance": Decimal("500.00"),
+        },
+    )
+    assert match.action == "match"
+    assert match.kind == "am_pm_alias"
+
+
+@pytest.mark.anyio
+async def test_force_new_bypasses_find_match(session: AsyncSession):
+    """force_new inserts a new row even when a same-balance candidate exists
+    — the manual Parse of a deferred row."""
+    await merge_transaction(
+        session, "sms",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
+        sms_message_id=389,
+    )
+    outcome, txn, _ = await merge_transaction(
+        session, "sms",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
+        sms_message_id=395,
+        force_new=True,
+    )
+    assert outcome == "created"
+    assert txn is not None
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 2
+
+
+@pytest.mark.anyio
+async def test_force_new_idempotent_on_already_linked_source(session: AsyncSession):
+    """A double Parse of the same SMS must not create two rows: force_new is
+    idempotent on a source row already linked to a transaction."""
+    o1, r1, _ = await merge_transaction(
+        session, "sms",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
+        sms_message_id=389,
+        force_new=True,
+    )
+    o2, r2, _ = await merge_transaction(
+        session, "sms",
+        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
+        sms_message_id=389,
+        force_new=True,
+    )
+    assert o1 == "created"
+    assert r2.id == r1.id
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1

@@ -88,6 +88,59 @@ async def test_reparse_single_not_found_returns_404(session):
     assert resp.status_code == 404
 
 
+@pytest.mark.anyio
+async def test_reparse_force_new_creates_row_for_deferred_sms(session):
+    """A [dup-defer] SMS reparsed with ?force_new=true must create a real
+    transaction (manual confirmation that it's a genuine second charge),
+    bypassing the matcher that would DEFER it again."""
+    from financial_dashboard.db import Transaction
+
+    # A pre-existing balance-less ICICI CC row the incoming SMS collides with.
+    existing = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=__import__("decimal").Decimal("5000.00"),
+        currency="INR",
+        transaction_date=datetime.date(2026, 6, 7),
+        transaction_time=datetime.time(21, 36, 0),
+        counterparty="TESTMERCHANT",
+        card_mask="XX1234",
+        balance=None,
+        source="email",
+        email_id=999,
+    )
+    session.add(existing)
+    sms = SmsMessage(
+        bank="icici",
+        sender="AD-ICICIT-S",
+        body=(
+            "Rs 5,000.00 spent on ICICI Bank Card XX1234 on 07-Jun-26 at "
+            "TESTMERCHANT. Avl Lmt: Rs 1,00,000.00. To dispute, call "
+            "18002662/SMS BLOCK 1234 to 9215676766."
+        ),
+        received_at=datetime.datetime(2026, 6, 7, 16, 6, 0, tzinfo=datetime.UTC),
+        status="skipped",
+        parse_error="[dup-defer] possible duplicate",
+    )
+    session.add(sms)
+    await session.commit()
+
+    async with await _client(session) as client:
+        # Without force_new it defers again (no row).
+        resp = await client.post(f"/sms/{sms.id}/reparse")
+        assert resp.status_code == 200
+        assert resp.json()["new_status"] == "skipped"
+        assert resp.json()["txn_id"] is None
+
+        # With force_new it creates a real transaction.
+        resp = await client.post(f"/sms/{sms.id}/reparse?force_new=true")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["new_status"] == "parsed"
+    assert data["txn_id"] is not None
+
+
 @pytest.mark.skip(
     reason=(
         "Known testability gap: the bulk endpoint spawns its own async_session() "

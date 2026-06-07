@@ -10,6 +10,7 @@ does NOT commit and does NOT fire Telegram.
 import datetime as _dt
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Literal, NamedTuple
 
 from sqlalchemy import select
@@ -24,8 +25,54 @@ from financial_dashboard.services.parser_quirks import (
 )
 
 Channel = Literal["sms", "email"]
-MergeOutcome = Literal["created", "enriched"]
+MergeOutcome = Literal["created", "enriched", "deferred"]
 MatchKind = Literal["standard", "am_pm_alias"]
+
+# find_match's three terminal outcomes:
+#   match  → enrich the carried Transaction
+#   insert → no candidate is the same event; create a new row
+#   defer  → ambiguous and not safely decidable from balance; skip the row
+#            for manual resolution rather than risk a wrong merge/split.
+MatchAction = Literal["match", "insert", "defer"]
+
+
+class MatchDecision(NamedTuple):
+    action: MatchAction
+    # Only set when action == "match".
+    transaction: Transaction | None = None
+    kind: MatchKind | None = None
+
+
+# Sentinel prefix on the channel-specific error note for a deferred row, so
+# the manual-review queue can tell duplicate-defers apart from the other
+# `skipped` shapes (unsupported, _stub, non-transaction, ref-race). Asserted
+# in tests.
+DUP_DEFER_PREFIX = "[dup-defer]"
+DUP_DEFER_NOTE = (
+    f"{DUP_DEFER_PREFIX} possible duplicate (no balance to confirm) — "
+    "click Parse if this is a real separate transaction"
+)
+
+
+def _quantize_balance(value) -> Decimal | None:
+    """Normalize a balance to 2dp for equality comparison. The incoming
+    balance is built as ``Decimal(str(float))`` while the candidate's is a
+    DB ``Numeric(12,2)`` round-trip; an unnormalized ``==`` can spuriously
+    fail and wrongly DEFER a real same-event pair."""
+    if value is None:
+        return None
+    if not isinstance(value, Decimal):
+        value = Decimal(str(value))
+    return value.quantize(Decimal("0.01"))
+
+
+def _slot_open(candidate: Transaction, channel: Channel) -> bool:
+    """True when ``candidate`` has no source row yet on the incoming
+    channel — its SMS slot (incoming SMS) or email slot (incoming email)
+    is unfilled."""
+    if channel == "sms":
+        return candidate.sms_message_id is None
+    return candidate.email_id is None
 
 
 @dataclass(frozen=True)
@@ -44,7 +91,8 @@ class EnrichmentDiff:
 
 class MergeTransactionResult(NamedTuple):
     outcome: MergeOutcome
-    transaction: Transaction
+    # None only when outcome == "deferred" (no row created).
+    transaction: Transaction | None
     diff: EnrichmentDiff
 
 
@@ -188,51 +236,19 @@ def _card_payment_mask_match(existing: Transaction, txn_data: dict) -> bool:
     return existing_last4 is not None and existing_last4 == incoming_last4
 
 
-async def find_match(
+async def _gather_fuzzy_candidates(
     session: AsyncSession, txn_data: dict
-) -> tuple[Transaction, MatchKind] | None:
-    """Return an existing Transaction representing the same logical
-    event, paired with the match kind, or None.
-
-    Strategy:
-    1. (bank, reference_number, direction) when ref is non-empty on
-       both sides — the strongest signal we have. Returns ("standard").
-    2. Fuzzy fallback on (bank, direction, amount, currency) within a
-       ±10-minute window in IST-local wall time, with merchant substring
-       as a tiebreaker. Date-only windows (one side has no time)
-       additionally require counterparty agreement — prevents wrongly
-       merging two same-day same-amount card swipes. Returns ("standard").
-    3. AM/PM alias retry — when the fuzzy pass found nothing, retry with
-       the incoming time shifted -12h, restricted to candidates whose
-       ``email_type`` is in ``AMBIGUOUS_12H_TIME_EMAIL_TYPES`` (i.e. the
-       bank's parser is known to drop AM/PM markers and may have stored
-       an AM time for a real PM transaction). Counterparty must agree.
-       Returns ("am_pm_alias"); the caller overwrites the candidate's
-       transaction_time on enrichment.
+) -> list[Transaction]:
+    """Return the time-window candidate *list* for the fuzzy path, with the
+    existing counterparty / date-only / card-mask gates applied as candidate
+    *filters*. These gates no longer make a terminal accept/reject — they
+    only shape the list the balance/slot decision in :func:`find_match` then
+    runs on. An empty list means "no plausible same-event candidate", not
+    "definitely a new event".
     """
-    ref = (txn_data.get("reference_number") or "").strip()
-    if ref:
-        result = await session.execute(
-            select(Transaction)
-            .where(
-                Transaction.bank == txn_data["bank"],
-                Transaction.direction == txn_data["direction"],
-                Transaction.reference_number == ref,
-            )
-            .limit(2)
-        )
-        rows = result.scalars().all()
-        if len(rows) == 1:
-            return rows[0], "standard"
-        if len(rows) > 1:
-            return None
-        # 0 rows: fall through to fuzzy.
-
-    # Fuzzy fallback.
     txn_date = txn_data.get("transaction_date")
     if txn_date is None:
-        # No date → can't fuzzy-match.
-        return None
+        return []  # No date → can't fuzzy-match.
 
     incoming_currency = txn_data.get("currency") or "INR"
     incoming_time = txn_data.get("transaction_time")
@@ -265,60 +281,172 @@ async def find_match(
         # Filter candidates to those within the time window too.
         def in_window(c):
             if c.transaction_time is None:
-                # Other side lacks time — date-only safety applies below.
+                # Other side lacks time — date-only gate applies below.
                 return True
             c_dt = datetime.combine(c.transaction_date, c.transaction_time)
             return lower <= c_dt <= upper
 
         candidates = [c for c in candidates if in_window(c)]
 
+    if not candidates:
+        return []
+
     incoming_cp = txn_data.get("counterparty")
 
-    if candidates:
-        # Date-only safety: if either side lacks transaction_time, a
-        # singleton candidate is NOT auto-accepted — require counterparty
-        # agreement. Two ₹500 card swipes on the same card on the same
-        # day would otherwise silently merge.
-        if incoming_time is None or any(c.transaction_time is None for c in candidates):
-            filtered = [
-                c
-                for c in candidates
-                if _counterparty_match(c.counterparty, incoming_cp)
-            ]
-            if len(filtered) == 1:
-                return filtered[0], "standard"
-            # Card payment-received pairs have no shared counterparty —
-            # fall back to card last-4, on a unique candidate only.
-            by_mask = [c for c in candidates if _card_payment_mask_match(c, txn_data)]
-            if len(by_mask) == 1:
-                return by_mask[0], "standard"
-            return None
-
-        if len(candidates) == 1:
-            return candidates[0], "standard"
-
-        # >1 candidates in time window: apply counterparty tiebreaker.
-        filtered = [
+    # Date-only gate: if either side lacks transaction_time, two ₹500 swipes
+    # on the same card on the same day are indistinguishable on time alone —
+    # require counterparty agreement, or (for the no-counterparty card-payment
+    # pair shape) card last-4 agreement. Applied as a filter, not an early
+    # return, so the balance/slot decision still runs on the survivors.
+    if incoming_time is None or any(c.transaction_time is None for c in candidates):
+        by_cp = [
             c for c in candidates if _counterparty_match(c.counterparty, incoming_cp)
         ]
-        if len(filtered) == 1:
-            return filtered[0], "standard"
-        return None
+        if by_cp:
+            return by_cp
+        return [c for c in candidates if _card_payment_mask_match(c, txn_data)]
 
-    # Standard fuzzy returned nothing. Try the AM/PM alias retry.
-    if incoming_time is None:
-        return None
+    # Timed window with >1 candidate: counterparty narrows it when it can.
+    # A single timed candidate passes through as-is (no counterparty info
+    # needed); the balance/slot decision is the real discriminator now.
+    if len(candidates) > 1:
+        by_cp = [
+            c for c in candidates if _counterparty_match(c.counterparty, incoming_cp)
+        ]
+        if by_cp:
+            return by_cp
+    return candidates
+
+
+def _decide(
+    candidates: list[Transaction], txn_data: dict, channel: Channel
+) -> MatchDecision:
+    """The unified balance/slot decision, run on the gathered candidate
+    list. Returns match / insert / defer.
+
+    1. Authoritative split — drop candidates with a different *known*
+       balance; if that empties the set, the incoming is a new event.
+    2. Positive confirmation — a single equal known balance is the same
+       event (a legit pair or a bank's duplicate notification).
+    3. Incoming has no balance — merge only the clean balance-less 1+1
+       pair; defer any balance-less multiplicity.
+    """
+    if not candidates:
+        return MatchDecision("insert")
+
+    incoming_balance = _quantize_balance(txn_data.get("balance"))
+
+    # Step 1 — authoritative split: drop candidates with a DIFFERENT *known*
+    # balance. A balance that differs can never be the same event. If this
+    # empties the set, the incoming is a genuinely new distinct charge.
+    if incoming_balance is not None:
+        candidates = [
+            c
+            for c in candidates
+            if c.balance is None or _quantize_balance(c.balance) == incoming_balance
+        ]
+        if not candidates:
+            return MatchDecision("insert")  # ← THE FIX
+
+        # Step 2 — positive balance confirmation. Equal known balance proves
+        # same event (a legit cross-channel pair OR a bank's duplicate
+        # notification), regardless of slot state.
+        eq = [
+            c
+            for c in candidates
+            if c.balance is not None
+            and _quantize_balance(c.balance) == incoming_balance
+        ]
+        if len(eq) == 1:
+            return MatchDecision("match", eq[0], "standard")
+        # eq>1 (two stored rows same balance) or survivors all balance-None
+        # (incoming has a balance, candidate doesn't — presence mismatch):
+        # ambiguous, don't guess.
+        return MatchDecision("defer")
+
+    # Step 3 — incoming has no balance.
+    balanceless = [c for c in candidates if c.balance is None]
+    open_bl = [c for c in balanceless if _slot_open(c, channel)]
+    if len(candidates) == 1 and len(balanceless) == 1 and len(open_bl) == 1:
+        # Clean balance-less 1+1 (e.g. HDFC CC) → merge as today.
+        return MatchDecision("match", candidates[0], "standard")
+    return MatchDecision("defer")
+
+
+async def find_match(
+    session: AsyncSession, txn_data: dict, channel: Channel = "sms"
+) -> MatchDecision:
+    """Decide whether an incoming ``txn_data`` matches an existing row,
+    is a new transaction, or is too ambiguous to decide.
+
+    Returns a :class:`MatchDecision`:
+    - ``"match"`` — enrich the carried Transaction (with its match kind).
+    - ``"insert"`` — no candidate is the same event; create a new row.
+    - ``"defer"`` — ambiguous; skip for manual resolution rather than risk a
+      wrong merge (silently loses a txn) or wrong split.
+
+    Strategy:
+    1. (bank, reference_number, direction) when ref is non-empty — the
+       strongest signal. A unique hit is a match; >1 is ambiguous (defer).
+    2. Fuzzy fallback on (bank, direction, amount, currency) within a
+       ±10-minute window, narrowed by counterparty / date-only / card-mask
+       gates, then resolved by the balance/slot decision: a different known
+       balance splits (insert), an equal known balance confirms (match),
+       and balance-less multiplicity defers.
+    3. AM/PM alias retry — when the fuzzy pass found no candidates, retry
+       with the incoming time shifted ±12h for known-ambiguous email_types,
+       then apply the same balance filter (differing balances → insert).
+    """
+    ref = (txn_data.get("reference_number") or "").strip()
+    if ref:
+        result = await session.execute(
+            select(Transaction)
+            .where(
+                Transaction.bank == txn_data["bank"],
+                Transaction.direction == txn_data["direction"],
+                Transaction.reference_number == ref,
+            )
+            .limit(2)
+        )
+        rows = result.scalars().all()
+        if len(rows) == 1:
+            return MatchDecision("match", rows[0], "standard")
+        if len(rows) > 1:
+            return MatchDecision("defer")
+        # 0 rows: fall through to fuzzy.
+
+    candidates = await _gather_fuzzy_candidates(session, txn_data)
+    if candidates:
+        return _decide(candidates, txn_data, channel)
+
+    # No fuzzy candidates. Try the AM/PM alias retry.
+    txn_date = txn_data.get("transaction_date")
+    incoming_time = txn_data.get("transaction_time")
+    if txn_date is None or incoming_time is None:
+        return MatchDecision("insert")
     aliased = await _find_am_pm_alias_match(
         session,
         txn_data,
         txn_date=txn_date,
         incoming_time=incoming_time,
-        incoming_currency=incoming_currency,
-        incoming_cp=incoming_cp,
+        incoming_currency=txn_data.get("currency") or "INR",
+        incoming_cp=txn_data.get("counterparty"),
     )
-    if aliased is not None:
-        return aliased, "am_pm_alias"
-    return None
+    if aliased is None:
+        return MatchDecision("insert")
+    # Apply the balance filter to the alias candidate too: if both balances
+    # are present and differ, it's a distinct event → insert. Otherwise
+    # MATCH — pre-AM/PM-fix rows may have balance=None and must still merge
+    # (treat candidate.balance is None as merge, NOT presence-mismatch defer).
+    incoming_balance = _quantize_balance(txn_data.get("balance"))
+    cand_balance = _quantize_balance(aliased.balance)
+    if (
+        incoming_balance is not None
+        and cand_balance is not None
+        and incoming_balance != cand_balance
+    ):
+        return MatchDecision("insert")
+    return MatchDecision("match", aliased, "am_pm_alias")
 
 
 async def _find_am_pm_alias_match(
@@ -469,16 +597,33 @@ async def merge_transaction(
     *,
     sms_message_id: int | None = None,
     email_id: int | None = None,
+    force_new: bool = False,
 ) -> MergeTransactionResult:
-    """Match against existing rows; insert or enrich accordingly.
+    """Match against existing rows; insert, enrich, or defer accordingly.
 
     Caller owns the transaction boundary. This function does NOT commit
     and does NOT fire Telegram. Returns a ``MergeTransactionResult``
-    (NamedTuple of outcome, transaction, diff); when outcome=="created"
-    the diff is empty.
+    (NamedTuple of outcome, transaction, diff):
+    - ``"created"`` — a new row was inserted; diff is empty.
+    - ``"enriched"`` — an existing row was matched and updated.
+    - ``"deferred"`` — find_match was too ambiguous to decide; NO row is
+      created and ``transaction`` is ``None``. The caller marks the source
+      row ``skipped`` with the ``[dup-defer]`` note.
+
+    ``force_new=True`` bypasses ``find_match`` and inserts a new row
+    directly — used by the manual "Parse" reparse of a deferred row, which
+    would otherwise DEFER again forever. It is idempotent on a source row
+    already linked to a transaction: if the incoming ``sms_message_id`` /
+    ``email_id`` already owns a row, that row is returned untouched.
     """
-    match_result = await find_match(session, txn_data)
-    if match_result is None:
+    if force_new:
+        existing = await _existing_for_source(session, sms_message_id, email_id)
+        if existing is not None:
+            return MergeTransactionResult("enriched", existing, EnrichmentDiff())
+        return await _insert_new(session, channel, txn_data, sms_message_id, email_id)
+
+    decision = await find_match(session, txn_data, channel)
+    if decision.action == "insert":
         try:
             async with session.begin_nested():
                 row = Transaction(
@@ -493,14 +638,19 @@ async def merge_transaction(
         except IntegrityError as exc:
             if not _is_duplicate_transaction_error(exc):
                 raise
-            match_result = await find_match(session, txn_data)
-            if match_result is None:
-                # Constraint hit we didn't model; surface it.
+            decision = await find_match(session, txn_data, channel)
+            # A ref-duplicate that re-resolves to insert or defer is still a
+            # hard duplicate we can't enrich — re-raise the original error.
+            if decision.action != "match":
                 raise
         else:
             return MergeTransactionResult("created", row, EnrichmentDiff())
 
-    match, match_kind = match_result
+    if decision.action == "defer":
+        return MergeTransactionResult("deferred", None, EnrichmentDiff())
+
+    assert decision.transaction is not None  # action == "match"
+    match, match_kind = decision.transaction, decision.kind
 
     # Enrichment path.
     diff = compute_enrichment_diff(match, txn_data, channel)
@@ -528,7 +678,53 @@ async def merge_transaction(
         match.sms_message_id = sms_message_id
     if email_id is not None and match.email_id is None:
         match.email_id = email_id
-    match.enriched_at = _dt.datetime.now(_dt.UTC)
+    # Gate the timestamp churn on a real change: a no-op duplicate (equal
+    # balance, slot already filled) must not rewrite the row.
+    if diff.changed_fields:
+        match.enriched_at = _dt.datetime.now(_dt.UTC)
 
     await session.flush()
     return MergeTransactionResult("enriched", match, diff)
+
+
+async def _existing_for_source(
+    session: AsyncSession, sms_message_id: int | None, email_id: int | None
+) -> Transaction | None:
+    """The transaction already linked to this source row, if any — the
+    idempotency key for a force-create reparse (so a double Parse of one SMS
+    or email can't create two rows). Channel-specific: SMS guards on
+    ``sms_message_id``, email on ``email_id``."""
+    if sms_message_id is not None:
+        result = await session.execute(
+            select(Transaction)
+            .where(Transaction.sms_message_id == sms_message_id)
+            .limit(1)
+        )
+        row = result.scalars().first()
+        if row is not None:
+            return row
+    if email_id is not None:
+        result = await session.execute(
+            select(Transaction).where(Transaction.email_id == email_id).limit(1)
+        )
+        return result.scalars().first()
+    return None
+
+
+async def _insert_new(
+    session: AsyncSession,
+    channel: Channel,
+    txn_data: dict,
+    sms_message_id: int | None,
+    email_id: int | None,
+) -> MergeTransactionResult:
+    row = Transaction(
+        **txn_data,
+        source=channel,
+        notified_channel=channel,
+        sms_message_id=sms_message_id,
+        email_id=email_id,
+    )
+    session.add(row)
+    await session.flush()
+    return MergeTransactionResult("created", row, EnrichmentDiff())

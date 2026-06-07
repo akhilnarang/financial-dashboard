@@ -611,6 +611,23 @@ async def handle_polled_email(
                         exc.orig,
                     )
                 else:
+                    if outcome == "deferred":
+                        # find_match found an ambiguous possible-duplicate it
+                        # couldn't safely resolve. No Transaction row created;
+                        # mark the email `skipped` with the [dup-defer]
+                        # sentinel (machine-matchable) so the review queue can
+                        # tell it apart from the other skip shapes. The user
+                        # clicks Parse to force a real row if it's genuine.
+                        # Handled before any `txn_row` access (it is None here).
+                        from financial_dashboard.services.txn_merge import (
+                            DUP_DEFER_NOTE,
+                        )
+
+                        email_row.status = "skipped"
+                        email_row.error = DUP_DEFER_NOTE
+                        stats["skipped"] += 1
+                        return
+                    assert txn_row is not None  # "created" or "enriched"
                     email_row.status = "parsed"
                     email_row.error = None
                     stats["parsed"] += 1

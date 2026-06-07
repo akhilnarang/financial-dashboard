@@ -842,3 +842,61 @@ async def test_process_sms_row_hdfc_payment_received_non_credit_not_gated(
     assert outcome.primary_notification is not None
     assert outcome.primary_notification.get("_provisional") is None
     assert outcome.primary_notification.get("_declined") is True
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_deferred_marks_skipped_no_row(session):
+    """When merge_transaction defers (ambiguous duplicate), the SMS row is
+    marked skipped with the [dup-defer] sentinel and NO transaction is
+    created — the pipeline must not crash dereferencing a None txn row."""
+    from financial_dashboard.db import Transaction
+    from financial_dashboard.services.txn_merge import DUP_DEFER_PREFIX
+
+    # A pre-existing balance-less ICICI CC row for the same amount/card/day.
+    # The incoming SMS carries a balance, so it's a presence mismatch → DEFER.
+    existing = Transaction(
+        bank="icici",
+        email_type="icici_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("5000.00"),
+        currency="INR",
+        transaction_date=datetime.date(2026, 6, 7),
+        transaction_time=datetime.time(21, 36, 0),
+        counterparty="TESTMERCHANT",
+        card_mask="XX1234",
+        balance=None,
+        source="email",
+        email_id=999,
+    )
+    session.add(existing)
+
+    sms = SmsMessage(
+        bank="icici",
+        sender="AD-ICICIT-S",
+        body=(
+            "Rs 5,000.00 spent on ICICI Bank Card XX1234 on 07-Jun-26 at "
+            "TESTMERCHANT. Avl Lmt: Rs 1,00,000.00. To dispute, call "
+            "18002662/SMS BLOCK 1234 to 9215676766."
+        ),
+        received_at=datetime.datetime(2026, 6, 7, 16, 6, 0, tzinfo=datetime.UTC),
+    )
+    session.add(sms)
+    await session.flush()
+
+    from financial_dashboard.services.linker import build_link_context
+
+    link_ctx = await build_link_context(session)
+
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.status == "skipped"
+    assert outcome.transaction_id is None
+    assert outcome.primary_notification is None
+    assert sms.status == "skipped"
+    assert sms.transaction_id is None
+    assert sms.parse_error is not None
+    assert sms.parse_error.startswith(DUP_DEFER_PREFIX)
+    # No new transaction row was created (only the pre-existing one).
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1

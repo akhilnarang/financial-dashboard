@@ -19,7 +19,7 @@ from bank_sms_parser.models import ParsedSms
 
 from financial_dashboard.db import SmsMessage
 from financial_dashboard.services.linker import LinkContext, link_transaction
-from financial_dashboard.services.txn_merge import merge_transaction
+from financial_dashboard.services.txn_merge import DUP_DEFER_NOTE, merge_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -129,12 +129,18 @@ async def process_sms_row(
     session,
     sms_row: SmsMessage,
     link_context: LinkContext,
+    *,
+    force_new: bool = False,
 ) -> ProcessSmsOutcome:
     """Parse one ``SmsMessage`` and merge into Transaction.
 
     Caller owns the outer transaction; this function never commits.
     Returns a ``ProcessSmsOutcome`` carrying status + pending notification
     payloads, which the caller dispatches after commit.
+
+    ``force_new=True`` (manual "Parse" of a [dup-defer] row) bypasses the
+    duplicate matcher and forces a new transaction; idempotent on a row
+    already linked to a transaction.
     """
     now = datetime.datetime.now(datetime.UTC)
     sms_row.parsed_at = now
@@ -216,8 +222,22 @@ async def process_sms_row(
 
     # 3. Merge.
     outcome, txn_row, diff = await merge_transaction(
-        session, "sms", txn_data, sms_message_id=sms_row.id
+        session, "sms", txn_data, sms_message_id=sms_row.id, force_new=force_new
     )
+
+    # A deferred merge means find_match found an ambiguous possible-duplicate
+    # it couldn't safely resolve, so no Transaction row was created. Mark the
+    # SMS `skipped` with the [dup-defer] sentinel so the review queue can tell
+    # it apart from the other skip shapes. The user clicks Parse (force_new) to
+    # force a real row if it's a genuine second transaction. Handled before any
+    # `txn_row.id` access below, which would be None here.
+    if outcome == "deferred":
+        sms_row.status = "skipped"
+        sms_row.transaction_id = None
+        sms_row.parse_error = DUP_DEFER_NOTE
+        return ProcessSmsOutcome(status="skipped", transaction_id=None)
+
+    assert txn_row is not None  # outcome is "created" or "enriched" here
 
     # 4. Link.
     if outcome == "created":
