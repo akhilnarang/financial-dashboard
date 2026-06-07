@@ -37,3 +37,21 @@ AMBIGUOUS_12H_TIME_EMAIL_TYPES: frozenset[str] = frozenset(
         "icici_cc_transaction_alert",
     }
 )
+
+
+# CC payment-received alerts the fuzzy matcher links by card last-4
+# instead of counterparty. These carry no merchant and no reference, and
+# the two channels split their identity (SMS: time, empty counterparty;
+# email: counterparty, no time), so the counterparty gate can't link them
+# and they land as duplicate rows. find_match falls back to card last-4
+# only for these types and only on a unique candidate. Excludes spend
+# alerts, so same-day same-amount swipes never merge on mask alone.
+# Add a bank only if it shares this shape: ref-less with an empty
+# counterparty on at least one channel (HDFC has a ref, Equitas has a
+# counterparty both sides; Axis fits but its email half isn't seen yet).
+CARD_PAYMENT_LINK_BY_MASK_EMAIL_TYPES: frozenset[str] = frozenset(
+    {
+        "icici_cc_payment_received_alert",
+        "icici_cc_payment_alert",
+    }
+)

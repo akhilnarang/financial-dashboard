@@ -16,9 +16,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from financial_dashboard.core.masks import mask_digits, mask_last4
 from financial_dashboard.db import Transaction
 from financial_dashboard.services.parser_quirks import (
     AMBIGUOUS_12H_TIME_EMAIL_TYPES,
+    CARD_PAYMENT_LINK_BY_MASK_EMAIL_TYPES,
 )
 
 Channel = Literal["sms", "email"]
@@ -67,15 +69,6 @@ _ENRICHMENT_FIELDS = (
 _MASK_FIELDS = ("card_mask", "account_mask")
 
 
-def _normalize_mask(s: str | None) -> str:
-    """Reduce a card/account mask to its significant digits so cosmetic
-    format differences between sources — "XX0000" vs "0000", "x0000" vs
-    "0000" — compare equal (same card/account, different masking style)."""
-    if not s:
-        return ""
-    return "".join(ch for ch in s if ch.isdigit())
-
-
 def _is_information_downgrade(field: str, old_val: object, new_val: object) -> bool:
     # Only the three string-valued fields below can degrade; every other
     # field short-circuits to False without touching old_val/new_val, so the
@@ -85,8 +78,8 @@ def _is_information_downgrade(field: str, old_val: object, new_val: object) -> b
         new_norm = _normalize_counterparty(new_val)
         return bool(new_norm) and new_norm in old_norm and new_norm != old_norm
     if field in _MASK_FIELDS:
-        old_digits = _normalize_mask(old_val)
-        new_digits = _normalize_mask(new_val)
+        old_digits = mask_digits(old_val)
+        new_digits = mask_digits(new_val)
         return len(new_digits) < len(old_digits) and old_digits.endswith(new_digits)
     if field == "raw_description":
         # Substring check is case-sensitive here (no .lower()), unlike the
@@ -135,7 +128,7 @@ def compute_enrichment_diff(
             filled[f] = new_val
         elif old_val == new_val:
             continue
-        elif f in _MASK_FIELDS and _normalize_mask(old_val) == _normalize_mask(new_val):
+        elif f in _MASK_FIELDS and mask_digits(old_val) == mask_digits(new_val):
             # Same card/account, only the mask format differs (e.g.
             # "XX0000" vs "0000"). Not a real enrichment — keep existing,
             # do not overwrite or notify.
@@ -181,6 +174,18 @@ def _counterparty_match(a: str | None, b: str | None) -> bool:
     if not na or not nb:
         return False
     return na in nb or nb in na
+
+
+def _card_payment_mask_match(existing: Transaction, txn_data: dict) -> bool:
+    """True iff both sides are a card payment alert (see
+    CARD_PAYMENT_LINK_BY_MASK_EMAIL_TYPES) on the same card by last-4."""
+    if existing.email_type not in CARD_PAYMENT_LINK_BY_MASK_EMAIL_TYPES:
+        return False
+    if txn_data.get("email_type") not in CARD_PAYMENT_LINK_BY_MASK_EMAIL_TYPES:
+        return False
+    existing_last4 = mask_last4(existing.card_mask)
+    incoming_last4 = mask_last4(txn_data.get("card_mask"))
+    return existing_last4 is not None and existing_last4 == incoming_last4
 
 
 async def find_match(
@@ -282,6 +287,11 @@ async def find_match(
             ]
             if len(filtered) == 1:
                 return filtered[0], "standard"
+            # Card payment-received pairs have no shared counterparty —
+            # fall back to card last-4, on a unique candidate only.
+            by_mask = [c for c in candidates if _card_payment_mask_match(c, txn_data)]
+            if len(by_mask) == 1:
+                return by_mask[0], "standard"
             return None
 
         if len(candidates) == 1:

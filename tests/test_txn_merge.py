@@ -5,6 +5,7 @@ from decimal import Decimal
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from financial_dashboard.db import Base, Transaction
@@ -1086,3 +1087,158 @@ def test_email_enrichment_unrelated_counterparty_still_overwrites():
         "PZCREDIT123",
         "Phone Pe Private Limited",
     )
+
+
+# ICICI CC payment-received pair: SMS (time, no counterparty) + email
+# (counterparty, no time), no reference on either side. Linked by card
+# last-4 — see CARD_PAYMENT_LINK_BY_MASK_EMAIL_TYPES.
+
+
+def _icici_payment_sms(**overrides):
+    data = {
+        "bank": "icici",
+        "email_type": "icici_cc_payment_received_alert",
+        "direction": "credit",
+        "amount": Decimal("50000.00"),
+        "currency": "INR",
+        "transaction_date": date(2026, 6, 6),
+        "transaction_time": time(17, 58, 10),
+        "counterparty": "",
+        "card_mask": "XX4321",
+        "reference_number": None,
+    }
+    data.update(overrides)
+    return data
+
+
+def _icici_payment_email(**overrides):
+    data = {
+        "bank": "icici",
+        "email_type": "icici_cc_payment_alert",
+        "direction": "credit",
+        "amount": Decimal("50000.00"),
+        "currency": "INR",
+        "transaction_date": date(2026, 6, 6),
+        "transaction_time": None,
+        "counterparty": "Payment received",
+        "card_mask": "4000 XXXX XXXX 4321",
+        "reference_number": None,
+    }
+    data.update(overrides)
+    return data
+
+
+@pytest.mark.anyio
+async def test_icici_payment_sms_then_email_merges_by_card_last4(
+    session: AsyncSession,
+):
+    _, sms_row, _ = await merge_transaction(
+        session, "sms", _icici_payment_sms(), sms_message_id=369
+    )
+    outcome, row, diff = await merge_transaction(
+        session, "email", _icici_payment_email(), email_id=3310
+    )
+    assert outcome == "enriched"
+    assert row.id == sms_row.id
+    assert row.source == "sms+email"
+    assert row.email_id == 3310
+    # SMS counterparty was "" (empty, not null), so the email value
+    # overwrites rather than fills — either way the row ends up correct.
+    assert row.counterparty == "Payment received"
+    assert "counterparty" in diff.changed_fields
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.anyio
+async def test_icici_payment_email_then_sms_merges_by_card_last4(
+    session: AsyncSession,
+):
+    # Reverse arrival: email row has no time, so the SMS still lands in
+    # the date-only branch (candidate has NULL transaction_time).
+    _, email_row, _ = await merge_transaction(
+        session, "email", _icici_payment_email(), email_id=3310
+    )
+    outcome, row, diff = await merge_transaction(
+        session, "sms", _icici_payment_sms(), sms_message_id=369
+    )
+    assert outcome == "enriched"
+    assert row.id == email_row.id
+    assert row.source == "sms+email"
+    assert row.sms_message_id == 369
+    assert "transaction_time" in diff.filled
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.anyio
+async def test_card_mask_fallback_excludes_spend_alerts(session: AsyncSession):
+    # Two distinct same-day same-amount swipes on the same card: spend
+    # alerts are NOT in the link-by-mask set, so they must stay split.
+    await merge_transaction(
+        session,
+        "email",
+        {
+            "bank": "icici",
+            "email_type": "icici_cc_transaction_alert",
+            "direction": "debit",
+            "amount": Decimal("500.00"),
+            "currency": "INR",
+            "transaction_date": date(2026, 6, 6),
+            "transaction_time": None,
+            "counterparty": "Zomato",
+            "card_mask": "XX4321",
+            "reference_number": None,
+        },
+    )
+    outcome, _row, _ = await merge_transaction(
+        session,
+        "email",
+        {
+            "bank": "icici",
+            "email_type": "icici_cc_transaction_alert",
+            "direction": "debit",
+            "amount": Decimal("500.00"),
+            "currency": "INR",
+            "transaction_date": date(2026, 6, 6),
+            "transaction_time": None,
+            "counterparty": "Swiggy",
+            "card_mask": "4000 XXXX XXXX 4321",
+            "reference_number": None,
+        },
+    )
+    assert outcome == "created"
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 2
+
+
+@pytest.mark.anyio
+async def test_card_mask_fallback_refuses_two_same_card_payments(
+    session: AsyncSession,
+):
+    # Two genuine same-card same-amount payments on one day are ambiguous;
+    # an arriving email must not merge into either (unique-candidate rule).
+    await merge_transaction(
+        session, "sms", _icici_payment_sms(transaction_time=time(10, 0, 0))
+    )
+    await merge_transaction(
+        session, "sms", _icici_payment_sms(transaction_time=time(17, 58, 10))
+    )
+    outcome, _row, _ = await merge_transaction(session, "email", _icici_payment_email())
+    assert outcome == "created"
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 3
+
+
+@pytest.mark.anyio
+async def test_card_mask_fallback_refuses_different_card(session: AsyncSession):
+    # Same email_type pair but different cards (last-4 differs) → no merge.
+    await merge_transaction(
+        session, "sms", _icici_payment_sms(card_mask="XX9999"), sms_message_id=1
+    )
+    outcome, _row, _ = await merge_transaction(
+        session, "email", _icici_payment_email(), email_id=2
+    )
+    assert outcome == "created"
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 2

@@ -45,6 +45,7 @@ from financial_dashboard.db import (
 
 from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
+from financial_dashboard.core.masks import mask_last4
 from financial_dashboard.integrations.parsers import parse_bank_statement_pdf
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.snapshots import emit_bank_snapshot
@@ -660,11 +661,9 @@ def _parse_pdf_bytes_sync(pdf_bytes: bytes, bank: str, password: str | None = No
 
 
 def _last4(account_number: str | None) -> str | None:
-    """Extract last 4 digits from an account number string."""
-    if not account_number:
-        return None
-    digits = re.sub(r"[^0-9]", "", account_number)
-    return digits[-4:] if len(digits) >= 4 else (digits if digits else None)
+    """Last 4 digits of an account number; the short suffix we do have
+    when fewer than 4 (statements sometimes show e.g. "XX34")."""
+    return mask_last4(account_number, partial=True)
 
 
 async def _find_bank_account(bank: str, parsed) -> "Account | None":

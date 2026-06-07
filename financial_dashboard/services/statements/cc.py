@@ -35,7 +35,6 @@ import datetime
 import email as email_lib
 import json
 import logging
-import re
 import tempfile
 from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
@@ -53,6 +52,7 @@ from financial_dashboard.db import (
 
 from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
+from financial_dashboard.core.masks import mask_digits, mask_last4
 from bank_email_parser.models import Money, ParsedEmail
 
 from financial_dashboard.integrations.parsers import parse_cc_statement_pdf
@@ -109,18 +109,13 @@ def parse_cc_date(date_str: str) -> date_type:
 
 
 def last4_from_card(card_str: str | None) -> str | None:
-    """Extract last 4 digits from a card number string."""
-    if not card_str:
-        return None
-    digits = re.sub(r"[^0-9]", "", card_str)
-    return digits[-4:] if len(digits) >= 4 else None
+    """Extract last 4 digits from a card number string, or None if < 4."""
+    return mask_last4(card_str)
 
 
 def _extract_digits(card_str: str | None) -> str:
     """Extract all digit characters from a card string (even if < 4)."""
-    if not card_str:
-        return ""
-    return re.sub(r"[^0-9]", "", card_str)
+    return mask_digits(card_str)
 
 
 def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:

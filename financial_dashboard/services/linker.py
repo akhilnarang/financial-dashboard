@@ -46,12 +46,12 @@ Batch usage:
 """
 
 import logging
-import re
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from financial_dashboard.core.masks import mask_digits
 from financial_dashboard.db import Account, Card, Transaction
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ def _trailing_digits(mask: str) -> str:
     >>> _trailing_digits("1234")          == "1234"
     >>> _trailing_digits("")              == ""
     """
-    return re.sub(r"[^0-9]", "", mask)
+    return mask_digits(mask)
 
 
 # ---------------------------------------------------------------------------
