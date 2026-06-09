@@ -26,7 +26,7 @@ from financial_dashboard.services.parser_quirks import (
 
 Channel = Literal["sms", "email"]
 MergeOutcome = Literal["created", "enriched", "deferred"]
-MatchKind = Literal["standard", "am_pm_alias"]
+MatchKind = Literal["standard", "am_pm_alias", "ref_amount_mismatch"]
 
 # find_match's three terminal outcomes:
 #   match  → enrich the carried Transaction
@@ -185,6 +185,12 @@ def compute_enrichment_diff(
             if f == "transaction_time" and not _incoming_time_is_earlier(
                 existing, incoming, new_val, old_val
             ):
+                continue
+            if f == "transaction_date" and new_val > old_val:
+                # A later date is a notification/parse-delay artifact — most
+                # often a date-less email_type whose date was backfilled from
+                # received_at on a later day. The earliest observation is the
+                # truer event date, mirroring the transaction_time rule above.
                 continue
             if _is_information_downgrade(f, old_val, new_val):
                 continue
@@ -410,6 +416,17 @@ async def find_match(
         )
         rows = result.scalars().all()
         if len(rows) == 1:
+            if rows[0].amount != txn_data["amount"]:
+                # The ref matched but the amount disagrees — not a confident
+                # same-event signal. This is the failure mode when a parser
+                # emits a non-unique reference_number (e.g. boilerplate
+                # scraped from the email body): two genuinely different
+                # transactions share a ref and would otherwise collapse into
+                # one row, silently destroying a transaction. Defer for manual
+                # resolution rather than merge across an amount mismatch. The
+                # ``ref_amount_mismatch`` kind lets the reparse handler tell
+                # this apart from a fuzzy duplicate defer (which it inserts).
+                return MatchDecision("defer", kind="ref_amount_mismatch")
             return MatchDecision("match", rows[0], "standard")
         if len(rows) > 1:
             return MatchDecision("defer")

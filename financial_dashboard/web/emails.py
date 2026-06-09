@@ -417,6 +417,7 @@ async def reparse_email(
                         )
                     ).scalar_one_or_none()
                     cross_channel = None
+                    match_deferred = False
                     if existing is None and was_dup_deferred and not force_new:
                         # A [dup-defer] email reparsed without explicit
                         # confirmation must stay skipped — the dup-defer gate
@@ -446,6 +447,19 @@ async def reparse_email(
                             and decision.transaction.email_id is None
                         ):
                             cross_channel = decision.transaction
+                        elif (
+                            decision.action == "defer"
+                            and decision.kind == "ref_amount_mismatch"
+                        ):
+                            # A ref hit whose amount disagrees — the symptom of
+                            # a non-unique parsed reference_number. A blind
+                            # insert here would violate the
+                            # (bank, reference_number, direction) unique index;
+                            # park the email for manual review instead. Clicking
+                            # Parse (force_new) overrides and inserts (below).
+                            # Other defers (fuzzy duplicate multiplicity) keep
+                            # the historical reparse contract: insert own row.
+                            match_deferred = True
                     # `was_orphaned` distinguishes "fix a historical
                     # unlinked row" (account_id was None → the original
                     # parse never fired check_payment_received, so
@@ -478,10 +492,12 @@ async def reparse_email(
                         existing.account_id = None
                         existing.card_id = None
                         txn_row = existing
-                    elif was_dup_deferred and not force_new:
+                    elif (was_dup_deferred or match_deferred) and not force_new:
                         # Withheld duplicate, no manual confirmation: re-defer
                         # rather than insert. Restore the skipped state and bail
-                        # out of the txn block without creating a row.
+                        # out of the txn block without creating a row. Covers
+                        # both a previously [dup-defer]'d email and a fresh
+                        # amount-mismatch ref defer raised by find_match above.
                         em.status = "skipped"
                         em.error = DUP_DEFER_NOTE
                         txn_row = None

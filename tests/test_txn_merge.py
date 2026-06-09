@@ -283,6 +283,92 @@ async def test_find_match_empty_reference_treated_as_null(
     assert match.action == "insert"
 
 
+def test_compute_diff_email_does_not_overwrite_transaction_date_with_later_value():
+    """Repro: a Kotak digital-transaction email carries no transaction date,
+    so the pipeline fills it from the email's received_at. Re-handling that
+    email_type on a later day (or a second event sharing a bad
+    reference_number) then arrives with transaction_date = today and clobbers
+    the real, earlier date. A LATER incoming date is a notification/parse-delay
+    artifact, not new evidence about when the event happened — keep the earlier
+    value, mirroring transaction_time."""
+    existing = _make_txn(transaction_date=date(2026, 5, 3))
+    incoming = {"transaction_date": date(2026, 6, 9)}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.filled == {}
+    assert diff.overwritten == {}
+
+
+def test_compute_diff_email_overwrites_transaction_date_with_earlier_value():
+    """Mirror case: a strictly earlier incoming date is a more accurate
+    observation of when the event happened and replaces the existing one."""
+    existing = _make_txn(transaction_date=date(2026, 6, 9))
+    incoming = {"transaction_date": date(2026, 5, 3)}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.overwritten == {"transaction_date": (date(2026, 6, 9), date(2026, 5, 3))}
+
+
+@pytest.mark.anyio
+async def test_find_match_by_reference_with_amount_mismatch_defers(
+    session: AsyncSession,
+):
+    """Repro: two distinct kotak_digital_transaction debits of different
+    amounts both extracted the same boilerplate string as reference_number.
+    The exact-ref match path keyed on (bank, ref, direction) and merged the
+    second event into the first row without ever comparing amounts — silently
+    destroying one transaction. A ref hit whose amount disagrees is not a
+    confident same-event signal; defer for manual resolution instead of
+    collapsing."""
+    existing = Transaction(
+        bank="kotak",
+        email_type="kotak_digital_transaction",
+        direction="debit",
+        amount=Decimal("5555"),
+        reference_number="If you are unable to view the below e-mailer.",
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(
+        session,
+        {
+            "bank": "kotak",
+            "direction": "debit",
+            "amount": Decimal("7777"),
+            "reference_number": "If you are unable to view the below e-mailer.",
+        },
+    )
+    assert match.action == "defer"
+
+
+@pytest.mark.anyio
+async def test_find_match_by_reference_with_matching_amount_still_hits(
+    session: AsyncSession,
+):
+    """The amount guard must not break the normal case: a ref hit whose
+    amount agrees is still a confident match."""
+    existing = Transaction(
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        reference_number="IMPS:000000000042",
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "reference_number": "IMPS:000000000042",
+        },
+    )
+    assert match.action == "match"
+    assert match.transaction.id == existing.id
+
+
 @pytest.mark.anyio
 async def test_find_match_fuzzy_window_hits_within_10min(
     session: AsyncSession,

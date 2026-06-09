@@ -28,6 +28,7 @@ import financial_dashboard.core.deps as core_deps
 import financial_dashboard.services.reminders as reminders_module
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.db import Account, Base, Email, FetchRule, Transaction
+from financial_dashboard.services.emails import _process_email_full
 from financial_dashboard.web import get_router as get_web_router
 
 
@@ -309,6 +310,116 @@ async def test_reparse_email_does_not_match_different_amount(session_maker):
         assert by_amount[Decimal("200000")].source == "sms"
         assert by_amount[Decimal("200000")].email_id is None
         assert by_amount[Decimal("100000")].email_id == email_id
+
+
+def _kotak_digital_eml(amount: str, txn_id: str) -> bytes:
+    """Kotak "Transaction Successful" digital debit email. Carries a
+    Transaction ID (reference_number) in a labeled grid, no transaction
+    date."""
+    msg = EmailMessage()
+    msg["Subject"] = "Transaction Successful"
+    msg["From"] = "Kotak Mahindra Bank <no-reply@kotak.com>"
+    msg["Date"] = "Tue, 09 Jun 2026 12:14:07 +0000"
+    msg.add_alternative(
+        f"""<html><body>
+        <table width="100%"><tbody><tr><td>
+          <p>Hello CUSTOMER,</p>
+          <p>Your transaction of &#8377; {amount} has been processed successfully.</p>
+          <table width="600"><tbody>
+            <tr><th>Transaction ID</th><th>Amount in &#8377;</th><th>Status</th></tr>
+            <tr><td rowspan="2">{txn_id}</td><td rowspan="2">{amount}</td></tr>
+            <tr><td>SUCCESS</td></tr>
+          </tbody></table>
+        </td></tr></tbody></table>
+        </body></html>""",
+        subtype="html",
+    )
+    return msg.as_bytes()
+
+
+@pytest.mark.anyio
+async def test_reparse_same_ref_different_amount_defers_not_409(session_maker):
+    """Repro of the Kotak digital-transaction ref-collision class on the
+    reparse path. A pre-existing
+    row carries a reference_number that a *different-amount* email reparse
+    also produces. The exact-ref match path now defers (amount mismatch), so
+    the reparse handler must route that to the [dup-defer] manual-review
+    state — NOT fall through to a blind insert that violates the
+    (bank, reference_number, direction) unique index and 500s/409s.
+
+    The shared reference_number is the literal the *currently pinned* parser
+    extracts from this email ("Transaction ID"); the test exercises the
+    dashboard merge/reparse layer independently of the parser deploy chain,
+    so it stays valid before and after the parser ref-scrape fix lands."""
+    shared_ref = _process_email_full(
+        "kotak", _kotak_digital_eml(amount="7777.00", txn_id="999000111222")
+    ).txn_data["reference_number"]
+    async with session_maker() as session:
+        rule = FetchRule(
+            provider="gmail",
+            sender="no-reply@kotak.com",
+            bank="kotak",
+            enabled=True,
+            email_kind="transaction",
+        )
+        session.add(rule)
+        await session.flush()
+        # Pre-existing ₹5,555 row sharing the parsed reference_number.
+        session.add(
+            Transaction(
+                bank="kotak",
+                email_type="kotak_digital_transaction",
+                direction="debit",
+                amount=Decimal("5555"),
+                currency="INR",
+                transaction_date=datetime.date(2026, 5, 3),
+                reference_number=shared_ref,
+                source="email",
+            )
+        )
+        email_row = Email(
+            provider="gmail",
+            message_id="test-kotak-digital-diffamt",
+            sender="no-reply@kotak.com",
+            subject="Transaction Successful",
+            received_at=datetime.datetime(2026, 6, 9, 12, 14, 7, tzinfo=datetime.UTC),
+            status="failed",
+            error="Previous parse failed",
+            rule_id=rule.id,
+        )
+        session.add(email_row)
+        await session.commit()
+        email_id = email_row.id
+
+    # Reparse a ₹7,777 email sharing the SAME Transaction ID.
+    raw = _kotak_digital_eml(amount="7777.00", txn_id="999000111222")
+    with (
+        patch(
+            "financial_dashboard.web.emails.load_or_fetch_raw_email",
+            new=AsyncMock(return_value=(raw, None)),
+        ),
+        patch(
+            "financial_dashboard.web.emails.should_notify_transactions",
+            return_value=False,
+        ),
+    ):
+        app = _build_test_app(session_maker)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post(f"/emails/{email_id}/reparse")
+            assert r.status_code == 200, r.text
+
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        # The ₹5,555 row is untouched; no second row inserted.
+        assert len(rows) == 1, f"expected 1 row, got {len(rows)}"
+        assert rows[0].amount == Decimal("5555")
+        assert rows[0].transaction_date == datetime.date(2026, 5, 3)
+        # The email is parked for manual review, not silently lost.
+        email = await s.get(Email, email_id)
+        assert email.status == "skipped"
+        assert "dup-defer" in (email.error or "")
 
 
 @pytest.mark.anyio
