@@ -131,6 +131,9 @@ async def _seed(
             total_amount_due=due_amount,
             payment_status=PaymentStatus.UNPAID,
             payment_paid_amount=Decimal("0"),
+            # Statement generated before the payment arrives, so the 06/05
+            # payment credit falls inside this cycle's recompute scope.
+            created_at=datetime.datetime(2026, 4, 20, tzinfo=datetime.UTC),
         )
         session.add(upload)
 

@@ -3,7 +3,7 @@
 Payment tracking fields live on StatementUpload directly:
 - payment_status: PaymentStatus enum (NULL = no due date)
 - payment_sent_offsets: JSON list of reminder day-offsets already sent
-- payment_paid_amount: cumulative payment amount
+- payment_paid_amount: recomputed sum of qualifying bill-payment credits
 - payment_paid_at: when fully paid
 
 Provides:
@@ -26,7 +26,11 @@ from financial_dashboard.db import (
     Account,
     PaymentStatus,
     StatementUpload,
+    Transaction,
     async_session,
+)
+from financial_dashboard.services.cc_disambiguation import (
+    is_cc_payment_received_email,
 )
 from financial_dashboard.services.snapshots import emit_cc_snapshot
 from financial_dashboard.services import telegram as telegram_service
@@ -336,11 +340,158 @@ async def handle_mark_paid_callback(update, context) -> None:
         pass
 
 
+async def _qualifying_payment_credit_sum(session, upload: StatementUpload) -> Decimal:
+    """Sum the CC bill-payment credits that belong to ``upload``'s cycle.
+
+    Cycle scope is "this statement's generation date onward": a credit
+    counts when its ``transaction_date`` is on/after ``upload.created_at``'s
+    calendar date. The comparison is on DATE (not datetime) so a payment
+    dated the same calendar day the statement was generated is INCLUDED.
+
+    A row with ``transaction_date IS NULL`` (digital alerts whose date isn't
+    parsed get it filled from received_at upstream, so this is unusual) counts
+    only when the row's own ``created_at`` is on/after the cycle start. Without
+    that bound a single NULL-date payment would be summed into this cycle AND
+    every later one, overstating paid and understating outstanding.
+
+    ``is_cc_payment_received_email`` is a Python suffix check that can't be
+    expressed cleanly in SQL, so we fetch the candidate credit rows for the
+    account+cycle in one query and apply the exact predicate in Python. This
+    deliberately EXCLUDES refunds/reversals/cashback (those don't satisfy a
+    bill), matching the canonical classification in cc_disambiguation.
+    """
+    created_at = upload.created_at or datetime.now(timezone.utc)
+    cycle_start = created_at.date()
+
+    rows = (
+        (
+            await session.execute(
+                select(Transaction).where(
+                    Transaction.account_id == upload.account_id,
+                    Transaction.direction == "credit",
+                    (Transaction.transaction_date >= cycle_start)
+                    | (
+                        (Transaction.transaction_date.is_(None))
+                        & (Transaction.created_at >= created_at)
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    total = Decimal("0")
+    for row in rows:
+        if is_cc_payment_received_email(row.email_type):
+            total += Decimal(str(row.amount))
+    return total.quantize(Decimal("0.01"))
+
+
+async def recompute_cc_payment_state(session, upload: StatementUpload) -> Decimal:
+    """Recompute ``payment_paid_amount`` + status for ``upload`` from scratch,
+    then emit its cc-outstanding snapshot. Returns the recomputed paid sum.
+
+    This is the self-healing core: ``payment_paid_amount`` is set to the SUM
+    of qualifying bill-payment credits in the cycle (not an accumulator), so
+    calling it repeatedly is idempotent and deleting a payment txn unwinds
+    cleanly when the caller re-invokes it. The caller owns the session/commit.
+
+    Precondition: ``upload.total_amount_due`` is set and parseable — callers
+    must check this first (both in-tree callers do).
+    """
+    if upload.total_amount_due is None:
+        raise ValueError("recompute_cc_payment_state requires a total_amount_due")
+
+    recomputed = await _qualifying_payment_credit_sum(session, upload)
+    upload.payment_paid_amount = recomputed
+
+    amount_due = parse_cc_amount(upload.total_amount_due)
+    fully_paid = recomputed >= amount_due
+    if fully_paid:
+        # Stamp paid-at only on the transition into PAID; a later recompute
+        # that stays PAID must preserve the original timestamp.
+        if upload.payment_status != PaymentStatus.PAID:
+            upload.payment_paid_at = datetime.now(timezone.utc)
+        upload.payment_status = PaymentStatus.PAID
+    else:
+        upload.payment_status = PaymentStatus.PARTIALLY_PAID
+        # A recompute that drops below the total (e.g. a payment txn was
+        # deleted) reopens a previously-paid cycle; clear the stale paid-at.
+        upload.payment_paid_at = None
+
+    await emit_cc_snapshot(session, upload)
+    return recomputed
+
+
+async def _latest_active_cycle(
+    session, account_id: int, *, include_paid: bool = False
+) -> StatementUpload | None:
+    """Return the latest CC statement cycle for ``account_id``, or None.
+
+    By default only active cycles (UNPAID / PARTIALLY_PAID / LATE) are
+    considered. ``include_paid=True`` also considers PAID cycles — needed on
+    the delete path, where removing an over-payment that had pushed the cycle
+    to PAID must be able to find that cycle again and reopen it.
+    """
+    statuses = (
+        (*ACTIVE_STATUSES, PaymentStatus.PAID) if include_paid else ACTIVE_STATUSES
+    )
+    candidates = (
+        (
+            await session.execute(
+                select(StatementUpload).where(
+                    StatementUpload.account_id == account_id,
+                    StatementUpload.payment_status.in_(statuses),
+                    StatementUpload.due_date.isnot(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Why: always act on the latest cycle per account — any unpaid balance from
+    # older cycles rolls into the new statement, so applying a payment to an
+    # older row would double-count.
+    latest = latest_per_account(list(candidates))
+    return latest[0] if latest else None
+
+
+async def recompute_cc_payment_for_account(session, account_id: int) -> Decimal | None:
+    """Self-heal an account's latest active CC cycle in the caller's session.
+
+    Intended for the CC-payment transaction DELETE path: after the row is
+    gone (and flushed, so it no longer counts in the SUM), call this to
+    recompute ``payment_paid_amount`` / status / snapshot for the affected
+    account's latest cycle. Returns the recomputed paid sum, or None if the
+    account isn't a CC or has no active cycle. Caller owns the commit.
+    """
+    account = await session.get(Account, account_id)
+    if not account or account.type != "credit_card":
+        return None
+    upload = await _latest_active_cycle(session, account_id, include_paid=True)
+    if upload is None or upload.total_amount_due is None:
+        return None
+    try:
+        parse_cc_amount(upload.total_amount_due)
+    except ValueError, InvalidOperation:
+        return None
+    return await recompute_cc_payment_state(session, upload)
+
+
 async def check_payment_received(txn_id: int, account_id: int, amount) -> bool:
     """Check if a credit transaction satisfies a pending statement payment.
 
-    Called after a credit transaction is committed. Updates payment status
-    and sends a Telegram notification if enabled.
+    Called after a credit transaction is committed. Recomputes the latest
+    active cycle's ``payment_paid_amount`` from the SUM of qualifying
+    bill-payment credits (idempotent — NOT an accumulator), updates payment
+    status, and sends a Telegram notification if enabled.
+
+    ``txn_id`` identifies the just-created credit (kept for the signature /
+    caller compatibility). ``amount`` is the just-received credit and is used
+    ONLY for the notification text — it is no longer added to the running
+    total, so double-taps / two-channel / force-parse-dup re-fires can't
+    inflate the paid amount.
     """
     amount = Decimal(str(amount))
 
@@ -351,27 +502,9 @@ async def check_payment_received(txn_id: int, account_id: int, amount) -> bool:
         ):
             return False
 
-        candidates = (
-            (
-                await session.execute(
-                    select(StatementUpload).where(
-                        StatementUpload.account_id == account_id,
-                        StatementUpload.payment_status.in_(ACTIVE_STATUSES),
-                        StatementUpload.due_date.isnot(None),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-
-        # Why: always act on the latest cycle per account — any unpaid balance from older
-        # cycles rolls into the new statement, so applying a payment to an older row would
-        # double-count.
-        latest = latest_per_account(list(candidates))
-        if not latest:
+        upload = await _latest_active_cycle(session, account_id)
+        if upload is None:
             return False
-        upload = latest[0]
 
         if upload.total_amount_due is None:
             return False
@@ -380,18 +513,11 @@ async def check_payment_received(txn_id: int, account_id: int, amount) -> bool:
         except ValueError, InvalidOperation:
             return False
 
-        new_paid = Decimal(str(upload.payment_paid_amount or 0)) + amount
-        upload.payment_paid_amount = new_paid
+        new_paid = await recompute_cc_payment_state(session, upload)
         fully_paid = new_paid >= amount_due
 
-        if fully_paid:
-            upload.payment_status = PaymentStatus.PAID
-            upload.payment_paid_at = datetime.now(timezone.utc)
-        else:
-            upload.payment_status = PaymentStatus.PARTIALLY_PAID
-
         logger.info(
-            "Statement #%s %s: received=%s total_paid=%s due=%s",
+            "Statement #%s %s: received=%s recomputed_total_paid=%s due=%s",
             upload.id,
             "fully paid" if fully_paid else "partially paid",
             amount,
@@ -399,27 +525,33 @@ async def check_payment_received(txn_id: int, account_id: int, amount) -> bool:
             amount_due,
         )
 
-        if is_telegram_configured() and get_setting_bool(
+        notify = is_telegram_configured() and get_setting_bool(
             "telegram.notify_payment_received"
-        ):
-            await _send_payment_received_notification(
-                upload,
-                account,
-                amount,
-                new_paid,
-                amount_due,
-                get_telegram_chat_id(),
-            )
+        )
+        # Capture the primitives the notification needs BEFORE commit so the
+        # send can run after a successful commit without relying on ORM state.
+        notify_args = (
+            account.label,
+            account.bank,
+            amount,
+            new_paid,
+            amount_due,
+            get_telegram_chat_id(),
+        )
 
-        await emit_cc_snapshot(session, upload)
         await session.commit()
+
+    # Telegram send only AFTER a successful commit — a failed commit must not
+    # produce a false "payment received" message.
+    if notify:
+        await _send_payment_received_notification(*notify_args)
 
     return fully_paid
 
 
 async def _send_payment_received_notification(
-    upload,
-    account,
+    account_label_raw,
+    account_bank_raw,
     credit_amount,
     total_paid,
     amount_due,
@@ -431,8 +563,8 @@ async def _send_payment_received_notification(
         return
 
     try:
-        account_label = html.escape(account.label)
-        bank = html.escape(account.bank.upper())
+        account_label = html.escape(account_label_raw)
+        bank = html.escape(account_bank_raw.upper())
         credit_str = f"{credit_amount:,.2f}"
 
         if total_paid >= amount_due:

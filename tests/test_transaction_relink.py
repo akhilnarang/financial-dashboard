@@ -92,6 +92,7 @@ async def _seed(maker, *, orphan: bool = True):
             total_amount_due="500.00",
             payment_status=PaymentStatus.UNPAID,
             payment_paid_amount=Decimal("0"),
+            created_at=datetime.datetime(2026, 4, 30, tzinfo=datetime.UTC),
         )
         session.add(statement)
 

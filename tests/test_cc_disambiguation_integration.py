@@ -117,6 +117,7 @@ async def _seed_three_indusind_ccs_with_statements(
                     total_amount_due="1,616.00",
                     payment_status=PaymentStatus.UNPAID,
                     payment_paid_amount=Decimal("0"),
+                    created_at=datetime.datetime(2026, 4, 30, tzinfo=datetime.UTC),
                 ),
                 StatementUpload(
                     account_id=b.id,
@@ -128,6 +129,7 @@ async def _seed_three_indusind_ccs_with_statements(
                     total_amount_due=target_total,
                     payment_status=PaymentStatus.UNPAID,
                     payment_paid_amount=Decimal("0"),
+                    created_at=datetime.datetime(2026, 4, 30, tzinfo=datetime.UTC),
                 ),
                 StatementUpload(
                     account_id=c.id,
@@ -139,6 +141,7 @@ async def _seed_three_indusind_ccs_with_statements(
                     total_amount_due="4,661.00",
                     payment_status=PaymentStatus.UNPAID,
                     payment_paid_amount=Decimal("0"),
+                    created_at=datetime.datetime(2026, 4, 30, tzinfo=datetime.UTC),
                 ),
             ]
         )
