@@ -117,24 +117,32 @@ _ENRICHMENT_FIELDS = (
 _MASK_FIELDS = ("card_mask", "account_mask")
 
 
+def _as_str(val: object) -> str | None:
+    # The downgrade checks only run for string-valued enrichment fields, but
+    # callers iterate ORM column values typed as `object`. Narrow to the
+    # str | None the string helpers expect; anything non-str behaves as the
+    # absent case (these fields never hold a non-str at runtime).
+    return val if isinstance(val, str) else None
+
+
 def _is_information_downgrade(field: str, old_val: object, new_val: object) -> bool:
     # Only the three string-valued fields below can degrade; every other
     # field short-circuits to False without touching old_val/new_val, so the
     # `object` annotation is honest about what callers actually pass.
     if field == "counterparty":
-        old_norm = _normalize_counterparty(old_val)
-        new_norm = _normalize_counterparty(new_val)
+        old_norm = _normalize_counterparty(_as_str(old_val))
+        new_norm = _normalize_counterparty(_as_str(new_val))
         return bool(new_norm) and new_norm in old_norm and new_norm != old_norm
     if field in _MASK_FIELDS:
-        old_digits = mask_digits(old_val)
-        new_digits = mask_digits(new_val)
+        old_digits = mask_digits(_as_str(old_val))
+        new_digits = mask_digits(_as_str(new_val))
         return len(new_digits) < len(old_digits) and old_digits.endswith(new_digits)
     if field == "raw_description":
         # Substring check is case-sensitive here (no .lower()), unlike the
         # counterparty path: a pure case flip is treated as a real change,
         # not a downgrade, since we can't tell which casing is more correct.
-        old_stripped = old_val.strip()
-        new_stripped = new_val.strip()
+        old_stripped = (_as_str(old_val) or "").strip()
+        new_stripped = (_as_str(new_val) or "").strip()
         return (
             bool(new_stripped)
             and new_stripped in old_stripped
@@ -426,6 +434,30 @@ async def find_match(
                 # resolution rather than merge across an amount mismatch. The
                 # ``ref_amount_mismatch`` kind lets the reparse handler tell
                 # this apart from a fuzzy duplicate defer (which it inserts).
+                return MatchDecision("defer", kind="ref_amount_mismatch")
+            # Apply the same balance guard the fuzzy path uses: when BOTH the
+            # incoming and the matched row carry a known available balance and
+            # they differ (after the shared 2dp quantization), they can never
+            # be the same event. A recycled or boilerplate-scraped ref can
+            # otherwise collapse two distinct same-amount charges into one row,
+            # silently destroying a transaction. When only one side knows its
+            # balance, keep matching — the guard only fires on a confirmed
+            # disagreement.
+            #
+            # Unlike the fuzzy authoritative-split (which inserts), DEFER here:
+            # we reached this branch because the ref is non-empty, and the
+            # `uq_transactions_ref` partial unique index on
+            # (bank, reference_number, direction) forbids a second row with
+            # the same ref — so a new insert can't physically land. These are
+            # genuinely distinct events we can neither merge (different
+            # balance) nor insert (unique ref); park for manual resolution.
+            incoming_balance = _quantize_balance(txn_data.get("balance"))
+            matched_balance = _quantize_balance(rows[0].balance)
+            if (
+                incoming_balance is not None
+                and matched_balance is not None
+                and incoming_balance != matched_balance
+            ):
                 return MatchDecision("defer", kind="ref_amount_mismatch")
             return MatchDecision("match", rows[0], "standard")
         if len(rows) > 1:

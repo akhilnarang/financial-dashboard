@@ -304,7 +304,9 @@ def test_compute_diff_email_overwrites_transaction_date_with_earlier_value():
     existing = _make_txn(transaction_date=date(2026, 6, 9))
     incoming = {"transaction_date": date(2026, 5, 3)}
     diff = compute_enrichment_diff(existing, incoming, "email")
-    assert diff.overwritten == {"transaction_date": (date(2026, 6, 9), date(2026, 5, 3))}
+    assert diff.overwritten == {
+        "transaction_date": (date(2026, 6, 9), date(2026, 5, 3))
+    }
 
 
 @pytest.mark.anyio
@@ -363,6 +365,107 @@ async def test_find_match_by_reference_with_matching_amount_still_hits(
             "direction": "debit",
             "amount": Decimal("500"),
             "reference_number": "IMPS:000000000042",
+        },
+    )
+    assert match.action == "match"
+    assert match.transaction.id == existing.id
+
+
+@pytest.mark.anyio
+async def test_find_match_by_reference_equal_amount_different_balance_defers(
+    session: AsyncSession,
+):
+    """Two distinct same-amount debits that share a recycled/garbage
+    reference_number but have DIFFERENT known available balances are not the
+    same event — so they must NOT silently collapse into one row. The exact-ref
+    path applies the same balance guard as the fuzzy path, but DEFERS rather
+    than inserts: the `uq_transactions_ref` partial unique index forbids a
+    second row with the same (bank, ref, direction), so a new insert can't
+    physically land. We can neither merge (different balance) nor insert
+    (unique ref) — park for manual resolution."""
+    existing = Transaction(
+        bank="kotak",
+        email_type="kotak_digital_transaction",
+        direction="debit",
+        amount=Decimal("500"),
+        reference_number="Transaction Successful",
+        balance=Decimal("9000.00"),
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(
+        session,
+        {
+            "bank": "kotak",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "reference_number": "Transaction Successful",
+            "balance": Decimal("8500.00"),
+        },
+    )
+    assert match.action == "defer"
+    assert match.kind == "ref_amount_mismatch"
+
+
+@pytest.mark.anyio
+async def test_find_match_by_reference_equal_amount_equal_balance_matches(
+    session: AsyncSession,
+):
+    """A genuine same-ref pair with equal known balances is still a confident
+    match — the balance guard must not break the legitimate cross-channel
+    merge case."""
+    existing = Transaction(
+        bank="kotak",
+        email_type="kotak_digital_transaction",
+        direction="debit",
+        amount=Decimal("500"),
+        reference_number="UTR000000111222",
+        balance=Decimal("8500.00"),
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(
+        session,
+        {
+            "bank": "kotak",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "reference_number": "UTR000000111222",
+            "balance": Decimal("8500.00"),
+        },
+    )
+    assert match.action == "match"
+    assert match.transaction.id == existing.id
+
+
+@pytest.mark.anyio
+async def test_find_match_by_reference_equal_amount_one_balance_unknown_matches(
+    session: AsyncSession,
+):
+    """When only one side has a known balance, the exact-ref hit still
+    matches — the guard only splits when BOTH balances are known and
+    differ (consistent with the fuzzy path keeping balance-None candidates)."""
+    existing = Transaction(
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        reference_number="IMPS:000000000077",
+        balance=None,
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "reference_number": "IMPS:000000000077",
+            "balance": Decimal("1234.00"),
         },
     )
     assert match.action == "match"
@@ -547,6 +650,50 @@ async def test_find_match_fuzzy_currency_must_match(
         },
     )
     assert match.action == "insert"
+
+
+@pytest.mark.anyio
+async def test_merge_transaction_same_ref_diff_balance_defers_cleanly(
+    session: AsyncSession,
+):
+    """End-to-end guard for the exact-ref balance split: a same-ref,
+    same-amount, DIFFERENT-balance incoming must defer through
+    merge_transaction WITHOUT crashing. The (bank, ref, direction) unique
+    index forbids a second same-ref row, so an 'insert' decision would hit an
+    IntegrityError and re-raise — defer is the only safe outcome."""
+    existing = Transaction(
+        bank="kotak",
+        email_type="kotak_digital_transaction",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        reference_number="Transaction Successful",
+        balance=Decimal("9000.00"),
+        source="email",
+    )
+    session.add(existing)
+    await session.flush()
+
+    outcome, row, diff = await merge_transaction(
+        session,
+        "sms",
+        {
+            "bank": "kotak",
+            "email_type": "kotak_digital_transaction",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": "Transaction Successful",
+            "balance": Decimal("8500.00"),
+        },
+        sms_message_id=None,
+    )
+    assert outcome == "deferred"
+    assert row is None
+    # The pre-existing row is untouched; no second row was inserted.
+    all_rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(all_rows) == 1
+    assert all_rows[0].balance == Decimal("9000.00")
 
 
 @pytest.mark.anyio
@@ -1490,22 +1637,26 @@ async def test_worked_trace_all_four_notifications_pair_by_balance(
     an sms+email row."""
     # SMS1 (charge A), SMS2 (charge B), Email1 (A), Email2 (B).
     await merge_transaction(
-        session, "sms",
+        session,
+        "sms",
         _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
         sms_message_id=389,
     )
     await merge_transaction(
-        session, "sms",
+        session,
+        "sms",
         _icici_spend_sms(balance="95000.00", transaction_time=time(21, 36, 55)),
         sms_message_id=390,
     )
     await merge_transaction(
-        session, "email",
+        session,
+        "email",
         _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 12)),
         email_id=3320,
     )
     await merge_transaction(
-        session, "email",
+        session,
+        "email",
         _icici_spend_sms(balance="95000.00", transaction_time=time(21, 36, 40)),
         email_id=3321,
     )
@@ -1594,12 +1745,14 @@ async def test_force_new_bypasses_find_match(session: AsyncSession):
     """force_new inserts a new row even when a same-balance candidate exists
     — the manual Parse of a deferred row."""
     await merge_transaction(
-        session, "sms",
+        session,
+        "sms",
         _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
         sms_message_id=389,
     )
     outcome, txn, _ = await merge_transaction(
-        session, "sms",
+        session,
+        "sms",
         _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
         sms_message_id=395,
         force_new=True,
@@ -1615,13 +1768,15 @@ async def test_force_new_idempotent_on_already_linked_source(session: AsyncSessi
     """A double Parse of the same SMS must not create two rows: force_new is
     idempotent on a source row already linked to a transaction."""
     o1, r1, _ = await merge_transaction(
-        session, "sms",
+        session,
+        "sms",
         _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
         sms_message_id=389,
         force_new=True,
     )
     o2, r2, _ = await merge_transaction(
-        session, "sms",
+        session,
+        "sms",
         _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
         sms_message_id=389,
         force_new=True,

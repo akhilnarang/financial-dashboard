@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, NamedTuple
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request as FastAPIRequest
@@ -47,7 +47,12 @@ from financial_dashboard.services.cc_disambiguation import (
 from financial_dashboard.services.emails import parse_email_by_kind
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.reminders import check_payment_received
-from financial_dashboard.services.txn_merge import find_match, merge_transaction
+from financial_dashboard.services.txn_merge import (
+    DUP_DEFER_NOTE,
+    DUP_DEFER_PREFIX,
+    find_match,
+    merge_transaction,
+)
 from financial_dashboard.services.settings import (
     get_telegram_chat_id,
     should_notify_transactions,
@@ -288,6 +293,189 @@ async def view_original_email(
     )
 
 
+class _ReparseTxnResult(NamedTuple):
+    """Side-effects of upserting one reparsed email's transaction, surfaced to
+    the caller so it can fire Telegram / payment-check / disambiguation
+    outside the DB transaction boundary."""
+
+    txn_id: int | None
+    deferred_noop: bool
+    pending_payment_check: tuple[int, int, Decimal] | None
+    pending_disambiguation: dict | None
+
+
+async def _apply_reparsed_transaction(
+    session: AsyncSession,
+    em: Email,
+    txn_data: dict,
+    *,
+    was_dup_deferred: bool,
+    force_new: bool,
+) -> _ReparseTxnResult:
+    """Shared upsert/merge for a reparsed email's transaction, used by both
+    the single-email reparse and the bulk reparse-all-failed path so they
+    dedup identically.
+
+    Caller owns the surrounding ``session.begin()`` block and the
+    ``IntegrityError`` / ``MultipleResultsFound`` handling; this opens a
+    ``begin_nested()`` savepoint for the upsert. May mutate ``em.status`` /
+    ``em.error`` (re-defer) and ``txn_data`` (account_label / channel).
+    """
+    txn_id = None
+    deferred_noop = False
+    pending_payment_check: tuple[int, int, Decimal] | None = None
+    pending_disambiguation: dict | None = None
+
+    async with session.begin_nested():
+        # Upsert: if a transaction is already attached to this email (the
+        # common case when reparse is invoked to pick up a downstream fix
+        # like the new CC disambiguation), update it in place rather than
+        # inserting a duplicate. Account/card FKs are cleared so the linker
+        # re-runs from scratch on the refreshed parser fields.
+        existing = (
+            await session.execute(
+                select(Transaction).where(Transaction.email_id == em.id)
+            )
+        ).scalar_one_or_none()
+        cross_channel = None
+        match_deferred = False
+        if existing is None and was_dup_deferred and not force_new:
+            # A [dup-defer] email reparsed without explicit confirmation must
+            # stay skipped — the dup-defer gate takes precedence over any
+            # cross-channel match the matcher might now find. Otherwise a
+            # deferred row silently flips to enriched/parsed on reparse,
+            # robbing the user of the deliberate manual decision.
+            em.status = "skipped"
+            em.error = DUP_DEFER_NOTE
+            txn_row = None
+            deferred_noop = True
+        elif existing is None:
+            # No row attached to this email yet. The same event may already
+            # exist from another channel (e.g. an SMS), so consult the
+            # cross-channel matcher before inserting — otherwise a reparse
+            # double-counts it. The live ingest path dedups via
+            # merge_transaction; route the match through it so the email
+            # enriches the existing row (fill-don't-clobber, guarded
+            # email_id, source='sms+email') instead of a blind overwrite.
+            # Only adopt rows not already claimed by another email, so we
+            # never steal a link.
+            decision = await find_match(session, txn_data, "email")
+            if (
+                decision.action == "match"
+                and decision.transaction is not None
+                and decision.transaction.email_id is None
+            ):
+                cross_channel = decision.transaction
+            elif decision.action == "defer" and decision.kind == "ref_amount_mismatch":
+                # A ref hit whose amount disagrees — the symptom of a
+                # non-unique parsed reference_number. A blind insert here
+                # would violate the (bank, reference_number, direction)
+                # unique index; park the email for manual review instead.
+                # Clicking Parse (force_new) overrides and inserts (below).
+                # Other defers (fuzzy duplicate multiplicity) keep the
+                # historical reparse contract: insert own row.
+                match_deferred = True
+        # `was_orphaned` distinguishes "fix a historical unlinked row"
+        # (account_id was None → the original parse never fired
+        # check_payment_received, so firing now is correct) from "re-apply an
+        # already-processed payment" (account_id was set → the statement was
+        # already credited, so firing again would double-count).
+        was_orphaned = (
+            (existing is None and cross_channel is None)
+            or (existing is not None and existing.account_id is None)
+            or (cross_channel is not None and cross_channel.account_id is None)
+        )
+        if cross_channel is not None:
+            # Enrich the matched cross-channel row via the canonical merger:
+            # it attaches the email (guarded email_id), sets source='sms+email',
+            # and applies downgrade-safe field merges (so a richer SMS value
+            # like an in-body time is not clobbered by the email's null). It
+            # does NOT clear FKs, so an already-linked row keeps its account.
+            _, txn_row, _ = await merge_transaction(
+                session, "email", txn_data, email_id=em.id
+            )
+        elif existing is not None:
+            # In-place refresh to pick up parser fixes. Skip None values so a
+            # field already enriched from another source (e.g. an SMS-only
+            # balance or a richer counterparty) is not clobbered by an email
+            # whose txn_data carries that field as None — the email txn_data
+            # always contains every key, including ones the email couldn't
+            # provide. Non-None parser values still overwrite as before.
+            for key, value in txn_data.items():
+                if value is not None:
+                    setattr(existing, key, value)
+            existing.account_id = None
+            existing.card_id = None
+            txn_row = existing
+        elif (was_dup_deferred or match_deferred) and not force_new:
+            # Withheld duplicate, no manual confirmation: re-defer rather than
+            # insert. Restore the skipped state and bail out of the txn block
+            # without creating a row. Covers both a previously [dup-defer]'d
+            # email and a fresh amount-mismatch ref defer raised by find_match
+            # above.
+            em.status = "skipped"
+            em.error = DUP_DEFER_NOTE
+            txn_row = None
+            deferred_noop = True
+        else:
+            txn_row = Transaction(email_id=em.id, **txn_data)
+            session.add(txn_row)
+        if txn_row is None:
+            # Deferred no-op (withheld duplicate, no force_new): skip all
+            # post-insert linking / notification / payment-check plumbing. The
+            # skipped status set above stands.
+            pass
+        else:
+            await session.flush()
+            if txn_row.account_id is None:
+                # Run the linker for fresh inserts, own-orphan upserts (FKs
+                # just cleared), and cross-channel rows that arrived unlinked.
+                # An already-linked cross-channel row is left untouched.
+                _link_ctx = await build_link_context(session)
+                link_transaction(_link_ctx, txn_row)
+                await session.flush()
+            # Maskless CC bill-payment: try amount-match against open
+            # statements; else queue a Telegram prompt.
+            pending_disambiguation = await resolve_cc_payment_account(session, txn_row)
+            txn_id = txn_row.id
+            account_obj = (
+                await session.get(Account, txn_row.account_id)
+                if txn_row.account_id
+                else None
+            )
+            card_obj = (
+                await session.get(Card, txn_row.card_id) if txn_row.card_id else None
+            )
+            txn_data["account_label"] = build_account_label(account_obj, card_obj)
+            txn_data["channel"] = txn_row.channel
+            # Only auto-reconcile when the original parse did NOT already
+            # credit the statement. Two cases qualify:
+            #   - Fresh insert (no prior txn for this email).
+            #   - Upsert of a previously-orphaned txn (prior account_id was
+            #     None, so check_payment_received never fired the first time
+            #     round — this is the "fix a historical orphan via reparse"
+            #     workflow).
+            # If the prior row was already linked, the statement was already
+            # credited; re-firing would double-count payment_paid_amount on a
+            # PARTIALLY_PAID statement. The redundant `account_id is not None`
+            # is for ty — should_auto_reconcile_statement already guarantees
+            # it at runtime but ty can't narrow helper calls.
+            if (
+                was_orphaned
+                and should_auto_reconcile_statement(txn_row)
+                and txn_row.account_id is not None
+            ):
+                pending_payment_check = (
+                    txn_row.id,
+                    txn_row.account_id,
+                    txn_row.amount,
+                )
+
+    return _ReparseTxnResult(
+        txn_id, deferred_noop, pending_payment_check, pending_disambiguation
+    )
+
+
 @router.post("/emails/{email_id}/reparse", response_model=ReparseEmailResponse)
 async def reparse_email(
     email_id: int,
@@ -359,11 +547,6 @@ async def reparse_email(
         # Was this email withheld by the duplicate matcher (DEFER)? If so, a
         # plain reparse must NOT re-insert the row the matcher deliberately
         # skipped — only an explicit force_new (user clicked Parse) does.
-        from financial_dashboard.services.txn_merge import (
-            DUP_DEFER_NOTE,
-            DUP_DEFER_PREFIX,
-        )
-
         was_dup_deferred = bool(
             em.status == "skipped"
             and em.error
@@ -403,167 +586,18 @@ async def reparse_email(
         pending_disambiguation: dict | None = None
         if txn_data:
             try:
-                async with session.begin_nested():
-                    # Upsert: if a transaction is already attached to this
-                    # email (the common case when reparse is invoked to
-                    # pick up a downstream fix like the new CC
-                    # disambiguation), update it in place rather than
-                    # inserting a duplicate. Account/card FKs are cleared
-                    # so the linker re-runs from scratch on the refreshed
-                    # parser fields.
-                    existing = (
-                        await session.execute(
-                            select(Transaction).where(Transaction.email_id == em.id)
-                        )
-                    ).scalar_one_or_none()
-                    cross_channel = None
-                    match_deferred = False
-                    if existing is None and was_dup_deferred and not force_new:
-                        # A [dup-defer] email reparsed without explicit
-                        # confirmation must stay skipped — the dup-defer gate
-                        # takes precedence over any cross-channel match the
-                        # matcher might now find. Otherwise a deferred row
-                        # silently flips to enriched/parsed on reparse, robbing
-                        # the user of the deliberate manual decision.
-                        em.status = "skipped"
-                        em.error = DUP_DEFER_NOTE
-                        txn_row = None
-                        deferred_noop = True
-                    elif existing is None:
-                        # No row attached to this email yet. The same event
-                        # may already exist from another channel (e.g. an
-                        # SMS), so consult the cross-channel matcher before
-                        # inserting — otherwise a reparse double-counts it.
-                        # The live ingest path dedups via merge_transaction;
-                        # route the match through it so the email enriches
-                        # the existing row (fill-don't-clobber, guarded
-                        # email_id, source='sms+email') instead of a blind
-                        # overwrite. Only adopt rows not already claimed by
-                        # another email, so we never steal a link.
-                        decision = await find_match(session, txn_data, "email")
-                        if (
-                            decision.action == "match"
-                            and decision.transaction is not None
-                            and decision.transaction.email_id is None
-                        ):
-                            cross_channel = decision.transaction
-                        elif (
-                            decision.action == "defer"
-                            and decision.kind == "ref_amount_mismatch"
-                        ):
-                            # A ref hit whose amount disagrees — the symptom of
-                            # a non-unique parsed reference_number. A blind
-                            # insert here would violate the
-                            # (bank, reference_number, direction) unique index;
-                            # park the email for manual review instead. Clicking
-                            # Parse (force_new) overrides and inserts (below).
-                            # Other defers (fuzzy duplicate multiplicity) keep
-                            # the historical reparse contract: insert own row.
-                            match_deferred = True
-                    # `was_orphaned` distinguishes "fix a historical
-                    # unlinked row" (account_id was None → the original
-                    # parse never fired check_payment_received, so
-                    # firing now is correct) from "re-apply an
-                    # already-processed payment" (account_id was set →
-                    # the statement was already credited, so firing
-                    # again would double-count).
-                    was_orphaned = (
-                        (existing is None and cross_channel is None)
-                        or (existing is not None and existing.account_id is None)
-                        or (
-                            cross_channel is not None
-                            and cross_channel.account_id is None
-                        )
-                    )
-                    if cross_channel is not None:
-                        # Enrich the matched cross-channel row via the
-                        # canonical merger: it attaches the email (guarded
-                        # email_id), sets source='sms+email', and applies
-                        # downgrade-safe field merges (so a richer SMS value
-                        # like an in-body time is not clobbered by the
-                        # email's null). It does NOT clear FKs, so an
-                        # already-linked row keeps its account.
-                        _, txn_row, _ = await merge_transaction(
-                            session, "email", txn_data, email_id=em.id
-                        )
-                    elif existing is not None:
-                        for key, value in txn_data.items():
-                            setattr(existing, key, value)
-                        existing.account_id = None
-                        existing.card_id = None
-                        txn_row = existing
-                    elif (was_dup_deferred or match_deferred) and not force_new:
-                        # Withheld duplicate, no manual confirmation: re-defer
-                        # rather than insert. Restore the skipped state and bail
-                        # out of the txn block without creating a row. Covers
-                        # both a previously [dup-defer]'d email and a fresh
-                        # amount-mismatch ref defer raised by find_match above.
-                        em.status = "skipped"
-                        em.error = DUP_DEFER_NOTE
-                        txn_row = None
-                        deferred_noop = True
-                    else:
-                        txn_row = Transaction(email_id=em.id, **txn_data)
-                        session.add(txn_row)
-                    if txn_row is None:
-                        # Deferred no-op (withheld duplicate, no force_new):
-                        # skip all post-insert linking / notification /
-                        # payment-check plumbing. The skipped status set above
-                        # stands.
-                        pass
-                    else:
-                        await session.flush()
-                        if txn_row.account_id is None:
-                            # Run the linker for fresh inserts, own-orphan
-                            # upserts (FKs just cleared), and cross-channel
-                            # rows that arrived unlinked. An already-linked
-                            # cross-channel row is left untouched.
-                            _link_ctx = await build_link_context(session)
-                            link_transaction(_link_ctx, txn_row)
-                            await session.flush()
-                        # Maskless CC bill-payment: try amount-match against
-                        # open statements; else queue a Telegram prompt.
-                        pending_disambiguation = await resolve_cc_payment_account(
-                            session, txn_row
-                        )
-                        txn_id = txn_row.id
-                        account_obj = (
-                            await session.get(Account, txn_row.account_id)
-                            if txn_row.account_id
-                            else None
-                        )
-                        card_obj = (
-                            await session.get(Card, txn_row.card_id)
-                            if txn_row.card_id
-                            else None
-                        )
-                        txn_data["account_label"] = build_account_label(
-                            account_obj, card_obj
-                        )
-                        txn_data["channel"] = txn_row.channel
-                        # Only auto-reconcile when the original parse did
-                        # NOT already credit the statement. Two cases qualify:
-                        #   - Fresh insert (no prior txn for this email).
-                        #   - Upsert of a previously-orphaned txn (prior
-                        #     account_id was None, so check_payment_received
-                        #     never fired the first time round — this is the
-                        #     "fix a historical orphan via reparse" workflow).
-                        # If the prior row was already linked, the statement
-                        # was already credited; re-firing would double-count
-                        # payment_paid_amount on a PARTIALLY_PAID statement.
-                        # The redundant `account_id is not None` is for ty —
-                        # should_auto_reconcile_statement already guarantees
-                        # it at runtime but ty can't narrow helper calls.
-                        if (
-                            was_orphaned
-                            and should_auto_reconcile_statement(txn_row)
-                            and txn_row.account_id is not None
-                        ):
-                            pending_payment_check = (
-                                txn_row.id,
-                                txn_row.account_id,
-                                txn_row.amount,
-                            )
+                (
+                    txn_id,
+                    deferred_noop,
+                    pending_payment_check,
+                    pending_disambiguation,
+                ) = await _apply_reparsed_transaction(
+                    session,
+                    em,
+                    txn_data,
+                    was_dup_deferred=was_dup_deferred,
+                    force_new=force_new,
+                )
             except IntegrityError:
                 em.status = "skipped"
                 em.error = "Duplicate transaction skipped because an identical transaction row already exists"
@@ -727,52 +761,31 @@ async def reparse_all_failed(
 
             if txn_data:
                 try:
-                    async with session.begin_nested():
-                        # Upsert: failed emails reaching the bulk-reparse
-                        # path rarely have an attached txn already, but
-                        # mirror the single-email reparse logic so a
-                        # mixed batch (e.g. some rows previously parsed
-                        # and re-failed) doesn't insert duplicates.
-                        existing = (
-                            await session.execute(
-                                select(Transaction).where(Transaction.email_id == em.id)
-                            )
-                        ).scalar_one_or_none()
-                        was_orphaned = existing is None or existing.account_id is None
-                        if existing is not None:
-                            for key, value in txn_data.items():
-                                setattr(existing, key, value)
-                            existing.account_id = None
-                            existing.card_id = None
-                            txn_row = existing
-                        else:
-                            txn_row = Transaction(email_id=em.id, **txn_data)
-                            session.add(txn_row)
-                        await session.flush()
-                        _link_ctx = await build_link_context(session)
-                        link_transaction(_link_ctx, txn_row)
-                        await session.flush()
-                        # Maskless CC bill-payment: try amount-match
-                        # against open statements; else queue a prompt.
-                        pending_disambiguation = await resolve_cc_payment_account(
-                            session, txn_row
-                        )
-                        # Only auto-reconcile when the original parse
-                        # did not already credit the statement (either a
-                        # fresh insert or an upsert of a previously-
-                        # orphaned txn). See the per-email reparse path
-                        # for the full rationale.
-                        # The redundant account_id check is for ty.
-                        if (
-                            was_orphaned
-                            and should_auto_reconcile_statement(txn_row)
-                            and txn_row.account_id is not None
-                        ):
-                            pending_payment_check = (
-                                txn_row.id,
-                                txn_row.account_id,
-                                txn_row.amount,
-                            )
+                    # Route through the SAME upsert/merge the single-email
+                    # reparse uses so the bulk path dedups identically (a
+                    # failed email whose event already exists from another
+                    # channel enriches that row instead of blind-inserting a
+                    # duplicate). Bulk reparse only ever processes
+                    # status='failed' rows, so a [dup-defer] (status='skipped')
+                    # never reaches here — was_dup_deferred is False — and the
+                    # batch retry has no per-row force confirmation.
+                    (
+                        _,
+                        bulk_deferred_noop,
+                        pending_payment_check,
+                        pending_disambiguation,
+                    ) = await _apply_reparsed_transaction(
+                        session,
+                        em,
+                        txn_data,
+                        was_dup_deferred=False,
+                        force_new=False,
+                    )
+                    if bulk_deferred_noop:
+                        # find_match withheld this as a possible duplicate
+                        # (e.g. an amount-mismatch ref defer). The helper
+                        # already restored the skipped state; count it skipped.
+                        was_skipped = True
                 except IntegrityError:
                     em.status = "skipped"
                     em.error = "Duplicate transaction skipped"

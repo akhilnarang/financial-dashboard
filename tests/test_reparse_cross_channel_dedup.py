@@ -160,7 +160,9 @@ async def test_reparse_email_enriches_existing_sms_row(session_maker):
     async with session_maker() as s:
         rows = (await s.execute(select(Transaction))).scalars().all()
         # Exactly one row — the SMS row, now enriched with the email.
-        assert len(rows) == 1, f"expected 1 row, got {len(rows)}: {[r.id for r in rows]}"
+        assert len(rows) == 1, (
+            f"expected 1 row, got {len(rows)}: {[r.id for r in rows]}"
+        )
         row = rows[0]
         assert row.id == sms_txn_id
         assert row.source == "sms+email"
@@ -420,6 +422,190 @@ async def test_reparse_same_ref_different_amount_defers_not_409(session_maker):
         email = await s.get(Email, email_id)
         assert email.status == "skipped"
         assert "dup-defer" in (email.error or "")
+
+
+@pytest.mark.anyio
+async def test_bulk_reparse_enriches_existing_sms_row(session_maker):
+    """Bulk reparse-all-failed must dedup against an existing SMS-sourced
+    transaction exactly like the single-email reparse: a failed email whose
+    event already exists from an SMS row (no ref) must NOT create a second
+    transaction — it must match/enrich the existing row instead of blind
+    inserting."""
+    sms_txn_id, email_id = await _seed_sms_row_and_failed_email(session_maker)
+
+    raw = _hdfc_ppf_transfer_eml()
+    with (
+        patch(
+            "financial_dashboard.web.emails.load_or_fetch_raw_email",
+            new=AsyncMock(return_value=(raw, None)),
+        ),
+        patch(
+            "financial_dashboard.web.emails.should_notify_transactions",
+            return_value=False,
+        ),
+    ):
+        app = _build_test_app(session_maker)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post("/emails/reparse-all-failed")
+            assert r.status_code == 200, r.text
+
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        # Exactly one row — the SMS row, now enriched with the email.
+        assert len(rows) == 1, (
+            f"expected 1 row, got {len(rows)}: {[r.id for r in rows]}"
+        )
+        row = rows[0]
+        assert row.id == sms_txn_id
+        assert row.source == "sms+email"
+        assert row.email_id == email_id
+        # Downgrade-safe enrichment: the SMS row's in-body time must NOT be
+        # clobbered by the email's missing time.
+        assert row.transaction_time == datetime.time(15, 15, 12)
+
+
+@pytest.mark.anyio
+async def test_bulk_reparse_retains_sms_enrichment_on_none(session_maker):
+    """Bulk reparse must not NULL an SMS-provided value when the email's
+    txn_data carries that field as None (fill-don't-clobber)."""
+    # Seed an SMS row with a balance + counterparty the email lacks.
+    async with session_maker() as session:
+        rule = FetchRule(
+            provider="gmail",
+            sender="alerts@hdfcbank.bank.in",
+            bank="hdfc",
+            enabled=True,
+            email_kind="transaction",
+        )
+        session.add(rule)
+        await session.flush()
+        sms_txn = Transaction(
+            bank="hdfc",
+            email_type="hdfc_account_transfer_debit_alert",
+            direction="debit",
+            amount=Decimal("100000"),
+            currency="INR",
+            transaction_date=datetime.date(2026, 6, 5),
+            transaction_time=datetime.time(15, 15, 12),
+            counterparty="PPF/SSY A/c XX0000",
+            channel="online",
+            balance=Decimal("4242.00"),
+            source="sms",
+            notified_channel="sms",
+        )
+        session.add(sms_txn)
+        email_row = Email(
+            provider="gmail",
+            message_id="test-hdfc-ppf-bulk-enrich",
+            sender="alerts@hdfcbank.bank.in",
+            subject="View: Account update for your HDFC Bank A/c",
+            received_at=datetime.datetime(2026, 6, 5, 9, 45, 11, tzinfo=datetime.UTC),
+            status="failed",
+            error="Previous parse failed",
+            rule_id=rule.id,
+        )
+        session.add(email_row)
+        await session.commit()
+        sms_txn_id = sms_txn.id
+
+    raw = _hdfc_ppf_transfer_eml()  # carries no balance
+    with (
+        patch(
+            "financial_dashboard.web.emails.load_or_fetch_raw_email",
+            new=AsyncMock(return_value=(raw, None)),
+        ),
+        patch(
+            "financial_dashboard.web.emails.should_notify_transactions",
+            return_value=False,
+        ),
+    ):
+        app = _build_test_app(session_maker)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post("/emails/reparse-all-failed")
+            assert r.status_code == 200, r.text
+
+    async with session_maker() as s:
+        row = await s.get(Transaction, sms_txn_id)
+        # SMS-only balance + counterparty must survive the email reparse.
+        assert row.balance == Decimal("4242.00")
+        assert row.counterparty == "PPF/SSY A/c XX0000"
+
+
+@pytest.mark.anyio
+async def test_single_reparse_retains_sms_enrichment_on_none(session_maker):
+    """Single-email reparse upsert of an existing SMS-enriched row whose
+    email txn_data has balance/counterparty as None must RETAIN the SMS
+    values rather than clobber them with None."""
+    # Seed an SMS row already attached to THIS email (the in-place upsert
+    # path), with a balance + counterparty the email lacks.
+    async with session_maker() as session:
+        rule = FetchRule(
+            provider="gmail",
+            sender="alerts@hdfcbank.bank.in",
+            bank="hdfc",
+            enabled=True,
+            email_kind="transaction",
+        )
+        session.add(rule)
+        await session.flush()
+        email_row = Email(
+            provider="gmail",
+            message_id="test-hdfc-ppf-single-enrich",
+            sender="alerts@hdfcbank.bank.in",
+            subject="View: Account update for your HDFC Bank A/c",
+            received_at=datetime.datetime(2026, 6, 5, 9, 45, 11, tzinfo=datetime.UTC),
+            status="parsed",
+            rule_id=rule.id,
+        )
+        session.add(email_row)
+        await session.flush()
+        txn = Transaction(
+            bank="hdfc",
+            email_type="hdfc_account_transfer_debit_alert",
+            direction="debit",
+            amount=Decimal("100000"),
+            currency="INR",
+            transaction_date=datetime.date(2026, 6, 5),
+            transaction_time=datetime.time(15, 15, 12),
+            counterparty="PPF/SSY A/c XX0000",
+            channel="online",
+            balance=Decimal("4242.00"),
+            source="sms+email",
+            notified_channel="sms",
+            email_id=email_row.id,
+        )
+        session.add(txn)
+        await session.commit()
+        txn_id = txn.id
+        email_id = email_row.id
+
+    raw = _hdfc_ppf_transfer_eml()  # carries no balance
+    with (
+        patch(
+            "financial_dashboard.web.emails.load_or_fetch_raw_email",
+            new=AsyncMock(return_value=(raw, None)),
+        ),
+        patch(
+            "financial_dashboard.web.emails.should_notify_transactions",
+            return_value=False,
+        ),
+    ):
+        app = _build_test_app(session_maker)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post(f"/emails/{email_id}/reparse")
+            assert r.status_code == 200, r.text
+
+    async with session_maker() as s:
+        row = await s.get(Transaction, txn_id)
+        # SMS-only balance + counterparty must survive the same-source reparse.
+        assert row.balance == Decimal("4242.00")
+        assert row.counterparty == "PPF/SSY A/c XX0000"
 
 
 @pytest.mark.anyio
