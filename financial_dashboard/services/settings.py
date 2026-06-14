@@ -16,8 +16,8 @@ from typing import Literal, Mapping
 
 from sqlalchemy import select
 
-from financial_dashboard.config import get_fernet
-from financial_dashboard.db import Setting, async_session
+from financial_dashboard.config import get_fernet, settings
+from financial_dashboard.db import EmailSource, Setting, async_session
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +253,62 @@ def parse_form_updates(
                             continue
                 updates[key] = raw
     return updates, errors
+
+
+async def assert_master_key_or_no_secrets(session) -> None:
+    """Fail fast at startup if encrypted data exists but no master key is set.
+
+    With EMAIL_SOURCE_MASTER_KEY unset, get_fernet() mints an ephemeral key,
+    so any previously-stored secret (email-source credentials, secret settings)
+    becomes undecryptable after a restart and load_all_settings() silently
+    blanks it. To avoid that data-loss-by-stealth, refuse to boot when such
+    data exists. A fresh DB with no secrets boots fine (with a warning).
+
+    Read-only: this only SELECTs, never writes.
+    """
+    if settings.email_source_master_key:
+        return
+
+    has_credentials = (
+        await session.execute(
+            select(EmailSource.id).where(EmailSource.credentials != "").limit(1)
+        )
+    ).first() is not None
+
+    secret_keys = [key for key, defn in SETTINGS_REGISTRY.items() if defn.secret]
+    has_secret_setting = False
+    if secret_keys:
+        has_secret_setting = (
+            await session.execute(
+                select(Setting.key)
+                .where(Setting.key.in_(secret_keys))
+                .where(Setting.value != "")
+                .limit(1)
+            )
+        ).first() is not None
+
+    if not (has_credentials or has_secret_setting):
+        logger.warning(
+            "EMAIL_SOURCE_MASTER_KEY is not set. No encrypted data exists yet, "
+            "so startup continues — but SET IT before storing any secrets or "
+            "they will not survive a restart."
+        )
+        return
+
+    message = (
+        "EMAIL_SOURCE_MASTER_KEY is not set but encrypted data exists in the "
+        "database (email-source credentials and/or secret settings). An "
+        "ephemeral key would make that data permanently undecryptable. Set "
+        "EMAIL_SOURCE_MASTER_KEY in the environment and restart."
+    )
+    if settings.allow_ephemeral_master_key:
+        logger.warning(
+            "%s ALLOW_EPHEMERAL_MASTER_KEY is set — continuing anyway; "
+            "existing secrets will be unreadable.",
+            message,
+        )
+        return
+    raise SystemExit(message)
 
 
 async def load_all_settings() -> dict[str, str]:

@@ -9,9 +9,13 @@ from fastapi.staticfiles import StaticFiles
 from financial_dashboard.api import router as api_router
 from financial_dashboard.config import settings
 from financial_dashboard.core.deps import verify_credentials
-from financial_dashboard.db import engine, init_db
+from financial_dashboard.db import async_session, engine, init_db
 from financial_dashboard.services.fetch import FetchService
-from financial_dashboard.services.settings import start_services, stop_services
+from financial_dashboard.services.settings import (
+    assert_master_key_or_no_secrets,
+    start_services,
+    stop_services,
+)
 from financial_dashboard.web import get_router
 
 logging.basicConfig(
@@ -28,6 +32,11 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database...")
     await init_db()
     logger.info("Database ready")
+
+    # Refuse to boot with no master key if encrypted data already exists,
+    # otherwise an ephemeral key would silently orphan those secrets.
+    async with async_session() as session:
+        await assert_master_key_or_no_secrets(session)
 
     await start_services()
     fetch_service = FetchService()

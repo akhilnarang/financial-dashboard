@@ -13,6 +13,13 @@ not survive a server restart.
 get_fernet() is a factory function (not a module-level instance) so that it
 can be called lazily from functions that need it. This avoids import-time
 failures when the key is not yet set in the environment.
+
+ALLOW_EPHEMERAL_MASTER_KEY (default False): the startup guard
+(services.settings.assert_master_key_or_no_secrets) refuses to boot when
+EMAIL_SOURCE_MASTER_KEY is unset but encrypted data already exists in the DB,
+because an ephemeral key would silently render those secrets undecryptable.
+Set this to true to downgrade that fatal refusal to a warning (e.g. for a
+throwaway/dev DB you don't mind re-entering secrets in).
 """
 
 from pydantic import SecretStr, model_validator
@@ -25,6 +32,10 @@ class Settings(BaseSettings):
     db_url: str = "sqlite+aiosqlite:///./data/financial_dashboard.db"
 
     email_source_master_key: str = ""  # Fernet key for encrypting credentials
+
+    # When True, the startup guard downgrades a missing master key + existing
+    # encrypted data from a fatal SystemExit to a warning. See module docstring.
+    allow_ephemeral_master_key: bool = False
 
     # HTTP Basic Auth — both must be set to enable, or both unset to disable.
     auth_username: str = ""
