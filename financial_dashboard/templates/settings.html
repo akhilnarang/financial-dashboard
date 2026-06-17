@@ -81,7 +81,7 @@
             {% set toggle_fields = [] %}
             {% set number_fields = [] %}
             {% for s in items %}
-                {% if s.secret or (s.type == "int" and s.key.endswith("chat_id")) %}
+                {% if s.secret or s.type == "str" or (s.type == "int" and s.key.endswith("chat_id")) %}
                     {% set _ = conn_fields.append(s) %}
                 {% elif s.type == "bool" %}
                     {% set _ = toggle_fields.append(s) %}
@@ -105,7 +105,7 @@
                     {% else %}
                     <label data-field>
                         {{ s.label }}
-                        <input type="number" name="{{ s.key }}" value="{{ s.value if s.value else '' }}" placeholder="Not set">
+                        <input type="{{ 'number' if s.type == 'int' else 'text' }}" name="{{ s.key }}" value="{{ s.value if s.value else '' }}" placeholder="Not set">
                         {% if s.description %}<small class="text-sm text-muted">{{ s.description }}</small>{% endif %}
                     </label>
                     {% endif %}
