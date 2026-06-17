@@ -48,6 +48,13 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
         label="Chat ID",
         description="Your Telegram chat ID — send /start to @userinfobot to find it",
     ),
+    "telegram.base_url": SettingDef(
+        default="",
+        data_type="str",
+        category="Telegram",
+        label="Bot API Base URL",
+        description="Override the Bot API server (e.g. a local Bot API server). Leave blank for the default https://api.telegram.org/bot",
+    ),
     "telegram.enabled": SettingDef(
         default="false",
         data_type="bool",
@@ -184,6 +191,18 @@ def get_telegram_chat_id() -> int:
 
 def get_telegram_bot_token() -> str:
     return get_setting("telegram.bot_token", "") or ""
+
+
+def get_telegram_base_url() -> str | None:
+    """Optional Bot API base URL override. None falls back to PTB's default
+    (https://api.telegram.org/bot).
+
+    A trailing slash is stripped: PTB appends the bot token directly to this
+    value, so the URL must end at ``…/bot`` (the default is literally
+    ``https://api.telegram.org/bot``). A trailing slash would otherwise yield
+    ``…/bot/<token>`` and break every request.
+    """
+    return (get_setting("telegram.base_url", "") or "").strip().rstrip("/") or None
 
 
 def get_grouped_settings() -> dict[str, list[dict]]:
@@ -383,7 +402,9 @@ async def start_services() -> None:
 
         if telegram_service.tg_app is None:
             try:
-                await telegram_service.init_telegram(get_telegram_bot_token())
+                await telegram_service.init_telegram(
+                    get_telegram_bot_token(), get_telegram_base_url()
+                )
             except Exception as e:
                 logger.warning("Telegram bot failed to start: %s", e)
 

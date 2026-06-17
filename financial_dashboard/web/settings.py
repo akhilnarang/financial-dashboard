@@ -68,6 +68,7 @@ async def save_settings_route(
         "telegram.bot_token",
         "telegram.chat_id",
         "telegram.enabled",
+        "telegram.base_url",
     }
     if changed_keys & telegram_restart_keys:
         await restart_services()

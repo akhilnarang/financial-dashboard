@@ -27,10 +27,17 @@ logger = logging.getLogger(__name__)
 tg_app: Application | None = None
 
 
-async def init_telegram(token: str):
-    """Initialize the Telegram bot application."""
+async def init_telegram(token: str, base_url: str | None = None):
+    """Initialize the Telegram bot application.
+
+    ``base_url`` overrides the Bot API server (e.g. a self-hosted local Bot
+    API server). When None, PTB defaults to https://api.telegram.org/bot.
+    """
     global tg_app
-    app = Application.builder().token(token).build()
+    builder = Application.builder().token(token)
+    if base_url:
+        builder = builder.base_url(base_url)
+    app = builder.build()
     # Application.updater is Optional in the PTB type stubs because some
     # builders (webhook mode, custom updater=None) intentionally produce
     # an app without one. The standard builder we use here always sets it;
