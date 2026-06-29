@@ -4,10 +4,26 @@ import asyncio
 import logging
 
 from financial_dashboard.integrations.email import orchestrator as fetch_orchestrator
+from financial_dashboard.services.categorization.merchant_rules import (
+    load_merchant_rules,
+)
+from financial_dashboard.services.categorization.sweep import (
+    run_llm_sweep,
+    run_review_notify,
+    run_rule_sweep,
+)
 from financial_dashboard.services.reminders import check_and_send_reminders
 from financial_dashboard.services.settings import get_setting_int
 
 logger = logging.getLogger(__name__)
+
+
+async def run_categorization_cycle() -> None:
+    # Refresh merchant-rule cache first so CLI edits land without a restart.
+    await load_merchant_rules()
+    await run_rule_sweep()
+    await run_llm_sweep()
+    await run_review_notify()
 
 
 def make_poll_status() -> dict:
@@ -86,6 +102,13 @@ class FetchService:
                 raise
             except Exception:
                 logger.exception("Reminder check failed")
+
+            try:
+                await run_categorization_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Categorization sweep failed")
 
             interval = max(1, get_setting_int("poll_interval_minutes", 15)) * 60
             await asyncio.sleep(interval)
