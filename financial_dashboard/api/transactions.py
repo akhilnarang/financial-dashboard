@@ -40,7 +40,12 @@ async def update_category(
     payload: TransactionCategoryUpdate,
     session: AsyncSession = Depends(get_session),
 ) -> TransactionCategoryResponse:
-    ok, category = await update_transaction_category(session, txn_id, payload.category)
+    try:
+        ok, category = await update_transaction_category(
+            session, txn_id, payload.category
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     if not ok:
         raise HTTPException(status_code=404, detail="Transaction not found")
     return TransactionCategoryResponse(ok=True, category=category)

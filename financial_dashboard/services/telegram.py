@@ -324,11 +324,21 @@ async def _handle_reply(update: Update, context) -> None:
         txn = await session.get(Transaction, txn_id)
         if txn:
             txn.note = note_text
-            if category_text is not None:
-                txn.category = category_text or None
             await session.commit()
-            saved = "note" + (" + category" if category_text is not None else "")
-            await msg.reply_text(f"Saved {saved} for #{txn_id}")
+            category_saved = False
+            if category_text is not None:
+                from financial_dashboard.services.categorization.manual import (
+                    assign_category_manual,
+                )
+
+                category_saved, _ = await assign_category_manual(
+                    session, txn_id, category_text or ""
+                )
+            saved = "note" + (" + category" if category_saved else "")
+            reply = f"Saved {saved} for #{txn_id}"
+            if category_text and not category_saved:
+                reply += f" (category {category_text!r} was invalid, not saved)"
+            await msg.reply_text(reply)
         else:
             await msg.reply_text(f"Transaction #{txn_id} not found")
 
