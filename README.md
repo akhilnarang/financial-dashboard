@@ -160,6 +160,8 @@ scripts/
 | `BalanceSnapshot` | `balance_snapshots` | Point-in-time asset/liability value emitted by bank, CC, CAS, or manual sources |
 | `SnapshotHolding` | `snapshot_holdings` | Asset-class breakdown rows for investment snapshots |
 | `ManualItem` | `manual_items` | User-maintained asset/liability sources such as property, cash, or loans |
+| `Category` | `categories` | Controlled vocabulary of transaction category slugs (editable; seeded at init) |
+| `MerchantRule` | `merchant_rules` | Editable substring→category rules; the deterministic layer that skips the LLM for known merchants |
 | `Setting` | `settings` | Small key/value store for app-level settings |
 
 ### Schema Diagram
@@ -353,6 +355,33 @@ erDiagram
         text raw_description
         text note
         string category
+        string category_method
+        float category_confidence
+        string category_model
+        string category_input_hash
+        int category_vocab_version
+        datetime categorized_at
+        string review_status
+        text review_reason
+        datetime last_notified_at
+        int notify_attempts
+        datetime created_at
+    }
+
+    CATEGORIES {
+        int id PK
+        string slug UK
+        string display_label
+        bool active
+        datetime created_at
+    }
+
+    MERCHANT_RULES {
+        int id PK
+        string pattern UK
+        string category
+        bool active
+        int priority
         datetime created_at
     }
 
@@ -374,7 +403,10 @@ erDiagram
     CARDS ||--o{ TRANSACTIONS : linked_card
     STATEMENT_UPLOADS ||--o{ TRANSACTIONS : imported_from_cc_statement
     BANK_STATEMENT_UPLOADS ||--o{ TRANSACTIONS : imported_from_bank_statement
+    CATEGORIES ||--o{ TRANSACTIONS : categorizes
 ```
+
+`transactions.category` references `categories.slug` as a soft (application-enforced) link — SQLite foreign-key enforcement is intentionally off, so there is no DB-level FK constraint.
 
 Relationship notes:
 - `transactions.account_id` and `transactions.card_id` are the canonical account/card links after the linker runs; `card_mask` and `account_mask` remain as parser-derived denormalized hints.
@@ -385,7 +417,7 @@ Relationship notes:
 ### Key Constraints
 - `emails.message_id` is globally unique (prevents re-inserting the same email).
 - `(source_id, remote_id)` is unique on `emails` (provider-scoped deduplication).
-- `transactions` has a partial unique index on `(bank, reference_number)` where `reference_number IS NOT NULL` (deduplicates transactions with known UTR/UPI reference numbers).
+- `transactions` has a partial unique index on `(bank, reference_number, direction)` where `reference_number IS NOT NULL` (deduplicates transactions with known UTR/UPI reference numbers; direction is included so a debit and credit sharing a ref don't collide).
 - `(account_id, card_mask)` is unique on `cards`.
 - `balance_snapshots` has a check constraint requiring exactly one source foreign key among `account_id`, `cas_upload_id`, and `manual_item_id`.
 - `balance_snapshots` has SQLite partial unique indexes for account, investment, and manual snapshot upserts: `(account_id, category, as_of_date)`, `(portfolio_key, category, as_of_date)`, and `(manual_item_id, as_of_date)`.
