@@ -22,6 +22,8 @@ dependencies = [
     "cryptography>=48.0.1,<49",
     "python-telegram-bot>=22.7,<23",
     "python-dateutil>=2.9.0.post0",
+    "google-genai>=1.75,<2",
+    "openai>=1.109,<2",
 ]
 
 [build-system]

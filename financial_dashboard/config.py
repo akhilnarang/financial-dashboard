@@ -33,6 +33,16 @@ class Settings(BaseSettings):
 
     email_source_master_key: str = ""  # Fernet key for encrypting credentials
 
+    # Optional .env fallback for the categorization Gemini key. The DB setting
+    # `gemini.api_key` (set via /settings, Fernet-encrypted) takes precedence;
+    # this lets you run the categorizer/preview from a local .env without the UI.
+    gemini_api_key: str = ""
+
+    # Optional .env fallback for the OpenAI-compatible categorization provider.
+    # DB settings `openai.api_key` / `openai.base_url` take precedence when set.
+    openai_api_key: str = ""
+    openai_base_url: str = ""
+
     # When True, the startup guard downgrades a missing master key + existing
     # encrypted data from a fatal SystemExit to a warning. See module docstring.
     allow_ephemeral_master_key: bool = False

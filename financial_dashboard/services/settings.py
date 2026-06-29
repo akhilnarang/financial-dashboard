@@ -30,6 +30,7 @@ class SettingDef:
     label: str
     description: str = ""
     secret: bool = False
+    internal: bool = False  # not shown in the settings UI; never set via the form
 
 
 SETTINGS_REGISTRY: dict[str, SettingDef] = {
@@ -126,6 +127,88 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
         description="PAN used to decrypt the CAS PDFs (stored encrypted)",
         secret=True,
     ),
+    "gemini.api_key": SettingDef(
+        default="",
+        data_type="str",
+        category="Categorization",
+        label="Gemini API Key",
+        description="Google Gemini API key used to categorize transactions (stored encrypted)",
+        secret=True,
+    ),
+    "gemini.model": SettingDef(
+        default="gemini-2.5-flash",
+        data_type="str",
+        category="Categorization",
+        label="Gemini Model",
+        description="Gemini model id used for transaction categorization",
+    ),
+    "openai.api_key": SettingDef(
+        default="",
+        data_type="str",
+        category="Categorization",
+        label="OpenAI API Key",
+        description="API key for the OpenAI-compatible categorization provider (stored encrypted)",
+        secret=True,
+    ),
+    "openai.model": SettingDef(
+        default="gpt-4o-mini",
+        data_type="str",
+        category="Categorization",
+        label="OpenAI Model",
+    ),
+    "openai.base_url": SettingDef(
+        default="",
+        data_type="str",
+        category="Categorization",
+        label="OpenAI Base URL",
+        description="OpenAI-compatible endpoint, e.g. https://host/openai/v1",
+    ),
+    "categorization.llm_provider": SettingDef(
+        default="gemini",
+        data_type="str",
+        category="Categorization",
+        label="LLM Provider",
+        description="gemini or openai",
+    ),
+    "categorization.enabled": SettingDef(
+        default="false",
+        data_type="bool",
+        category="Categorization",
+        label="Enable LLM Categorization",
+        description="Run the Gemini fallback for transactions the rules can't classify",
+    ),
+    "categorization.confidence_threshold": SettingDef(
+        default="0.6",
+        data_type="str",
+        category="Categorization",
+        label="Confidence Threshold",
+        description="LLM results below this confidence route to manual review",
+    ),
+    "categorization.self_identifiers": SettingDef(
+        default="",
+        data_type="str",
+        category="Categorization",
+        label="Self Identifiers",
+        description="Comma-separated tokens that identify YOUR OWN accounts — first name, "
+        "phone, UPI handles, acct last-4. Drives self_transfer detection AND is censored "
+        "before sending to the LLM. e.g. your first name, a phone number, a UPI handle you own",
+    ),
+    "categorization.hidden_identifiers": SettingDef(
+        default="",
+        data_type="str",
+        category="Categorization",
+        label="Hidden Identifiers",
+        description="Comma-separated family/private tokens to censor before sending to the "
+        "LLM but NOT treat as self. e.g. names of family members whose transfers you receive",
+    ),
+    "category_vocab_version": SettingDef(
+        default="1",
+        data_type="int",
+        category="Categorization",
+        label="Vocabulary Version",
+        description="Internal: bumped when a category is added; triggers re-categorization",
+        internal=True,
+    ),
 }
 
 _cache: dict[str, str] = {}
@@ -173,6 +256,52 @@ def get_setting_json(key: str, default=None):
         return default
 
 
+def get_self_identifier_tokens() -> tuple[str, ...]:
+    """Tokens that identify the account holder's own accounts (for self_transfer detection)."""
+    raw = get_setting("categorization.self_identifiers") or ""
+    return tuple(t.strip() for t in raw.split(",") if t.strip())
+
+
+def get_redact_name_tokens() -> tuple[str, ...]:
+    """Name fragments to mask before sending text to the LLM.
+
+    Returns the deduplicated union of self_identifiers and hidden_identifiers.
+    Both sets are censored before the LLM sees them; only self_identifiers
+    also trigger self_transfer detection.
+    """
+    self_raw = get_setting("categorization.self_identifiers") or ""
+    hidden_raw = get_setting("categorization.hidden_identifiers") or ""
+    self_tokens = [t.strip() for t in self_raw.split(",") if t.strip()]
+    hidden_tokens = [t.strip() for t in hidden_raw.split(",") if t.strip()]
+    return tuple(dict.fromkeys(self_tokens + hidden_tokens))
+
+
+def get_gemini_api_key() -> str:
+    """Gemini API key for categorization. DB setting `gemini.api_key` takes
+    precedence; falls back to the GEMINI_API_KEY .env value for local runs."""
+    return get_setting("gemini.api_key") or settings.gemini_api_key
+
+
+def get_openai_api_key() -> str:
+    """OpenAI-compatible API key. DB setting `openai.api_key` takes precedence;
+    falls back to the OPENAI_API_KEY .env value for local runs."""
+    return get_setting("openai.api_key") or settings.openai_api_key
+
+
+def get_openai_base_url() -> str:
+    """OpenAI-compatible base URL. DB setting `openai.base_url` takes precedence;
+    falls back to the OPENAI_BASE_URL .env value."""
+    return get_setting("openai.base_url") or settings.openai_base_url
+
+
+def get_active_llm_key() -> str:
+    """API key for whichever LLM provider is currently selected."""
+    provider = get_setting("categorization.llm_provider") or "gemini"
+    if provider == "openai":
+        return get_openai_api_key()
+    return get_gemini_api_key()
+
+
 def is_telegram_configured() -> bool:
     return (
         get_setting_bool("telegram.enabled")
@@ -210,6 +339,8 @@ def get_grouped_settings() -> dict[str, list[dict]]:
     current = get_all_settings()
     grouped: dict[str, list[dict]] = {}
     for key, defn in SETTINGS_REGISTRY.items():
+        if defn.internal:
+            continue
         cat = defn.category
         if cat not in grouped:
             grouped[cat] = []
@@ -239,6 +370,8 @@ def parse_form_updates(
     updates: dict[str, str] = {}
     errors: list[str] = []
     for key, defn in SETTINGS_REGISTRY.items():
+        if defn.internal:
+            continue
         if defn.data_type == "bool":
             updates[key] = "true" if form.get(key) else "false"
         else:

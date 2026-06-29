@@ -50,13 +50,19 @@ async def update_transaction_category(
     txn_id: int,
     category: str,
 ) -> tuple[bool, str | None]:
-    cleaned = category.strip()
+    """Returns (ok, slug). Raises ValueError if the transaction exists but the
+    category is invalid (so callers can return 400, not 404)."""
+    from financial_dashboard.services.categorization.manual import (
+        assign_category_manual,
+    )
+
     txn = await session.get(Transaction, txn_id)
-    if not txn:
+    if txn is None:
         return False, None
-    txn.category = cleaned or None
-    await session.commit()
-    return True, cleaned
+    ok, slug = await assign_category_manual(session, txn_id, category)
+    if not ok:
+        raise ValueError(f"Invalid category: {category!r}")
+    return True, slug
 
 
 async def relink_transaction(
