@@ -118,6 +118,119 @@ async def init_db(engine) -> None:
             await conn.execute(
                 text("ALTER TABLE transactions ADD COLUMN category VARCHAR")
             )
+        for _col, _type in (
+            ("category_method", "VARCHAR"),
+            ("category_confidence", "REAL"),
+            ("category_model", "VARCHAR"),
+            ("category_input_hash", "VARCHAR"),
+            ("category_vocab_version", "INTEGER"),
+            ("categorized_at", "DATETIME"),
+            ("review_status", "VARCHAR"),
+            ("review_reason", "TEXT"),
+            ("last_notified_at", "DATETIME"),
+            ("notify_attempts", "INTEGER"),
+        ):
+            try:
+                await conn.execute(text(f"SELECT {_col} FROM transactions LIMIT 0"))
+            except Exception:
+                await conn.execute(
+                    text(f"ALTER TABLE transactions ADD COLUMN {_col} {_type}")
+                )
+        # One-time backfill: rows that already had a hand-entered category before
+        # this feature must be treated as user-set (manual), or the rule/LLM
+        # sweeps would see category_method IS NULL and OVERWRITE them on first run.
+        _method_marker = (
+            await conn.execute(
+                text(
+                    "SELECT 1 FROM settings WHERE key = "
+                    "'migrations.category_method_backfill'"
+                )
+            )
+        ).first()
+        if not _method_marker:
+            await conn.execute(
+                text(
+                    "UPDATE transactions SET category_method = 'manual' "
+                    "WHERE category IS NOT NULL AND category != '' "
+                    "AND category_method IS NULL"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO settings (key, value) VALUES "
+                    "('migrations.category_method_backfill', '1')"
+                )
+            )
+        from financial_dashboard.services.categorization.vocabulary import (
+            SEED_CATEGORIES,
+        )
+
+        _cat_before = (
+            await conn.execute(text("SELECT COUNT(*) FROM categories"))
+        ).scalar() or 0
+        for _slug in SEED_CATEGORIES:
+            await conn.execute(
+                text("INSERT OR IGNORE INTO categories (slug, active) VALUES (:slug, 1)"),
+                {"slug": _slug},
+            )
+        _cat_after = (
+            await conn.execute(text("SELECT COUNT(*) FROM categories"))
+        ).scalar() or 0
+        if _cat_after > _cat_before:
+            # New seed slugs landed → bump the vocab version so non-manual rows
+            # get reconsidered against the expanded vocabulary.
+            await conn.execute(
+                text(
+                    "INSERT INTO settings (key, value) VALUES "
+                    "('category_vocab_version', '2') "
+                    "ON CONFLICT(key) DO UPDATE SET "
+                    "value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+                )
+            )
+
+        # One-time migration: the categorization name settings were renamed
+        # (self_names → self_identifiers, redact_names → hidden_identifiers).
+        # Without this, a DB that persisted the old keys would silently stop
+        # redacting/self-detecting those names — leaking them to the LLM.
+        _rename_marker = (
+            await conn.execute(
+                text(
+                    "SELECT 1 FROM settings WHERE key = "
+                    "'migrations.categorization_identifier_rename'"
+                )
+            )
+        ).first()
+        if not _rename_marker:
+            for _old, _new in (
+                ("categorization.self_names", "categorization.self_identifiers"),
+                ("categorization.redact_names", "categorization.hidden_identifiers"),
+            ):
+                _old_val = (
+                    await conn.execute(
+                        text("SELECT value FROM settings WHERE key = :k"), {"k": _old}
+                    )
+                ).scalar()
+                if not _old_val:
+                    continue
+                _new_val = (
+                    await conn.execute(
+                        text("SELECT value FROM settings WHERE key = :k"), {"k": _new}
+                    )
+                ).scalar()
+                if not _new_val:  # only fill if the new key is missing/blank
+                    await conn.execute(
+                        text(
+                            "INSERT INTO settings (key, value) VALUES (:k, :v) "
+                            "ON CONFLICT(key) DO UPDATE SET value = :v"
+                        ),
+                        {"k": _new, "v": _old_val},
+                    )
+            await conn.execute(
+                text(
+                    "INSERT INTO settings (key, value) VALUES "
+                    "('migrations.categorization_identifier_rename', '1')"
+                )
+            )
         try:
             await conn.execute(
                 text("SELECT source_kind FROM statement_uploads LIMIT 0")
@@ -275,7 +388,33 @@ async def init_db(engine) -> None:
             )
         )
 
+    async with engine.begin() as conn:
+        # Seed the generic built-in merchant rules (INSERT OR IGNORE, idempotent).
+        # Personal/local overrides are loaded separately via the CLI from the
+        # untracked merchant_seed_data.py — the runtime never depends on that.
+        from financial_dashboard.services.categorization.merchant_defaults import (
+            DEFAULT_MERCHANT_RULES,
+        )
+
+        for _category, _patterns in DEFAULT_MERCHANT_RULES.items():
+            for _pattern in _patterns:
+                await conn.execute(
+                    text(
+                        "INSERT OR IGNORE INTO merchant_rules "
+                        "(pattern, category, active, priority) "
+                        "VALUES (:pattern, :category, 1, 100)"
+                    ),
+                    {"pattern": _pattern, "category": _category},
+                )
+
     # function-local: breaks cycle with services.settings (settings imports db at top)
     from financial_dashboard.services.settings import load_all_settings
 
     await load_all_settings()
+
+    # function-local: breaks cycle with categorization (merchant_rules imports db at top)
+    from financial_dashboard.services.categorization.merchant_rules import (
+        load_merchant_rules,
+    )
+
+    await load_merchant_rules()
