@@ -19,7 +19,7 @@ dependencies = [
     "cas-parser",
     "cc-parser",
     "fastapi[standard]>=0.135,<1",
-    "cryptography>=44.0,<47",
+    "cryptography>=48.0.1,<49",
     "python-telegram-bot>=22.7,<23",
     "python-dateutil>=2.9.0.post0",
 ]
