@@ -547,15 +547,20 @@ async def test_init_db_is_idempotent(tmp_path, monkeypatch):
     db_path = tmp_path / "idempotent.sqlite"
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
 
-    # Patch load_all_settings — it's called at the tail of init_db but needs
-    # the real async_session, which we aren't using here.
+    # Patch load_all_settings and load_merchant_rules — both are called at the
+    # tail of init_db but need the real async_session which we aren't using here.
     import financial_dashboard.services.settings as settings_mod
+    import financial_dashboard.services.categorization.merchant_rules as mr_mod
 
     async def _noop_load() -> dict[str, str]:
         return {}
 
+    async def _noop_load_mr() -> None:
+        pass
+
     try:
         monkeypatch.setattr(settings_mod, "load_all_settings", _noop_load)
+        monkeypatch.setattr(mr_mod, "load_merchant_rules", _noop_load_mr)
         await _init_db(engine)
         await _init_db(engine)  # second run: must not error
     finally:
@@ -577,12 +582,17 @@ async def test_init_db_summary_columns_present_and_filename_non_null(
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
 
     import financial_dashboard.services.settings as settings_mod
+    import financial_dashboard.services.categorization.merchant_rules as mr_mod
 
     async def _noop_load() -> dict[str, str]:
         return {}
 
+    async def _noop_load_mr() -> None:
+        pass
+
     try:
         monkeypatch.setattr(settings_mod, "load_all_settings", _noop_load)
+        monkeypatch.setattr(mr_mod, "load_merchant_rules", _noop_load_mr)
         await _init_db(engine)
 
         async with engine.begin() as conn:
@@ -613,12 +623,17 @@ async def test_init_db_migrates_pre_branch_schema(tmp_path, monkeypatch):
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
 
     import financial_dashboard.services.settings as settings_mod
+    import financial_dashboard.services.categorization.merchant_rules as mr_mod
 
     async def _noop_load() -> dict[str, str]:
         return {}
 
+    async def _noop_load_mr() -> None:
+        pass
+
     try:
         monkeypatch.setattr(settings_mod, "load_all_settings", _noop_load)
+        monkeypatch.setattr(mr_mod, "load_merchant_rules", _noop_load_mr)
 
         # Seed the pre-branch schema by hand — just the rows ``init_db`` looks
         # at. All columns the inline migrations may ADD are intentionally
