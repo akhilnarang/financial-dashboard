@@ -8,6 +8,7 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -380,6 +381,16 @@ class Transaction(Base):
     raw_description: Mapped[str | None] = mapped_column(Text)
     note: Mapped[str | None] = mapped_column(Text)
     category: Mapped[str | None] = mapped_column(String)
+    category_method: Mapped[str | None] = mapped_column(String)
+    category_confidence: Mapped[float | None] = mapped_column(Float)
+    category_model: Mapped[str | None] = mapped_column(String)
+    category_input_hash: Mapped[str | None] = mapped_column(String)
+    category_vocab_version: Mapped[int | None] = mapped_column(Integer)
+    categorized_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    review_status: Mapped[str | None] = mapped_column(String)
+    review_reason: Mapped[str | None] = mapped_column(Text)
+    last_notified_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    notify_attempts: Mapped[int | None] = mapped_column(Integer, default=0)
     sms_message_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("sms_messages.id"), nullable=True
     )
@@ -428,4 +439,28 @@ class SmsMessage(Base):
         UniqueConstraint(
             "sender", "received_at", "body", name="uq_sms_sender_received_body"
         ),
+    )
+
+
+class Category(Base):
+    __tablename__ = "categories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    slug: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, default=utc_now
+    )
+
+
+class MerchantRule(Base):
+    __tablename__ = "merchant_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    pattern: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    category: Mapped[str] = mapped_column(String, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    created_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, default=utc_now
     )

@@ -21,3 +21,4 @@ data/
 .env
 
 .codex
+financial_dashboard/services/categorization/merchant_seed_data.py
