@@ -1,6 +1,7 @@
 """Query-driven categorization sweeps + durable review notifications."""
 
 import asyncio
+import html
 import logging
 
 from sqlalchemy import select
@@ -13,6 +14,7 @@ from financial_dashboard.services.categorization.engine import (
 )
 from financial_dashboard.services.settings import (
     get_active_llm_key,
+    get_app_base_url,
     get_setting_bool,
     get_telegram_chat_id,
     is_telegram_configured,
@@ -125,19 +127,33 @@ async def run_review_notify(*, max_attempts: int = 5) -> int:
             .limit(50)
         )
         rows = (await session.execute(stmt)).scalars().all()
+        base_url = get_app_base_url()
         for txn in rows:
+            # HTML parse mode: link the id to its transaction page when a base URL
+            # is configured. EVERY interpolated field is html-escaped — counterparty,
+            # reason, direction, currency and the base_url are free text (parser/user
+            # output) that could otherwise contain & or " or < and break Telegram's
+            # HTML parser, stranding the row — as is the literal <note>/<category>
+            # hint. txn.amount is a Decimal, so it's safe as-is.
+            if base_url:
+                href = html.escape(f"{base_url}/transactions/{txn.id}", quote=True)
+                id_label = f'<a href="{href}">#{txn.id}</a>'
+            else:
+                id_label = f"#{txn.id}"
+            detail = html.escape(txn.counterparty or txn.raw_description or "")
+            reason = html.escape(txn.review_reason or "low confidence")
+            direction = html.escape(txn.direction or "")
+            currency = html.escape(txn.currency or "INR")
             text = (
-                f"\U0001f50d Needs a category: #{txn.id}\n"
-                f"{txn.direction} {txn.amount} {txn.currency or 'INR'}\n"
-                f"{txn.counterparty or txn.raw_description or ''}\n"
-                f"Reason: {txn.review_reason or 'low confidence'}\n"
-                f"Reply with: <note>\\n<category>"
+                f"\U0001f50d Needs a category: {id_label}\n"
+                f"{direction} {txn.amount} {currency}\n"
+                f"{detail}\n"
+                f"Reason: {reason}\n"
+                f"Reply with: &lt;note&gt;\n&lt;category&gt;"
             )
             try:
-                # Plain text (parse_mode=None): counterparty/reason can contain
-                # & or < which would break Telegram's HTML parser and strand the row.
                 await _send_with_retry(
-                    tg_app, chat_id=chat_id, text=text, parse_mode=None
+                    tg_app, chat_id=chat_id, text=text, parse_mode="HTML"
                 )
                 txn.review_status = "notified"
                 txn.last_notified_at = utc_now()
