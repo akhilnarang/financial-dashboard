@@ -56,6 +56,14 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
         label="Bot API Base URL",
         description="Override the Bot API server (e.g. a local Bot API server). Leave blank for the default https://api.telegram.org/bot",
     ),
+    "app.base_url": SettingDef(
+        default="",
+        data_type="str",
+        category="General",
+        label="Dashboard Base URL",
+        description="Public base URL of this dashboard (e.g. http://localhost:8000), "
+        "used to build clickable links in Telegram notifications. Blank omits links.",
+    ),
     "telegram.enabled": SettingDef(
         default="false",
         data_type="bool",
@@ -320,6 +328,12 @@ def get_telegram_chat_id() -> int:
 
 def get_telegram_bot_token() -> str:
     return get_setting("telegram.bot_token", "") or ""
+
+
+def get_app_base_url() -> str:
+    """Dashboard base URL for links in notifications (e.g. http://host:8000).
+    Empty when unset; trailing slash stripped."""
+    return (get_setting("app.base_url") or "").rstrip("/")
 
 
 def get_telegram_base_url() -> str | None:
