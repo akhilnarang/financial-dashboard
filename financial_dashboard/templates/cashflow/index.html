@@ -3,6 +3,57 @@
 
 {% block content %}
 
+{#- Scoped to this page: base.html turns every `.table` from `overflow-x: auto`
+    to `overflow-x: visible` at >=1400px, so that the ledger's 10-column tables
+    can use the full container. This page is the one place that rule is wrong.
+    The breakdown tables are *side by side in a grid*, not stacked full-width, so
+    a table that declines to clip does not simply run wide — it paints into the
+    next grid track, drawing the Investments rows on top of the Transfers In
+    links. The overlap was not only ugly: the covering table's anchors were the
+    real click targets, so clicking a Transfers In counterparty navigated to the
+    Income line sitting invisibly over it, and the page listed the wrong
+    transactions.
+
+    `min-width: 0` on the grid items is the actual root cause. A grid item's
+    default `min-width: auto` refuses to shrink below its content's intrinsic
+    width, so a wide table forces its track wider than its 1fr share instead of
+    being clipped inside it — and the `overflow-x: auto` below can only take
+    effect once the item is allowed to be narrower than what it holds.
+
+    `.cf-tables .table` outranks base's bare `.table` on specificity, so this
+    holds inside the >=1400px media query too — which is the whole point. -#}
+<style>
+    .cf-tables {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+        gap: 1.5rem;
+    }
+
+    .cf-tables > article {
+        min-width: 0;
+    }
+
+    .cf-tables .table {
+        width: 100%;
+        max-width: 100%;
+        overflow-x: auto;
+    }
+
+    /* The charts are sized from their SVG's measured width, so a card that let
+       its chart overflow would feed the next resize a width it just grew to. */
+    .cf-chart-card {
+        overflow: hidden;
+    }
+
+    #cf-breakdown,
+    #cf-trend {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        overflow: hidden;
+    }
+</style>
+
 {#- Set inside the block, not at template top level: an extending template's
     top-level assignments are not in scope inside its blocks.
 
@@ -129,7 +180,7 @@
         something the chart should be re-deriving from a label. The newest month is
         partial, so its upper bound is today rather than a month end in the future. -#}
     <script type="application/json" id="cf-trend-ranges">{{ trend_ranges|tojson }}</script>
-    <article class="card" style="padding: 0.75rem;">
+    <article class="card cf-chart-card" style="padding: 0.75rem;">
         {#- The trend is the one series that *is* fetched: its window is the trailing
             {{ trend_months }} months, not the selected range, so unlike the breakdown
             it is not a re-read of numbers already on this page. -#}
@@ -151,7 +202,7 @@
         /api/cashflow/summary, which would re-run the same six aggregate queries to
         recompute figures that are already in this response. -#}
     <script type="application/json" id="cf-summary">{{ summary.model_dump(mode="json")|tojson }}</script>
-    <article class="card" style="padding: 0.75rem;">
+    <article class="card cf-chart-card" style="padding: 0.75rem;">
         <svg id="cf-breakdown" style="width: 100%; display: block;" aria-label="Category breakdown"></svg>
         <p id="cf-breakdown-caption" class="text-sm text-muted" style="margin: 0.5rem 0 0;"></p>
         <p id="cf-breakdown-empty" class="text-sm text-muted" style="margin: 0.25rem 0 0; display: none;">Nothing to break down in this range.</p>
@@ -160,7 +211,7 @@
 
 {#- The bars above are a rendering of exactly these rows; the tables are what
     make the page readable (and drillable) with JavaScript off. -#}
-<section class="cf-tables" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1.5rem;">
+<section class="cf-tables">
 
     {% if summary.income.lines %}
     <article data-section="income">
