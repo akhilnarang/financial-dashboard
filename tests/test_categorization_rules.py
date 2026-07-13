@@ -75,8 +75,12 @@ def test_email_type_cc_payment_forms_are_card_payments():
     # direction): payment_alert (no "received"), bill_paid, smartpay/BBPS. The
     # bank prefix is irrelevant — only the substring matters.
     def f(et, direction="credit"):
-        return {"counterparty": None, "raw_description": None,
-                "email_type": et, "direction": direction}
+        return {
+            "counterparty": None,
+            "raw_description": None,
+            "email_type": et,
+            "direction": direction,
+        }
 
     for et in (
         "banka_cc_payment_alert",
@@ -85,7 +89,9 @@ def test_email_type_cc_payment_forms_are_card_payments():
     ):
         assert match_rules(f(et), CFG).slug == "credit_card_payment", et
     # debit-side payoffs (paying the card from the bank account) still map
-    assert match_rules(f("bankd_cc_bill_paid", "debit"), CFG).slug == "credit_card_payment"
+    assert (
+        match_rules(f("bankd_cc_bill_paid", "debit"), CFG).slug == "credit_card_payment"
+    )
     assert match_rules(f("banke_cc_smartpay_bbps_alert", "debit"), CFG).slug == (
         "credit_card_payment"
     )

@@ -58,7 +58,10 @@ async def run_llm_sweep(*, batch_limit: int = 100) -> int:
     Returns the number categorized this batch, so a backfill loop stops at 0.
     No-op (0) when LLM categorization is disabled or no provider is configured.
     """
-    if not get_setting_bool("categorization.enabled", False) or not get_active_llm_key():
+    if (
+        not get_setting_bool("categorization.enabled", False)
+        or not get_active_llm_key()
+    ):
         return 0
     # Fetch IDs first, then process each in its own fresh session. A failed row
     # must not expire/contaminate the others (a rollback expires preloaded ORM

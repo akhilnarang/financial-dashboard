@@ -16,7 +16,9 @@ from financial_dashboard.services.categorization.normalize import (
 
 MODEL_DEFAULT = "gemini-2.5-flash"
 NEEDS_REVIEW = "needs_review"
-LLM_TIMEOUT_MS = 30_000  # cap per-call latency so a slow provider can't stall the poll loop
+LLM_TIMEOUT_MS = (
+    30_000  # cap per-call latency so a slow provider can't stall the poll loop
+)
 
 _RESPONSE_SCHEMA: dict[str, object] = {
     "type": "object",

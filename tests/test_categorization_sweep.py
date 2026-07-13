@@ -91,8 +91,12 @@ def test_needs_llm_eligibility_guard():
 
     def txn(method, category=None):
         return Transaction(
-            bank="b", email_type="x", direction="debit", amount=Decimal("1"),
-            category_method=method, category=category,
+            bank="b",
+            email_type="x",
+            direction="debit",
+            amount=Decimal("1"),
+            category_method=method,
+            category=category,
         )
 
     assert sweep._needs_llm(txn(None)) is True
@@ -127,9 +131,14 @@ async def test_review_notify_links_id_and_escapes_fields(memdb, monkeypatch):
         s.add(
             Transaction(
                 # direction/currency are free-text parser fields — include markup.
-                bank="b", email_type="x", direction="deb<it", currency="IN&R",
-                amount=Decimal("5"), counterparty="A & B <x>",
-                review_status="pending", review_reason="unclear <tag>",
+                bank="b",
+                email_type="x",
+                direction="deb<it",
+                currency="IN&R",
+                amount=Decimal("5"),
+                counterparty="A & B <x>",
+                review_status="pending",
+                review_reason="unclear <tag>",
             )
         )
         await s.commit()
@@ -140,8 +149,8 @@ async def test_review_notify_links_id_and_escapes_fields(memdb, monkeypatch):
     assert mode == "HTML"
     # href attribute value escaped — the stray quote can't terminate the attribute
     assert 'href="http://host:8000&quot;x/transactions/' in text
-    assert "A &amp; B &lt;x&gt;" in text          # counterparty escaped
-    assert "unclear &lt;tag&gt;" in text          # reason escaped
-    assert "deb&lt;it" in text                    # direction escaped
-    assert "IN&amp;R" in text                     # currency escaped
+    assert "A &amp; B &lt;x&gt;" in text  # counterparty escaped
+    assert "unclear &lt;tag&gt;" in text  # reason escaped
+    assert "deb&lt;it" in text  # direction escaped
+    assert "IN&amp;R" in text  # currency escaped
     assert "&lt;note&gt;" in text and "&lt;category&gt;" in text
