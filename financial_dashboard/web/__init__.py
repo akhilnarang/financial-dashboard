@@ -6,6 +6,7 @@ from financial_dashboard.web import (
     accounts,
     bank_statements,
     cas,
+    cashflow,
     dashboard,
     emails,
     polling,
@@ -21,6 +22,7 @@ from financial_dashboard.web import (
 router = APIRouter()
 router.include_router(dashboard.router)
 router.include_router(transactions.router)
+router.include_router(cashflow.router)
 router.include_router(emails.router)
 router.include_router(accounts.router)
 router.include_router(networth.router)
