@@ -14,6 +14,13 @@ normalize_text(counterparty + ' ' + raw_description).
 DEFAULT_MERCHANT_RULES: dict[str, list[str]] = {
     "credit_card_payment": [
         "credit card bill payment",
+        # Bill-payment rails, as they appear on BOTH legs: the debit leaving the
+        # bank and the matching credit landing on the card. Neutral either way.
+        "bppy cc payment",
+        "cc payment",
+        "credit card payment",
+        "bill repayment",
+        "bbps pmt",
         "innopay",
         "cred club",
         "payment on cred",

@@ -15,5 +15,17 @@ routes) can depend on it without pulling a session, a setting or a model in.
 # somebody handing money back is not money earned.
 REPAYMENT_SLUG = "repayment"
 
+# Money moving onto a credit card to settle its bill — internal churn, so the
+# cashflow report counts it as neither income nor spend:
+CREDIT_CARD_PAYMENT_SLUG = "credit_card_payment"
+
+# A merchant handing money back:
+REFUND_SLUG = "refund"
+
 # Not a category — the sentinel a classifier writes when it could not pick one.
 UNKNOWN_SLUG = "unknown"
+
+# accounts.type of a credit-card account. Load-bearing outside the vocabulary:
+# a card can only ever be credited by a refund or a bill payment, so the
+# categorizer has to branch on it.
+CREDIT_CARD_ACCOUNT_TYPE = "credit_card"
