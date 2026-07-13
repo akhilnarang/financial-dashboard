@@ -17,9 +17,41 @@ from financial_dashboard.services.categorization.polarity import (
     EXPENSE_SLUGS,
     INCOME_SLUGS,
 )
+from financial_dashboard.services.categorization.slugs import (
+    CREDIT_CARD_ACCOUNT_TYPE,
+    CREDIT_CARD_PAYMENT_SLUG,
+    REFUND_SLUG,
+)
 from financial_dashboard.services.settings import get_self_identifier_tokens
 
 RULESET_VERSION = "rules-v1"
+
+# Narration evidence for the two things that can credit a credit card. Matched as
+# whole tokens (not bare substrings) so e.g. "cc payment" cannot fire on an
+# unrelated "...acc payment..." run of characters.
+CARD_BILL_PAYMENT_MARKERS: tuple[str, ...] = (
+    "cc payment",
+    "credit card payment",
+    "card payment",
+    "bill payment",
+    "bill repayment",
+    "bppy",
+    "bbps pmt",
+    "payment received",
+)
+CARD_REFUND_MARKERS: tuple[str, ...] = (
+    "refund",
+    "refunded",
+    "reversal",
+    "reversed",
+    "chargeback",
+    "cancellation",
+)
+
+
+def _has_marker(text_norm: str, markers: tuple[str, ...]) -> bool:
+    padded = f" {text_norm} "
+    return any(f" {marker} " in padded for marker in markers)
 
 
 class RuleConfig(NamedTuple):
@@ -83,6 +115,23 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
     ):
         return RuleResult("credit_card_payment", 0.95)
 
+    # A credit on a credit card is money returning TO the card — the account
+    # holds what you owe, so it cannot receive inbound income. Only two things
+    # produce one: a merchant reversing a charge, or a payment against the bill.
+    # Decide on narration evidence here, ahead of the merchant rules, so a bill
+    # payment routed through a merchant-looking rail is still read as a payment.
+    is_card_credit = (
+        direction == "credit" and fields.get("account_type") == CREDIT_CARD_ACCOUNT_TYPE
+    )
+    if is_card_credit:
+        if _has_marker(text_norm, CARD_REFUND_MARKERS):
+            return RuleResult(REFUND_SLUG, 0.9)
+        # A leading "Payment/..." is the bank's own label for a card bill payment.
+        if _has_marker(text_norm, CARD_BILL_PAYMENT_MARKERS) or text_norm.startswith(
+            "payment "
+        ):
+            return RuleResult(CREDIT_CARD_PAYMENT_SLUG, 0.95)
+
     # Merchant/type rules run BEFORE the self-by-counterparty rule: a specific
     # narration signal (e.g. "CASHBACK FOR BILLPAY", a CRED payment) must win
     # over a weak "Self"/own-name counterparty label (common in bank statements).
@@ -111,5 +160,14 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
         for tok in (normalize_counterparty(t) for t in config.self_name_tokens)
     ):
         return RuleResult("self_transfer", 0.9)
+
+    # No narration or merchant evidence, but the account still constrains the
+    # answer: a card credit with nothing to go on is overwhelmingly a bill
+    # payment, and letting it through would hand it to the credit fallback
+    # ('repayment'), which counts as inbound money on a card that cannot receive
+    # any. Lower confidence than the narration-backed rules above: it is a
+    # structural default, not a positive identification.
+    if is_card_credit:
+        return RuleResult(CREDIT_CARD_PAYMENT_SLUG, 0.7)
 
     return None

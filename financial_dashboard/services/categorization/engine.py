@@ -97,6 +97,9 @@ async def categorize_one(
         "direction": txn.direction,
         "amount": str(txn.amount),
         "currency": txn.currency or "INR",
+        # None when the transaction has no linked account. The rules layer needs
+        # it: what a credit can possibly mean depends on the account it lands on.
+        "account_type": account_type,
     }
 
     rule_hit = match_rules(fields, load_rule_config())
@@ -156,12 +159,12 @@ async def categorize_one(
     txn.categorized_at = utc_now()
 
     if result.slug == NEEDS_REVIEW or result.confidence < _confidence_threshold():
-        resolved, _ = resolve_direction("unknown", txn.direction)
+        resolved, _ = resolve_direction("unknown", txn.direction, account_type)
         txn.category = resolved
         txn.review_status = "pending"
         txn.review_reason = result.reason
     else:
-        resolved, changed = resolve_direction(result.slug, txn.direction)
+        resolved, changed = resolve_direction(result.slug, txn.direction, account_type)
         txn.category = resolved
         if changed:
             # The model gave a directionally-impossible slug — it was confused,
