@@ -281,6 +281,37 @@ async def init_db(engine) -> None:
             )
         )
 
+        # An existing database does not get the index from the model's table_args
+        # — create_all only builds indexes for tables it creates — so it is added
+        # here. Category-first so a filter with no date bounds can seek instead of
+        # scanning the table; transaction_date second so a dated category filter
+        # uses both terms of one index. The marker keeps the ANALYZE off every
+        # subsequent boot; the index itself is created idempotently regardless, so
+        # a database that somehow lost it still gets it back.
+        category_index_marker = (
+            await conn.execute(
+                text(
+                    "SELECT 1 FROM settings WHERE key = 'migrations.ix_transactions_category_date'"
+                )
+            )
+        ).first()
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_transactions_category_date "
+                "ON transactions (category, transaction_date)"
+            )
+        )
+        if not category_index_marker:
+            # Without fresh stats the planner keeps its old shape for the queries
+            # this index exists for.
+            await conn.execute(text("ANALYZE transactions"))
+            await conn.execute(
+                text(
+                    "INSERT INTO settings (key, value) VALUES "
+                    "('migrations.ix_transactions_category_date', '1')"
+                )
+            )
+
         nach_marker = (
             await conn.execute(
                 text(

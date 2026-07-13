@@ -1,9 +1,19 @@
 from decimal import Decimal  # noqa: F401
+from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import financial_dashboard
+from financial_dashboard.api import router as api_router
+from financial_dashboard.core.deps import get_session
 from financial_dashboard.db.models import Base
+from financial_dashboard.web import get_router
+
+STATIC_DIR = Path(financial_dashboard.__file__).resolve().parent / "static"
 
 
 @pytest.fixture
@@ -34,6 +44,36 @@ async def session():
     async with maker() as s:
         yield s
     await engine.dispose()
+
+
+@pytest.fixture
+async def client(session):
+    """HTTP client over an app mounting both routers, bound to the ``session`` fixture.
+
+    Both the JSON (``/api/...``) and HTML routers are mounted, as the real app
+    factory does, so a single fixture serves page tests and endpoint tests alike.
+    The app is built directly rather than via ``create_app`` to skip the lifespan
+    (DB init, pollers, auth), and ``get_session`` yields the test session so
+    writes made in a test are visible to the request that follows.
+
+    ``/static`` is mounted from the same directory the real app serves, so a page's
+    ``<script src="/static/...">`` resolves under test: without it every asset a
+    page loads would 404 here and a renamed or deleted module would still pass.
+    """
+    app = FastAPI()
+
+    async def _override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.include_router(api_router)
+    app.include_router(get_router())
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        yield c
 
 
 @pytest.fixture

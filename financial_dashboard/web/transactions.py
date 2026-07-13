@@ -21,6 +21,15 @@ from financial_dashboard.db import (
     SmsMessage,
     Transaction,
 )
+from financial_dashboard.services.cashflow.buckets import INTERNAL_SLUGS
+from financial_dashboard.services.cashflow.report import (
+    BLANK_CATEGORY,
+    BLANK_COUNTERPARTY,
+    INR_OR_NULL,
+    NON_INR,
+    UNCATEGORIZED,
+    is_blank_counterparty,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +66,33 @@ async def transaction_list(
     date_to: Annotated[
         str | None, Query(description="Transaction date on/before (YYYY-MM-DD)")
     ] = None,
+    category: Annotated[
+        str | None, Query(description="Filter by category slug")
+    ] = None,
+    counterparty: Annotated[
+        str | None,
+        Query(description="Filter by counterparty; blank matches no counterparty"),
+    ] = None,
+    uncategorized: Annotated[
+        str | None, Query(description="Set to 1 for rows with no usable category")
+    ] = None,
+    category_null: Annotated[
+        str | None,
+        Query(description="Set to 1 for rows carrying no category (NULL or blank)"),
+    ] = None,
+    internal: Annotated[
+        str | None, Query(description="Set to 1 for internal-movement rows")
+    ] = None,
+    non_inr: Annotated[
+        str | None,
+        Query(
+            description="1 for rows not denominated in INR, 0 for rupee rows only "
+            "(INR or no currency); omit for no currency filter"
+        ),
+    ] = None,
+    undated: Annotated[
+        str | None, Query(description="Set to 1 for rows with no transaction date")
+    ] = None,
     sort: Annotated[str, Query(description="Sort column")] = "date",
     order: Annotated[str, Query(description="Sort order: asc or desc")] = "desc",
     page: Annotated[int, Query(ge=1, description="Page number (1-indexed)")] = 1,
@@ -92,6 +128,47 @@ async def transaction_list(
             )
         except ValueError:
             pass
+    if category:
+        stmt = stmt.where(Transaction.category == category)
+    if counterparty is not None:
+        if is_blank_counterparty(counterparty):
+            # A blank counterparty is a filter, not an absent one: it selects the
+            # rows that carry no counterparty at all, whether that is stored as
+            # NULL, as an empty string, or as whitespace. Both the test for the
+            # incoming value and the clause it produces come from the report, so
+            # this lists exactly the rows the report's "(no counterparty)" line
+            # counted — no spelling of blank can fall between the two.
+            stmt = stmt.where(BLANK_COUNTERPARTY)
+        else:
+            stmt = stmt.where(Transaction.counterparty == counterparty)
+    if uncategorized == "1":
+        # Uncategorized means "has no category the bucket map can place": blank,
+        # the 'unknown' sentinel, or a runtime slug the map does not know. The
+        # clause is the one the report's uncategorized line aggregates on, imported
+        # rather than restated, so the count on the tile and the rows listed here
+        # cannot drift apart. No currency clause — a non-INR row with no category
+        # is still uncategorized.
+        stmt = stmt.where(UNCATEGORIZED)
+    if category_null == "1":
+        # Strictly the rows carrying no category at all — NULL or blank, which are
+        # the same absence and are counted as one line by the report. This is
+        # narrower than `uncategorized`, which also takes in the 'unknown' sentinel
+        # and slugs the bucket map does not know: a report line that counts only
+        # the category-less rows needs a filter that lists only those rows, or its
+        # link would return more rows than the line it sits on says it has.
+        stmt = stmt.where(BLANK_CATEGORY)
+    if internal == "1":
+        stmt = stmt.where(Transaction.category.in_(tuple(INTERNAL_SLUGS)))
+    if non_inr == "1":
+        stmt = stmt.where(NON_INR)
+    elif non_inr == "0":
+        # The complement, and the exact population the rupee buckets of the
+        # cashflow report sum: a NULL currency is a rupee row that predates the
+        # column's default. Without this value a bucket's drill-through would
+        # list foreign rows its own total left out.
+        stmt = stmt.where(INR_OR_NULL)
+    if undated == "1":
+        stmt = stmt.where(Transaction.transaction_date.is_(None))
 
     count_stmt = select(func.count()).select_from(stmt.subquery())
     total_count = (await session.execute(count_stmt)).scalar() or 0
@@ -160,7 +237,7 @@ async def transaction_list(
         )
 
     # Build base query string for pagination/sort links
-    filters = {
+    form_filters = {
         "bank": bank,
         "account_id": account_id,
         "card_id": card_id,
@@ -168,7 +245,23 @@ async def transaction_list(
         "date_from": date_from,
         "date_to": date_to,
     }
-    base_qs = urlencode({k: v for k, v in filters.items() if v})
+    drill_filters = {
+        "category": category,
+        "counterparty": counterparty,
+        "uncategorized": uncategorized,
+        "category_null": category_null,
+        "internal": internal,
+        "non_inr": non_inr,
+        "undated": undated,
+    }
+    filters = {**form_filters, **drill_filters}
+    # Drill params are kept whenever they are present, empty string included: a
+    # blank counterparty narrows the result set, so dropping it on truthiness
+    # would silently widen page 2 to every row.
+    base_qs = urlencode(
+        {k: v for k, v in form_filters.items() if v}
+        | {k: v for k, v in drill_filters.items() if v is not None}
+    )
 
     # Page window: show pages around current
     def page_window():

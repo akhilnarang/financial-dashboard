@@ -404,6 +404,13 @@ class Transaction(Base):
     __table_args__ = (
         Index("ix_transactions_transaction_date", "transaction_date"),
         Index("ix_transactions_bank", "bank"),
+        # Category-first, date-second. A drill-through that carries dates was
+        # already served by the date index alone; the case this exists for is a
+        # bare ?category= with no bounds, whose row query scanned the whole table
+        # through the date index and whose paging count() scanned it outright. The
+        # date column rides along so a dated category filter uses both terms of one
+        # index instead of narrowing on dates and re-checking the category per row.
+        Index("ix_transactions_category_date", "category", "transaction_date"),
         Index(
             "ix_transactions_reference_number",
             "reference_number",
