@@ -2,6 +2,11 @@
 
 from typing import NamedTuple
 
+from financial_dashboard.services.categorization.slugs import (
+    REPAYMENT_SLUG,
+    UNKNOWN_SLUG,
+)
+
 EXPENSE_SLUGS: frozenset = frozenset(
     {
         "expense",
@@ -46,7 +51,7 @@ INCOME_SLUGS: frozenset = frozenset(
 # credit_card_payment, investment, misc. NOTE: 'unknown' is NOT neutral — it is
 # always replaced by the direction default below.
 DEBIT_DEFAULT = "expense"
-CREDIT_DEFAULT = "repayment"
+CREDIT_DEFAULT = REPAYMENT_SLUG
 
 
 class DirectionResult(NamedTuple):
@@ -62,9 +67,9 @@ def resolve_direction(slug: str, direction: str) -> DirectionResult:
       otherwise unchanged.
     """
     if direction == "debit":
-        if slug in INCOME_SLUGS or slug == "unknown":
+        if slug in INCOME_SLUGS or slug == UNKNOWN_SLUG:
             return DirectionResult(DEBIT_DEFAULT, True)
     elif direction == "credit":
-        if slug in EXPENSE_SLUGS or slug == "unknown":
+        if slug in EXPENSE_SLUGS or slug == UNKNOWN_SLUG:
             return DirectionResult(CREDIT_DEFAULT, True)
     return DirectionResult(slug, False)
