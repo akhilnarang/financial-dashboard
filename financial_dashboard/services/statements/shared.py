@@ -16,6 +16,9 @@ from financial_dashboard.db import (
     async_session,
 )
 from financial_dashboard.services.linker import build_link_context, link_transaction
+from financial_dashboard.services.categorization.self_transfer import (
+    apply_reference_self_transfer_rule,
+)
 from financial_dashboard.services.snapshots import emit_bank_snapshot, emit_cc_snapshot
 from financial_dashboard.services.statements.dates import (
     bank_stmt_date_range,
@@ -226,6 +229,7 @@ async def retry_bank_statement_upload(
             await session.flush()
             link_transaction(link_ctx, txn)
             await session.flush()
+            await apply_reference_self_transfer_rule(session, txn)
             entry["imported"] = True
             entry["imported_txn_id"] = txn.id
             imported += 1

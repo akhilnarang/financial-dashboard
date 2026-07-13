@@ -18,6 +18,9 @@ from financial_dashboard.services.categorization.rules import (
     match_rules,
 )
 from financial_dashboard.services.categorization.polarity import resolve_direction
+from financial_dashboard.services.categorization.self_transfer import (
+    apply_reference_self_transfer_rule,
+)
 from financial_dashboard.services.categorization.vocabulary import (
     get_active_slugs,
     get_vocab_version,
@@ -80,6 +83,9 @@ def _confidence_threshold() -> float:
 async def categorize_one(
     session: AsyncSession, txn: Transaction, *, use_llm: bool
 ) -> str:
+    if await apply_reference_self_transfer_rule(session, txn):
+        return "rule"
+
     account_type = await resolve_account_type(session, txn)
     payload = build_input_payload(txn, account_type)
     input_hash = compute_input_hash(payload)

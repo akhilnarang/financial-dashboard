@@ -170,7 +170,9 @@ async def init_db(engine) -> None:
         ).scalar() or 0
         for _slug in SEED_CATEGORIES:
             await conn.execute(
-                text("INSERT OR IGNORE INTO categories (slug, active) VALUES (:slug, 1)"),
+                text(
+                    "INSERT OR IGNORE INTO categories (slug, active) VALUES (:slug, 1)"
+                ),
                 {"slug": _slug},
             )
         _cat_after = (
@@ -271,6 +273,13 @@ async def init_db(engine) -> None:
                     "('migrations.uq_ref_includes_direction', '1')"
                 )
             )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_transactions_reference_number "
+                "ON transactions (reference_number) "
+                "WHERE reference_number IS NOT NULL"
+            )
+        )
 
         nach_marker = (
             await conn.execute(

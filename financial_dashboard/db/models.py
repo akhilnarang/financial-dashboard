@@ -405,6 +405,11 @@ class Transaction(Base):
         Index("ix_transactions_transaction_date", "transaction_date"),
         Index("ix_transactions_bank", "bank"),
         Index(
+            "ix_transactions_reference_number",
+            "reference_number",
+            sqlite_where=text("reference_number IS NOT NULL"),
+        ),
+        Index(
             "uq_transactions_ref",
             "bank",
             "reference_number",

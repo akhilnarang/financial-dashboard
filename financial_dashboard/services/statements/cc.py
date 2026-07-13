@@ -56,6 +56,9 @@ from financial_dashboard.core.masks import mask_digits, mask_last4
 from bank_email_parser.models import Money, ParsedEmail
 
 from financial_dashboard.integrations.parsers import parse_cc_statement_pdf
+from financial_dashboard.services.categorization.self_transfer import (
+    apply_reference_self_transfer_rule,
+)
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.snapshots import emit_cc_snapshot
 from financial_dashboard.services.statements.hint import extract_password_hint
@@ -433,6 +436,7 @@ async def import_missing_cc_txns(
         await session.flush()
         link_transaction(link_ctx, txn)
         await session.flush()
+        await apply_reference_self_transfer_rule(session, txn)
         entry["imported"] = True
         entry["imported_txn_id"] = txn.id
         imported.append(txn)

@@ -48,6 +48,9 @@ from financial_dashboard.core.dates import parse_date
 from financial_dashboard.core.masks import mask_last4
 from financial_dashboard.integrations.parsers import parse_bank_statement_pdf
 from financial_dashboard.services.linker import build_link_context, link_transaction
+from financial_dashboard.services.categorization.self_transfer import (
+    apply_reference_self_transfer_rule,
+)
 from financial_dashboard.services.snapshots import emit_bank_snapshot
 from financial_dashboard.services.settings import (
     get_setting_int,
@@ -1047,6 +1050,8 @@ async def process_bank_statement_email(
                     entry.get("reference_number"),
                 )
                 continue
+
+            await apply_reference_self_transfer_rule(session, txn)
 
             entry["imported"] = True
             entry["imported_txn_id"] = txn.id

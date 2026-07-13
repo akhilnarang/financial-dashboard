@@ -19,6 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.masks import mask_digits, mask_last4
 from financial_dashboard.db import Transaction
+from financial_dashboard.services.categorization.self_transfer import (
+    apply_reference_self_transfer_rule,
+)
 from financial_dashboard.services.parser_quirks import (
     AMBIGUOUS_12H_TIME_EMAIL_TYPES,
     CARD_PAYMENT_LINK_BY_MASK_EMAIL_TYPES,
@@ -693,6 +696,7 @@ async def merge_transaction(
             if decision.action != "match":
                 raise
         else:
+            await apply_reference_self_transfer_rule(session, row)
             return MergeTransactionResult("created", row, EnrichmentDiff())
 
     if decision.action == "defer":
@@ -733,6 +737,7 @@ async def merge_transaction(
         match.enriched_at = _dt.datetime.now(_dt.UTC)
 
     await session.flush()
+    await apply_reference_self_transfer_rule(session, match)
     return MergeTransactionResult("enriched", match, diff)
 
 
@@ -776,4 +781,5 @@ async def _insert_new(
     )
     session.add(row)
     await session.flush()
+    await apply_reference_self_transfer_rule(session, row)
     return MergeTransactionResult("created", row, EnrichmentDiff())

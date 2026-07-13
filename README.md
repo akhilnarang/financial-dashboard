@@ -418,6 +418,7 @@ Relationship notes:
 - `emails.message_id` is globally unique (prevents re-inserting the same email).
 - `(source_id, remote_id)` is unique on `emails` (provider-scoped deduplication).
 - `transactions` has a partial unique index on `(bank, reference_number, direction)` where `reference_number IS NOT NULL` (deduplicates transactions with known UTR/UPI reference numbers; direction is included so a debit and credit sharing a ref don't collide).
+- `transactions` also has a partial lookup index on `reference_number` where it is non-null; ingest uses it to find an opposite-direction leg on a different linked or masked account and mark both transactions as `self_transfer`.
 - `(account_id, card_mask)` is unique on `cards`.
 - `balance_snapshots` has a check constraint requiring exactly one source foreign key among `account_id`, `cas_upload_id`, and `manual_item_id`.
 - `balance_snapshots` has SQLite partial unique indexes for account, investment, and manual snapshot upserts: `(account_id, category, as_of_date)`, `(portfolio_key, category, as_of_date)`, and `(manual_item_id, as_of_date)`.

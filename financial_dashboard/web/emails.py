@@ -44,6 +44,9 @@ from financial_dashboard.services.cc_disambiguation import (
     resolve_cc_payment_account,
     should_auto_reconcile_statement,
 )
+from financial_dashboard.services.categorization.self_transfer import (
+    apply_reference_self_transfer_rule,
+)
 from financial_dashboard.services.emails import parse_email_by_kind
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.reminders import check_payment_received
@@ -427,6 +430,7 @@ async def _apply_reparsed_transaction(
             pass
         else:
             await session.flush()
+            await apply_reference_self_transfer_rule(session, txn_row)
             if txn_row.account_id is None:
                 # Run the linker for fresh inserts, own-orphan upserts (FKs
                 # just cleared), and cross-channel rows that arrived unlinked.
