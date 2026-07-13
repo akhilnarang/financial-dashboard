@@ -366,12 +366,14 @@ async def test_reparse_same_ref_different_amount_defers_not_409(session_maker):
         )
         session.add(rule)
         await session.flush()
-        # Pre-existing ₹5,555 row sharing the parsed reference_number.
+        # Pre-existing ₹5,555 row sharing the parsed reference_number. The Kotak
+        # digital "Transaction Successful" mail is a credit, so the row must be a
+        # credit too — direction is part of the dedup match key.
         session.add(
             Transaction(
                 bank="kotak",
                 email_type="kotak_digital_transaction",
-                direction="debit",
+                direction="credit",
                 amount=Decimal("5555"),
                 currency="INR",
                 transaction_date=datetime.date(2026, 5, 3),
