@@ -851,3 +851,171 @@ async def test_embedded_json_cannot_break_out_of_its_script_block(client, sessio
     # table below the chart is free to carry them.
     assert "\u2028" not in block.group(1)
     assert "\u2029" not in block.group(1)
+
+
+# ---------------------------------------------------------------------------
+# Layout: the breakdown tables must stay inside their own grid track.
+#
+# These are structural assertions, not layout ones. Nothing here lays the page
+# out — there is no browser in this suite — so what they prove is that the
+# selectors and the overriding declarations the fix depends on are still on the
+# page, not that the pixels land where they should. That is exactly the gap that
+# let the bug ship: the whole suite passed while the Investments table painted
+# over the Transfers In links. A test that could have *caught* it needs a DOM
+# harness with real layout (jsdom does not compute it; a headless browser does),
+# which is a known, filed gap and a new dependency this suite does not take.
+#
+# What they do catch is the regression by which the bug arrived and would arrive
+# again: someone deletes the page-scoped override, base.html's global rule wins
+# back, and the tables stop clipping.
+# ---------------------------------------------------------------------------
+
+# The bucket each rendered table charts under. The investment table is the odd
+# one: its section is "investment" but its rows drill under the "net_invested"
+# tile, because that is the tile they are the breakdown of.
+SECTION_LINES = {
+    "income": "income",
+    "expense": "expense",
+    "investment": "net_invested",
+    "transfers_in": "transfers_in",
+    "uncategorized": "uncategorized",
+}
+
+
+def _css(page: str) -> str:
+    """Every <style> block on the page, whitespace-normalized for matching."""
+    return re.sub(
+        r"\s+", " ", "\n".join(re.findall(r"<style>(.*?)</style>", page, re.DOTALL))
+    )
+
+
+async def _seed_all_five_buckets(session):
+    """One line in every bucket, so all five tables render side by side."""
+    await _add(session, amount="90000", direction="credit", category="salary")
+    await _add(session, amount="19500", direction="debit", category="rent")
+    await _add(session, amount="10000", direction="debit", category="investment")
+    await _add(session, amount="4000", direction="credit", category="investment")
+    await _add(
+        session,
+        amount="1500",
+        direction="credit",
+        category="repayment",
+        counterparty="Alice",
+    )
+    await _add(session, amount="700", direction="debit", category=None)
+
+
+async def test_breakdown_tables_are_scoped_so_they_cannot_overflow_their_grid_track(
+    client, session
+):
+    """The tables sit in a grid, and base.html stops clipping `.table` at >=1400px.
+
+    That rule is right for the ledger's wide stacked tables and wrong for these:
+    a table that will not clip does not run wide harmlessly here, it paints into
+    the *next grid track*. The Investments table is 4 columns and the widest, so
+    it drew over the Transfers In links beside it — and being on top, its anchors
+    took the clicks, sending a reader who clicked a counterparty to the wrong
+    transactions entirely.
+
+    So the page must override that rule for its own tables. If the override goes,
+    the global rule wins again and the overlap comes back.
+    """
+    await _seed_all_five_buckets(session)
+
+    r = await client.get(f"/cashflow?{RANGE}")
+    assert r.status_code == 200
+    page = r.text
+    css = _css(page)
+
+    # The hazard this override exists to answer is really on the page: without
+    # base.html's wide-screen rule, none of what follows would be load-bearing,
+    # and this test would be asserting against nothing.
+    assert re.search(
+        r"@media \(min-width: 1400px\) \{ \.table \{ overflow-x: visible;", css
+    ), "base.html's global wide-screen rule is gone; this override may be obsolete"
+
+    # The tables are the grid, and every table region is inside it.
+    grid = _region(page, 'class="cf-tables"')
+    for section in SECTION_LINES:
+        assert f'data-section="{section}"' in grid, (
+            f"the {section} table is outside .cf-tables, so the scoping below "
+            f"does not reach it"
+        )
+
+    # A grid item defaults to min-width: auto and refuses to shrink below its
+    # content's intrinsic width — which is what forced the table wider than its
+    # track in the first place. Without this, the overflow rule below cannot fire.
+    assert ".cf-tables > article { min-width: 0; }" in css
+
+    # And with shrinking allowed, the table clips inside the track it was given.
+    # `.cf-tables .table` outranks base's bare `.table` on specificity, so this
+    # holds *inside* the >=1400px media query too, which is the entire point.
+    assert re.search(
+        r"\.cf-tables \.table \{ width: 100%; max-width: 100%; overflow-x: auto;", css
+    ), "the cashflow tables no longer override the global overflow-x: visible"
+
+    # A track that cannot go below 320px on a narrow phone would itself overflow
+    # the viewport; min() lets it fall back to the full width instead.
+    assert (
+        "grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));" in css
+    )
+
+    # The charts are sized from their SVG's measured width, so a chart that
+    # overflowed its card would feed the next resize a width it had just grown to.
+    assert ".cf-chart-card { overflow: hidden; }" in css
+    assert re.search(
+        r"#cf-breakdown, #cf-trend \{ display: block; width: 100%; max-width: 100%; overflow: hidden;",
+        css,
+    )
+    # Both chart cards actually carry the clipping class — a rule matching nothing
+    # is not a fix.
+    assert page.count('class="card cf-chart-card"') == 2
+
+    # The override must come *after* base.html's rule as well as outrank it: a
+    # page-level <style> that the base stylesheet followed would lose on order.
+    assert page.index(".cf-tables .table") > page.index("overflow-x: visible")
+
+
+async def test_each_tables_drill_anchors_are_namespaced_to_its_own_tile(
+    client, session
+):
+    """No table's anchors can be mistaken for another's.
+
+    The chart looks a bar's link up as DRILL[tile][key], so the anchors have to
+    partition cleanly by tile. This is also the invariant the overlap bug made a
+    liar of *visually*: an Income anchor sat on top of a Transfers In row and took
+    its click. The markup was never the problem — the anchors were correctly
+    namespaced all along — and this pins that down so a future refactor of the
+    tables cannot quietly merge two tiles' links into one namespace.
+    """
+    await _seed_all_five_buckets(session)
+
+    r = await client.get(f"/cashflow?{RANGE}")
+    page = r.text
+
+    seen = set()
+    for section, line in SECTION_LINES.items():
+        region = _region(page, "data-section", section)
+        lines_in_region = set(re.findall(r"<a data-line=\"([^\"]+)\"", region))
+        assert lines_in_region == {line}, (
+            f"the {section} table renders anchors for {lines_in_region}, not just "
+            f"{line!r}: a bar in one tile would drill into another tile's rows"
+        )
+        # Each key is unique within its tile, so DRILL[tile][key] cannot collide.
+        keys = [key for key, _ in _lines(region, line)]
+        assert keys, f"the {section} table rendered no drill anchors at all"
+        assert len(keys) == len(set(keys)), f"duplicate drill keys in {section}: {keys}"
+        seen.add(line)
+
+    # Every anchor on the page belongs to one of the five, so none is orphaned
+    # into a namespace no tile selects.
+    assert set(re.findall(r"<a data-line=\"([^\"]+)\"", page)) == seen
+
+    # The Income and Transfers In anchors — the two the overlap confused — carry
+    # genuinely different predicates, so landing on the wrong one lists the wrong
+    # rows. That is what made the overlap damaging rather than merely ugly.
+    (income_href,) = [href for _, href in _lines(page, "income")]
+    (transfers_href,) = [href for _, href in _lines(page, "transfers_in")]
+    assert income_href != transfers_href
+    assert "category=salary" in income_href
+    assert "category=repayment&amp;counterparty=Alice" in transfers_href
