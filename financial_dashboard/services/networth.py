@@ -7,6 +7,7 @@ from decimal import Decimal
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from financial_dashboard.core.dates import month_end
 from financial_dashboard.db.enums import SnapshotCategory, SnapshotKind
 from financial_dashboard.db.models import (
     Account,
@@ -175,14 +176,6 @@ async def current_networth(
     )
 
 
-def _month_end(year: int, month: int) -> datetime.date:
-    if month == 12:
-        first_of_next = datetime.date(year + 1, 1, 1)
-    else:
-        first_of_next = datetime.date(year, month + 1, 1)
-    return first_of_next - datetime.timedelta(days=1)
-
-
 async def monthly_trend(
     session: AsyncSession, *, today: datetime.date | None = None
 ) -> list[TrendPoint]:
@@ -237,8 +230,8 @@ async def monthly_trend(
     points: list[TrendPoint] = []
     year, month = earliest.year, earliest.month
     while True:
-        month_end = _month_end(year, month)
-        cutoff = min(month_end, as_of_today)
+        last_day = month_end(datetime.date(year, month, 1))
+        cutoff = min(last_day, as_of_today)
         while snap_idx < len(snapshots) and snapshots[snap_idx].as_of_date <= cutoff:
             snapshot = snapshots[snap_idx]
             best[_source_key(snapshot)] = snapshot
@@ -256,7 +249,7 @@ async def monthly_trend(
         points.append(
             TrendPoint(month=cutoff.strftime("%Y-%m"), value=assets - liabilities)
         )
-        if month_end >= as_of_today:
+        if last_day >= as_of_today:
             break
         if month == 12:
             year += 1

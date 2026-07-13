@@ -306,3 +306,24 @@ async def test_inactive_item_history_has_no_edit_delete_forms(session):
     # History date still shown (read-only), but no mutate forms for this item.
     assert "01 Apr 2026" in body
     assert "/snapshot/" not in body
+
+
+async def test_networth_page_carries_its_chart_and_the_app_serves_it(client):
+    """The page's own tests assert the figure and the heading, and every one of them
+    would still pass with the trend chart gone: the module tag deleted, networth.js
+    renamed under the mount, the SVG's data-trend-url dropped. This is the assertion
+    that fails when that happens — the tag is on the page, its src resolves through
+    the app, and the hooks the module reads are where it looks for them."""
+    page = await client.get("/networth")
+    assert page.status_code == 200
+    assert '<script type="module" src="/static/js/networth.js"></script>' in page.text
+    assert 'id="nw-trend"' in page.text
+    assert 'data-trend-url="/api/networth/trend"' in page.text
+
+    module = await client.get("/static/js/networth.js")
+    assert module.status_code == 200, "the page loads networth.js, the app 404s it"
+    assert "charts.js" in module.text, "networth.js does not import the chart module"
+
+    # The URL the SVG names is one the app answers, so the chart has data to draw.
+    trend = await client.get("/api/networth/trend")
+    assert trend.status_code == 200
