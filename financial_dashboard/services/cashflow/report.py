@@ -6,11 +6,30 @@ Nothing here writes; the numbers are aggregated in SQL and returned as the
 pydantic response models, so the JSON API and the HTML page render the same
 figures from the same source.
 
+The report is a **cash-basis** one: every headline figure, the trend and the
+footnotes are scoped to the **bank** (``scope.BANK_SCOPE``). Money is spent when
+it leaves the bank, which for a card is the day the *bill* is paid, not the day
+of the swipe — so ``credit_card_payment`` is an expense here, and the swipes
+themselves are out of scope entirely. That answers "did I spend more than I
+earned".
+
+The one figure that is *not* bank-scoped is the expense **detail**, which
+aggregates every account and answers a different question — "what did I actually
+buy" — by counting the swipes. There, a card bill is internal churn again, or it
+would charge the same rupee twice. The two are therefore never added together,
+and they do not reconcile: over any range their difference is exactly the timing
+gap between what was bought and what has been paid for.
+
+Nothing is dropped for being out of scope. A row on no account, or on an account
+whose type the code does not know, is *unaccounted* and is counted in a footnote
+of its own, outside the reconciliation arithmetic.
+
 The one rule everything else falls out of: a row's signed flow is ``+amount``
 for a credit and ``-amount`` for a debit. Contra behaviour needs no special
 case — a refund or cashback credit lands in the expense bucket with a positive
 signed flow, which *reduces* spend once the bucket is displayed; an investment
-redemption credit likewise nets against contributions.
+redemption credit likewise nets against contributions; and a reversed card bill
+nets off the bills it was reversed from, with no machinery of its own.
 
 Date basis is ``transaction_date`` alone (never a ``created_at`` fallback): it
 is the column ``/transactions`` filters on, so every figure here covers exactly
@@ -44,15 +63,26 @@ from financial_dashboard.schemas.cashflow import (
 )
 from financial_dashboard.services.cashflow.buckets import (
     BUCKET_BY_SLUG,
-    INTERNAL_SLUGS,
     TRANSFERS_IN_SLUG,
     bucket_for_slug,
+    internal_slugs_for_scope,
     label_for_slug,
+)
+from financial_dashboard.services.cashflow.scope import (
+    BANK_SCOPE,
+    UNACCOUNTED_SCOPE,
+    Scope,
 )
 from financial_dashboard.services.categorization.slugs import UNKNOWN_SLUG
 
 MAX_TREND_MONTHS = 60
 NO_COUNTERPARTY_LABEL = "(no counterparty)"
+
+#: The scope every headline figure, footnote and trend point is drawn over. Named
+#: once so the report, its drill-through links and the bucket map cannot come to
+#: disagree about which rows a figure counted.
+REPORT_SCOPE: Scope = "bank"
+BANK_INTERNAL_SLUGS = tuple(internal_slugs_for_scope(REPORT_SCOPE))
 
 # A NULL currency is an INR row that predates the column's default, not an
 # unknown one: bucket it as INR rather than dropping it.
@@ -168,11 +198,16 @@ async def cashflow_summary(
     date_from: datetime.date,
     date_to: datetime.date,
 ) -> CashflowSummary:
-    """Aggregate one inclusive ``transaction_date`` range into report buckets."""
+    """Aggregate one inclusive ``transaction_date`` range into report buckets.
+
+    Every figure on the returned summary is bank-scoped except ``expense_detail``,
+    which spans all accounts, and the unaccounted/undated footnotes, which exist
+    precisely to count what the bank scope leaves out.
+    """
     in_range = Transaction.transaction_date.between(date_from, date_to)
 
-    # The headline buckets share one scan of the in-range INR-or-null rows.
-    # Grouping by direction as well as category is what lets the investment
+    # The headline buckets share one scan of the in-range, bank-side INR-or-null
+    # rows. Grouping by direction as well as category is what lets the investment
     # bucket split: `investment` is direction-neutral and can be both a
     # contribution and a redemption in the same range, which category alone
     # cannot tell apart.
@@ -184,7 +219,7 @@ async def cashflow_summary(
                 SIGNED_FLOW,
                 ROW_COUNT,
             )
-            .where(in_range, INR_OR_NULL)
+            .where(in_range, INR_OR_NULL, BANK_SCOPE)
             .group_by(Transaction.category, Transaction.direction)
         )
     ).all()
@@ -195,7 +230,7 @@ async def cashflow_summary(
 
     for slug, direction, flow, count in grouped:
         signed = _decimal(flow)
-        bucket = bucket_for_slug(slug)
+        bucket = bucket_for_slug(slug, scope=REPORT_SCOPE)
         if bucket == "income":
             _merge(income, slug, signed, count)
         elif bucket == "expense":
@@ -239,6 +274,7 @@ async def cashflow_summary(
 
     transfers_in = await _transfers_in(session, in_range)
     uncategorized = await _uncategorized(session, in_range)
+    expense_detail = await _expense_detail(session, in_range)
     footnotes = await _footnotes(session, in_range)
 
     income_summary = _bucket(income_lines)
@@ -248,6 +284,7 @@ async def cashflow_summary(
         date_to=date_to,
         income=income_summary,
         expense=expense_summary,
+        expense_detail=expense_detail,
         investment=investment_summary,
         transfers_in=transfers_in,
         uncategorized=uncategorized,
@@ -291,7 +328,12 @@ async def _transfers_in(
     rows = (
         await session.execute(
             select(NORMALIZED_COUNTERPARTY, SIGNED_FLOW, ROW_COUNT)
-            .where(in_range, INR_OR_NULL, Transaction.category == TRANSFERS_IN_SLUG)
+            .where(
+                in_range,
+                INR_OR_NULL,
+                BANK_SCOPE,
+                Transaction.category == TRANSFERS_IN_SLUG,
+            )
             .group_by(NORMALIZED_COUNTERPARTY)
         )
     ).all()
@@ -319,6 +361,11 @@ async def _uncategorized(
 ) -> BucketSummary:
     """Rows no bucket can place: NULL, the 'unknown' sentinel, or an unmapped slug.
 
+    Bank-scoped, like the buckets it is the error bar on: only a bank-side
+    uncategorized row can distort a bank-basis identity. A card-side one is out
+    of the view entirely and would inflate the error bar with rows no figure here
+    ever counted.
+
     No currency clause — a non-INR row with no category is still uncategorized,
     and the drill-through link (``/transactions?uncategorized=1``) has no
     currency clause either, so the tile's count and the list's row count agree.
@@ -333,7 +380,7 @@ async def _uncategorized(
     rows = (
         await session.execute(
             select(NORMALIZED_CATEGORY, SIGNED_FLOW, ROW_COUNT)
-            .where(in_range, UNCATEGORIZED)
+            .where(in_range, BANK_SCOPE, UNCATEGORIZED)
             .group_by(NORMALIZED_CATEGORY)
         )
     ).all()
@@ -352,36 +399,101 @@ async def _uncategorized(
     return _bucket(lines)
 
 
-async def _footnotes(session: AsyncSession, in_range: ColumnElement[bool]) -> Footnotes:
-    """The three excluded-from-the-headline populations, counted so they are visible.
+async def _expense_detail(
+    session: AsyncSession, in_range: ColumnElement[bool]
+) -> BucketSummary:
+    """What was actually bought, over every account — the swipes, by category.
 
-    ``internal_gross`` and ``undated_net`` are currency-agnostic sums (they add
-    any non-INR rows in as plain rupees), which is why they are rough figures
-    kept out of every headline bucket. The counts stay currency-agnostic too, so
-    each one matches the row count of its drill-through link.
+    Deliberately *not* bank-scoped: a card swipe is where a purchase is legible,
+    and it never touches the bank. Deliberately *not* the headline either: the
+    headline is what left the bank, and a swipe has not left it until the bill is
+    paid. The difference between the two is the timing gap, not an error, so the
+    two figures must never be added together or expected to reconcile.
+
+    A ``credit_card_payment`` is internal here — over every account it settles
+    swipes this very aggregation already counted, and counting both would charge
+    the same rupee twice. Only the scope-free bucket map can say that, so this is
+    the one caller that asks it without a scope.
+
+    INR-or-null, like every other rupee figure, so the drill-through link that
+    lists these rows can carry ``non_inr=0`` and match the total on the page.
+    Direction does not split an expense line, so one group per category is
+    enough; the signed sum is negated, which is what makes a refund read as the
+    contra it is.
     """
-    internal_count, internal_gross = (
+    rows = (
         await session.execute(
-            select(ROW_COUNT, func.sum(Transaction.amount)).where(
-                in_range, Transaction.category.in_(tuple(INTERNAL_SLUGS))
+            select(Transaction.category, SIGNED_FLOW, ROW_COUNT)
+            .where(in_range, INR_OR_NULL)
+            .group_by(Transaction.category)
+        )
+    ).all()
+    lines: dict[str | None, CategoryLine] = {}
+    for slug, flow, count in rows:
+        if bucket_for_slug(slug) == "expense":
+            _merge(lines, slug, -_decimal(flow), count)
+    return _bucket(sorted(lines.values(), key=_by_magnitude))
+
+
+async def _footnotes(session: AsyncSession, in_range: ColumnElement[bool]) -> Footnotes:
+    """The excluded-from-the-headline populations, counted so they are visible.
+
+    The internal footnote is bank-scoped and, under that scope, counts
+    ``self_transfer`` alone: a card bill is expense here, so counting it as
+    internal would both double-count it and list rows the headline claims.
+
+    It carries a **signed** net as well as the unsigned gross, and the signed one
+    is the informative figure: money the owner sends themselves inside the tracked
+    accounts nets to zero, so a net that is *not* zero says the tracked perimeter
+    leaks — money left for accounts this dashboard cannot see. That is exactly why
+    ``net_cash_retained`` cannot be read as "the tracked bank balances went up by
+    this much", and the page has to be able to say so.
+
+    ``unaccounted`` is the rest of the table: a row on no account, on an account
+    row that is gone, or on an account whose type nothing recognizes. It is the
+    complement of the bank and card scopes, so no row can fall between the two and
+    vanish. It is range-scoped, currency-agnostic and sits outside the
+    reconciliation arithmetic entirely — it is a data-quality figure, not a term.
+
+    The monetary footnotes are currency-agnostic sums (they add any non-INR rows
+    in as plain rupees), which is why they are rough figures kept out of every
+    headline bucket. The counts stay currency-agnostic too, so each one matches the
+    row count of its drill-through link.
+    """
+    internal_count, internal_gross, internal_net = (
+        await session.execute(
+            select(ROW_COUNT, func.sum(Transaction.amount), SIGNED_FLOW).where(
+                in_range,
+                BANK_SCOPE,
+                Transaction.category.in_(BANK_INTERNAL_SLUGS),
             )
         )
     ).one()
     non_inr_count = (
-        await session.execute(select(ROW_COUNT).where(in_range, NON_INR))
+        await session.execute(select(ROW_COUNT).where(in_range, BANK_SCOPE, NON_INR))
     ).scalar_one()
-    # Undated rows match no range, so this figure is range-independent.
+    # Undated rows match no range, so this figure is range-independent. It stays
+    # global for the same reason: a row with no date is a data problem wherever it
+    # sits, and its drill-through carries neither a range nor a scope.
     undated_count, undated_net = (
         await session.execute(
             select(ROW_COUNT, SIGNED_FLOW).where(Transaction.transaction_date.is_(None))
         )
     ).one()
+    unaccounted_count, unaccounted_net = (
+        await session.execute(
+            select(ROW_COUNT, SIGNED_FLOW).where(in_range, UNACCOUNTED_SCOPE)
+        )
+    ).one()
     return Footnotes(
         internal_count=internal_count,
         internal_gross=_decimal(internal_gross),
+        internal_net=_decimal(internal_net),
         non_inr_count=non_inr_count,
         undated_count=undated_count,
         undated_net=_decimal(undated_net),
+        unaccounted_count=unaccounted_count,
+        unaccounted_net=_decimal(unaccounted_net),
     )
 
 
@@ -417,10 +529,12 @@ async def cashflow_trend(
 ) -> list[TrendPoint]:
     """Month-by-month income / expense / net-invested over a trailing window.
 
-    Uses the same bucket map and the same exclusions as ``cashflow_summary``, so
-    a month here always reconciles with the summary for that month: income is
-    the income bucket's slugs, never every credit, which is what keeps a
-    ``repayment`` out of it.
+    Uses the same bucket map, the same bank scope and the same exclusions as
+    ``cashflow_summary``, so a month here always reconciles with the summary for
+    that month: income is the income bucket's slugs, never every credit, which is
+    what keeps a ``repayment`` out of it, and the scope is the bank, which is what
+    keeps the chart from telling a different story month by month than the tiles
+    above it tell for the selected range.
     """
     today = today or datetime.date.today()
     months = max(1, min(months, MAX_TREND_MONTHS))
@@ -438,7 +552,7 @@ async def cashflow_trend(
                 Transaction.direction,
                 SIGNED_FLOW,
             )
-            .where(in_window, INR_OR_NULL)
+            .where(in_window, INR_OR_NULL, BANK_SCOPE)
             .group_by(month_key, Transaction.category, Transaction.direction)
         )
     ).all()
@@ -447,11 +561,13 @@ async def cashflow_trend(
     # rupee sums and so must drop foreign-currency rows, but a salary paid in
     # another currency is still a salary credit that month, and the count has to
     # match the row count of the `category=salary` drill-through, which applies
-    # no currency filter either.
+    # no currency filter either. It is a separate query, so it needs the scope
+    # said again: a card-side salary is out of the bank view, and a count that
+    # kept it would contradict the income bar it sits under.
     salary_counts = (
         await session.execute(
             select(month_key, ROW_COUNT)
-            .where(in_window, Transaction.category == "salary")
+            .where(in_window, BANK_SCOPE, Transaction.category == "salary")
             .group_by(month_key)
         )
     ).all()
@@ -471,7 +587,7 @@ async def cashflow_trend(
     for month, slug, _direction, flow in rows:
         point = points[month]
         signed = _decimal(flow)
-        bucket = bucket_for_slug(slug)
+        bucket = bucket_for_slug(slug, scope=REPORT_SCOPE)
         if bucket == "income":
             point.income += signed
         elif bucket == "expense":

@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import Transaction
+from tests.conftest import bank_account
 
 pytestmark = pytest.mark.anyio
 D = Decimal
@@ -12,11 +13,17 @@ TODAY = datetime.date.today()
 
 
 async def _add(session: AsyncSession, **kw) -> None:
+    """Seed one transaction, linked to the bank account unless ``account_id`` says else.
+
+    The summary counts bank rows, so a row seeded without a link would be
+    unaccounted and would reach none of the figures asserted below.
+    """
     base = dict(
         bank="hdfc",
         email_type="x",
         currency="INR",
         transaction_date=datetime.date(2026, 6, 15),
+        account_id=await bank_account(session),
     )
     base.update(kw)
     session.add(Transaction(**base))

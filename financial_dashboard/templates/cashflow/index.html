@@ -60,27 +60,47 @@
     The active range is built once here — every range-scoped drill-through link
     appends it, so they can never disagree with the figure they sit next to. -#}
 {% set range_qs = "date_from=" ~ date_from ~ "&date_to=" ~ date_to %}
-{#- The rupee buckets (income, expense, investment, transfers in) sum only INR
-    and no-currency rows, so their drill-throughs must carry the same currency
-    clause: without it a foreign-currency row would be listed by a link whose
-    figure and count never counted it. The uncategorized, internal, undated and
-    non-INR links are deliberately currency-agnostic and use `range_qs`. -#}
-{% set core_qs = range_qs ~ "&non_inr=0" %}
+{#- Every headline figure on this page is drawn over the bank, so its link has to
+    be too: an unscoped one would list the card swipes the figure never counted.
+    The scope is not a blanket, though — the links below carry exactly the scope of
+    the figure they sit next to, and three of them are deliberately not `bank`:
+
+      * `bank_qs`        currency-agnostic, bank scope — uncategorized, non-INR
+      * `core_qs`        + the rupee clause the summing buckets apply — income,
+                         expense, investments, transfers in
+      * `detail_qs`      UNSCOPED, rupee — the all-account expense detail counts
+                         every account on purpose, so its link must not say bank
+      * `unaccounted_qs` the rows on no known account — the complement, not the bank
+      * undated          neither range nor scope: an undated row is in no range, and
+                         a missing date is a data problem on any account
+
+    The rupee buckets sum only INR and no-currency rows, so their drill-throughs
+    carry the same currency clause: without it a foreign-currency row would be
+    listed by a link whose figure never counted it. Uncategorized stays
+    currency-agnostic, because a foreign row with no category is still one. -#}
+{% set bank_qs = range_qs ~ "&scope=bank" %}
+{% set core_qs = range_qs ~ "&non_inr=0&scope=bank" %}
+{% set detail_qs = range_qs ~ "&non_inr=0" %}
+{% set unaccounted_qs = range_qs ~ "&scope=unaccounted" %}
 {% set fn = summary.footnotes %}
-{#- Non-INR rows count as activity even though no bucket sums them: a range holding
-    only a categorized foreign-currency row would otherwise claim "no transactions"
-    while the footnote right below it counted that very row. Undated rows are
-    deliberately left out — they belong to no range, so they do not make *this* one
-    non-empty, and their footnote says so. -#}
+{#- What makes a range non-empty is anything the page has something to say about,
+    not merely the headline buckets: a range holding only a categorized
+    foreign-currency row, only card swipes, or only rows on no known account would
+    otherwise claim "no transactions" directly above a footnote or a table that
+    counts those very rows. The expense detail and the unaccounted footnote are
+    therefore activity too. Undated rows are deliberately left out — they belong to
+    no range, so they do not make *this* one non-empty, and their footnote says so. -#}
 {% set activity = summary.income.count + summary.expense.count + summary.investment.count
                   + summary.transfers_in.count + summary.uncategorized.count
-                  + fn.internal_count + fn.non_inr_count %}
+                  + summary.expense_detail.count
+                  + fn.internal_count + fn.non_inr_count + fn.unaccounted_count %}
 
 <div class="section-header">
     <div>
         <h2>Cashflow</h2>
         <p class="text-sm text-muted" style="margin: 0;">
             {{ summary.date_from.strftime("%d %b %Y") }} &ndash; {{ summary.date_to.strftime("%d %b %Y") }}
+            &middot; bank accounts, cash basis
         </p>
     </div>
 </div>
@@ -136,7 +156,7 @@
             <dt>Expense</dt>
             <dd class="amt-debit">{{ summary.expense.total|inr_compact }}</dd>
         </dl>
-        <p class="text-sm text-muted" style="margin: 0.35rem 0 0;">{{ summary.expense.count }} txns &middot; net of refunds</p>
+        <p class="text-sm text-muted" style="margin: 0.35rem 0 0;">{{ summary.expense.count }} txns &middot; net of refunds &middot; card bills, not swipes</p>
     </article>
     <article class="stat-card card" data-tile="net_invested" data-select="net_invested" role="button" tabindex="0" aria-pressed="false" style="cursor: pointer;">
         <dl>
@@ -160,7 +180,7 @@
     <article class="stat-card card" data-tile="uncategorized" data-select="uncategorized" role="button" tabindex="0" aria-pressed="false" style="opacity: 0.85; cursor: pointer;">
         <dl>
             <dt>Uncategorized</dt>
-            <dd><a href="/transactions?uncategorized=1&amp;{{ range_qs }}" style="color: inherit;">{{ summary.uncategorized.total|inr_compact }}</a></dd>
+            <dd><a href="/transactions?uncategorized=1&amp;{{ bank_qs }}" style="color: inherit;">{{ summary.uncategorized.total|inr_compact }}</a></dd>
         </dl>
         <p class="text-sm text-muted" style="margin: 0.35rem 0 0;">
             {{ summary.uncategorized.count }} txns &middot; rough figure &mdash; may mix currencies
@@ -174,7 +194,12 @@
     has months of real data in it. Its own "No monthly history yet." line is what
     covers the genuinely-empty case. -#}
 <section data-trend style="margin-bottom: 1.5rem;">
-    <h3 style="font-size: 1.05rem;">Trend &middot; last {{ trend_months }} months</h3>
+    {#- The trend is drawn over the same bank scope and the same cash basis as the
+        tiles: a chart that stayed on every account and on the accrual basis would
+        contradict the tiles above it month by month. Clicking a month sets this
+        page's range, and this page is the bank view, so a clicked month is a
+        bank-scoped range too. -#}
+    <h3 style="font-size: 1.05rem;">Trend &middot; last {{ trend_months }} months &middot; bank accounts, cash basis</h3>
     {#- Each trend month's inclusive bounds, server-computed: clicking a month sets
         the report's range to that month, and the days a month covers are not
         something the chart should be re-deriving from a label. The newest month is
@@ -199,7 +224,7 @@
     {#- The summary this page was rendered from, serialized for the breakdown chart.
         The chart draws the selected range — the very range the tables above already
         show — so it hydrates from this payload instead of fetching
-        /api/cashflow/summary, which would re-run the same six aggregate queries to
+        /api/cashflow/summary, which would re-run the same eight aggregate queries to
         recompute figures that are already in this response. -#}
     <script type="application/json" id="cf-summary">{{ summary.model_dump(mode="json")|tojson }}</script>
     <article class="card cf-chart-card" style="padding: 0.75rem;">
@@ -340,7 +365,7 @@
                             empty string is a *category-less* line, and treating it as a
                             named slug would link it to ?category= with nothing after the
                             "=". -#}
-                        <td><a data-line="uncategorized" data-key="{{ line.slug or "" }}" href="{% if line.slug is not none %}/transactions?category={{ line.slug|urlencode }}&amp;{{ range_qs }}{% else %}/transactions?category_null=1&amp;{{ range_qs }}{% endif %}">{{ line.label }}</a></td>
+                        <td><a data-line="uncategorized" data-key="{{ line.slug or "" }}" href="{% if line.slug is not none %}/transactions?category={{ line.slug|urlencode }}&amp;{{ bank_qs }}{% else %}/transactions?category_null=1&amp;{{ bank_qs }}{% endif %}">{{ line.label }}</a></td>
                         <td class="text-sm text-muted">{{ line.count }}</td>
                         <td class="amt" style="text-align: right;">{{ line.total|inr_exact }}</td>
                     </tr>
@@ -352,6 +377,49 @@
     {% endif %}
 
 </section>
+
+{#- The other question, and the reason it is a section of its own rather than a
+    sixth tile: the headline above is what left the *bank*, and this is what was
+    *bought*, over every account. A card swipe is where a purchase is legible and it
+    never touches the bank; the bank only sees the bill, later, as one line. So the
+    two figures answer different questions, they are never added together, and they
+    do not reconcile — their difference is the timing gap between buying a thing and
+    paying the bill for it, which is spend not yet out of the bank.
+
+    Its links are the one set on this page that carry no scope: the figure counts
+    every account, so a `scope=bank` on its link would list a fraction of the rows it
+    summed. They keep `non_inr=0`, because the detail is INR-or-null like every other
+    rupee figure here. -#}
+{% if summary.expense_detail.lines %}
+<section data-section="expense_detail" style="margin-top: 1.5rem;">
+    <div class="section-header" style="margin-bottom: 0.5rem;">
+        <h3 style="margin: 0; font-size: 1.05rem;">Expense detail &middot; all accounts</h3>
+        <span class="amt amt-debit">{{ summary.expense_detail.total|inr_exact }}</span>
+    </div>
+    <p class="text-sm text-muted" style="margin: 0 0 0.5rem;">
+        What was bought, card swipes included &mdash; a different question from the Expense
+        tile above, which counts the card <em>bills paid</em>. Swipes are not bills, so
+        this will <strong>not</strong> reconcile to it: the difference is card spend that
+        has not left the bank yet. Never add the two together.
+    </p>
+    <div class="table">
+        <table>
+            <tbody>
+                {% for line in summary.expense_detail.lines %}
+                <tr>
+                    {#- No `data-line`: the breakdown chart draws the five headline tiles,
+                        and an anchor in a sixth namespace would be a bar no tile can
+                        select. The row still drills, which is what the figure owes. -#}
+                    <td><a href="/transactions?category={{ line.slug|urlencode }}&amp;{{ detail_qs }}">{{ line.label }}</a></td>
+                    <td class="text-sm text-muted">{{ line.count }}</td>
+                    <td class="amt {% if line.total < 0 %}amt-credit{% else %}amt-debit{% endif %}" style="text-align: right;">{{ line.total|inr_exact }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endif %}
 
 {#- The identity the four rupee buckets add up to, spelled out with its terms so
     the retained figure can be checked against the tiles it comes from rather
@@ -378,6 +446,24 @@
     </p>
 </section>
 
+{#- Kept out of the reconciliation section on purpose: it is not a term in that
+    identity, it is the reason the identity cannot be read as a balance. Money the
+    owner sends between their own tracked accounts nets to zero, so an internal net
+    that is *not* zero is money that left the tracked accounts for accounts this
+    dashboard cannot see — and every rupee of it is missing from the retained figure
+    above. The count, the signed net and the drill are all here, because a caveat a
+    reader cannot check is a caveat they have to take on trust. -#}
+<section data-perimeter style="margin-top: 0.75rem;">
+    <p class="text-sm text-muted" style="margin: 0;">
+        <strong>Net cash retained is not the change in your tracked bank balances.</strong>
+        <a href="/transactions?internal=1&amp;{{ bank_qs }}">{{ fn.internal_count }} internal movements</a>
+        net {{ fn.internal_net|inr_exact }} over this range (rough figure &mdash; may mix
+        currencies). Self-transfers inside the tracked accounts would cancel to zero, so
+        whatever this is not, is money that crossed the tracked perimeter &mdash; it left
+        the figures above without being spent.
+    </p>
+</section>
+
 {% endif %}
 
 <section style="margin-top: 1.5rem;">
@@ -386,12 +472,25 @@
         <table>
             <tbody>
                 <tr data-footnote="internal">
-                    <td><a href="/transactions?internal=1&amp;{{ range_qs }}">Internal movements</a></td>
-                    <td class="text-sm text-muted">{{ fn.internal_count }} txns &middot; self-transfers and card payments, in neither income nor expense &middot; gross {{ fn.internal_gross|inr_exact }} (rough figure &mdash; may mix currencies)</td>
+                    {#- `internal=1` under `scope=bank` is self-transfers alone, which is
+                        exactly what this footnote counts: over the bank a card bill is
+                        money gone, so it reads as expense above and an unscoped link
+                        here would list bills this row never counted. -#}
+                    <td><a href="/transactions?internal=1&amp;{{ bank_qs }}">Internal movements</a></td>
+                    <td class="text-sm text-muted">{{ fn.internal_count }} txns &middot; self-transfers, in neither income nor expense &middot; gross {{ fn.internal_gross|inr_exact }} &middot; net {{ fn.internal_net|inr_exact }} (rough figure &mdash; may mix currencies)</td>
                 </tr>
                 <tr data-footnote="non_inr">
-                    <td><a href="/transactions?non_inr=1&amp;{{ range_qs }}">Non-INR rows</a></td>
+                    <td><a href="/transactions?non_inr=1&amp;{{ bank_qs }}">Non-INR rows</a></td>
                     <td class="text-sm text-muted">{{ fn.non_inr_count }} txns &middot; left out of the rupee buckets above</td>
+                </tr>
+                <tr data-footnote="unaccounted">
+                    {#- The complement of the bank and the card, so nothing falls between
+                        them and vanishes: a row on no account at all, on an account row
+                        that is gone, or on an account whose type nothing here recognizes.
+                        It reaches no figure above and is not a term in the identity — it
+                        is a data-quality number, and the fix is to link the rows. -#}
+                    <td><a href="/transactions?{{ unaccounted_qs }}">Unaccounted rows</a></td>
+                    <td class="text-sm text-muted">{{ fn.unaccounted_count }} txns &middot; on no known account, so in no figure above &middot; net {{ fn.unaccounted_net|inr_exact }} (rough figure &mdash; may mix currencies)</td>
                 </tr>
                 <tr data-footnote="undated">
                     {#- Undated rows fall into no range at all, so this link must carry

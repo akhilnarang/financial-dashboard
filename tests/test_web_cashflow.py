@@ -14,6 +14,7 @@ from decimal import Decimal
 import pytest
 
 from financial_dashboard.db.models import Transaction
+from tests.conftest import bank_account
 
 pytestmark = pytest.mark.anyio
 
@@ -86,6 +87,12 @@ def _links(page: str, prefix: str) -> list[str]:
     return re.findall(rf'href="({re.escape(prefix)}[^"]*)"', page)
 
 
+#: ``_add`` links the row to the bank account. Anything else — a card, or no
+#: account at all — is the caller's explicit choice, because it changes which of
+#: the page's figures the row can reach.
+LINKED_TO_BANK = object()
+
+
 async def _add(
     session,
     *,
@@ -97,7 +104,16 @@ async def _add(
     currency="INR",
     dated=True,
     month=SEED_MONTH,
+    account_id=LINKED_TO_BANK,
 ):
+    """Seed one transaction the page can count.
+
+    The page's figures are bank-scoped, so a row with no account is *unaccounted*
+    and lands in none of them. Linking by default keeps each test below about the
+    figure it names rather than about the linker.
+    """
+    if account_id is LINKED_TO_BANK:
+        account_id = await bank_account(session)
     session.add(
         Transaction(
             bank="hdfc",
@@ -108,6 +124,7 @@ async def _add(
             counterparty=counterparty,
             currency=currency,
             transaction_date=month.replace(day=day) if dated else None,
+            account_id=account_id,
         )
     )
     await session.commit()
@@ -456,7 +473,7 @@ async def test_breakdown_hydrates_from_the_page_not_a_second_summary_query(
     """The breakdown draws the range the page already aggregated, so the summary is
     serialized into the page and the chart reads it there.
 
-    Re-fetching /api/cashflow/summary would be the same six aggregate queries run a
+    Re-fetching /api/cashflow/summary would be the same eight aggregate queries run a
     second time to recompute figures that are already in this response, so the page
     must not carry that URL at all. The trend *is* fetched: its window is the
     trailing twelve months, which is not the selected range and so is genuinely not

@@ -165,9 +165,13 @@ const trend = async () => {
     const render = sizedRenderer(svg, draw);
     render();
 
+    // The series come from the same bank-scoped, cash-basis aggregation the tiles
+    // do, so the caption says so: a chart that quietly counted card swipes while
+    // the tiles counted card bills would contradict them month by month, and a
+    // reader would have no way to see which of the two they were looking at.
     const totals = series.map((s) => values.reduce((acc, v) => acc + v[s.key], 0));
     caption.innerHTML =
-        `<span>${fmtMonth(values[0].month)} &rarr; ${fmtMonth(values[values.length - 1].month)}</span>` +
+        `<span>${fmtMonth(values[0].month)} &rarr; ${fmtMonth(values[values.length - 1].month)} &middot; bank accounts, cash basis</span>` +
         `<span>` + series.map((s, j) => `${s.label}: <strong>${fmtINR(totals[j])}</strong>`).join(" &middot; ") +
         ` &middot; <span class="text-sm text-muted">hover to inspect &middot; click a month to set the range</span></span>`;
 

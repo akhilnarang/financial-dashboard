@@ -21,7 +21,7 @@ from financial_dashboard.db import (
     SmsMessage,
     Transaction,
 )
-from financial_dashboard.services.cashflow.buckets import INTERNAL_SLUGS
+from financial_dashboard.services.cashflow.buckets import internal_slugs_for_scope
 from financial_dashboard.services.cashflow.report import (
     BLANK_CATEGORY,
     BLANK_COUNTERPARTY,
@@ -30,6 +30,7 @@ from financial_dashboard.services.cashflow.report import (
     UNCATEGORIZED,
     is_blank_counterparty,
 )
+from financial_dashboard.services.cashflow.scope import Scope, scope_predicate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,6 +93,14 @@ async def transaction_list(
     ] = None,
     undated: Annotated[
         str | None, Query(description="Set to 1 for rows with no transaction date")
+    ] = None,
+    scope: Annotated[
+        Scope | None,
+        Query(
+            description="Account scope: bank (bank accounts and debit cards), card "
+            "(credit cards), or unaccounted (no account, or an account type neither "
+            "of those names); omit for every account"
+        ),
     ] = None,
     sort: Annotated[str, Query(description="Sort column")] = "date",
     order: Annotated[str, Query(description="Sort order: asc or desc")] = "desc",
@@ -158,7 +167,16 @@ async def transaction_list(
         # link would return more rows than the line it sits on says it has.
         stmt = stmt.where(BLANK_CATEGORY)
     if internal == "1":
-        stmt = stmt.where(Transaction.category.in_(tuple(INTERNAL_SLUGS)))
+        # Which slugs are internal is a question the account scope answers, so the
+        # set is asked for under the scope this listing is drawn over rather than
+        # fixed here. Over the bank a card bill is money leaving it — expense, and
+        # counted as such by the report — so listing it as internal would hand the
+        # internal footnote a link to rows its own count excludes. Over every
+        # account the same slug is internal churn again, and the unscoped filter
+        # keeps saying so.
+        stmt = stmt.where(
+            Transaction.category.in_(tuple(internal_slugs_for_scope(scope)))
+        )
     if non_inr == "1":
         stmt = stmt.where(NON_INR)
     elif non_inr == "0":
@@ -169,6 +187,13 @@ async def transaction_list(
         stmt = stmt.where(INR_OR_NULL)
     if undated == "1":
         stmt = stmt.where(Transaction.transaction_date.is_(None))
+    account_scope = scope_predicate(scope)
+    if account_scope is not None:
+        # The report's own predicate, imported rather than restated: a cash-basis
+        # figure counts one account perimeter, and the rows behind its link have to
+        # be that same perimeter. A second spelling of "the bank" here is a second
+        # thing to drift, which is the bug class the currency clause already hit.
+        stmt = stmt.where(account_scope)
 
     count_stmt = select(func.count()).select_from(stmt.subquery())
     total_count = (await session.execute(count_stmt)).scalar() or 0
@@ -253,6 +278,10 @@ async def transaction_list(
         "internal": internal,
         "non_inr": non_inr,
         "undated": undated,
+        # A drill param like any other, so paging and re-sorting keep it: a page-2
+        # or newly-sorted link that dropped the scope would widen the listing to
+        # every account while still claiming to be the figure's rows.
+        "scope": scope,
     }
     filters = {**form_filters, **drill_filters}
     # Drill params are kept whenever they are present, empty string included: a

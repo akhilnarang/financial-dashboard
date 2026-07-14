@@ -6,7 +6,7 @@ two SVG charts are progressive enhancement over that.
 
 The breakdown chart draws the range the page already shows, so it is handed the
 summary the page was rendered from, serialized into the document. Fetching it
-back would re-run the same six aggregate queries for numbers already in the
+back would re-run the same eight aggregate queries for numbers already in the
 response. The trend chart *does* fetch, because it is a trailing-12-month series
 that ignores the selected range and so is not on the page at all.
 
@@ -86,7 +86,7 @@ async def cashflow_index(
 
     The summary is aggregated once, here, and serialized into the page for the
     breakdown chart to hydrate from. The chart must not re-fetch it: it would be
-    the identical range, i.e. the same six aggregate queries run a second time to
+    the identical range, i.e. the same eight aggregate queries run a second time to
     produce numbers already on the page. Only the trend is fetched, because its
     trailing-window figures are genuinely not on the page.
     """

@@ -6,6 +6,7 @@ from financial_dashboard.services.cashflow.buckets import (
     INTERNAL_SLUGS,
     TRANSFERS_IN_SLUG,
     bucket_for_slug,
+    internal_slugs_for_scope,
     label_for_slug,
 )
 from financial_dashboard.services.categorization.polarity import (
@@ -48,6 +49,34 @@ def test_internal_slugs_excluded():
     assert INTERNAL_SLUGS == frozenset({"self_transfer", "credit_card_payment"})
     assert BUCKET_BY_SLUG["self_transfer"] == "internal"
     assert BUCKET_BY_SLUG["credit_card_payment"] == "internal"
+
+
+def test_card_payment_is_the_one_slug_whose_bucket_depends_on_scope():
+    # Over the bank, paying the card bill is when the cash actually leaves.
+    assert bucket_for_slug("credit_card_payment", scope="bank") == "expense"
+    # Over every account it is internal churn — the swipes it settles are in
+    # scope there, and counting both would charge the same rupee twice.
+    assert bucket_for_slug("credit_card_payment") == "internal"
+    assert bucket_for_slug("credit_card_payment", scope=None) == "internal"
+
+
+def test_self_transfer_is_internal_under_every_scope():
+    assert bucket_for_slug("self_transfer", scope="bank") == "internal"
+    assert bucket_for_slug("self_transfer") == "internal"
+
+
+def test_scope_changes_no_other_slug():
+    for slug in BUCKET_BY_SLUG:
+        if slug == "credit_card_payment":
+            continue
+        assert bucket_for_slug(slug, scope="bank") == bucket_for_slug(slug), slug
+
+
+def test_internal_slugs_narrow_under_bank_scope():
+    # What the footnote counts and what its drill-through lists are one set.
+    assert internal_slugs_for_scope("bank") == frozenset({"self_transfer"})
+    assert internal_slugs_for_scope() == INTERNAL_SLUGS
+    assert internal_slugs_for_scope(None) == INTERNAL_SLUGS
 
 
 def test_bucket_for_unknown_and_unmapped():

@@ -134,13 +134,17 @@ class Footnotes(BaseModel):
     """The populations deliberately excluded from every headline bucket.
 
     They are counted rather than dropped, so money the buckets do not sum is
-    still visible. The two monetary figures are currency-agnostic sums — they add
+    still visible. The monetary figures are currency-agnostic sums — they add
     any foreign-currency rows in as plain rupees — which is exactly why they are
     rough figures kept out of the headline.
     """
 
     internal_count: int = Field(
-        description="Self-transfers and credit-card payments in the range.",
+        description=(
+            "Bank-side self-transfers in the range. A credit-card payment is NOT here: "
+            "on a cash basis, paying the card bill is when the money leaves the bank, "
+            "so it is counted as expense."
+        ),
     )
     internal_gross: Decimal = Field(
         description=(
@@ -148,13 +152,23 @@ class Footnotes(BaseModel):
             "mix currencies."
         ),
     )
+    internal_net: Decimal = Field(
+        description=(
+            "Signed net flow of those internal movements (credits positive). Money the "
+            "owner sends between their own tracked accounts nets to zero, so a non-zero "
+            "figure here is money that left the tracked accounts for accounts the "
+            "dashboard does not see — which is why net_cash_retained is not the change "
+            "in tracked bank balances. Rough figure — may mix currencies."
+        ),
+    )
     non_inr_count: int = Field(
-        description="Rows in the range with a currency other than INR.",
+        description="Bank-side rows in the range with a currency other than INR.",
     )
     undated_count: int = Field(
         description=(
             "Rows with no transaction_date. They fall into no range, so this figure is "
-            "range-independent."
+            "range-independent — and, unlike every other figure here, it is not scoped "
+            "to the bank either: a row with no date is a data problem on any account."
         ),
     )
     undated_net: Decimal = Field(
@@ -163,10 +177,30 @@ class Footnotes(BaseModel):
             "figure — may mix currencies."
         ),
     )
+    unaccounted_count: int = Field(
+        description=(
+            "Rows in the range on no account at all, or on an account whose type is "
+            "neither a bank nor a card. They are in no scope, so they reach no headline "
+            "figure; counted here so they are visible rather than dropped."
+        ),
+    )
+    unaccounted_net: Decimal = Field(
+        description=(
+            "Signed net flow of the unaccounted rows (credits positive). Outside the "
+            "reconciliation arithmetic — a data-quality figure, not a term in it. Rough "
+            "figure — may mix currencies."
+        ),
+    )
 
 
 class CashflowSummary(BaseModel):
-    """Every cashflow figure for one inclusive ``transaction_date`` range."""
+    """Every cashflow figure for one inclusive ``transaction_date`` range.
+
+    Cash basis, scoped to the bank: income is what landed there and expense is
+    what left it, so a card bill is spend and a card swipe is not. The one
+    exception is ``expense_detail``, which spans every account on purpose and
+    answers a different question — see its own description.
+    """
 
     date_from: datetime.date = Field(
         description="First day of the range; inclusive. Rows on this date are counted.",
@@ -178,7 +212,21 @@ class CashflowSummary(BaseModel):
         description="Earnings only: transfers-in and investment redemptions are not here.",
     )
     expense: BucketSummary = Field(
-        description="Spend, net of refunds and cashback, which appear as negative lines.",
+        description=(
+            "Money that left the bank, net of refunds and cashback, which appear as "
+            "negative lines. On a cash basis this counts the card BILLS paid, not the "
+            "swipes they settled: a credit-card payment is an expense line here."
+        ),
+    )
+    expense_detail: BucketSummary = Field(
+        description=(
+            "What was bought, over EVERY account: the card swipes by category, where a "
+            "credit-card payment is internal instead (counting both would charge the "
+            "same rupee twice). This is a different question from `expense` and will "
+            "NOT reconcile to it — the difference is the timing gap between buying and "
+            "paying the bill. Never add the two together. INR-or-null, like the other "
+            "rupee figures."
+        ),
     )
     investment: InvestmentSummary = Field(
         description=(
@@ -202,15 +250,18 @@ class CashflowSummary(BaseModel):
     )
     net_cash_retained: Decimal = Field(
         description=(
-            "income + transfers_in - expense - investment.net. Informational, not an "
-            "enforced invariant: single-leg transfers and untracked accounts mean it "
-            "will not reconcile exactly, and the uncategorized total is its error bar."
+            "income + transfers_in - expense - investment.net, over the bank. "
+            "Informational, not an enforced invariant, and NOT the change in tracked "
+            "bank balances: single-leg transfers and untracked accounts mean it will "
+            "not reconcile exactly. The uncategorized total is its error bar, and a "
+            "non-zero footnotes.internal_net says how much left the tracked perimeter."
         ),
     )
     footnotes: Footnotes = Field(
         description=(
             "The populations every headline bucket excludes — internal movements, "
-            "non-INR rows and undated rows — counted rather than silently dropped."
+            "non-INR rows, undated rows and rows on no known account — counted rather "
+            "than silently dropped."
         ),
     )
 

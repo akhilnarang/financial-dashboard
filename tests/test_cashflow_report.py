@@ -11,6 +11,12 @@ from financial_dashboard.services.cashflow.report import (
     cashflow_trend,
     trend_ranges,
 )
+from tests.conftest import (
+    MISSING_ACCOUNT_ID,
+    bank_account,
+    card_account,
+    ensure_account,
+)
 
 pytestmark = pytest.mark.anyio
 D = Decimal
@@ -19,11 +25,19 @@ JUN_END = datetime.date(2026, 6, 30)
 
 
 async def _add(session, **kw):
+    """Seed one transaction, linked to the bank account unless ``account_id`` says else.
+
+    The report is bank-scoped, so an unlinked row is *unaccounted* and reaches no
+    headline figure. Defaulting the link here is what keeps every test below about
+    the thing it is named for; a test that wants a card row, or a row on no account
+    at all, passes ``account_id`` and says so.
+    """
     base = dict(
         bank="hdfc",
         email_type="x",
         currency="INR",
         transaction_date=datetime.date(2026, 6, 15),
+        account_id=await bank_account(session),
     )
     base.update(kw)
     session.add(Transaction(**base))
@@ -91,26 +105,80 @@ async def test_breakdown_line_display_signs(session: AsyncSession):
     assert refund.total == D("-50")  # contra shown negative
 
 
-async def test_internal_excluded_but_footnoted(session: AsyncSession):
+async def test_card_bill_is_bank_expense_and_self_transfer_is_the_internal_one(
+    session: AsyncSession,
+):
+    # On a cash basis the bill payment IS the expense: it is the moment the money
+    # leaves the bank. The only internal movement left is money sent to oneself.
     await _add(
         session, direction="debit", amount=D("9999"), category="credit_card_payment"
     )
     await _add(session, direction="debit", amount=D("100"), category="dining")
+    await _add(session, direction="debit", amount=D("700"), category="self_transfer")
     s = await cashflow_summary(session, JUN, JUN_END)
-    assert s.expense.total == D("100")
-    assert s.footnotes.internal_count == 1
+    assert s.expense.total == D("10099")  # 9999 bill + 100 dining
+    assert {ln.slug for ln in s.expense.lines} == {"credit_card_payment", "dining"}
+    assert s.footnotes.internal_count == 1  # the self-transfer, not the bill
+    assert s.footnotes.internal_gross == D("700")
 
 
-async def test_cc_no_double_count(session: AsyncSession):
-    await _add(session, direction="debit", amount=D("500"), category="dining")  # swipe
+async def test_card_bill_reversal_nets_off_the_bills_it_reversed(session: AsyncSession):
+    # No new machinery: the signed sum already does this. Two bills paid, one of
+    # them reversed, and the expense line is what is left.
+    await _add(
+        session, direction="debit", amount=D("9000"), category="credit_card_payment"
+    )
+    await _add(
+        session, direction="debit", amount=D("1000"), category="credit_card_payment"
+    )
+    await _add(
+        session, direction="credit", amount=D("1000"), category="credit_card_payment"
+    )  # the reversal
+    s = await cashflow_summary(session, JUN, JUN_END)
+    bill = next(ln for ln in s.expense.lines if ln.slug == "credit_card_payment")
+    assert bill.total == D("9000")  # 9000 + 1000 - 1000
+    assert bill.count == 3  # all three rows are behind the figure
+    assert s.expense.total == D("9000")
+
+
+async def test_the_swipe_is_out_of_the_bank_view_and_the_bill_is_not_double_counted(
+    session: AsyncSession,
+):
+    """The two views count different rows, which is what stops the double count.
+
+    Bank: the bill paid. All accounts: the swipe it settled. The bill is internal
+    in the detail — counting it there as well would charge the same rupee twice.
+    """
+    card = await card_account(session)
+    await _add(
+        session,
+        direction="debit",
+        amount=D("500"),
+        category="dining",
+        account_id=card,
+    )  # the swipe
     await _add(
         session, direction="debit", amount=D("500"), category="credit_card_payment"
-    )  # bank leg
+    )  # the bank leg: paying that swipe's bill
     await _add(
-        session, direction="credit", amount=D("500"), category="credit_card_payment"
-    )  # card leg
+        session,
+        direction="credit",
+        amount=D("500"),
+        category="credit_card_payment",
+        account_id=card,
+    )  # the card leg of the same payment
+
     s = await cashflow_summary(session, JUN, JUN_END)
+
+    # Bank: the bill, and only the bill. The card's two rows are out of scope.
     assert s.expense.total == D("500")
+    assert [ln.slug for ln in s.expense.lines] == ["credit_card_payment"]
+    assert s.expense.count == 1
+
+    # All accounts: the swipe, and only the swipe.
+    assert s.expense_detail.total == D("500")
+    assert [ln.slug for ln in s.expense_detail.lines] == ["dining"]
+    assert s.expense_detail.count == 1
 
 
 async def test_uncategorized_line_is_currency_agnostic(session: AsyncSession):
@@ -199,13 +267,199 @@ async def test_boundaries_inclusive_and_zero_amount(session: AsyncSession):
 
 
 async def test_reconciliation_identity(session: AsyncSession):
+    """Every term pinned to a figure computed from the fixture, not from the code.
+
+    The decoys are the point: a card row, an unlinked row and a dangling one are
+    all in range and all carry bucketable slugs, so a summary that forgot its
+    scope anywhere would land them in a headline and be caught here rather than
+    quietly reconciling with itself.
+    """
+    card = await card_account(session)
+
+    # Bank income: 1000 + 50 = 1050.
     await _add(session, direction="credit", amount=D("1000"), category="salary")
+    await _add(session, direction="credit", amount=D("50"), category="interest")
+    # Transfers in: 200.
     await _add(session, direction="credit", amount=D("200"), category="repayment")
+    # Bank expense: 300 dining - 50 refund + (400 - 100) of card bills = 550.
     await _add(session, direction="debit", amount=D("300"), category="dining")
+    await _add(session, direction="credit", amount=D("50"), category="refund")
+    await _add(
+        session, direction="debit", amount=D("400"), category="credit_card_payment"
+    )
+    await _add(
+        session, direction="credit", amount=D("100"), category="credit_card_payment"
+    )
+    # Net invested: 100 - 40 = 60.
     await _add(session, direction="debit", amount=D("100"), category="investment")
+    await _add(
+        session, direction="credit", amount=D("40"), category="investment_redemption"
+    )
+    # Internal: excluded from every term above; gross 900, net -500.
+    await _add(session, direction="debit", amount=D("700"), category="self_transfer")
+    await _add(session, direction="credit", amount=D("200"), category="self_transfer")
+    # Decoys. The card rows are out of the bank view; the unlinked and the
+    # dangling row are in no scope at all.
+    await _add(
+        session, direction="debit", amount=D("900"), category="dining", account_id=card
+    )
+    await _add(
+        session,
+        direction="credit",
+        amount=D("5000"),
+        category="salary",
+        account_id=card,
+    )
+    await _add(
+        session, direction="debit", amount=D("111"), category="dining", account_id=None
+    )
+    await _add(
+        session,
+        direction="credit",
+        amount=D("222"),
+        category="salary",
+        account_id=MISSING_ACCOUNT_ID,
+    )
+
     s = await cashflow_summary(session, JUN, JUN_END)
-    # income + transfers_in - expense - net_invested
-    assert s.net_cash_retained == D("1000") + D("200") - D("300") - D("100")
+
+    assert s.income.total == D("1050")
+    assert s.transfers_in.total == D("200")
+    assert s.expense.total == D("550")
+    assert s.investment.net == D("60")
+    # 1050 + 200 - 550 - 60, to the paisa.
+    assert s.net_cash_retained == D("640")
+
+    # The detail is a different question over a different population: every
+    # account's expense-bucket rows (300 - 50 + 900 + 111), card bills internal.
+    assert s.expense_detail.total == D("1261")
+
+    assert s.footnotes.internal_count == 2
+    assert s.footnotes.internal_gross == D("900")
+    assert s.footnotes.internal_net == D("-500")
+    assert s.footnotes.unaccounted_count == 2
+    assert s.footnotes.unaccounted_net == D("111")  # -111 + 222
+
+
+async def test_card_rows_leave_the_bank_view_but_reach_the_expense_detail(
+    session: AsyncSession,
+):
+    # A manual override can put a `salary` on a card. It is out of the bank view
+    # regardless of its slug — and there is no all-account income output either,
+    # so a card *swipe* is what proves card rows still reach the detail.
+    card = await card_account(session)
+    await _add(session, direction="credit", amount=D("300"), category="salary")
+    await _add(
+        session,
+        direction="credit",
+        amount=D("8000"),
+        category="salary",
+        account_id=card,
+    )
+    await _add(
+        session, direction="debit", amount=D("450"), category="dining", account_id=card
+    )
+
+    s = await cashflow_summary(session, JUN, JUN_END)
+
+    assert s.income.total == D("300")  # the card salary is not bank income
+    assert s.income.count == 1
+    assert s.expense.total == D("0")  # nor is the card swipe bank expense
+    assert s.expense_detail.total == D("450")  # but the swipe is in the detail
+    assert [ln.slug for ln in s.expense_detail.lines] == ["dining"]
+
+
+async def test_unaccounted_rows_are_footnoted_and_reach_no_headline(
+    session: AsyncSession,
+):
+    """Three ways to be in no scope, all landing in the one footnote.
+
+    The unknown-type row cannot be built the obvious way: ``Account.type`` is
+    non-null in the ORM, so no fixture can store a NULL type. A dangling
+    ``account_id`` — pointing at an account row that does not exist — is what
+    reaches that branch, and the test engine does not enforce foreign keys.
+    """
+    weird = await ensure_account(session, 42, "prepaid_wallet")
+    await _add(session, direction="debit", amount=D("60"), category="dining")
+    await _add(
+        session, direction="debit", amount=D("10"), category="dining", account_id=None
+    )
+    await _add(
+        session,
+        direction="debit",
+        amount=D("20"),
+        category="groceries",
+        account_id=MISSING_ACCOUNT_ID,
+    )
+    await _add(
+        session, direction="debit", amount=D("30"), category="rent", account_id=weird
+    )
+
+    s = await cashflow_summary(session, JUN, JUN_END)
+
+    assert s.expense.total == D("60")  # only the bank row
+    assert s.footnotes.unaccounted_count == 3
+    assert s.footnotes.unaccounted_net == D("-60")  # -(10 + 20 + 30)
+
+
+async def test_internal_net_is_signed_where_the_gross_is_not(session: AsyncSession):
+    # The gross says how much moved; only the signed net says whether it came
+    # back. A perimeter that leaks reads as a non-zero net.
+    await _add(session, direction="debit", amount=D("5000"), category="self_transfer")
+    await _add(session, direction="credit", amount=D("2000"), category="self_transfer")
+    s = await cashflow_summary(session, JUN, JUN_END)
+    assert s.footnotes.internal_gross == D("7000")  # 5000 + 2000
+    assert s.footnotes.internal_net == D("-3000")  # 2000 - 5000
+
+
+async def test_trend_and_salary_count_are_both_bank_scoped(session: AsyncSession):
+    # The salary count is a second, independent query: a scope applied to the
+    # monetary series alone would leave the count contradicting the bar above it.
+    today = datetime.date(2026, 6, 15)
+    card = await card_account(session)
+    await _add(
+        session,
+        direction="credit",
+        amount=D("1000"),
+        category="salary",
+        transaction_date=datetime.date(2026, 6, 5),
+    )
+    await _add(
+        session,
+        direction="credit",
+        amount=D("7000"),
+        category="salary",
+        account_id=card,
+        transaction_date=datetime.date(2026, 6, 6),
+    )
+    await _add(
+        session,
+        direction="debit",
+        amount=D("400"),
+        category="dining",
+        account_id=card,
+        transaction_date=datetime.date(2026, 6, 7),
+    )
+
+    pts = await cashflow_trend(session, months=1, today=today)
+    jun = next(p for p in pts if p.month == "2026-06")
+
+    assert jun.income == D("1000")  # the card salary is not in the bank series
+    assert jun.salary_count == 1  # nor in the count beside it
+    assert jun.expense == D("0")  # and the card swipe is not bank spend
+
+
+async def test_trend_card_bill_is_the_months_expense(session: AsyncSession):
+    today = datetime.date(2026, 6, 15)
+    await _add(
+        session,
+        direction="debit",
+        amount=D("2500"),
+        category="credit_card_payment",
+        transaction_date=datetime.date(2026, 6, 3),
+    )
+    pts = await cashflow_trend(session, months=1, today=today)
+    assert next(p for p in pts if p.month == "2026-06").expense == D("2500")
 
 
 async def test_trend_zero_filled_and_salary_count(session: AsyncSession):

@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import financial_dashboard
 from financial_dashboard.api import router as api_router
 from financial_dashboard.core.deps import get_session
-from financial_dashboard.db.models import Base
+from financial_dashboard.db.models import Account, Base
 from financial_dashboard.web import get_router
 
 STATIC_DIR = Path(financial_dashboard.__file__).resolve().parent / "static"
@@ -33,6 +33,45 @@ def _restore_settings_cache():
     finally:
         settings_mod._cache.clear()
         settings_mod._cache.update(snapshot)
+
+
+# The cashflow report is scoped to the accounts a row is linked to, so an
+# unlinked row reaches none of its figures. These give a test one place to say
+# which side of that boundary a seeded transaction is on. The ids are fixed so a
+# helper can link a row without threading an Account object through every call,
+# and MISSING_ACCOUNT_ID deliberately names no row at all: the test engine does
+# not enforce foreign keys, which is what makes a dangling link — the only way to
+# reach a NULL account type through the ORM's non-null column — reachable here.
+BANK_ACCOUNT_ID = 1
+CARD_ACCOUNT_ID = 2
+MISSING_ACCOUNT_ID = 9999
+
+
+async def ensure_account(
+    session: AsyncSession, account_id: int, account_type: str
+) -> int:
+    """Create the account with this id and type once; return its id either way."""
+    if await session.get(Account, account_id) is None:
+        session.add(
+            Account(
+                id=account_id,
+                bank="hdfc",
+                label=f"test {account_type}",
+                type=account_type,
+            )
+        )
+        await session.flush()
+    return account_id
+
+
+async def bank_account(session: AsyncSession) -> int:
+    """The bank account a seeded cashflow row belongs to unless it says otherwise."""
+    return await ensure_account(session, BANK_ACCOUNT_ID, "bank_account")
+
+
+async def card_account(session: AsyncSession) -> int:
+    """A credit-card account: its rows are out of every bank-scoped figure."""
+    return await ensure_account(session, CARD_ACCOUNT_ID, "credit_card")
 
 
 @pytest.fixture
