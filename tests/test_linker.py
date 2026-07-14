@@ -232,3 +232,184 @@ async def test_bank_only_fallback_falls_back_to_unfiltered_when_email_type_uninf
     txn = _txn(bank="x-bank", email_type="x_bank_misc_alert")
     assert link_transaction(ctx, txn) is True
     assert txn.account_id == acct.id
+
+
+# ---------------------------------------------------------------------------
+# Positional wildcard matching: masks with visible digits at BOTH ends.
+#
+# Flattening a mask to its digit run is lossy and cannot express these: an
+# incoming "73XXXXXX3942" collapses to "733942", which is not a suffix of the
+# stored account number "730055113942" (whose last 6 are "113942") — the leading
+# "73" is a prefix, but concatenation makes it part of the suffix. The stored
+# side has the same hazard, since a card_mask carries wildcards of its own.
+#
+# Every account/card number here is fabricated.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_account_mask_with_digits_at_both_ends_links(session):
+    """73XXXXXX3942 must link to 730055113942 — the leading digits are a prefix."""
+    acct = Account(
+        bank="indusind",
+        type="bank_account",
+        label="IndusInd Savings",
+        account_number="730055113942",
+    )
+    session.add(acct)
+    await session.flush()
+
+    txn = _txn(bank="indusind", account_mask="73XXXXXX3942")
+    session.add(txn)
+    await session.flush()
+
+    ctx = await build_link_context(session)
+    assert link_transaction(ctx, txn) is True
+    assert txn.account_id == acct.id
+
+
+@pytest.mark.anyio
+async def test_star_wildcard_mask_links(session):
+    """Banks also mask with '*', not just 'X' — 730***113942 is the same account."""
+    acct = Account(
+        bank="indusind",
+        type="bank_account",
+        label="IndusInd Savings",
+        account_number="730055113942",
+    )
+    session.add(acct)
+    await session.flush()
+
+    txn = _txn(bank="indusind", account_mask="730***113942")
+    session.add(txn)
+    await session.flush()
+
+    ctx = await build_link_context(session)
+    assert link_transaction(ctx, txn) is True
+    assert txn.account_id == acct.id
+
+
+@pytest.mark.anyio
+async def test_flattened_digit_run_decoy_does_not_link(session):
+    """The digit run of "73XXXXXX3942" is "733942". An account ending in exactly
+    that run is a DIFFERENT account, and must not be matched — this is the
+    false-positive the old suffix-on-digit-run matcher could produce."""
+    decoy = Account(
+        bank="indusind",
+        type="bank_account",
+        label="Decoy",
+        account_number="888888733942",
+    )
+    session.add(decoy)
+    await session.flush()
+
+    txn = _txn(bank="indusind", account_mask="73XXXXXX3942")
+    session.add(txn)
+    await session.flush()
+
+    ctx = await build_link_context(session)
+    assert link_transaction(ctx, txn) is False
+    assert txn.account_id is None
+
+
+@pytest.mark.anyio
+async def test_full_pan_picks_the_card_whose_bin_it_shares(session):
+    """A full PAN must select the card whose stored mask it fits POSITIONALLY.
+
+    The incoming side carries every digit; the stored side is masked. Flattening
+    the stored masks collapses "5100 XXXX XXXX 1234" to "51001234", which is not
+    a suffix of the incoming PAN and not a prefix-aware comparison either — so
+    the old matcher linked nothing at all here. Positionally the BIN lines up
+    with exactly one card, and the same-last-4 card with a different BIN is
+    correctly rejected.
+    """
+    acct = Account(bank="hdfc", type="credit_card", label="HDFC Cards")
+    session.add(acct)
+    await session.flush()
+    visa = Card(account_id=acct.id, card_mask="4000 XXXX XXXX 1234", label="Visa")
+    mc = Card(account_id=acct.id, card_mask="5100 XXXX XXXX 1234", label="MC")
+    session.add_all([visa, mc])
+    await session.flush()
+
+    txn = _txn(bank="hdfc", card_mask="5100987654321234")
+    session.add(txn)
+    await session.flush()
+
+    ctx = await build_link_context(session)
+    assert link_transaction(ctx, txn) is True
+    assert txn.card_id == mc.id
+    assert txn.card_id != visa.id
+
+
+@pytest.mark.anyio
+async def test_leading_digits_only_mask_is_refused(session):
+    """A mask whose visible digits are all LEADING identifies only a bank/branch
+    prefix, which accounts share. It carries 3 digits, so the old "3 digits
+    anywhere" guard admitted it, and the account below genuinely ENDS in those
+    digits — so the old matcher linked it. The trailing-digit guard must refuse.
+
+    The stored number must end in the flattened run for this to distinguish the
+    two guards. A mask like "XX12" is refused by both and would prove nothing.
+    """
+    acct = Account(
+        bank="icici",
+        type="bank_account",
+        label="ICICI Savings",
+        account_number="999999999123",
+    )
+    session.add(acct)
+    await session.flush()
+
+    txn = _txn(bank="icici", account_mask="123XXXXXXXXX")
+    session.add(txn)
+    await session.flush()
+
+    ctx = await build_link_context(session)
+    assert link_transaction(ctx, txn) is False
+    assert txn.account_id is None
+
+
+@pytest.mark.anyio
+async def test_stored_shorter_than_incoming_still_links(session):
+    """Overhang on the incoming side is ignored: a bank that stores only the
+    last-4 must still match a transaction carrying the full masked PAN."""
+    acct = Account(
+        bank="axis",
+        type="bank_account",
+        label="Axis Savings",
+        account_number="4321",
+    )
+    session.add(acct)
+    await session.flush()
+
+    txn = _txn(bank="axis", account_mask="0000 XXXX XXXX 4321")
+    session.add(txn)
+    await session.flush()
+
+    ctx = await build_link_context(session)
+    assert link_transaction(ctx, txn) is True
+    assert txn.account_id == acct.id
+
+
+@pytest.mark.anyio
+async def test_unreadable_mask_is_rejected_not_silently_flattened(session):
+    """A mask carrying a character we do not understand must fail to match rather
+    than match something else. Dropping the stray char would turn "12A3456" into
+    "123456" and link it to an account ending in that run — a wrong attribution
+    invented by the normalizer."""
+    acct = Account(
+        bank="kotak",
+        type="bank_account",
+        label="Kotak Savings",
+        account_number="999999123456",
+    )
+    session.add(acct)
+    await session.flush()
+
+    txn = _txn(bank="kotak", account_mask="12A3456")
+    session.add(txn)
+    await session.flush()
+
+    ctx = await build_link_context(session)
+    assert link_transaction(ctx, txn) is False
+    assert txn.account_id is None

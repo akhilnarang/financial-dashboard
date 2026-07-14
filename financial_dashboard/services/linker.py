@@ -13,15 +13,22 @@ Indian bank emails and SMSes use at least these mask formats:
     "0000 XXXX XXXX 1234"  -- full 16-digit card layout with spaces
     "12XXXXXX1234"         -- partial mask, digits at both ends
     "1234"                 -- bare last-4 (SBI, some bare-numeric forms)
+    "12***21234"           -- partial mask, '*' wildcard, digits at both ends
 
-The matcher works on the **digit run** of the incoming mask: it strips
-non-digit characters, then suffix-matches against the stored digits of
-each account/card scoped to the same bank. The stored digit string
-can be longer than the incoming one — whichever is shorter must be a
-suffix of the longer. So an account_number `000000001234` matches
-incoming mask `XX234` because `234` is a suffix of `000000001234`.
-A minimum of 3 trailing digits is required to avoid pathological
-matches.
+The matcher is **positional**: both the incoming mask and the stored
+account_number / card_mask are normalized to digits-and-wildcards
+(`core.masks.normalize_mask`), right-aligned, and compared over their
+overlap — equal digits match, and a wildcard on either side matches any
+digit. The stored side is a mask too, so it must NOT be flattened to its
+digits either; doing so would corrupt `4000 XXXX XXXX 1234` into the
+non-contiguous run `40001234` and lose the BIN's position.
+
+Overhang beyond the overlap is ignored, so a mask shorter than the value
+it masks still matches: `XX234` denotes account_number `000000001234`.
+
+A minimum of 3 *trailing* visible digits is required. A mask whose digits
+are all leading (`123XXXXXXXXX`) identifies only a bank/branch prefix,
+which accounts share, so it is refused.
 
 Lookup is scoped by bank, so a card in one bank cannot collide with
 an unrelated account in another bank that happens to share the same
@@ -51,7 +58,11 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.core.masks import mask_digits
+from financial_dashboard.core.masks import (
+    mask_matches,
+    normalize_mask,
+    trailing_visible_digits,
+)
 from financial_dashboard.db import Account, Card, Transaction
 
 logger = logging.getLogger(__name__)
@@ -63,32 +74,18 @@ logger = logging.getLogger(__name__)
 
 
 MIN_MASK_DIGITS = 3
-"""Minimum trailing-digit count required to attempt a match.
+"""Minimum number of *trailing* visible digits required to attempt a match.
 
-ICICI savings SMSes carry as few as 3 digits in the account_mask
-(e.g. ``XX234``). Shorter masks produce dangerous false positives
-(e.g. matching every account ending in ``1``).
+ICICI savings SMSes carry as few as 3 (e.g. ``XX234``), so this is the floor
+rather than 4. Fewer than 3 produces dangerous false positives (every account
+ending in ``1``), and digits that are merely *present* are not enough: a mask
+like ``123XXXXXXXXX`` shows only a bank/branch prefix, which accounts share.
 """
 
 
-def _trailing_digits(mask: str) -> str:
-    """Return every digit in *mask*, in order, with non-digits stripped.
-
-    For an incoming mask the matcher uses the full digit string and asks
-    "is this a suffix of the stored account number?". For an existing
-    account, we store the same digit string and let the suffix-match
-    happen on the *stored* side.
-
-    Examples
-    --------
-    >>> _trailing_digits("XX1234")        == "1234"
-    >>> _trailing_digits("xx5678")        == "5678"
-    >>> _trailing_digits("XX234")         == "234"
-    >>> _trailing_digits("0000 XXXX XXXX 1234") == "00001234"
-    >>> _trailing_digits("1234")          == "1234"
-    >>> _trailing_digits("")              == ""
-    """
-    return mask_digits(mask)
+def _usable(normalized: str) -> bool:
+    """Whether a normalized mask carries enough trailing signal to match on."""
+    return trailing_visible_digits(normalized) >= MIN_MASK_DIGITS
 
 
 # ---------------------------------------------------------------------------
@@ -100,16 +97,19 @@ def _trailing_digits(mask: str) -> str:
 class LinkContext:
     """Preloaded lookup structures built once and reused for a batch.
 
-    cards_by_bank:
-        bank (lowercase) -> list of (digit_string, account_id, card_id)
-        One entry per Card. digit_string is the trailing digit run of
-        Card.card_mask. Matched by suffix-equality against the incoming
-        transaction's mask digits.
+    Stored masks are kept **normalized, not flattened** — a Card.card_mask
+    carries wildcards of its own, and collapsing it to a digit run would lose
+    where those wildcards sat.
 
-    accounts_by_bank_with_digits:
-        bank (lowercase) -> list of (digit_string, account_id)
-        One entry per Account that has a non-empty account_number.
-        Matched the same way as cards.
+    cards_by_bank:
+        bank (lowercase) -> list of (normalized_mask, account_id, card_id)
+        One entry per Card, from Card.card_mask. Matched positionally against
+        the incoming transaction's normalized mask.
+
+    accounts_by_bank_with_masks:
+        bank (lowercase) -> list of (normalized_mask, account_id)
+        One entry per Account that has a non-empty account_number. A bare
+        account number normalizes to itself. Matched the same way as cards.
 
     accounts_by_bank:
         bank (lowercase) -> list[account_id]
@@ -119,7 +119,7 @@ class LinkContext:
     """
 
     cards_by_bank: dict[str, list[tuple[str, int, int]]] = field(default_factory=dict)
-    accounts_by_bank_with_digits: dict[str, list[tuple[str, int]]] = field(
+    accounts_by_bank_with_masks: dict[str, list[tuple[str, int]]] = field(
         default_factory=dict
     )
     accounts_by_bank: dict[str, list[int]] = field(default_factory=dict)
@@ -147,19 +147,6 @@ def _expected_account_type(email_type: str | None) -> str | None:
     return None
 
 
-def _suffix_match(incoming: str, stored: str) -> bool:
-    """True iff the shorter of *incoming* and *stored* is a suffix of
-    the longer.
-
-    Both are digit-only strings (non-digit chars already stripped).
-    """
-    if not incoming or not stored:
-        return False
-    if len(incoming) <= len(stored):
-        return stored.endswith(incoming)
-    return incoming.endswith(stored)
-
-
 async def build_link_context(session: AsyncSession) -> LinkContext:
     """Load all accounts and cards from the DB and build lookup tables.
 
@@ -177,16 +164,16 @@ async def build_link_context(session: AsyncSession) -> LinkContext:
             ctx.account_types[acct.id] = acct.type
 
         if acct.account_number:
-            digits = _trailing_digits(acct.account_number)
-            if digits:
-                ctx.accounts_by_bank_with_digits.setdefault(bank_key, []).append(
-                    (digits, acct.id)
+            stored = normalize_mask(acct.account_number)
+            if stored:
+                ctx.accounts_by_bank_with_masks.setdefault(bank_key, []).append(
+                    (stored, acct.id)
                 )
 
     cards = (await session.execute(select(Card))).scalars().all()
     for card in cards:
-        digits = _trailing_digits(card.card_mask)
-        if not digits:
+        stored = normalize_mask(card.card_mask)
+        if not stored:
             continue
         # Look up the card's owning account to get its bank.
         acct = next((a for a in accounts if a.id == card.account_id), None)
@@ -194,68 +181,66 @@ async def build_link_context(session: AsyncSession) -> LinkContext:
             continue
         bank_key = acct.bank.strip().lower()
         ctx.cards_by_bank.setdefault(bank_key, []).append(
-            (digits, card.account_id, card.id)
+            (stored, card.account_id, card.id)
         )
 
     logger.debug(
         "LinkContext built: %d banks with cards, %d banks with accounts, %d banks total",
         len(ctx.cards_by_bank),
-        len(ctx.accounts_by_bank_with_digits),
+        len(ctx.accounts_by_bank_with_masks),
         len(ctx.accounts_by_bank),
     )
     return ctx
 
 
 def _find_card_match(
-    ctx: LinkContext, bank_key: str, incoming_digits: str
+    ctx: LinkContext, bank_key: str, incoming: str
 ) -> tuple[int, int] | None:
-    """Find a card in *bank_key* whose stored digits suffix-match
-    *incoming_digits*.
+    """Find the card in *bank_key* whose stored mask *incoming* can denote.
 
+    Both sides are normalized masks, matched positionally.
     Returns (account_id, card_id) on a unique match, None otherwise.
-    Logs a warning when multiple candidates suffix-match (ambiguous).
+    Logs a warning when several cards match (ambiguous — refuse to guess).
     """
     matches = [
         (acct_id, card_id)
         for stored, acct_id, card_id in ctx.cards_by_bank.get(bank_key, [])
-        if _suffix_match(incoming_digits, stored)
+        if mask_matches(incoming, stored)
     ]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
         logger.warning(
-            "Ambiguous card-mask match in bank %r: incoming digits %r matched "
+            "Ambiguous card-mask match in bank %r: incoming mask %r matched "
             "%d cards %r — refusing to link.",
             bank_key,
-            incoming_digits,
+            incoming,
             len(matches),
             matches,
         )
     return None
 
 
-def _find_account_match(
-    ctx: LinkContext, bank_key: str, incoming_digits: str
-) -> int | None:
-    """Find an account in *bank_key* whose account_number digits
-    suffix-match *incoming_digits*.
+def _find_account_match(ctx: LinkContext, bank_key: str, incoming: str) -> int | None:
+    """Find the account in *bank_key* whose account_number *incoming* can denote.
 
+    Both sides are normalized masks, matched positionally.
     Returns account_id on a unique match, None otherwise.
     Logs a warning on ambiguity.
     """
     matches = [
         acct_id
-        for stored, acct_id in ctx.accounts_by_bank_with_digits.get(bank_key, [])
-        if _suffix_match(incoming_digits, stored)
+        for stored, acct_id in ctx.accounts_by_bank_with_masks.get(bank_key, [])
+        if mask_matches(incoming, stored)
     ]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
         logger.warning(
-            "Ambiguous account-mask match in bank %r: incoming digits %r matched "
+            "Ambiguous account-mask match in bank %r: incoming mask %r matched "
             "%d accounts %r — refusing to link.",
             bank_key,
-            incoming_digits,
+            incoming,
             len(matches),
             matches,
         )
@@ -301,56 +286,53 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
 
     bank_key = txn.bank.strip().lower() if txn.bank else ""
 
+    card_mask = normalize_mask(txn.card_mask)
+    account_mask = normalize_mask(txn.account_mask)
+
     # ---- 1. card_mask -> cards table ----
-    if txn.card_mask:
-        digits = _trailing_digits(txn.card_mask)
-        if digits and len(digits) >= MIN_MASK_DIGITS:
-            hit = _find_card_match(ctx, bank_key, digits)
-            if hit is not None:
-                acct_id, card_id = hit
-                txn.account_id = acct_id
-                txn.card_id = card_id
-                logger.debug(
-                    "txn %s: linked via cards table (mask=%r -> digits=%s, account=%s card=%s)",
-                    txn.id,
-                    txn.card_mask,
-                    digits,
-                    acct_id,
-                    card_id,
-                )
-                return True
+    if _usable(card_mask):
+        hit = _find_card_match(ctx, bank_key, card_mask)
+        if hit is not None:
+            acct_id, card_id = hit
+            txn.account_id = acct_id
+            txn.card_id = card_id
+            logger.debug(
+                "txn %s: linked via cards table (mask=%r -> %s, account=%s card=%s)",
+                txn.id,
+                txn.card_mask,
+                card_mask,
+                acct_id,
+                card_id,
+            )
+            return True
 
     # ---- 2. card_mask -> accounts table ----
-    if txn.card_mask:
-        digits = _trailing_digits(txn.card_mask)
-        if digits and len(digits) >= MIN_MASK_DIGITS:
-            hit = _find_account_match(ctx, bank_key, digits)
-            if hit is not None:
-                txn.account_id = hit
-                logger.debug(
-                    "txn %s: linked via accounts table by card_mask (mask=%r -> digits=%s, account=%s)",
-                    txn.id,
-                    txn.card_mask,
-                    digits,
-                    hit,
-                )
-                return True
+    if _usable(card_mask):
+        hit = _find_account_match(ctx, bank_key, card_mask)
+        if hit is not None:
+            txn.account_id = hit
+            logger.debug(
+                "txn %s: linked via accounts table by card_mask (mask=%r -> %s, account=%s)",
+                txn.id,
+                txn.card_mask,
+                card_mask,
+                hit,
+            )
+            return True
 
     # ---- 3. account_mask -> accounts table ----
-    if txn.account_mask:
-        digits = _trailing_digits(txn.account_mask)
-        if digits and len(digits) >= MIN_MASK_DIGITS:
-            hit = _find_account_match(ctx, bank_key, digits)
-            if hit is not None:
-                txn.account_id = hit
-                logger.debug(
-                    "txn %s: linked via accounts table by account_mask (mask=%r -> digits=%s, account=%s)",
-                    txn.id,
-                    txn.account_mask,
-                    digits,
-                    hit,
-                )
-                return True
+    if _usable(account_mask):
+        hit = _find_account_match(ctx, bank_key, account_mask)
+        if hit is not None:
+            txn.account_id = hit
+            logger.debug(
+                "txn %s: linked via accounts table by account_mask (mask=%r -> %s, account=%s)",
+                txn.id,
+                txn.account_mask,
+                account_mask,
+                hit,
+            )
+            return True
 
     # ---- 4. bank-only fallback ----
     # Used when the message body carries no mask (typical for CC bill-paid
