@@ -1,0 +1,69 @@
+; user-authored.ledger — operator-shaped directives.
+; Hand-reviewable. Safe to extend with real account aliases.
+
+commodity "INE000A01020"
+commodity INR
+commodity SYNSYNT
+commodity USD
+
+account Assets:Bank:HDFCSalary
+account Assets:Bank:HDFCSavings
+account Assets:Bank:ICICISavings
+account Assets:Bank:KotakSalary
+account Assets:Investments:INE000A01020
+account Assets:Investments:Synthetic Fund
+account Equity:Opening Balances
+account Equity:Opening Balances:Investment
+account Equity:Unknown
+account Expenses:Bill Payment
+account Expenses:Car Maintenance
+account Expenses:Cash Withdrawal
+account Expenses:Charity Gift
+account Expenses:Dining
+account Expenses:Education
+account Expenses:Emi Loan
+account Expenses:Entertainment
+account Expenses:Expense
+account Expenses:Fees Charges
+account Expenses:Fuel
+account Expenses:Gift
+account Expenses:Groceries
+account Expenses:Healthcare
+account Expenses:Insurance:Medical Health Insurance Premium
+account Expenses:Misc
+account Expenses:Personal Care
+account Expenses:Rent
+account Expenses:Shopping
+account Expenses:Tax
+account Expenses:Transport
+account Expenses:Travel
+account Expenses:Unknown
+account Expenses:Utilities
+account Income:Cashback Rewards
+account Income:Interest
+account Income:Other Income
+account Income:Refund
+account Income:Repayment
+account Income:Salary
+account Liabilities:Card:HDFCMillenniaCC
+
+= Expenses:Rent
+    ; Recurring: Rent
+    ; Period: 1 * ?
+
+= Expenses:Utilities
+    ; Recurring: Utilities
+    ; Period: 1 * ?
+
+~ Monthly from 2025-06-01 to 2026-06-01
+    Expenses:Rent                                   15000.00 INR
+    Expenses:Utilities                              2000.00 INR
+    Assets:Bank:HDFCSavings
+
+2025-06-01 * Opening Balances
+    Assets:Bank:HDFCSavings                         5000.00 INR
+    Assets:Bank:HDFCSalary                          5000.00 INR
+    Assets:Bank:ICICISavings                        5000.00 INR
+    Assets:Bank:KotakSalary                         5000.00 INR
+    Equity:Opening Balances                         -20000.00 INR
+

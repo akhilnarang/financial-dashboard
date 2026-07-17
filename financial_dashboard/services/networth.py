@@ -179,6 +179,21 @@ async def current_networth(
 async def monthly_trend(
     session: AsyncSession, *, today: datetime.date | None = None
 ) -> list[TrendPoint]:
+    """Month-end net-worth spine from the earliest snapshot to the current month.
+
+    The series is **intentionally uncapped**: it spans the full history from the
+    earliest (non-excluded) snapshot's month through the current month, with one
+    forward-filled point per calendar month. Net-worth snapshots grow at most
+    monthly (bank/CAS statements are monthly), so the series is bounded by the
+    user's real history, not unbounded growth, and an operator sees complete
+    long-term growth rather than a silently truncated window.
+
+    A cap is deliberately NOT applied here: the ``/api/networth/trend`` route
+    exposes no ``months`` parameter, so capping would be a breaking change that
+    drops the earliest points without the caller opting in. ``DEFAULT_TREND_MONTHS``
+    exists only for clients that want a trailing window; the server returns the
+    whole history and leaves windowing to the caller.
+    """
     as_of_today = today or datetime.date.today()
 
     snapshots = list(

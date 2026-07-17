@@ -69,6 +69,7 @@ from financial_dashboard.services.statements.shared import (
     retry_bank_statement_upload,
     retry_cc_statement_upload,
 )
+from financial_dashboard.services.statements.skip_summary import import_skip_summary
 from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
 from financial_dashboard.web.forms import _unlink_statement_file
 
@@ -317,6 +318,11 @@ async def statement_upload(
     upload.reconciliation_data = reconciliation_to_json(recon)
     if upload.missing_count == 0:
         upload.status = "imported"
+    elif imported > 0:
+        upload.status = "partial_import"
+    _dupes, _errs, skip_error = import_skip_summary(recon)
+    if skip_error:
+        upload.error = skip_error
     await emit_cc_snapshot(session, upload)
     await session.commit()
     upload_id = upload.id
@@ -665,6 +671,9 @@ async def statement_reprocess(
         upload.status = "imported"
     elif newly_imported > 0:
         upload.status = "partial_import"
+    _dupes, _errs, skip_error = import_skip_summary(recon)
+    if skip_error:
+        upload.error = skip_error
     await emit_cc_snapshot(session, upload)
     await session.commit()
 

@@ -47,6 +47,19 @@
         </select>
     </label>
     <label data-field>
+        Category
+        <select name="category" id="category-filter">
+            <option value="">All Categories</option>
+            {% for slug, label in category_labels.items() %}
+            <option value="{{ slug }}" {% if filters.category == slug %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+        </select>
+    </label>
+    <label data-field data-checkbox style="flex-direction: row; align-items: center; gap: 0.4rem; min-width: auto;">
+        <input type="checkbox" name="uncategorized" value="1" id="uncategorized-toggle" {% if filters.uncategorized == "1" %}checked{% endif %}>
+        Uncategorized only
+    </label>
+    <label data-field>
         Date From
         <input type="date" name="date_from" value="{{ filters.date_from or '' }}">
     </label>
@@ -54,7 +67,7 @@
         Date To
         <input type="date" name="date_to" value="{{ filters.date_to or '' }}">
     </label>
-    {% if filters.bank or filters.direction or filters.date_from or filters.date_to or filters.account_id or filters.card_id %}
+    {% if filters.bank or filters.direction or filters.date_from or filters.date_to or filters.account_id or filters.card_id or filters.category or filters.uncategorized %}
     <a
         href="/transactions"
         aria-label="Clear filters"
@@ -76,6 +89,7 @@
                     <th>Direction</th>
                     <th>{{ sort_link('amount', 'Amount') }}</th>
                     <th>{{ sort_link('counterparty', 'Counterparty') }}</th>
+                    <th>{{ sort_link('category', 'Category') }}</th>
                     <th>Card / Account</th>
                     <th>Reference</th>
                 </tr>
@@ -96,6 +110,13 @@
                     <td class="cell-counterparty">
                         <span class="truncate" title="{{ txn.counterparty or '' }}">{{ txn.counterparty or "&mdash;"|safe }}</span>
                         {% if txn.channel %}<small>{{ txn.channel }}</small>{% endif %}
+                    </td>
+                    <td>
+                        {% if not txn.category or txn.category == 'unknown' %}
+                        <span class="badge badge-pending">Uncategorized</span>
+                        {% else %}
+                        <span class="badge">{{ category_labels.get(txn.category, txn.category.replace('_', ' ')|title) }}</span>
+                        {% endif %}
                     </td>
                     <td class="text-sm text-muted">{% if txn.card %}<a href="/accounts/{{ txn.card.account_id }}/edit" onclick="event.stopPropagation();">{% if txn.account %}{{ txn.account.label }} - {% endif %}{{ txn.card.label or txn.card.card_mask }}{% if txn.card.label and not txn.card.is_primary %} (addon){% endif %}</a>{% elif txn.account %}<a href="/accounts/{{ txn.account.id }}/edit" onclick="event.stopPropagation();">{{ txn.account.label }}</a>{% else %}{{ txn.card_mask or txn.account_mask or "&mdash;"|safe }}{% endif %}</td>
                     <td class="text-sm text-muted" style="font-family: var(--font-mono);">{{ txn.reference_number or "&mdash;"|safe }}</td>
@@ -221,13 +242,32 @@
     const transactionsFilterForm = document.getElementById("transactions-filter-form");
     if (transactionsFilterForm) {
         transactionsFilterForm
-            .querySelectorAll('select, input[type="date"]')
+            .querySelectorAll('select, input[type="date"], input[type="checkbox"]')
             .forEach((field) => {
                 field.addEventListener("change", () => {
                     if (skipAutoSubmit) return;
                     transactionsFilterForm.requestSubmit();
                 });
             });
+    }
+
+    // A specific category and "uncategorized only" are mutually exclusive: a row
+    // cannot be both groceries and uncategorized. Checking the toggle clears the
+    // category dropdown, and picking a category clears the toggle, so the two
+    // never travel together as a contradictory query string.
+    const categoryFilter = document.getElementById("category-filter");
+    const uncategorizedToggle = document.getElementById("uncategorized-toggle");
+    if (categoryFilter && uncategorizedToggle) {
+        categoryFilter.addEventListener("change", () => {
+            if (categoryFilter.value && uncategorizedToggle.checked) {
+                uncategorizedToggle.checked = false;
+            }
+        });
+        uncategorizedToggle.addEventListener("change", () => {
+            if (uncategorizedToggle.checked && categoryFilter.value) {
+                categoryFilter.value = "";
+            }
+        });
     }
 </script>
 {% endblock %}

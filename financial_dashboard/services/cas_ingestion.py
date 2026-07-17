@@ -10,7 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.dates import parse_date
 from financial_dashboard.db.enums import SnapshotCategory, SnapshotKind, SnapshotSource
-from financial_dashboard.db.models import BalanceSnapshot, CasUpload, SnapshotHolding
+from financial_dashboard.db.models import (
+    BalanceSnapshot,
+    CasUpload,
+    InvestmentLot,
+    SnapshotHolding,
+)
 
 
 class CasIngestError(ValueError):
@@ -84,6 +89,9 @@ async def ingest_cas_payload(
         await session.execute(
             delete(BalanceSnapshot).where(BalanceSnapshot.cas_upload_id == upload.id)
         )
+        await session.execute(
+            delete(InvestmentLot).where(InvestmentLot.cas_upload_id == upload.id)
+        )
         await session.execute(delete(CasUpload).where(CasUpload.id == upload.id))
 
     upload = CasUpload(
@@ -140,6 +148,16 @@ async def ingest_cas_payload(
                 value=value,
             )
         )
+    await session.flush()
+
+    # Normalize complete capital-gains lots from the CAS transactions. Only an
+    # explicit acquisition fact (MF purchase with units+nav+amount+date+isin)
+    # becomes a lot; value-only holdings and demat movements are excluded by
+    # the service and reported as diagnostics, never fabricated here. The prior
+    # upload's lots were deleted above, so this is idempotent on re-ingest.
+    from financial_dashboard.services.investments import create_investment_lots
+
+    await create_investment_lots(session, cas_upload_id=upload.id, payload=payload)
     return upload
 
 

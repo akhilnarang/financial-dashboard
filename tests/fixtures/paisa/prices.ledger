@@ -1,0 +1,7 @@
+; prices.ledger — local price directives (no network).
+; Included from main.ledger; re-generated deterministically from the
+; synthetic scenario.
+
+P 2025-06-01 SYNSYNT 100.00 INR
+P 2025-06-01 USD 1.00 INR
+P 2026-03-17 "INE000A01020" 100.0000 INR

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
 from financial_dashboard.integrations.email import orchestrator as fetch_orchestrator
 from financial_dashboard.services.categorization.merchant_rules import (
@@ -14,6 +15,9 @@ from financial_dashboard.services.categorization.sweep import (
 )
 from financial_dashboard.services.reminders import check_and_send_reminders
 from financial_dashboard.services.settings import get_setting_int
+
+if TYPE_CHECKING:
+    from financial_dashboard.services.extensions import ExtensionManager
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +42,15 @@ def make_poll_status() -> dict:
 
 
 class FetchService:
-    def __init__(self) -> None:
+    def __init__(self, extension_manager: ExtensionManager | None = None) -> None:
         self._lock = asyncio.Lock()
         self.status = make_poll_status()
         self._poll_loop_task: asyncio.Task | None = None
         self._active_poll_task: asyncio.Task | None = None
+        # Optional extension manager: when present, after-fetch-cycle hooks run
+        # once per cycle (e.g. automatic Paisa sync). Absent (None) keeps the
+        # legacy behavior so existing constructions stay compatible.
+        self._extension_manager = extension_manager
 
     def get_poll_status(self) -> dict:
         return fetch_orchestrator.get_poll_status(self.status)
@@ -109,6 +117,17 @@ class FetchService:
                 raise
             except Exception:
                 logger.exception("Categorization sweep failed")
+
+            # Extension after-fetch-cycle hooks run ONCE per cycle, after native
+            # polling/reminders/categorization, then the loop sleeps. The manager
+            # isolates per-extension failures, so this can never break polling.
+            if self._extension_manager is not None:
+                try:
+                    await self._extension_manager.after_fetch_cycle_all()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Extension after-fetch-cycle hooks failed")
 
             interval = max(1, get_setting_int("poll_interval_minutes", 15)) * 60
             await asyncio.sleep(interval)

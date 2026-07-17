@@ -10,6 +10,7 @@ from financial_dashboard.api import router as api_router
 from financial_dashboard.config import settings
 from financial_dashboard.core.deps import verify_credentials
 from financial_dashboard.db import async_session, engine, init_db
+from financial_dashboard.services.extensions import bootstrap_extensions
 from financial_dashboard.services.fetch import FetchService
 from financial_dashboard.services.settings import (
     assert_master_key_or_no_secrets,
@@ -29,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Register builtin extensions before init_db() runs load_all_settings(), so
+    # contributed SettingDef entries are present when the settings cache fills.
+    app.state.extension_manager = bootstrap_extensions()
+
     logger.info("Initializing database...")
     await init_db()
     logger.info("Database ready")
@@ -39,8 +44,12 @@ async def lifespan(app: FastAPI):
         await assert_master_key_or_no_secrets(session)
 
     await start_services()
-    fetch_service = FetchService()
+    fetch_service = FetchService(extension_manager=app.state.extension_manager)
     app.state.fetch_service = fetch_service
+    # Start extension runtimes now that the DB + settings are ready. This is
+    # inert for Paisa (startup never starts Paisa or enables auto-sync); it only
+    # marks runtimes ready to receive after-fetch-cycle hooks from the poll loop.
+    await app.state.extension_manager.startup_all()
     await fetch_service.start_poll_loop()
 
     if not settings.auth_enabled:
@@ -52,6 +61,7 @@ async def lifespan(app: FastAPI):
     yield
 
     await fetch_service.stop_poll_loop()
+    await app.state.extension_manager.shutdown_all()
     await stop_services()
     await engine.dispose()
 

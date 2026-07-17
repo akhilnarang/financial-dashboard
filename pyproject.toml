@@ -13,6 +13,7 @@ dependencies = [
     "jinja2>=3.1,<4",
     "sqlalchemy[asyncio]>=2.0,<3",
     "aiosqlite>=0.20,<1",
+    "httpx>=0.28,<1",
     "bank-email-parser",
     "bank-sms-parser",
     "bank-statement-parser",
@@ -42,6 +43,7 @@ cc-parser = { git = "https://github.com/akhilnarang/cc-parser" }
 
 [dependency-groups]
 dev = [
+    "beancount>=3.2.3",
     "pytest>=9.0,<10",
     "pytest-anyio>=0.0.0",
     "ruff>=0.15.12",

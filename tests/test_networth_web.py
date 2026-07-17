@@ -327,3 +327,83 @@ async def test_networth_page_carries_its_chart_and_the_app_serves_it(client):
     # The URL the SVG names is one the app answers, so the chart has data to draw.
     trend = await client.get("/api/networth/trend")
     assert trend.status_code == 200
+
+
+async def test_networth_page_renders_stale_banner_and_row_badge(session):
+    """A bank snapshot older than the 45-day bank staleness threshold surfaces the
+    page-level 'stale' banner and the per-row stale badge."""
+    from financial_dashboard.db.models import Account
+
+    account = Account(
+        bank="Example", label="Old Bank", type="bank_account", active=True
+    )
+    session.add(account)
+    await session.flush()
+    old = dt.date.today() - dt.timedelta(days=60)  # 60 > 45-day bank threshold
+    session.add(
+        BalanceSnapshot(
+            account_id=account.id,
+            kind=SnapshotKind.asset.value,
+            category=SnapshotCategory.bank_balance.value,
+            as_of_date=old,
+            value=Decimal("100000.00"),
+            source=SnapshotSource.bank_statement.value,
+        )
+    )
+    await session.commit()
+
+    async def override():
+        yield session
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_build_app(override)), base_url="http://test"
+    ) as client:
+        resp = await client.get("/networth")
+
+    assert resp.status_code == 200
+    body = resp.text
+    # Page-level banner (summary.has_stale) and per-row badge both present.
+    assert "stale" in body
+    assert "badge-pending" in body
+
+
+async def test_networth_page_renders_unreconciled_badge_for_failed_cas(session):
+    """An investment snapshot whose CAS upload failed reconciliation surfaces the
+    per-row 'unreconciled' (danger) badge on the net worth page."""
+    recent = dt.date.today() - dt.timedelta(days=5)  # recent -> not stale
+    upload = CasUpload(
+        portfolio_key="PANBAD1",
+        depository_source="cdsl",
+        investor_name="Example Investor",
+        statement_date=recent,
+        grand_total=Decimal("50000.00"),
+        portfolio_ok=False,
+        raw_holdings_json="{}",
+    )
+    session.add(upload)
+    await session.flush()
+    session.add(
+        BalanceSnapshot(
+            cas_upload_id=upload.id,
+            portfolio_key=upload.portfolio_key,
+            kind=SnapshotKind.asset.value,
+            category=SnapshotCategory.investment.value,
+            as_of_date=recent,
+            value=Decimal("50000.00"),
+            source=SnapshotSource.cas.value,
+        )
+    )
+    await session.commit()
+
+    async def override():
+        yield session
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_build_app(override)), base_url="http://test"
+    ) as client:
+        resp = await client.get("/networth")
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert "unreconciled" in body
+    assert "badge danger" in body

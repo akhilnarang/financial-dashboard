@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
-from financial_dashboard.db import SmsMessage, Transaction, async_session
+from financial_dashboard.db import SmsMessage, Transaction
 from financial_dashboard.services.linker import build_link_context
 from financial_dashboard.services.settings import (
     get_telegram_chat_id,
@@ -147,7 +147,18 @@ class ReparseAllSmsResponse(BaseModel):
 async def reparse_all_failed_sms(
     session: AsyncSession = Depends(get_session),
 ) -> ReparseAllSmsResponse:
-    # 1. Read row IDs only.
+    # 1. Read row IDs and build the link context in one read pass, then
+    # close that transaction. ``LinkContext`` holds only preloaded
+    # primitives (masks / account_ids / card_ids / types), so it survives
+    # the rollback that closes the read transaction.
+    #
+    # The whole batch runs against the injected request session (via
+    # ``Depends(get_session)``) rather than spawning production-global
+    # ``async_session()`` instances, so the per-row transactions stay
+    # isolated to whatever DB the request is bound to (the configured DB in
+    # prod, the in-memory engine under test). Per-row ``session.begin()``
+    # blocks give the same one-row-rolls-back-isolation the old per-row
+    # sessions did.
     ids = (
         (
             await session.execute(
@@ -157,11 +168,8 @@ async def reparse_all_failed_sms(
         .scalars()
         .all()
     )
+    link_ctx = await build_link_context(session)
     await session.rollback()
-
-    # Build link_context once for the whole batch.
-    async with async_session() as s:
-        link_ctx = await build_link_context(s)
 
     # Lazy-imported here to avoid a top-level cycle.
     from financial_dashboard.services.reminders import check_payment_received
@@ -173,13 +181,13 @@ async def reparse_all_failed_sms(
     )
     for sms_id in ids:
         try:
-            async with async_session() as s:
-                async with s.begin():
-                    row = await s.get(SmsMessage, sms_id)
-                    if row is None:
-                        continue
-                    outcome = await process_sms_row(s, row, link_ctx)
-                # Bucket outside the txn block — row attrs are still loaded.
+            async with session.begin():
+                row = await session.get(SmsMessage, sms_id)
+                if row is None:
+                    continue
+                outcome = await process_sms_row(session, row, link_ctx)
+            # Bucket outside the txn block — row attrs are still loaded
+            # (the session is configured with expire_on_commit=False).
             match outcome.status:
                 case "parsed":
                     counts["processed"] += 1

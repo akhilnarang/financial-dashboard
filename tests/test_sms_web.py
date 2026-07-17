@@ -1,6 +1,8 @@
 """Tests for /sms web routes."""
 
 import datetime
+from decimal import Decimal
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -141,14 +143,6 @@ async def test_reparse_force_new_creates_row_for_deferred_sms(session):
     assert data["txn_id"] is not None
 
 
-@pytest.mark.skip(
-    reason=(
-        "Known testability gap: the bulk endpoint spawns its own async_session() "
-        "instances for per-row isolation, which connect to the production DB URL "
-        "rather than the in-memory test session injected via dependency override. "
-        "Requires option (b) refactor (injectable session_factory) to fix properly."
-    )
-)
 @pytest.mark.anyio
 async def test_reparse_all_pending_and_error(session):
     good = SmsMessage(
@@ -186,3 +180,62 @@ async def test_reparse_all_pending_and_error(session):
     # The "skipped" row stays untouched.
     await session.refresh(skipped)
     assert skipped.status == "skipped"
+
+
+@pytest.mark.anyio
+async def test_reparse_maskless_multi_card_dispatches_disambiguation_prompt(
+    session, monkeypatch
+):
+    """A maskless CC bill-payment SMS with multiple CC candidates (and no
+    statement amount-match) reaches the notification boundary: the web reparse
+    route dispatches ``send_disambiguation_prompt`` exactly once, post-commit,
+    with the candidate payload — never silently guessing an account."""
+    from bank_sms_parser.models import Money, ParsedSms, SmsTransactionAlert
+
+    from financial_dashboard.db import Account
+
+    # Two IndusInd CC accounts → linker can't pick, amount-match finds nothing.
+    a = Account(bank="indusind", type="credit_card", label="IndusInd A")
+    b = Account(bank="indusind", type="credit_card", label="IndusInd B")
+    session.add_all([a, b])
+    await session.flush()
+
+    parsed = ParsedSms(
+        email_type="indusind_cc_payment_received_alert",
+        bank="indusind",
+        transaction=SmsTransactionAlert(
+            direction="credit",
+            amount=Money(amount=Decimal("133"), currency="INR"),
+            transaction_date=datetime.date(2026, 5, 17),
+            # maskless — no card_mask / account_mask
+        ),
+    )
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms",
+        lambda *a, **k: parsed,
+    )
+
+    sms = SmsMessage(
+        bank="indusind",
+        sender="VK-INDBNK",
+        body="<maskless multi-card payment body>",
+        received_at=datetime.datetime(2026, 5, 17, 13, 12, 35, tzinfo=datetime.UTC),
+        status="error",
+    )
+    session.add(sms)
+    await session.commit()
+
+    prompt_mock = AsyncMock()
+    with patch(
+        "financial_dashboard.services.telegram.send_disambiguation_prompt",
+        prompt_mock,
+    ):
+        async with await _client(session) as client:
+            resp = await client.post(f"/sms/{sms.id}/reparse")
+
+    assert resp.status_code == 200
+    # Fired exactly once at the notification boundary, carrying both candidates.
+    prompt_mock.assert_awaited_once()
+    payload = prompt_mock.await_args.args[0]
+    assert set(payload["candidate_account_ids"]) == {a.id, b.id}
+    assert payload["txn_id"] is not None

@@ -1,0 +1,20 @@
+{
+  "as_of": "2026-07-15",
+  "backends": [
+    "ledger",
+    "hledger",
+    "beancount"
+  ],
+  "currencies": [
+    "INE000A01020",
+    "INR",
+    "USD"
+  ],
+  "cutover_date": "2025-06-01",
+  "entry_count": 50,
+  "lot_count": 1,
+  "price_directive_count": 2,
+  "profile": "golden",
+  "rendered_by": "financial_dashboard.services.paisa.renderers.render_document",
+  "seed": 4242
+}

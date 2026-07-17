@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}Paisa {{ report }} - Ledger{% endblock %}
+{% block content %}
+
+<style>
+    .report-table { width: 100%; }
+    .report-table th, .report-table td { white-space: nowrap; }
+    .report-table td.amt { font-family: var(--font-mono); text-align: right; }
+    .status-dot { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%; vertical-align: middle; margin-right: 0.3rem; }
+    .status-dot.ok { background: var(--clr-credit); }
+    .status-dot.bad { background: var(--clr-debit); }
+    .status-dot.unknown { background: var(--border-light); }
+    .cache-chip { font-size: 0.72rem; font-weight: 600; padding: 0.1rem 0.4rem; border-radius: 999px; background: var(--surface-inset); color: var(--text-muted); }
+</style>
+
+<div class="section-header">
+    <div>
+        <h2>Paisa · {{ report }}</h2>
+        <p class="text-sm text-muted" style="margin: 0;">Curated, normalized read from the local Paisa instance (v0.7.4). Server-side TTL-cached; a slow/down instance degrades to a notice, never an error.</p>
+    </div>
+    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+        <a href="/extensions/paisa/reports/budget" role="button" class="secondary">Budget</a>
+        <a href="/extensions/paisa/reports/allocation" role="button" class="secondary">Allocation</a>
+        <a href="/extensions/paisa/reports/recurring" role="button" class="secondary">Recurring</a>
+        <a href="/extensions/paisa/reports/income_statement" role="button" class="secondary">Income statement</a>
+        <a href="/extensions/paisa/reports/liabilities" role="button" class="secondary">Liabilities</a>
+        <a href="/extensions/paisa" role="button" class="secondary">Back to Paisa</a>
+    </div>
+</div>
+
+<p id="report-status" class="text-sm text-muted" style="margin: 0 0 1rem;"><span class="status-dot unknown"></span>loading…</p>
+<div id="report-body"></div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// All values are rendered via textContent/createElement — never innerHTML — so a
+// misconfigured upstream string cannot inject markup. Headers are static constants.
+const REPORT = {{ report | tojson }};
+
+function setStatus(cls, text) {
+    const p = document.getElementById('report-status');
+    const dot = document.createElement('span');
+    dot.classList.add('status-dot', cls);
+    p.replaceChildren(dot);
+    p.appendChild(document.createTextNode(text));
+}
+
+function makeTable(headers, rows) {
+    const wrap = document.createElement('div');
+    wrap.className = 'table';
+    wrap.style.overflowX = 'auto';
+    const table = document.createElement('table');
+    table.className = 'report-table';
+    const thead = document.createElement('thead');
+    const htr = document.createElement('tr');
+    headers.forEach(h => {
+        const th = document.createElement('th');
+        th.textContent = h;
+        htr.appendChild(th);
+    });
+    thead.appendChild(htr);
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    rows.forEach(r => {
+        const tr = document.createElement('tr');
+        r.forEach((cell, i) => {
+            const td = document.createElement('td');
+            if (i > 0 && typeof cell === 'string' && /^[-0-9.,]+$/.test(cell)) td.classList.add('amt');
+            td.textContent = cell === null || cell === undefined ? '—' : String(cell);
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    return wrap;
+}
+
+function render(data) {
+    const body = document.getElementById('report-body');
+    body.replaceChildren();
+    const card = document.createElement('article');
+    card.className = 'card';
+    if (REPORT === 'budget' && data.budget) {
+        card.appendChild(h3('Budget by month'));
+        card.appendChild(makeTable(
+            ['Month', 'Forecast', 'Actual', 'Available', 'End-of-month balance'],
+            data.budget.months.map(m => [m.month, m.forecast, m.actual, m.available_this_month, m.end_of_month_balance])
+        ));
+    } else if (REPORT === 'allocation' && data.allocation) {
+        card.appendChild(h3('Allocation targets'));
+        card.appendChild(makeTable(
+            ['Name', 'Target %', 'Current %'],
+            data.allocation.targets.map(t => [t.name, t.target_percent, t.current_percent])
+        ));
+    } else if (REPORT === 'recurring' && data.recurring) {
+        card.appendChild(h3('Recurring transactions'));
+        card.appendChild(makeTable(
+            ['Key', 'Period', 'Interval (days)', 'Count'],
+            data.recurring.sequences.map(s => [s.key, s.period || '—', s.interval_days != null ? s.interval_days : '—', s.count])
+        ));
+    } else if (REPORT === 'income_statement' && data.income_statement) {
+        card.appendChild(h3('Income statement (by fiscal year)'));
+        data.income_statement.periods.forEach(p => {
+            card.appendChild(h4(p.period));
+            card.appendChild(makeTable(
+                ['Section', 'Account', 'Amount'],
+                [].concat(
+                    [['Income', '', '']].slice(0,0),
+                    p.income.map(r => ['Income', r.account, r.amount]),
+                    p.interest.map(r => ['Interest', r.account, r.amount]),
+                    p.expenses.map(r => ['Expenses', r.account, r.amount]),
+                    p.tax.map(r => ['Tax', r.account, r.amount]),
+                    p.pnl.map(r => ['PnL', r.account, r.amount]),
+                    [['', 'Starting balance', p.starting_balance], ['', 'Ending balance', p.ending_balance]]
+                )
+            ));
+        });
+    } else if (REPORT === 'liabilities' && data.liabilities) {
+        card.appendChild(h3('Liability balances'));
+        card.appendChild(makeTable(
+            ['Group', 'Drawn', 'Repaid', 'Interest', 'Balance', 'APR'],
+            data.liabilities.breakdowns.map(b => [b.group, b.drawn_amount, b.repaid_amount, b.interest_amount, b.balance_amount, b.apr || '—'])
+        ));
+    } else {
+        card.appendChild(muted('No data for this report.'));
+    }
+    body.appendChild(card);
+}
+
+function h3(text) { const h = document.createElement('h3'); h.style.cssText = 'margin: 0 0 0.75rem; font-size: 1.05rem;'; h.textContent = text; return h; }
+function h4(text) { const h = document.createElement('h4'); h.style.cssText = 'margin: 1rem 0 0.4rem; font-size: 0.95rem;'; h.textContent = text; return h; }
+function muted(text) { const p = document.createElement('p'); p.className = 'text-sm text-muted'; p.style.margin = '0'; p.textContent = text; return p; }
+
+async function load() {
+    try {
+        const resp = await fetch('/api/extensions/paisa/reports/' + REPORT, {headers: {'Accept': 'application/json'}});
+        const data = await resp.json();
+        if (data.ok) {
+            const chip = document.createElement('span');
+            chip.className = 'cache-chip';
+            chip.textContent = data.cached ? 'cached' : 'fresh';
+            setStatus('ok', 'loaded ');
+            document.getElementById('report-status').appendChild(chip);
+            render(data);
+        } else {
+            setStatus(data.reason === 'disabled' ? 'unknown' : 'bad', 'unavailable: ' + (data.reason || 'unknown'));
+        }
+    } catch (e) {
+        setStatus('bad', 'failed to load report');
+    }
+}
+load();
+</script>
+{% endblock %}

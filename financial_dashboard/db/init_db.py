@@ -428,6 +428,30 @@ async def init_db(engine) -> None:
             )
         )
 
+        # --- Investment-grade holding detail (Phase 4) ---
+        # SnapshotHolding gains optional instrument-level columns a CAS payload
+        # can state for a priced instrument. They stay NULL on the existing
+        # per-asset-class aggregated rows; the columns are added so a future
+        # instrument-level holding can record them. The new investment_lots
+        # table is created by ``create_all`` (it only creates missing tables),
+        # so it needs no ALTER here.
+        for _col, _type in (
+            ("instrument_id", "VARCHAR"),
+            ("quantity", "NUMERIC(20,6)"),
+            ("unit_price", "NUMERIC(20,6)"),
+            ("currency", "VARCHAR(3)"),
+            ("cost_basis", "NUMERIC(18,4)"),
+            ("acquired_on", "DATE"),
+        ):
+            try:
+                await conn.execute(
+                    text(f"SELECT {_col} FROM snapshot_holdings LIMIT 0")
+                )
+            except Exception:
+                await conn.execute(
+                    text(f"ALTER TABLE snapshot_holdings ADD COLUMN {_col} {_type}")
+                )
+
     async with engine.begin() as conn:
         # Seed the generic built-in merchant rules (INSERT OR IGNORE, idempotent).
         # Personal/local overrides are loaded separately via the CLI from the

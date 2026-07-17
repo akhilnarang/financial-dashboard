@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Extensions - Ledger{% endblock %}
+{% block content %}
+
+<div class="section-header">
+    <h2>Extensions</h2>
+</div>
+
+<p class="text-sm text-muted" style="margin: 0 0 1.5rem;">
+    First-party extensions extend the dashboard with optional integrations. Each is registered explicitly — there is no plugin discovery.
+</p>
+
+<div style="display: grid; gap: 1rem;">
+{% for ext in extensions %}
+    <article class="card" style="display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap;">
+        <div>
+            <h3 style="margin: 0 0 0.25rem; font-size: 1.05rem;">{{ ext.display_name }}</h3>
+            <p class="text-sm text-muted" style="margin: 0;">{{ ext.description }}</p>
+            <div style="margin-top: 0.4rem; display: flex; gap: 0.35rem; flex-wrap: wrap;">
+            {% for cap in ext.capabilities %}
+                <span class="badge badge-pending" style="font-size: 0.72rem; text-transform: none;">{{ cap }}</span>
+            {% endfor %}
+            </div>
+        </div>
+        <div>
+        {% if ext.id == "paisa" %}
+            <a href="/extensions/paisa" role="button" class="secondary">Configure</a>
+        {% else %}
+            <span class="text-sm text-muted">No configuration</span>
+        {% endif %}
+        </div>
+    </article>
+{% endfor %}
+</div>
+
+{% endblock %}

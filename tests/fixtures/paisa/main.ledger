@@ -1,0 +1,9 @@
+; main.ledger — Paisa entry point.
+; Includes the operator journal, the dashboard-generated journal, and
+; the local price directives.
+; Tested against ananthakumaran/paisa:0.7.4 via scripts/paisa_contract.py
+; (``paisa --config /data/paisa.yaml --now <d> update --journal``).
+
+include user-authored.ledger
+include dashboard-generated.ledger
+include prices.ledger

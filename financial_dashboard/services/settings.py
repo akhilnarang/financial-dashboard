@@ -219,6 +219,19 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
     ),
 }
 
+
+def register_setting(key: str, defn: SettingDef) -> None:
+    """Register a SettingDef. Raises ValueError if the key is already known.
+
+    Use this instead of mutating SETTINGS_REGISTRY directly so contributed
+    settings (e.g. from extensions) can't silently overwrite a built-in or
+    another contribution.
+    """
+    if key in SETTINGS_REGISTRY:
+        raise ValueError(f"Setting already registered: {key}")
+    SETTINGS_REGISTRY[key] = defn
+
+
 _cache: dict[str, str] = {}
 
 

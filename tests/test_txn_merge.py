@@ -15,6 +15,7 @@ from financial_dashboard.services.txn_merge import (
     MatchDecision,
     compute_enrichment_diff,
     find_match,
+    is_duplicate_transaction_error,
     merge_transaction,
 )
 
@@ -1863,3 +1864,281 @@ async def test_force_new_idempotent_on_already_linked_source(session: AsyncSessi
     assert r2.id == r1.id
     rows = (await session.execute(select(Transaction))).scalars().all()
     assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# raw_description enrichment downgrade guard
+# ---------------------------------------------------------------------------
+
+
+def test_compute_diff_raw_description_downgrade_blocked():
+    """A shorter incoming raw_description that is a strict substring of the
+    existing one is a downgrade (the first source had more context), so it
+    must NOT overwrite — mirroring the counterparty / mask downgrade guards."""
+    existing = _make_txn(raw_description="Sent via UPI to merchant for order #1234")
+    incoming = {"raw_description": "Sent via UPI to merchant"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert "raw_description" not in diff.overwritten
+
+
+def test_compute_diff_raw_description_real_change_overwrites():
+    """A genuinely different (non-substring) incoming raw_description is a
+    real change from the second source and overwrites — the guard must not
+    freeze the field. A pure case flip is also treated as a real change."""
+    existing = _make_txn(raw_description="spent at zomato")
+    incoming = {"raw_description": "SPENT AT ZOMATO ONLINE ORDER"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.overwritten["raw_description"] == (
+        "spent at zomato",
+        "SPENT AT ZOMATO ONLINE ORDER",
+    )
+
+
+def test_compute_diff_raw_description_fills_null():
+    existing = _make_txn(raw_description=None)
+    incoming = {"raw_description": "Billed by merchant"}
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.filled == {"raw_description": "Billed by merchant"}
+
+
+# ---------------------------------------------------------------------------
+# No-date fuzzy insert: an incoming row with no date and no ref cannot fuzzy
+# match and must insert.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_find_match_no_date_no_ref_inserts(session: AsyncSession):
+    """An incoming txn with neither reference_number nor transaction_date can
+    neither exact-ref-match nor fuzzy-match (the fuzzy window is anchored on
+    the date). It must insert — never silently merge into an unrelated row."""
+    existing = Transaction(
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 2),
+        transaction_time=time(14, 23),
+        counterparty="Zomato",
+    )
+    session.add(existing)
+    await session.flush()
+
+    match = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": None,
+            "transaction_date": None,  # no date at all
+            "transaction_time": None,
+            "counterparty": "Zomato",
+        },
+    )
+    assert match.action == "insert"
+
+
+# ---------------------------------------------------------------------------
+# ref multiplicity is schema-infeasible: uq_transactions_ref forbids two rows
+# sharing (bank, reference_number, direction), so find_match's >1 branch is
+# defense-only.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_reference_unique_index_forbids_duplicate_ref(session: AsyncSession):
+    """The partial unique index ``uq_transactions_ref`` on
+    (bank, reference_number, direction) makes the >1-ref-match branch in
+    find_match unreachable by construction. Pin that here so a future schema
+    change that drops the index doesn't quietly reintroduce the silent-merge
+    bug the multiplicity defer exists to guard against."""
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
+    session.add(
+        Transaction(
+            bank="hdfc",
+            email_type="t",
+            direction="debit",
+            amount=Decimal("500"),
+            reference_number="IMPS:DUP",
+        )
+    )
+    await session.flush()
+    session.add(
+        Transaction(
+            bank="hdfc",
+            email_type="t",
+            direction="debit",
+            amount=Decimal("999"),
+            reference_number="IMPS:DUP",
+        )
+    )
+    with pytest.raises(SAIntegrityError):
+        await session.flush()
+
+
+# ---------------------------------------------------------------------------
+# merge insert IntegrityError re-resolve: a concurrent insert (race) lands the
+# ref row between find_match and the insert; the savepoint IntegrityError must
+# re-resolve and enrich instead of crashing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_merge_insert_integrity_error_re_resolves_to_enrich(
+    session: AsyncSession, monkeypatch
+):
+    """Repro of the race ``merge_transaction``'s savepoint catch defends
+    against: ``find_match`` first returns ``insert`` (nothing found), but a
+    concurrent commit adds the ref row before the insert flushes, so the
+    insert hits ``uq_transactions_ref``. The handler must re-run find_match,
+    see the now-present row, and enrich it — never leak the IntegrityError.
+
+    The race is simulated deterministically by wrapping find_match so its
+    first call inserts the conflicting row (mimicking the concurrent commit)
+    before returning insert, then returns the match on the re-resolve call.
+    """
+    import financial_dashboard.services.txn_merge as txn_merge_mod
+
+    real_find_match = txn_merge_mod.find_match
+    call_count = {"n": 0}
+
+    ref = "IMPS:RACE-001"
+
+    async def _racing_find_match(sess, txn_data, channel="sms"):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Simulate the concurrent commit landing between find_match and
+            # the insert: insert the row this very call "didn't see".
+            sess.add(
+                Transaction(
+                    bank="hdfc",
+                    email_type="hdfc_dc_transaction_alert",
+                    direction="debit",
+                    amount=Decimal("500"),
+                    currency="INR",
+                    reference_number=ref,
+                    source="email",
+                    counterparty="Zomato",
+                )
+            )
+            await sess.flush()
+            return txn_merge_mod.MatchDecision("insert")
+        # Re-resolve call after the IntegrityError: now it matches.
+        return await real_find_match(sess, txn_data, channel)
+
+    monkeypatch.setattr(txn_merge_mod, "find_match", _racing_find_match)
+
+    outcome, row, _ = await merge_transaction(
+        session,
+        "sms",
+        {
+            "bank": "hdfc",
+            "email_type": "hdfc_dc_transaction_alert",
+            "direction": "debit",
+            "amount": Decimal("500"),
+            "currency": "INR",
+            "reference_number": ref,
+            "counterparty": "Zomato",
+        },
+        sms_message_id=77,
+    )
+    assert outcome == "enriched"
+    assert row is not None
+    assert row.reference_number == ref
+    # Exactly one row exists (the race-injected one), now enriched with SMS.
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].sms_message_id == 77
+
+
+@pytest.mark.anyio
+async def test_merge_insert_integrity_error_reraises_when_still_unresolvable(
+    session: AsyncSession, monkeypatch
+):
+    """When the IntegrityError re-resolves to anything other than a clean
+    match (still 'insert' or 'defer'), the original error must be re-raised
+    rather than silently swallowed — there's no safe recovery."""
+    import financial_dashboard.services.txn_merge as txn_merge_mod
+
+    # Pre-seed the conflicting row. find_match is patched to ignore it and
+    # always return 'insert', so merge's insert hits uq_transactions_ref and
+    # the re-resolve (still 'insert') must re-raise.
+    session.add(
+        Transaction(
+            bank="hdfc",
+            email_type="t",
+            direction="debit",
+            amount=Decimal("500"),
+            reference_number="IMPS:RERAISE",
+            source="email",
+        )
+    )
+    await session.flush()
+
+    async def _always_insert(sess, txn_data, channel="sms"):
+        return txn_merge_mod.MatchDecision("insert")
+
+    monkeypatch.setattr(txn_merge_mod, "find_match", _always_insert)
+
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
+    with pytest.raises(SAIntegrityError):
+        await merge_transaction(
+            session,
+            "sms",
+            {
+                "bank": "hdfc",
+                "email_type": "t",
+                "direction": "debit",
+                "amount": Decimal("500"),
+                "reference_number": "IMPS:RERAISE",
+            },
+            sms_message_id=1,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Canonical IntegrityError classifier (shared by txn_merge + emails).
+# ---------------------------------------------------------------------------
+
+
+def _exc_with_orig(message: str):
+    from sqlalchemy.exc import IntegrityError
+
+    return IntegrityError(statement=None, params=None, orig=Exception(message))
+
+
+def test_is_duplicate_transaction_error_named_index():
+    assert is_duplicate_transaction_error(
+        _exc_with_orig("UNIQUE constraint failed: uq_transactions_ref")
+    )
+
+
+def test_is_duplicate_transaction_error_legacy_name():
+    """The legacy uq_transaction_dedup name is still recognized for back-compat
+    with DBs migrated before the rename."""
+    assert is_duplicate_transaction_error(
+        _exc_with_orig("UNIQUE constraint failed: uq_transaction_dedup")
+    )
+
+
+def test_is_duplicate_transaction_error_generic_sqlite_text():
+    assert is_duplicate_transaction_error(
+        _exc_with_orig(
+            "UNIQUE constraint failed: transactions.bank, "
+            "transactions.reference_number, transactions.direction"
+        )
+    )
+
+
+def test_is_duplicate_transaction_error_unrelated_constraint_is_false():
+    assert not is_duplicate_transaction_error(
+        _exc_with_orig("UNIQUE constraint failed: emails.message_id")
+    )
+    assert not is_duplicate_transaction_error(
+        _exc_with_orig("NOT NULL constraint failed: transactions.amount")
+    )

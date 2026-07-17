@@ -111,6 +111,27 @@
     <label style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.55; display: block; margin-bottom: 0.3rem;">Category</label>
     <input id="txn-category" class="note-area" type="text" placeholder="e.g. Food & Dining" value="{{ txn.category or '' }}">
     <div id="category-status" class="note-status"></div>
+    <div style="display: flex; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.35rem; align-items: center;">
+        {% if not txn.category or txn.category == 'unknown' %}
+        <span class="badge badge-pending">Uncategorized</span>
+        {% endif %}
+        {% if txn.category_method and category_method_labels.get(txn.category_method) %}
+        <span class="badge">{{ category_method_labels.get(txn.category_method) }}</span>
+        {% endif %}
+        {% if txn.review_status == "pending" %}
+        <span class="badge badge-pending">Needs review</span>
+        {% elif txn.review_status == "resolved" %}
+        <span class="badge success-outline">Reviewed</span>
+        {% elif txn.review_status == "notified" %}
+        <span class="badge">Notified</span>
+        {% endif %}
+        {% if txn.category_confidence is not none %}
+        <small class="text-muted" style="font-size: 0.72rem;">confidence {{ "%.0f"|format(txn.category_confidence * 100) }}%</small>
+        {% endif %}
+    </div>
+    {% if txn.review_reason %}
+    <small class="text-muted" style="display: block; margin-top: 0.3rem; font-size: 0.75rem;">{{ txn.review_reason }}</small>
+    {% endif %}
 </div>
 
 <div style="margin-top: 1rem;">

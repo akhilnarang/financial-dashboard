@@ -329,7 +329,77 @@ class SnapshotHolding(Base):
     label: Mapped[str] = mapped_column(String, nullable=False)
     value: Mapped[Decimal] = mapped_column(Numeric(16, 2), nullable=False)
 
+    # Optional investment detail a CAS payload carries for a single priced
+    # instrument. The current CAS ingestion still aggregates holdings by asset
+    # class for the net-worth breakdown (so these stay NULL on those rows); the
+    # fields exist so an instrument-level holding can record the facts the CAS
+    # explicitly states without fabricating any. None of them is ever derived
+    # from ``value`` — ``acquired_on``/``cost_basis`` are only set when the
+    # source states them, and a complete cost-basis lot is normalized into a
+    # separate :class:`InvestmentLot` row instead.
+    instrument_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    quantity: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    cost_basis: Mapped[Decimal | None] = mapped_column(Numeric(18, 4), nullable=True)
+    acquired_on: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+
     snapshot: Mapped["BalanceSnapshot"] = relationship(back_populates="holdings")
+
+
+class InvestmentLot(Base):
+    """A complete, capital-gains-eligible investment lot normalized from an
+    explicit CAS acquisition fact.
+
+    A row exists ONLY when the source states every field a lot needs to be
+    projected truthfully — an instrument id, a quantity, a per-unit cost, a
+    cost basis, a currency and an acquisition date — and they are mutually
+    consistent (``quantity * unit_cost`` agrees with ``cost_basis`` to the
+    penny). Today the only CAS source that satisfies this is a mutual-fund
+    purchase/switch_in transaction whose ``units`` + ``nav`` + ``amount`` +
+    ``date`` + ``isin`` are all present. Value-only holdings and demat
+    movements (CAS carries no cost for them) are excluded and reported as
+    diagnostics by :mod:`financial_dashboard.services.investments`; they are
+    never fabricated into a lot here. Acquisition dates and cost basis are
+    never derived from a current market value.
+
+    Re-ingestion of the same CAS period deletes the prior upload (and its
+    lots) first, so the ``(cas_upload_id, source_ref, instrument_id,
+    acquired_on, reference)`` natural key only needs to deduplicate within a
+    single upload; the application-level ingest also dedupes in memory because
+    SQLite treats multiple NULLs as distinct in a UNIQUE constraint.
+    """
+
+    __tablename__ = "investment_lots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cas_upload_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("cas_uploads.id"), nullable=False
+    )
+    instrument_id: Mapped[str] = mapped_column(String, nullable=False)
+    instrument_name: Mapped[str] = mapped_column(String, nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    unit_cost: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    cost_basis: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    acquired_on: Mapped[datetime.date] = mapped_column(Date, nullable=False)
+    source_ref: Mapped[str] = mapped_column(String, nullable=False)
+    transaction_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    reference: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "cas_upload_id",
+            "source_ref",
+            "instrument_id",
+            "acquired_on",
+            "reference",
+            name="uq_investment_lot_natural",
+        ),
+        Index("ix_investment_lots_upload", "cas_upload_id"),
+        Index("ix_investment_lots_instrument", "instrument_id"),
+    )
 
 
 class Setting(Base):
@@ -339,6 +409,58 @@ class Setting(Base):
     value: Mapped[str] = mapped_column(Text, nullable=False, default="")
     updated_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime, default=utc_now, onupdate=utc_now
+    )
+
+
+class ExtensionRun(Base):
+    """Audit/state row for a single extension operation (generic, not Paisa-specific).
+
+    One row per attempted extension operation (a probe, a generate, an automatic
+    or manual sync). It is the single source of truth for "what did the extension
+    do, when, and how did it end" — it stores NO credentials and never duplicates
+    financial rows; ``details``/``error`` carry sanitized summary text only.
+
+    operation   ``manual`` | ``automatic`` | ``probe`` | ``generate`` | ``sync``
+    status      ``running`` | ``success`` | ``failure`` | ``skipped``
+    outcome     free-form machine token (``synced`` | ``skipped_unchanged`` |
+                ``disabled`` | ``connect_only`` | ``not_configured`` | …) mirroring
+                the orchestrator's outcomes where applicable
+    trigger     what started it (``fetch_cycle`` | ``api`` | ``startup`` | …)
+    started/completed_at are tz-aware UTC (see utc_now)
+    input_hash  hash of the inputs that produced this run (e.g. the projected
+                journal body hash) so two runs over identical inputs are comparable
+    output_hash hash of the emitted output (the published file body hash) so an
+                operator can verify the on-disk file matches the audit row
+    emitted/skipped_count  projection counts when the operation produced them
+    details     JSON-encoded text blob of safe, non-secret summary fields
+    error       sanitized error text (truncated, no credentials)
+    """
+
+    __tablename__ = "extension_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    extension_id: Mapped[str] = mapped_column(String, nullable=False)
+    operation: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="running")
+    outcome: Mapped[str | None] = mapped_column(String)
+    trigger: Mapped[str | None] = mapped_column(String)
+    started_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utc_now)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    input_hash: Mapped[str | None] = mapped_column(String)
+    output_hash: Mapped[str | None] = mapped_column(String)
+    emitted_count: Mapped[int | None] = mapped_column(Integer)
+    skipped_count: Mapped[int | None] = mapped_column(Integer)
+    details: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        # The hot query is "most recent run(s) for this extension", often filtered
+        # to an operation/status — a compound index on (extension_id, started_at)
+        # serves both the recent-list and the debounce lookup, and a per-status
+        # index serves a future "show me failures" filter.
+        Index("ix_extension_runs_ext_started", "extension_id", "started_at"),
+        Index("ix_extension_runs_ext_status", "extension_id", "status"),
+        Index("ix_extension_runs_operation", "operation"),
     )
 
 

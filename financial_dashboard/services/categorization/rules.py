@@ -48,6 +48,37 @@ CARD_REFUND_MARKERS: tuple[str, ...] = (
     "cancellation",
 )
 
+# Narration evidence for a credit that reverses a previously-debited fee. A
+# real fee reversal nets against the fee it reversed, so it belongs on the
+# ``fees_charges`` line as a contra-credit rather than on ``refund`` /
+# ``repayment``. This is the one explicit, evidence-gated path that lets a
+# credit ``fees_charges`` through: the polarity guard still flips a credit
+# ``fees_charges`` (LLM output, no evidence) to ``repayment`` / a card bill,
+# so ordinary contra-credit slugs stay guarded. Whole-token matched like the
+# card markers, so a generic "...fees..." run of characters cannot fire it.
+FEE_REVERSAL_MARKERS: tuple[str, ...] = (
+    "fee reversal",
+    "fee reversed",
+    "fee refund",
+    "fee waived",
+    "fees reversed",
+    "fees refund",
+    "fees waived",
+    "annual fee reversal",
+    "annual fee reversed",
+    "annual fee refund",
+    "annual charges reversal",
+    "annual charges reversed",
+    "joining fee reversal",
+    "joining fee reversed",
+    "card fee reversal",
+    "card fee reversed",
+    "late fee reversal",
+    "late fee reversed",
+    "finance charges reversal",
+    "finance charges reversed",
+)
+
 
 def _has_marker(text_norm: str, markers: tuple[str, ...]) -> bool:
     padded = f" {text_norm} "
@@ -114,6 +145,17 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
         or "cc_smartpay" in email_type
     ):
         return RuleResult("credit_card_payment", 0.95)
+
+    # Fee reversal: a credit reversing a previously-debited fee nets against the
+    # fee it reversed, so it belongs on the fees_charges line as a contra-credit
+    # (the cashflow report's expense bucket reads it as a negative contra). This
+    # is the explicit, evidence-gated path the polarity guard deliberately does
+    # NOT take: a credit fees_charges is directionally impossible for the LLM
+    # (which has no evidence to offer), so the guard still flips a no-evidence
+    # credit fees_charges to 'repayment' / a card bill. Direction-gated to
+    # credit because the markers themselves describe a credit event.
+    if direction == "credit" and _has_marker(text_norm, FEE_REVERSAL_MARKERS):
+        return RuleResult("fees_charges", 0.9)
 
     # A credit on a credit card is money returning TO the card — the account
     # holds what you owe, so it cannot receive inbound income. Only two things
