@@ -238,6 +238,140 @@ async def test_summary_refuses_when_multiple_accounts_share_last4(
         assert rows == []
 
 
+@pytest.mark.parametrize(
+    ("accounts", "card_mask", "attaches", "expected_log"),
+    [
+        # A left-visible BIN denotes no card. Flattened to digits it would
+        # read as the suffix of the account ending 1234 — one clean, wrong
+        # hit. It selects nothing, and with two accounts there is no sole
+        # account to fall back to.
+        pytest.param(
+            [{"card_last4": "9999"}, {"card_last4": "1234"}],
+            "1234XXXXXXXX",
+            False,
+            None,
+            id="bin-only-mask-two-accounts-refused",
+        ),
+        # One account is not a licence to skip the card check: a readable
+        # mask that positively disagrees means this summary is about a card
+        # the dashboard does not track.
+        pytest.param(
+            [{"card_last4": "9012"}],
+            "XXXX XXXX XXXX 7788",
+            False,
+            "disagrees with the only credit_card account",
+            id="sole-account-refuted-by-readable-mask",
+        ),
+        # Some banks print no mask at all; absent data is not a conflict.
+        pytest.param(
+            [{"card_last4": "9012"}],
+            None,
+            True,
+            None,
+            id="absent-mask-attaches-to-sole-account",
+        ),
+        # The stored side of the same rule: an account recording no card has
+        # said nothing, and silence cannot disagree.
+        pytest.param(
+            [{}],
+            "1234",
+            True,
+            None,
+            id="sole-account-recording-no-mask-attaches",
+        ),
+        # Refuting the only account needs no trailing digits: the BIN shows a
+        # digit where the stored mask shows a different one.
+        pytest.param(
+            [{"account_number": "5100XXXXXXXX9012"}],
+            "1234 XXXX XXXX XXXX",
+            False,
+            "disagrees with the only credit_card account",
+            id="left-bin-disagreeing-refused",
+        ),
+        # ...and a BIN agreeing everywhere the two masks can see each other
+        # contradicts nothing.
+        pytest.param(
+            [{"account_number": "5100XXXXXXXX9012"}],
+            "5100 XXXX XXXX XXXX",
+            True,
+            None,
+            id="left-bin-consistent-attaches",
+        ),
+        # The limit of what refutation can see, pinned so it is not mistaken
+        # for a bug later: masks compare right-aligned, so a 12-position
+        # BIN's visible digits land against the 16-position stored mask's
+        # hidden middle and can contradict nothing.
+        pytest.param(
+            [{"account_number": "5100XXXXXXXX9012"}],
+            "1234XXXXXXXX",
+            True,
+            None,
+            id="short-bin-cannot-reach-stored-digits",
+        ),
+        # An account is refuted only when NONE of its cards can be the one
+        # named — otherwise every add-on statement would be thrown away as a
+        # conflict with the primary.
+        pytest.param(
+            [
+                {
+                    "account_number": "5100XXXXXXXX9012",
+                    "card_last4": "4111XXXXXXXX7788",
+                }
+            ],
+            "XXXX XXXX XXXX 7788",
+            True,
+            None,
+            id="addon-card-keeps-sole-account",
+        ),
+    ],
+)
+@pytest.mark.anyio
+async def test_summary_card_mask_gates_attachment(
+    session_factory, monkeypatch, caplog, accounts, card_mask, attaches, expected_log
+):
+    """The card-mask gate on the summary path, in both directions.
+
+    With one account on the bank the question is refutation — attach unless
+    the mask positively disagrees; with several it is selection, which needs
+    trailing visible digits. Either way a refused summary leaves no upload
+    row, and an attached one lands on the first (sole) account.
+    """
+    first_id = None
+    for idx, kwargs in enumerate(accounts):
+        acc_id = await _add_cc_account(
+            session_factory, label=f"OneCard {idx}", **kwargs
+        )
+        first_id = first_id if first_id is not None else acc_id
+    summary = _default_summary()
+    summary.card_mask = card_mask
+    parsed = _parsed_with(summary)
+    monkeypatch.setattr(cc_module, "should_notify_transactions", lambda: False)
+
+    import financial_dashboard.services.reminders as reminders_mod
+
+    async def _noop(_uid):
+        return True
+
+    monkeypatch.setattr(reminders_mod, "init_payment_tracking", _noop)
+
+    with caplog.at_level("WARNING"):
+        result = await cc_module.process_cc_statement_email_summary(
+            "onecard", parsed, email_id=None
+        )
+
+    async with session_factory() as session:
+        uploads = (await session.execute(select(StatementUpload))).scalars().all()
+
+    if attaches:
+        assert result is not None
+        assert [upload.account_id for upload in uploads] == [first_id]
+    else:
+        assert result is None
+        assert uploads == []
+    if expected_log:
+        assert any(expected_log in r.message for r in caplog.records)
+
+
 @pytest.mark.anyio
 async def test_summary_picks_matching_account_by_card_mask(
     session_factory, monkeypatch
@@ -266,6 +400,41 @@ async def test_summary_picks_matching_account_by_card_mask(
         upload = (await session.execute(select(StatementUpload))).scalars().first()
         assert upload is not None
         assert upload.account_id == target_id
+
+
+@pytest.mark.anyio
+async def test_summary_refuses_when_only_match_is_a_bin_only_stored_mask(
+    session_factory, monkeypatch
+):
+    """A stored mask carrying no trailing visible digit identifies no card.
+
+    Account A holds a real card that does not match the statement; account B
+    holds a BIN-only mask (5100XXXXXXXX). Because mask_matches right-aligns,
+    B's wildcard suffix lands over the statement's real digits and matches
+    every card of that issuer — so without a trailing-digit gate the summary
+    would attach to B, an account it has nothing to do with. It must refuse.
+    """
+    await _add_cc_account(session_factory, label="OneCard A", card_last4="9999")
+    await _add_cc_account(session_factory, label="OneCard B", card_last4="5100XXXXXXXX")
+    parsed = _parsed_with(_default_summary())  # statement card_mask "1234"
+
+    monkeypatch.setattr(cc_module, "should_notify_transactions", lambda: False)
+
+    import financial_dashboard.services.reminders as reminders_mod
+
+    async def _noop(_uid):
+        return True
+
+    monkeypatch.setattr(reminders_mod, "init_payment_tracking", _noop)
+
+    result = await cc_module.process_cc_statement_email_summary(
+        "onecard", parsed, email_id=None
+    )
+
+    assert result is None
+    async with session_factory() as session:
+        upload = (await session.execute(select(StatementUpload))).scalars().first()
+        assert upload is None
 
 
 @pytest.mark.anyio

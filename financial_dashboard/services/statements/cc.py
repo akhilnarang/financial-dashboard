@@ -22,9 +22,11 @@ Provides:
   matching Account, reconciles, auto-imports missing transactions, and creates
   a StatementUpload row.
 
-- _find_account(): finds an existing credit card Account matching the
-  statement's card last-4 (checking both account_number and cards table).
-  Returns None when no match exists — statements do not auto-create accounts.
+- _find_account(): finds the existing credit card Account whose card the
+  statement's mask denotes, via _match_account_by_mask (checking both
+  account_number and cards table, comparing masks positionally rather than
+  by last-4). Returns None unless exactly one account matches — statements
+  do not auto-create accounts.
 
 Inline imports (from financial_dashboard.db, financial_dashboard.linker) are
 used inside async functions to avoid circular import issues.
@@ -39,8 +41,13 @@ import tempfile
 from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from sqlalchemy import func, select
+
+if TYPE_CHECKING:
+    # Aliased: the statement parser's row model shares the name Transaction
+    # with the DB model imported below.
+    from cc_parser.parsers.models import Transaction as ParsedCcTransaction
 from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.db import (
     Account,
@@ -52,7 +59,13 @@ from financial_dashboard.db import (
 
 from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
-from financial_dashboard.core.masks import mask_digits, mask_last4
+from financial_dashboard.core.masks import (
+    mask_digits,
+    mask_last4,
+    mask_matches,
+    normalize_mask,
+    trailing_visible_digits,
+)
 from bank_email_parser.models import Money, ParsedEmail
 
 from financial_dashboard.integrations.parsers import parse_cc_statement_pdf
@@ -61,6 +74,7 @@ from financial_dashboard.services.categorization.self_transfer import (
 )
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.snapshots import emit_cc_snapshot
+from financial_dashboard.services.statements.contention import contended_miss
 from financial_dashboard.services.statements.hint import extract_password_hint
 from financial_dashboard.services.settings import (
     get_setting_int,
@@ -121,12 +135,80 @@ def _extract_digits(card_str: str | None) -> str:
     return mask_digits(card_str)
 
 
+def cc_card_compatible(db_card_mask: str | None, account_card_masks: list[str]) -> bool:
+    """Could a DB row masked ``db_card_mask`` be a row on this account's
+    statement?
+
+    Asked only by the picker, to decide whether a pairing is allowed — never
+    when assembling the evidence a row is judged against. Answering ``False``
+    therefore costs a match and nothing more: the row keeps its candidates,
+    claims nothing, and surfaces for a human.
+
+    The question is asked at **account** grain: a DB row is compatible if its
+    mask can be *any* card the account holds, primary or add-on. The statement
+    row's own card field is deliberately not consulted — banks stamp the
+    statement *header* mask onto every row they print, so read as per-row
+    evidence it would turn every add-on card's transaction into a card
+    conflict with the primary's header. Account scoping keeps this safe: the
+    reconciler is handed one account's rows, so nothing here can match across
+    accounts.
+
+    Identity is positional, never a last-4: ``5100XXXXXXXX9012`` and
+    ``4111XXXXXXXX9012`` are different cards that flatten to the same digits,
+    while ``XX9012`` and the full masked PAN are one card in two spellings.
+    ``mask_matches`` compares right-aligned, so visible digits conflict where
+    they meet and wildcards absorb what a mask cannot see. That also makes a
+    visible-digit floor unnecessary and harmful: a short mask like ``XX34``
+    can only conflict on a digit it actually shows, and dismissing it as
+    "unknown" would throw that evidence away.
+
+    Either side unknown means unknown, not conflict: an absent or unreadable
+    DB mask stays compatible, and an account recording no cards at all gates
+    nothing.
+
+    Args:
+        db_card_mask: The DB row's card mask, as stored (not normalized).
+        account_card_masks: Every card the account answers to, already
+            normalized — see ``load_account_card_masks``. Collected once per
+            reconcile, not per row.
+    """
+    db_mask = normalize_mask(db_card_mask)
+    if not db_mask or not account_card_masks:
+        return True
+    return any(mask_matches(db_mask, card_mask) for card_mask in account_card_masks)
+
+
+def _refresh_identity(txn: "ParsedCcTransaction") -> str:
+    """Everything a refresh would write onto the DB row a statement row wins.
+
+    Two statement rows with equal identities are interchangeable as *winners*:
+    pairing either with the same DB row leaves it holding the same value. On
+    this path a refresh writes the narration and nothing else, so the
+    narration is the whole identity.
+    """
+    return (txn.narration or "").strip()
+
+
 def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
     return (txn_date, amount, direction)
 
 
-def reconcile_statement(parsed, db_transactions: list, account_id: int) -> dict:
+def reconcile_statement(
+    parsed,
+    db_transactions: list,
+    account_id: int,
+    account_card_masks: list[str],
+) -> dict:
     """Match statement transactions against DB transactions.
+
+    Args:
+        parsed: The parsed statement.
+        db_transactions: This account's DB rows to reconcile against.
+        account_id: The account the statement was resolved to.
+        account_card_masks: Every card the account answers to, normalized —
+            see ``load_account_card_masks``. Required rather than defaulted,
+            because an empty list legitimately disables the card check and a
+            caller that forgot to look the masks up would silently get that.
 
     Returns a dict with matched, missing, and extra lists.
     """
@@ -148,6 +230,38 @@ def reconcile_statement(parsed, db_transactions: list, account_id: int) -> dict:
                 db_txn.transaction_date, Decimal(str(db_txn.amount)), db_txn.direction
             )
             db_pool.setdefault(key, []).append(db_txn)
+
+    # Each statement row's evidence set (see ``contention``): this account's
+    # DB rows in its date/amount/direction window, built from the pool before
+    # any row draws from it so a rival stays visible after it loses. The card
+    # check deliberately stays out: it is judged against the account's
+    # registered cards, and that registry drifts (an add-on nobody recorded,
+    # or one deleted after its transactions were stored), so a card conflict
+    # must surface as ambiguity — the picker declines the pairing and the row
+    # is held back — rather than empty the set and read as "import it".
+    pool_snapshot: dict[tuple, list] = {
+        key: list(rows) for key, rows in db_pool.items()
+    }
+
+    def _reachable(amount: Decimal, direction: str, txn_date: date_type) -> set[int]:
+        """The DB rows that could be this statement row's transaction, across
+        the window. Card-blind: see the note above."""
+        found: set[int] = set()
+        for offset in (0, -1, 1):
+            key = _match_key(txn_date + timedelta(days=offset), amount, direction)
+            found.update(db_txn.id for db_txn in pool_snapshot.get(key, []))
+        return found
+
+    candidate_sets: dict[int, set[int]] = {}
+    for stmt_idx, (_stmt_list, direction, txn) in enumerate(stmt_txns):
+        try:
+            candidate_sets[stmt_idx] = _reachable(
+                parse_cc_amount(txn.amount),
+                direction,
+                parse_cc_date(txn.date),
+            )
+        except ValueError, InvalidOperation:
+            continue
 
     matched = []
     missing = []
@@ -180,8 +294,20 @@ def reconcile_statement(parsed, db_transactions: list, account_id: int) -> dict:
             candidate_date = txn_date + timedelta(days=date_offset)
             key = _match_key(candidate_date, amount, direction)
             candidates = db_pool.get(key, [])
-            if candidates:
-                db_txn = candidates.pop(0)  # greedy: take first match
+            # Greedy, but never across a known card conflict: a row on a card
+            # this account does not hold is not this transaction, and taking it
+            # would both corrupt that row's narration and swallow this
+            # statement row.
+            pick = next(
+                (
+                    idx
+                    for idx, cand in enumerate(candidates)
+                    if cc_card_compatible(cand.card_mask, account_card_masks)
+                ),
+                None,
+            )
+            if pick is not None:
+                db_txn = candidates.pop(pick)
                 if not candidates:
                     del db_pool[key]
                 matched.append(
@@ -208,6 +334,9 @@ def reconcile_statement(parsed, db_transactions: list, account_id: int) -> dict:
                 {
                     "stmt_idx": stmt_idx,
                     "stmt_list": stmt_list,
+                    # No DB match, but a non-empty candidate set means it may
+                    # only have lost a race — hold it back, don't import.
+                    "ambiguous": contended_miss(candidate_sets[stmt_idx]),
                     "date": txn.date,
                     "amount": txn.amount,
                     "direction": direction,
@@ -218,6 +347,52 @@ def reconcile_statement(parsed, db_transactions: list, account_id: int) -> dict:
                     "imported_txn_id": None,
                 }
             )
+
+    # Demote contested winners. The pick is greedy, so a winner won on
+    # statement order, which is not evidence: where a rival also reached its
+    # DB row, committing the winner would let enrichment write the wrong
+    # narration and swallow the winner's own — possibly new — transaction.
+    # Exception: rivals with equal refresh identities are interchangeable as
+    # winners (either pairing lands the same narration), so the winner keeps
+    # its match. The loser is held back regardless — it is a second statement
+    # row for a transaction the DB holds once.
+    txn_by_idx = {
+        stmt_idx: txn for stmt_idx, (_list, _dir, txn) in enumerate(stmt_txns)
+    }
+    contested = []
+    for entry in matched:
+        rivals = [
+            stmt_idx
+            for stmt_idx, candidates in candidate_sets.items()
+            if stmt_idx != entry["stmt_idx"] and entry["db_txn_id"] in candidates
+        ]
+        if not rivals:
+            continue
+        identities = {
+            _refresh_identity(txn_by_idx[i]) for i in (entry["stmt_idx"], *rivals)
+        }
+        if len(identities) > 1:
+            contested.append(entry)
+    for entry in contested:
+        matched.remove(entry)
+        missing.append(
+            {
+                "stmt_idx": entry["stmt_idx"],
+                "stmt_list": entry["stmt_list"],
+                "ambiguous": True,
+                "date": entry["date"],
+                "amount": entry["amount"],
+                "direction": entry["direction"],
+                "narration": entry["narration"],
+                "card_number": entry["card_number"],
+                "person": entry["person"],
+                "imported": False,
+                "imported_txn_id": None,
+            }
+        )
+    # Demoted rows are appended after the rows that missed outright; restore
+    # statement order so the operator reads the sheet in the order it arrived.
+    missing.sort(key=lambda entry: entry["stmt_idx"])
 
     return {
         "matched": matched,
@@ -410,6 +585,12 @@ async def import_missing_cc_txns(
     imported: list[Transaction] = []
     for entry in recon["missing"]:
         if entry.get("imported"):
+            continue
+        if entry.get("ambiguous"):
+            entry["import_error"] = (
+                "ambiguous match — the DB may already hold this transaction under a "
+                "row it could not be safely paired with; resolve manually"
+            )
             continue
         try:
             amount = parse_cc_amount(entry["amount"])
@@ -637,21 +818,45 @@ async def process_cc_statement_email_summary(
         return None
 
     card_mask = summary.card_mask
+    stmt_mask = normalize_mask(card_mask)
     if len(cc_accounts) == 1:
+        # One account on the bank: the question is not which account this
+        # summary picks but whether it *refutes* the only one there is.
+        # Attach unless the mask positively disagrees — that keeps banks that
+        # print no mask, and accounts configured without a card number,
+        # working.
         account = cc_accounts[0]
+        async with async_session() as session:
+            stored = await _stored_masks_by_account(session, list(cc_accounts))
+        if _mask_refutes(stmt_mask, stored[account.id]):
+            logger.warning(
+                "summary card=%r disagrees with the only credit_card account "
+                "for bank=%s (account_id=%s); refusing to attach",
+                card_mask,
+                bank,
+                account.id,
+            )
+            return None
     else:
-        match: Account | None = None
-        if stmt_last4 := last4_from_card(card_mask):
-            async with async_session() as session:
-                match = await _match_account_by_last4(
-                    session, list(cc_accounts), stmt_last4
-                )
-        if match is None:
+        # Several accounts: picking one needs trailing visible digits — a
+        # leading BIN can refute an account but never single one out.
+        if trailing_visible_digits(stmt_mask) == 0:
             logger.warning(
                 "multiple CC accounts for bank=%s; refusing to auto-pick "
                 "(card_mask=%r)",
                 bank,
                 card_mask,
+            )
+            return None
+        async with async_session() as session:
+            match = await _match_account_by_mask(session, list(cc_accounts), stmt_mask)
+        if match is None:
+            logger.warning(
+                "summary card=%r matches no single credit_card account of the "
+                "%d for bank=%s; refusing to auto-pick",
+                card_mask,
+                len(cc_accounts),
+                bank,
             )
             return None
         account = match
@@ -726,51 +931,129 @@ async def process_cc_statement_email_summary(
     return {"statement_upload_id": upload_id, "summary_only": True}
 
 
-async def _match_account_by_last4(
+async def _stored_masks_by_account(
     session: AsyncSession,
     cc_accounts: list[Account],
-    stmt_last4: str,
-) -> Account | None:
-    """Pick the CC account whose card last-4 matches ``stmt_last4``.
+) -> dict[int, list[str]]:
+    """Every readable mask each account answers to, normalized.
 
-    Checks both ``Account.account_number`` (older accounts that stored the
-    card number directly) and the ``cards`` table (primary + add-on cards
-    keyed by account). Refuses to auto-pick under any ambiguity so a
-    statement never gets silently attached to the wrong account.
-
-    Args:
-        session: Active async DB session; used to query the ``cards`` table
-            for last-4 matches that didn't hit on ``Account.account_number``.
-        cc_accounts: Candidate active credit_card accounts for the bank
-            (already filtered by caller).
-        stmt_last4: Last-4 digits from the statement's ``card_mask``.
-
-    Returns:
-        The matching ``Account`` iff exactly one account has a last-4 match
-        across both sources. ``None`` when zero or multiple match; the
-        multi-match case logs a WARNING listing the ambiguous account ids.
+    An account may record its card in two places — ``Account.account_number``
+    (older accounts that stored the card number directly) and the ``cards``
+    table (primary + add-on cards) — and an account with an add-on legitimately
+    answers to several. Both routes are gathered together so no caller has to
+    know which one a given account happened to use; an account holding nothing
+    readable maps to an empty list.
     """
-    account_id_matches: set[int] = {
-        acc.id
-        for acc in cc_accounts
-        if last4_from_card(acc.account_number) == stmt_last4
-    }
     cc_account_ids = {acc.id for acc in cc_accounts}
     cards = (
         (await session.execute(select(Card).where(Card.account_id.in_(cc_account_ids))))
         .scalars()
         .all()
     )
+    stored: dict[int, list[str]] = {acc.id: [] for acc in cc_accounts}
+    for acc in cc_accounts:
+        if acc_mask := normalize_mask(acc.account_number):
+            stored[acc.id].append(acc_mask)
     for card in cards:
-        if last4_from_card(card.card_mask) == stmt_last4:
-            account_id_matches.add(card.account_id)
+        if card_mask := normalize_mask(card.card_mask):
+            stored[card.account_id].append(card_mask)
+    return stored
+
+
+async def load_account_card_masks(session: AsyncSession, account_id: int) -> list[str]:
+    """Every card mask one account answers to, normalized.
+
+    Read once per reconcile and handed to ``reconcile_statement``. An account
+    with nothing recorded yields ``[]``, which ``cc_card_compatible`` reads as
+    "no cards known" rather than "no cards match".
+    """
+    account = await session.get(Account, account_id)
+    if account is None:
+        return []
+    return (await _stored_masks_by_account(session, [account]))[account_id]
+
+
+def _mask_refutes(stmt_mask: str, stored_masks: list[str]) -> bool:
+    """Whether a normalized statement mask positively disagrees with an account.
+
+    Answers "is this statement definitely *not* about this account?" — cheaper
+    than selection: any position where the two masks both show a digit and the
+    digits differ settles it, so no trailing digits are needed. Disagreement
+    must be positive — a mask with no visible digit, and an account recording
+    no readable mask, each say nothing, and silence is not disagreement.
+    Comparison is right-aligned, so a shorter mask can only disagree where the
+    two actually overlap. An account answering to several masks is refuted
+    only if *none* of them can be this statement's card — an add-on card is
+    still this account's.
+    """
+    if not any("0" <= ch <= "9" for ch in stmt_mask):
+        return False
+    if not stored_masks:
+        return False
+    return not any(mask_matches(stmt_mask, stored) for stored in stored_masks)
+
+
+async def _match_account_by_mask(
+    session: AsyncSession,
+    cc_accounts: list[Account],
+    stmt_mask: str,
+) -> Account | None:
+    """Pick the CC account whose card ``stmt_mask`` denotes.
+
+    The single rule for *selecting* one account out of several. Identity is
+    positional, never a last-4: flattening a mask to its digits reads
+    ``5100XXXXXXXX9012`` and ``4111XXXXXXXX9012`` as the same card, and reads
+    the BIN ``1234XXXXXXXX`` as a suffix that claims an account *ending*
+    ``1234``. ``mask_matches`` right-aligns and compares, so visible digits
+    conflict where they meet and wildcards absorb what neither side can see;
+    the stored side is normalized, not flattened.
+
+    Both stored routes (``Account.account_number`` and the ``cards`` table)
+    are gathered before either decides — stopping at the first route to
+    produce something would hide a conflict the other route can see. An
+    account that records no readable mask is never selected: silence neither
+    disagrees with a statement nor identifies one, and promoting such an
+    account when nothing matches would make it a wildcard absorbing every
+    unclaimed statement. (Refuting a *lone* account is the cheaper question
+    answered by ``_mask_refutes``.)
+
+    Args:
+        session: Active async DB session; used to query the ``cards`` table.
+        cc_accounts: Candidate active credit_card accounts for the bank
+            (already filtered by caller).
+        stmt_mask: The statement's card mask, already normalized. Callers
+            must reject a mask with no trailing visible digits before
+            calling: a leading BIN is shared by every card an issuer prints,
+            so it denotes nothing to select on.
+
+    Returns:
+        The matching ``Account`` iff exactly one account has a stored mask
+        that ``stmt_mask`` can denote; ``None`` when zero or several do —
+        refusing to choose is what guards against the wrong account. The
+        multi-match case logs a WARNING listing the ambiguous account ids.
+    """
+    stored = await _stored_masks_by_account(session, cc_accounts)
+
+    # A stored mask identifies an account only if it carries a trailing
+    # visible digit of its own. mask_matches right-aligns, so a BIN-only
+    # stored mask (5100XXXXXXXX — digits at the left, wildcard suffix) lands
+    # its wildcards over the statement's real digits and matches every card
+    # of that issuer. Selecting on it would route a statement to an account
+    # that merely shares a BIN and import every row there.
+    account_id_matches: set[int] = {
+        acc_id
+        for acc_id, masks in stored.items()
+        if any(
+            trailing_visible_digits(m) > 0 and mask_matches(stmt_mask, m) for m in masks
+        )
+    }
 
     if len(account_id_matches) != 1:
         if len(account_id_matches) > 1:
             logger.warning(
-                "ambiguous CC account match for last4=%s across accounts=%s; "
+                "ambiguous CC account match for card=%s across accounts=%s; "
                 "refusing to auto-pick",
-                stmt_last4,
+                stmt_mask,
                 sorted(account_id_matches),
             )
         return None
@@ -827,10 +1110,25 @@ async def _find_account(bank: str, parsed) -> "Account | None":
     """Find an existing credit_card account matching the statement's card.
 
     Returns None if nothing matches — statements must not auto-create accounts.
+
+    This decides which account an entire statement lands in, so the card is
+    an identity question, answered by ``_match_account_by_mask`` and nothing
+    else. What guards against the wrong account is that helper's refusal to
+    choose between several, not a floor on visible digits: a short suffix
+    reaching exactly one account is trusted deliberately (SBI never prints
+    more than two digits), and one reaching several refuses on its own. The
+    only real floor is a mask with no trailing visible digits — it denotes
+    nothing to compare, and is refused rather than matched loosely.
     """
-    stmt_card_last4 = last4_from_card(parsed.card_number)
-    # Some banks (e.g. SBI) only show 2 digits: "XXXX XXXX XXXX XX67"
-    stmt_partial = _extract_digits(parsed.card_number) if not stmt_card_last4 else ""
+    stmt_mask = normalize_mask(parsed.card_number)
+    if trailing_visible_digits(stmt_mask) == 0:
+        logger.info(
+            "Statement card=%s for bank=%s shows no trailing digits to identify "
+            "an account; statement not imported",
+            parsed.card_number,
+            bank,
+        )
+        return None
 
     async with async_session() as session:
         cc_accounts = (
@@ -846,52 +1144,15 @@ async def _find_account(bank: str, parsed) -> "Account | None":
             .scalars()
             .all()
         )
+        account = await _match_account_by_mask(session, list(cc_accounts), stmt_mask)
 
-    # Try to match by last-4 of card number
-    account = None
-    if stmt_card_last4:
-        # Check account numbers
-        for acc in cc_accounts:
-            if last4_from_card(acc.account_number) == stmt_card_last4:
-                account = acc
-                break
-        # Check cards table
-        if not account:
-            async with async_session() as session:
-                cards = (await session.execute(select(Card))).scalars().all()
-                for card in cards:
-                    if last4_from_card(card.card_mask) == stmt_card_last4:
-                        for acc in cc_accounts:
-                            if acc.id == card.account_id:
-                                account = acc
-                                break
-                        if account:
-                            break
-    elif stmt_partial:
-        # Suffix match: bank only provides partial digits (e.g. "67" from SBI)
-        for acc in cc_accounts:
-            acc_l4 = last4_from_card(acc.account_number)
-            if acc_l4 and acc_l4.endswith(stmt_partial):
-                account = acc
-                break
-        if not account:
-            async with async_session() as session:
-                cards = (await session.execute(select(Card))).scalars().all()
-                for card in cards:
-                    card_l4 = last4_from_card(card.card_mask)
-                    if card_l4 and card_l4.endswith(stmt_partial):
-                        for acc in cc_accounts:
-                            if acc.id == card.account_id:
-                                account = acc
-                                break
-                        if account:
-                            break
-
-    if account:
+    if account is not None:
         return account
 
-    logger.info(
-        "No matching credit_card account for bank=%s card=%s; statement not imported",
+    # WARNING because it is actionable: a card is missing from the config or
+    # its mask is wrong, and both are silent until someone looks.
+    logger.warning(
+        "No single credit_card account for bank=%s card=%s; statement not imported",
         bank,
         parsed.card_number,
     )
@@ -1109,8 +1370,9 @@ async def process_statement_email(
             .scalars()
             .all()
         )
+        card_masks = await load_account_card_masks(session, account.id)
 
-    recon = reconcile_statement(parsed, list(db_txns), account.id)
+    recon = reconcile_statement(parsed, list(db_txns), account.id, card_masks)
 
     # Save the PDF to disk
     STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)

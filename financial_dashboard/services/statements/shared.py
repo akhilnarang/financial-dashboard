@@ -34,6 +34,7 @@ from financial_dashboard.services.statements.bank import (
 from financial_dashboard.services.statements.cc import (
     enrich_matched_transactions,
     import_missing_cc_txns,
+    load_account_card_masks,
     parse_statement,
     reconcile_statement,
     reconciliation_to_json,
@@ -93,7 +94,12 @@ async def retry_cc_statement_upload(
             )
         db_txns = list((await session.execute(stmt)).scalars().all())
 
-        recon = reconcile_statement(parsed, db_txns, account_id)
+        recon = reconcile_statement(
+            parsed,
+            db_txns,
+            account_id,
+            await load_account_card_masks(session, account_id),
+        )
         await enrich_matched_transactions(recon)
 
         upload = await session.get(StatementUpload, upload_id)
@@ -202,6 +208,13 @@ async def retry_bank_statement_upload(
         imported = 0
         for entry in recon["missing"]:
             if entry.get("imported"):
+                continue
+            if entry.get("ambiguous"):
+                entry["import_error"] = (
+                    "ambiguous match — the DB may already hold this transaction "
+                    "under a row it could not be safely paired with; "
+                    "resolve manually"
+                )
                 continue
             try:
                 amount = parse_bank_amount(entry["amount"])

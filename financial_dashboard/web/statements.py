@@ -57,6 +57,7 @@ from financial_dashboard.services.statements.cc import (
     extract_pdf_from_email,
     group_recon_by_person,
     import_missing_cc_txns,
+    load_account_card_masks,
     parse_cc_amount,
     parse_statement,
     process_statement_email,
@@ -278,7 +279,12 @@ async def statement_upload(
     )
 
     db_txns = list(db_txns)
-    recon = reconcile_statement(parsed, db_txns, account_id)
+    recon = reconcile_statement(
+        parsed,
+        db_txns,
+        account_id,
+        await load_account_card_masks(session, account_id),
+    )
 
     # Enrich matched DB transactions with statement narrations
     await enrich_matched_transactions(recon)
@@ -619,7 +625,12 @@ async def statement_reprocess(
     )
 
     db_txns = list(db_txns)
-    recon = reconcile_statement(parsed, db_txns, account_id)
+    recon = reconcile_statement(
+        parsed,
+        db_txns,
+        account_id,
+        await load_account_card_masks(session, account_id),
+    )
     await enrich_matched_transactions(recon)
 
     upload = await session.get(StatementUpload, upload_id)
