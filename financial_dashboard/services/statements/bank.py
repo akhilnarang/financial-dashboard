@@ -28,7 +28,7 @@ import tempfile
 from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -58,6 +58,7 @@ from financial_dashboard.services.settings import (
     should_notify_transactions,
 )
 from financial_dashboard.services.statements.cc import extract_pdf_from_email
+from financial_dashboard.services.statements.contention import contended_miss
 from financial_dashboard.services.statements.hint import extract_password_hint
 from financial_dashboard.services.telegram import (
     build_account_label,
@@ -119,15 +120,24 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
     return (txn_date, amount, direction)
 
 
-def _take_first_unconsumed(
+def _take_sole_unconsumed(
     candidates: list[int] | None, consumed: set[int]
 ) -> int | None:
-    """Return the first id in ``candidates`` not already consumed."""
+    """Return the id in ``candidates`` not already consumed, iff there is
+    exactly one.
+
+    A reference bucket is keyed on ``(reference_number, direction)`` alone,
+    and that is not an identity — ``uq_transactions_ref`` keys on ``bank`` as
+    well, so two DB rows from different banks may legitimately share a
+    reference. A reference therefore decides only when it decides alone;
+    otherwise the row falls through to the date pass, and its non-empty
+    candidate set surfaces it as an ambiguous miss rather than a guess.
+    """
     if not candidates:
         return None
-    for cid in candidates:
-        if cid not in consumed:
-            return cid
+    pool = [cid for cid in candidates if cid not in consumed]
+    if len(pool) == 1:
+        return pool[0]
     return None
 
 
@@ -331,7 +341,17 @@ def _is_compatible(
     return False
 
 
-def _select_unique_compatible(
+class CompatibleCandidates(NamedTuple):
+    """Candidates from one date-bucket that could be the statement row.
+
+    ``strong`` (ref-substring evidence) is a subset of ``compatible``.
+    """
+
+    strong: list[int]
+    compatible: list[int]
+
+
+def _compatible_candidates(
     candidates: list[int] | None,
     consumed: set[int],
     db_by_id: dict[int, object],
@@ -341,32 +361,15 @@ def _select_unique_compatible(
     stmt_channel: str | None,
     holder_tokens: set[str],
     is_fuzzy_date: bool,
-) -> int | None:
-    """Return the unique compatible candidate, or ``None``.
-
-    Uniqueness is enforced in two tiers so distinctive narration evidence
-    can break ties:
-
-    1. If at least one candidate matches by ref-substring (DB ref ⊆ stmt
-       narration, or stmt ref ⊆ DB raw_description, both word-bounded),
-       restrict to that set. This is high-confidence evidence.
-    2. Otherwise consider all compatible candidates.
-
-    Within the chosen tier, return the candidate iff exactly one passes —
-    never silently pick the first of multiple. Refusal pushes the row
-    into ``missing`` so the operator can resolve manually rather than
-    have us merge into the wrong sibling row.
-    """
-    if not candidates:
-        return None
-
-    pool = [cid for cid in candidates if cid not in consumed]
-    if not pool:
-        return None
-
+) -> CompatibleCandidates:
+    """Split one date-bucket's unconsumed candidates into compatible ones
+    and the subset backed by ref-substring evidence (DB ref ⊆ stmt
+    narration, or stmt ref ⊆ DB raw_description, both word-bounded)."""
     strong: list[int] = []
     compatible: list[int] = []
-    for cid in pool:
+    for cid in candidates or []:
+        if cid in consumed:
+            continue
         cand = db_by_id.get(cid)
         if cand is None:
             continue
@@ -389,15 +392,60 @@ def _select_unique_compatible(
         ):
             strong.append(cid)
 
-    pool_to_use = strong or compatible
+    return CompatibleCandidates(strong=strong, compatible=compatible)
+
+
+def _select_unique_compatible(found: CompatibleCandidates) -> int | None:
+    """Return the unique compatible candidate in one bucket, or ``None``.
+
+    Uniqueness is enforced in two tiers so distinctive narration evidence
+    can break ties: if any candidate carries ref-substring evidence,
+    restrict to that set; otherwise consider all compatible candidates.
+
+    Within the chosen tier, return the candidate iff exactly one passes —
+    never silently pick the first of multiple. Refusal pushes the row
+    into ``missing`` so the operator can resolve manually rather than
+    have us merge into the wrong sibling row.
+
+    This is per-bucket, so it says nothing about rivals a day away: the
+    caller compares the whole ±1-day window before trusting the pick
+    enough to overwrite a narration with it.
+    """
+    pool_to_use = found.strong or found.compatible
     if len(pool_to_use) == 1:
         return pool_to_use[0]
     return None
 
 
-def _missing_entry(stmt_idx: int, direction: str, txn) -> dict:
+class RefreshIdentity(NamedTuple):
+    """What distinguishes two statement rows competing for the same DB row.
+
+    Two rows with equal identities are interchangeable as *winners*: pairing
+    either with the same DB row leaves it in the same state. ``counterparty``
+    holds the value enrichment would land — falling back to the narration
+    exactly as enrichment does — not the raw field, which would read two rows
+    with merely *absent* counterparties as identical. ``channel`` is not
+    written by any refresh today but stays as a semantic discriminator: rows
+    arriving through different channels are not obviously the same event, and
+    keeping it can only err toward a spare demotion.
+    """
+
+    counterparty: str
+    channel: str | None
+
+
+def _refresh_identity(txn: "BankTransaction") -> RefreshIdentity:
+    counterparty = (txn.counterparty or "").strip()
+    narration = (txn.narration or "").strip()
+    return RefreshIdentity(counterparty or narration, txn.channel)
+
+
+def _missing_entry(
+    stmt_idx: int, direction: str, txn, *, ambiguous: bool = False
+) -> dict:
     return {
         "stmt_idx": stmt_idx,
+        "ambiguous": ambiguous,
         "date": txn.date,
         "amount": txn.amount,
         "direction": direction,
@@ -499,17 +547,33 @@ def reconcile_bank_statement(
 
     consumed: set[int] = set()
     matched_db_ids: dict[int, object] = {}
+    # Which DB row each matched statement row claimed. The claim has to be
+    # re-examined once every row's reach is known, so the id is kept, not just
+    # the object.
+    claimed_ids: dict[int, int] = {}
+
+    # What each statement row carrying a reference could claim by reference.
+    # The ref pass gets the same candidate-set treatment as the fuzzy one:
+    # two statement rows can carry the same reference, in which case one of
+    # them is claiming a DB row the other has as good a title to.
+    ref_sets: dict[int, set[int]] = {}
+    for stmt_idx, direction, txn, _amount, _txn_date in parsed_rows:
+        if not txn.reference_number:
+            continue
+        if ref_ids := ref_pool.get((txn.reference_number, direction)):
+            ref_sets[stmt_idx] = set(ref_ids)
 
     # Pass 1: reference-number matches across all stmt rows.
     for stmt_idx, direction, txn, _amount, _txn_date in parsed_rows:
         if not txn.reference_number:
             continue
         ref_key = (txn.reference_number, direction)
-        candidate_id = _take_first_unconsumed(ref_pool.get(ref_key), consumed)
+        candidate_id = _take_sole_unconsumed(ref_pool.get(ref_key), consumed)
         if candidate_id is None:
             continue
         consumed.add(candidate_id)
         matched_db_ids[stmt_idx] = db_by_id[candidate_id]
+        claimed_ids[stmt_idx] = candidate_id
 
     # Pass 2: date+amount+direction fallback for stmt rows still unmatched.
     # Compatibility is ref-and-narration-aware (see ``_is_compatible``).
@@ -519,6 +583,44 @@ def reconcile_bank_statement(
     # both-refs-disagree path lives inside ``_is_compatible`` via the
     # ``is_fuzzy_date`` flag.
     holder_tokens = _holder_name_tokens(parsed.account_holder_name)
+
+    # What each statement row could claim by date: every DB candidate across
+    # its window that passes the same compatibility rule the picker applies.
+    # Evaluated as though nothing had been consumed — consumption is the
+    # *outcome* of the race, so it cannot be an input to deciding who was in
+    # it: hiding a DB row because pass 1 claimed it would make the rival that
+    # also reached it read as a brand-new transaction and import a second
+    # copy. The pick still respects `consumed`; only this analysis is blind
+    # to it.
+    unconsumed: set[int] = set()
+    fuzzy_sets: dict[int, set[int]] = {}
+    for stmt_idx, direction, txn, amount, txn_date in parsed_rows:
+        if amount is None or txn_date is None:
+            continue
+        reachable: set[int] = set()
+        for offset in (0, -1, 1):
+            key = _match_key(txn_date + timedelta(days=offset), amount, direction)
+            reachable.update(
+                _compatible_candidates(
+                    date_pool.get(key),
+                    unconsumed,
+                    db_by_id,
+                    stmt_ref=txn.reference_number,
+                    stmt_narration=txn.narration,
+                    stmt_channel=txn.channel,
+                    holder_tokens=holder_tokens,
+                    is_fuzzy_date=offset != 0,
+                ).compatible
+            )
+        fuzzy_sets[stmt_idx] = reachable
+
+    # One set per statement row, spanning both passes: what it could claim by
+    # reference, plus what it could claim by date. Contention is read off these.
+    candidate_sets: dict[int, set[int]] = {
+        stmt_idx: ref_sets.get(stmt_idx, set()) | fuzzy_sets.get(stmt_idx, set())
+        for stmt_idx, *_ in parsed_rows
+    }
+
     for stmt_idx, direction, txn, amount, txn_date in parsed_rows:
         if stmt_idx in matched_db_ids:
             continue
@@ -537,23 +639,55 @@ def reconcile_bank_statement(
             missing.append(_missing_entry(stmt_idx, direction, txn))
             continue
         stmt_ref = txn.reference_number
+        # The pick: first bucket to yield a unique compatible candidate wins,
+        # exact date first. Whether a row that got *no* pick may be imported is
+        # a separate question, answered by the candidate sets above.
+        chosen_id: int | None = None
         for offset in (0, -1, 1):
             key = _match_key(txn_date + timedelta(days=offset), amount, direction)
-            candidate_id = _select_unique_compatible(
-                date_pool.get(key),
-                consumed,
-                db_by_id,
-                stmt_ref=stmt_ref,
-                stmt_narration=txn.narration,
-                stmt_channel=txn.channel,
-                holder_tokens=holder_tokens,
-                is_fuzzy_date=offset != 0,
+            chosen_id = _select_unique_compatible(
+                _compatible_candidates(
+                    date_pool.get(key),
+                    consumed,
+                    db_by_id,
+                    stmt_ref=stmt_ref,
+                    stmt_narration=txn.narration,
+                    stmt_channel=txn.channel,
+                    holder_tokens=holder_tokens,
+                    is_fuzzy_date=offset != 0,
+                )
             )
-            if candidate_id is None:
-                continue
-            consumed.add(candidate_id)
-            matched_db_ids[stmt_idx] = db_by_id[candidate_id]
-            break
+            if chosen_id is not None:
+                break
+
+        if chosen_id is None:
+            continue
+        consumed.add(chosen_id)
+        matched_db_ids[stmt_idx] = db_by_id[chosen_id]
+        claimed_ids[stmt_idx] = chosen_id
+
+    # Demote contested winners. Both passes are greedy, so a winner won on
+    # statement order, which is not evidence: where a rival also reached its
+    # DB row, committing the winner would let enrichment write the wrong
+    # merchant and swallow the winner's own — possibly new — transaction.
+    # Exception: rivals with equal refresh identities are interchangeable as
+    # winners (either pairing lands the same values), so the winner keeps its
+    # match. The loser is held back regardless — it is a second statement row
+    # for a transaction the DB holds once.
+    txn_by_idx = {stmt_idx: txn for stmt_idx, _direction, txn, *_rest in parsed_rows}
+    contested = []
+    for stmt_idx, db_id in claimed_ids.items():
+        rivals = [
+            other_idx
+            for other_idx, candidates in candidate_sets.items()
+            if other_idx != stmt_idx and db_id in candidates
+        ]
+        if not rivals:
+            continue
+        if len({_refresh_identity(txn_by_idx[i]) for i in (stmt_idx, *rivals)}) > 1:
+            contested.append(stmt_idx)
+    for stmt_idx in contested:
+        del matched_db_ids[stmt_idx]
 
     # Build matched / missing entries in original statement order.
     for stmt_idx, direction, txn, _amount, _txn_date in parsed_rows:
@@ -561,7 +695,14 @@ def reconcile_bank_statement(
         if cand is not None:
             matched.append(_matched_entry(stmt_idx, direction, txn, cand))
         else:
-            missing.append(_missing_entry(stmt_idx, direction, txn))
+            missing.append(
+                _missing_entry(
+                    stmt_idx,
+                    direction,
+                    txn,
+                    ambiguous=contended_miss(candidate_sets.get(stmt_idx, set())),
+                )
+            )
 
     # Balance verification
     balance_verification = None
@@ -998,6 +1139,13 @@ async def process_bank_statement_email(
         import_error_count = 0
         imported_txns: list[tuple[int, dict]] = []
         for entry in recon["missing"]:
+            if entry.get("ambiguous"):
+                entry["import_error"] = (
+                    "ambiguous match — the DB may already hold this transaction "
+                    "under a row it could not be safely paired with; "
+                    "resolve manually"
+                )
+                continue
             try:
                 amount = _parse_amount(entry["amount"])
                 txn_date = _parse_date(entry["date"])

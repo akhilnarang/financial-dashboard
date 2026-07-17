@@ -143,6 +143,12 @@ async def bank_statement_upload(
 
     imported = 0
     for entry in recon["missing"]:
+        if entry.get("ambiguous"):
+            entry["import_error"] = (
+                "ambiguous match — the DB may already hold this transaction under a "
+                "row it could not be safely paired with; resolve manually"
+            )
+            continue
         try:
             amount = _parse_amount(entry["amount"])
             txn_date = _parse_date(entry["date"])

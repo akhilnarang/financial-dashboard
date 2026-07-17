@@ -99,10 +99,8 @@ async def test_send_transaction_notification_no_source_no_badge():
     assert "via" not in captured["text"].lower()
 
 
-@pytest.mark.anyio
-async def test_provisional_notification_renders_not_yet_settled():
-    """A _provisional payload renders the 'not yet settled' copy and omits
-    the #txn_id suffix (no transaction row exists for a provisional ping)."""
+async def _render_ledger_role_notification(role: str) -> str:
+    """Render a notify-only SMS notification for a given ledger_role."""
     from financial_dashboard.services.telegram import send_transaction_notification
 
     captured = {}
@@ -118,7 +116,7 @@ async def test_provisional_notification_renders_not_yet_settled():
             await send_transaction_notification(
                 0,  # no txn id
                 {
-                    "_provisional": True,
+                    "_ledger_role": role,
                     "direction": "credit",
                     "amount": Decimal("50000"),
                     "bank": "hdfc",
@@ -127,9 +125,26 @@ async def test_provisional_notification_renders_not_yet_settled():
                 chat_id=12345,
                 source="sms",
             )
-    text = captured["text"]
+    return captured["text"]
+
+
+@pytest.mark.anyio
+async def test_provisional_notification_renders_not_yet_settled():
+    """A provisional ledger_role renders the 'not yet settled' copy and omits
+    the #txn_id suffix (no transaction row exists for a provisional ping)."""
+    text = await _render_ledger_role_notification("provisional")
     assert "not yet settled" in text.lower()
     assert "#" not in text  # no #txn_id suffix
+    assert "50,000.00" in text
+
+
+@pytest.mark.anyio
+async def test_restatement_notification_renders_already_recorded():
+    """A restatement ledger_role renders the 'already recorded' copy — the
+    other notify-only label, distinct from provisional."""
+    text = await _render_ledger_role_notification("restatement")
+    assert "already recorded" in text.lower()
+    assert "#" not in text
     assert "50,000.00" in text
 
 

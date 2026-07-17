@@ -531,6 +531,7 @@ async def test_process_sms_row_hdfc_provisional_payment_is_notify_only(
     parsed = ParsedSms(
         email_type="hdfc_cc_payment_received_alert",
         bank="hdfc",
+        ledger_role="provisional",
         transaction=SmsTransactionAlert(
             direction="credit",
             amount=Money(amount=Decimal("50000"), currency="INR"),
@@ -561,7 +562,7 @@ async def test_process_sms_row_hdfc_provisional_payment_is_notify_only(
     assert outcome.status == "parsed"
     assert outcome.transaction_id is None
     assert outcome.primary_notification is not None
-    assert outcome.primary_notification.get("_provisional") is True
+    assert outcome.primary_notification.get("_ledger_role") == "provisional"
     assert outcome.pending_payment_check is None
     assert outcome.pending_disambiguation is None
 
@@ -573,6 +574,276 @@ async def test_process_sms_row_hdfc_provisional_payment_is_notify_only(
     assert sms.status == "parsed"
     assert sms.transaction_id is None
     assert sms.parse_error is None
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_equitas_payment_confirmation_is_notify_only(
+    session, monkeypatch
+):
+    """Equitas's second payment SMS (the "Thank you for the payment"
+    confirmation) → notify only: no Transaction row, transaction_id None,
+    _already_recorded flag set."""
+    from financial_dashboard.services.sms_pipeline import process_sms_row
+    from financial_dashboard.services.linker import build_link_context
+    from financial_dashboard.db import Transaction
+
+    parsed = ParsedSms(
+        email_type="equitas_cc_payment_confirmation_alert",
+        bank="equitas",
+        ledger_role="restatement",
+        transaction=SmsTransactionAlert(
+            direction="credit",
+            amount=Money(amount=Decimal("50000"), currency="INR"),
+            transaction_date=datetime.date(2026, 6, 5),
+            reference_number=None,
+            card_mask="9012",
+        ),
+    )
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms",
+        lambda *a, **k: parsed,
+    )
+
+    sms = SmsMessage(
+        bank="equitas",
+        sender="CP-EQUTAS-S",
+        body="Thank you for the payment of Rs.50,000.00 towards Equitas ...",
+        received_at=datetime.datetime(2026, 6, 6, 5, 46, 0, tzinfo=datetime.UTC),
+    )
+    session.add(sms)
+    await session.flush()
+
+    link_ctx = await build_link_context(session)
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.status == "parsed"
+    assert outcome.transaction_id is None
+    assert outcome.primary_notification is not None
+    assert outcome.primary_notification.get("_ledger_role") == "restatement"
+    assert outcome.pending_payment_check is None
+    assert outcome.pending_disambiguation is None
+
+    count = len((await session.execute(select(Transaction))).scalars().all())
+    assert count == 0
+
+    assert sms.status == "parsed"
+    assert sms.transaction_id is None
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_equitas_confirmation_reparse_keeps_its_link(
+    session, monkeypatch
+):
+    """Reparsing a confirmation that made a row under an earlier parser must
+    not orphan that row: the SMS stays linked to it, and the outcome returns
+    the existing id rather than clearing it."""
+    from financial_dashboard.services.sms_pipeline import process_sms_row
+    from financial_dashboard.services.linker import build_link_context
+    from financial_dashboard.db import Transaction
+
+    parsed = ParsedSms(
+        email_type="equitas_cc_payment_confirmation_alert",
+        bank="equitas",
+        ledger_role="restatement",
+        transaction=SmsTransactionAlert(
+            direction="credit",
+            amount=Money(amount=Decimal("50000"), currency="INR"),
+            transaction_date=datetime.date(2026, 6, 5),
+            reference_number=None,
+            card_mask="9012",
+        ),
+    )
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms",
+        lambda *a, **k: parsed,
+    )
+
+    sms = SmsMessage(
+        bank="equitas",
+        sender="CP-EQUTAS-S",
+        body="Thank you for the payment of Rs.50,000.00 towards Equitas ...",
+        received_at=datetime.datetime(2026, 6, 6, 5, 46, 0, tzinfo=datetime.UTC),
+    )
+    session.add(sms)
+    await session.flush()
+
+    # Pre-existing row this SMS produced under the old parser, linked both ways.
+    txn = Transaction(
+        bank="equitas",
+        email_type="equitas_cc_payment_alert",
+        direction="credit",
+        amount=Decimal("50000"),
+        currency="INR",
+        transaction_date=datetime.date(2026, 6, 5),
+        sms_message_id=sms.id,
+    )
+    session.add(txn)
+    await session.flush()
+    sms.transaction_id = txn.id
+
+    link_ctx = await build_link_context(session)
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.status == "parsed"
+    assert outcome.transaction_id == txn.id
+    assert sms.transaction_id == txn.id
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_hdfc_provisional_reparse_keeps_its_link(
+    session, monkeypatch
+):
+    """The reparse-link guarantee holds for the provisional role too, not only
+    the Equitas restatement: a provisional reparsed after it made a row keeps
+    that link rather than orphaning the row."""
+    from financial_dashboard.services.sms_pipeline import process_sms_row
+    from financial_dashboard.services.linker import build_link_context
+    from financial_dashboard.db import Transaction
+
+    parsed = ParsedSms(
+        email_type="hdfc_cc_payment_received_alert",
+        bank="hdfc",
+        ledger_role="provisional",
+        transaction=SmsTransactionAlert(
+            direction="credit",
+            amount=Money(amount=Decimal("50000"), currency="INR"),
+            transaction_date=datetime.date(2026, 5, 17),
+            reference_number=None,
+            card_mask="9710",
+        ),
+    )
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms",
+        lambda *a, **k: parsed,
+    )
+
+    sms = SmsMessage(
+        bank="hdfc",
+        sender="VK-HDFCBK",
+        body="DEAR HDFCBANK CARDMEMBER, PAYMENT OF Rs. 50000.00 RECEIVED ...",
+        received_at=datetime.datetime(2026, 5, 17, 17, 15, 0, tzinfo=datetime.UTC),
+    )
+    session.add(sms)
+    await session.flush()
+
+    txn = Transaction(
+        bank="hdfc",
+        email_type="hdfc_cc_payment_received_alert",
+        direction="credit",
+        amount=Decimal("50000"),
+        currency="INR",
+        transaction_date=datetime.date(2026, 5, 17),
+        sms_message_id=sms.id,
+    )
+    session.add(txn)
+    await session.flush()
+    sms.transaction_id = txn.id
+
+    link_ctx = await build_link_context(session)
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.status == "parsed"
+    assert outcome.transaction_id == txn.id
+    assert sms.transaction_id == txn.id
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_notify_only_role_with_debit_falls_through_to_merge(
+    session, monkeypatch
+):
+    """The notify-only gate suppresses only a credit. A non-primary role on a
+    debit direction is not swallowed — it falls through to merge and creates a
+    row, the same as any ordinary debit."""
+    from financial_dashboard.services.sms_pipeline import process_sms_row
+    from financial_dashboard.services.linker import build_link_context
+    from financial_dashboard.db import Transaction
+
+    parsed = ParsedSms(
+        email_type="hdfc_cc_payment_received_alert",
+        bank="hdfc",
+        ledger_role="provisional",
+        transaction=SmsTransactionAlert(
+            direction="debit",  # not credit → gate must not suppress
+            amount=Money(amount=Decimal("50000"), currency="INR"),
+            transaction_date=datetime.date(2026, 5, 17),
+            reference_number=None,
+            card_mask="9710",
+        ),
+    )
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms",
+        lambda *a, **k: parsed,
+    )
+
+    sms = SmsMessage(
+        bank="hdfc",
+        sender="VK-HDFCBK",
+        body="<hypothetical non-credit body carrying a provisional role>",
+        received_at=datetime.datetime(2026, 5, 17, 17, 15, 0, tzinfo=datetime.UTC),
+    )
+    session.add(sms)
+    await session.flush()
+
+    link_ctx = await build_link_context(session)
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    # Reached merge and created a row; not suppressed as notify-only.
+    assert outcome.transaction_id is not None
+    assert outcome.primary_notification is not None
+    assert outcome.primary_notification.get("_ledger_role") is None
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].direction == "debit"
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_equitas_payment_alert_creates_row(session, monkeypatch):
+    """Equitas's FIRST payment SMS (the "was received and credited" alert)
+    is the ledger-bearing one → normal credit row. Only the confirmation
+    restatement is suppressed."""
+    from financial_dashboard.services.sms_pipeline import process_sms_row
+    from financial_dashboard.services.linker import build_link_context
+    from financial_dashboard.db import Transaction
+
+    parsed = ParsedSms(
+        email_type="equitas_cc_payment_alert",
+        bank="equitas",
+        transaction=SmsTransactionAlert(
+            direction="credit",
+            amount=Money(amount=Decimal("50000"), currency="INR"),
+            transaction_date=datetime.date(2026, 6, 5),
+            reference_number=None,
+            card_mask="9012",
+        ),
+    )
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms",
+        lambda *a, **k: parsed,
+    )
+
+    sms = SmsMessage(
+        bank="equitas",
+        sender="JM-EQUTAS-S",
+        body="INR 50,000.00 was received on 05/06/2026 and was credited ...",
+        received_at=datetime.datetime(2026, 6, 5, 10, 17, 0, tzinfo=datetime.UTC),
+    )
+    session.add(sms)
+    await session.flush()
+
+    link_ctx = await build_link_context(session)
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.status in ("parsed", "enriched")
+    assert outcome.transaction_id is not None
+
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].direction == "credit"
 
 
 @pytest.mark.anyio
@@ -629,6 +900,7 @@ async def test_process_sms_row_hdfc_payment_order_independent(session, monkeypat
         return ParsedSms(
             email_type="hdfc_cc_payment_received_alert",
             bank="hdfc",
+            ledger_role="provisional",
             transaction=SmsTransactionAlert(
                 direction="credit",
                 amount=Money(amount=Decimal("50000"), currency="INR"),
@@ -754,6 +1026,7 @@ async def test_process_sms_row_hdfc_payment_settlement_first_then_provisional(
         return ParsedSms(
             email_type="hdfc_cc_payment_received_alert",
             bank="hdfc",
+            ledger_role="provisional",
             transaction=SmsTransactionAlert(
                 direction="credit",
                 amount=Money(amount=Decimal("50000"), currency="INR"),
@@ -792,7 +1065,7 @@ async def test_process_sms_row_hdfc_payment_settlement_first_then_provisional(
     )
 
     assert outcome.transaction_id is None
-    assert outcome.primary_notification.get("_provisional") is True
+    assert outcome.primary_notification.get("_ledger_role") == "provisional"
     rows = (await session.execute(select(Transaction))).scalars().all()
     assert len(rows) == 1
     assert rows[0].reference_number == "137224528Vgr2OD"
@@ -812,6 +1085,7 @@ async def test_process_sms_row_hdfc_payment_received_non_credit_not_gated(
     parsed = ParsedSms(
         email_type="hdfc_cc_payment_received_alert",
         bank="hdfc",
+        ledger_role="provisional",
         transaction=SmsTransactionAlert(
             direction="declined",  # not credit
             amount=Money(amount=Decimal("50000"), currency="INR"),
@@ -840,7 +1114,7 @@ async def test_process_sms_row_hdfc_payment_received_non_credit_not_gated(
 
     # Routed to the declined path, NOT the provisional notify-only path.
     assert outcome.primary_notification is not None
-    assert outcome.primary_notification.get("_provisional") is None
+    assert outcome.primary_notification.get("_ledger_role") is None
     assert outcome.primary_notification.get("_declined") is True
 
 

@@ -555,12 +555,17 @@
     </section>
     {% endif %}
 
-    {% if txn_unimported %}
-    <section style="margin-bottom: 2rem;">
-        <h3 style="font-size: 1.05rem; font-weight: 700; margin-bottom: 0.75rem;">Missing <span class="text-sm text-muted">(in statement but not matched or imported)</span></h3>
-        {{ missing_table(txn_unimported) }}
-    </section>
-    {% endif %}
+{% endif %}
+
+{# Unmatched rows need manual resolution and must show in both layouts. The
+   grouped view renders only a person's matched and imported rows, so an
+   ambiguous row placed here would otherwise be invisible despite counting
+   toward the missing total. #}
+{% if txn_unimported %}
+<section style="margin-bottom: 2rem;">
+    <h3 style="font-size: 1.05rem; font-weight: 700; margin-bottom: 0.75rem;">Missing <span class="text-sm text-muted">(in statement but not matched or imported)</span></h3>
+    {{ missing_table(txn_unimported) }}
+</section>
 {% endif %}
 
 {# ── Overall Totals ──────────────────────────────────────────────────── #}

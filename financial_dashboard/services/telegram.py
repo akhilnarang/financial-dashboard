@@ -159,16 +159,24 @@ async def send_transaction_notification(
         return
     try:
         is_declined = txn_info.get("_declined", False)
-        is_provisional = txn_info.get("_provisional", False)
+        # A notify-only message carries no ledger row; its parser role picks the
+        # label. "declined" is a separate axis (a transaction outcome) and keeps
+        # its own flag.
+        ledger_role = txn_info.get("_ledger_role")
         direction = txn_info.get("direction", "")
         if is_declined:
             direction_emoji = "\U0001f6ab"
             direction_label = "DECLINED"
-        elif is_provisional:
-            # HDFC's no-ref provisional payment-received SMS: payment seen
-            # but not yet settled. No transaction row exists for it.
+        elif ledger_role == "provisional":
+            # A payment seen but not yet settled — no transaction row exists
+            # yet; the settlement message that follows becomes the row.
             direction_emoji = "⏳"  # hourglass
             direction_label = "PAYMENT RECEIVED — NOT YET SETTLED"
+        elif ledger_role == "restatement":
+            # A message restating a payment already on the ledger from an
+            # earlier one — the gate that sets this makes no row for it.
+            direction_emoji = "\U0001f501"  # repeat
+            direction_label = "PAYMENT CONFIRMED — ALREADY RECORDED"
         elif direction == "debit":
             direction_emoji = "\U0001f534"
             direction_label = "DEBIT"
