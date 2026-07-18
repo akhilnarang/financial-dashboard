@@ -56,7 +56,17 @@ import uuid
 #: (``000``, digit-first → ``invalid_currency``); the complete CAS lot's
 #: instrument no longer carries a redemption (so it is no longer suppressed and
 #: ``investment_lot_count`` >= 1).
-GENERATOR_VERSION = "1.3.1"
+#:
+#: 1.4.0 — extension_sync_state: the offline seed now carries one pristine
+#: Paisa sync-state singleton (``desired_revision=1``, ``applied_revision=0``,
+#: ``force_reload=1``, ``failure_count=0``, every hash/retry/diagnosis/lease
+#: field NULL), mirroring production ``init_db``'s seed. The loader re-stamps
+#: it to canonical values as the final write so the row stays deterministic
+#: even if ``init_db``'s SQLite triggers were installed on the synthetic DB
+#: (the loader itself uses ``create_all``, which installs no triggers). The
+#: manifest's ``expected`` block gains ``extension_sync_state: 1``; the table
+#: is wiped on shape-upgrade reset so no stale lease/hash/revision survives.
+GENERATOR_VERSION = "1.4.0"
 
 #: Bumped when the on-disk manifest JSON schema changes.
 SCHEMA_VERSION = "1"

@@ -177,6 +177,19 @@ JSON (`api/extensions.py`) — probe/preview/generate/sync failures are caught i
 - **Audit.** Every manual generate/sync/probe and every automatic sync records a start/complete `ExtensionRun` row (operation, trigger, outcome, emitted/skipped counts, output hash, duration, sanitized error). `details` carries only safe summary fields — never credentials or raw journal text.
 - **Reconciliation.** `/extensions/paisa/reconciliation` shows, per selected account: the local projection diagnostics (unknown/unmatched/missing-FX/card-clearing), projected ending balances, the latest native `BalanceSnapshot`, and the curated Paisa balance. The native ↔ Paisa join is **only** by explicit `paisa.account_mappings`; there is no fuzzy matching, and the view writes nothing — it never corrects or mutates a core row. Mapping suggestions are preview-only deterministic defaults that must be accepted through the normal config-save path.
 
+#### Auto sync
+
+When `paisa.auto_sync_enabled=true` and the mode is `project`, a coordinator keeps the generated Paisa include in sync with core data using **transaction-driven coalescing** rather than a per-fetch hook. (In `disabled`/`connect` the coordinator does no I/O — see the last bullet.)
+
+- **Dirty detection — exact post-commit semantics.** SQLite AFTER triggers on the tables the projection reads — `transactions`, `accounts`, `cards`, `balance_snapshots`, `investment_lots`, `cas_uploads` (insert/update/delete) and `settings` (`paisa.%` keys only) — atomically bump `extension_sync_state.desired_revision` and maintain `first_dirty_at`/`last_dirty_at`. The bump shares the dirtying write's transaction, so it commits or rolls back *together* with it (a rolled-back savepoint drops only its own bump); the coordinator never observes a revision for an uncommitted change. A `paisa.%` settings change additionally resets the retry backoff.
+- **Full-journal `/api/sync`.** Paisa exposes no per-transaction/partial sync API, so each reconcile re-generates the whole include file and asks Paisa to reload the full journal. A bulk statement import (≈200 rows) lands as one outer commit, so it produces exactly one dirty bump and one coalesced reload — not one per row.
+- **Coalescing + latency (fixed).** A 5s quiet debounce groups a burst of dirtying writes into one reload; a 30s maximum dirty latency guarantees a reload is triggered even if writes keep coming. The coordinator polls `extension_sync_state` every 2s.
+- **Single-flight.** A lease on `extension_sync_state` (`lease_owner`/`lease_token`/`lease_expires_at`) ensures at most one coordinator reconciles at a time.
+- **Retry + force reload (fixed).** A failed remote reload backs off `1/2/5/10/15` minutes (`next_attempt_at`/`failure_count`); a `paisa.%` settings change resets the backoff so a config fix is retried immediately. A six-hour force reload (`force_reload`) periodically reconciles even with no observable drift, so a silent out-of-band Paisa change is corrected.
+- **Hard minimum interval (the only tunable knob).** `paisa.auto_sync_min_interval_minutes` (default **1**) is a hard floor between remote reloads/retries only — it is **not** the event debounce (5s) or the max latency (30s), both fixed. A value of 1 reloads as soon as the coordinator allows; a higher value throttles a healthy stream and a failing one alike. Existing persisted values are preserved across upgrades.
+- **disabled/connect.** The triggers still bump `desired_revision` in `disabled`/`connect`, so dirty state accumulates with no I/O — the coordinator performs no projection, file, or network work until `project` mode + auto-sync is on. The bump is cheap and nothing is lost.
+- **Audited + failure-isolated.** Each reconcile records an `ExtensionRun` row; any exception is caught and swallowed so it can never break polling. When `paisa.notify_sync_failures=true`, repeated *identical* failures are deduped via a fingerprint in the audit `details` (`notify_fp`); a changed failure notifies again.
+
 #### Constraints & caveats
 
 - **Paisa 0.7.4 / supported backends.** Projection targets the `ananthakumaran/paisa:0.7.4` config schema. Every generated entry balances to zero and uses `:`-joined account hierarchies; a manual sync requires the upstream Paisa `ledger_cli` to equal the configured `paisa.ledger_cli` (one of `ledger`/`hledger`/`beancount`) — a mismatch is rejected up front with `outcome=unsupported_backend`.
@@ -297,7 +310,7 @@ scripts/
 ### Request Lifecycle
 
 1. FastAPI `lifespan` in `financial_dashboard.main` bootstraps builtin extensions (`bootstrap_extensions()`, so contributed `paisa.*` settings exist before settings load, and first-party runtimes are attached), initializes the DB, starts support services, starts extension runtimes (`ExtensionManager.startup_all()`), and stores a shared `FetchService` (wired with the manager) on `app.state`.
-2. On each poll tick (or manual trigger), `FetchService.poll_all()` delegates to `integrations/email/orchestrator.py`. After native polling, reminders, and categorization complete, the loop invokes `ExtensionManager.after_fetch_cycle_all()` once (e.g. an automatic Paisa sync when `paisa.auto_sync_enabled` is on); failures are isolated per extension so they can never break polling. On teardown the lifespan stops the poll loop, then `ExtensionManager.shutdown_all()`.
+2. On each poll tick (or manual trigger), `FetchService.poll_all()` delegates to `integrations/email/orchestrator.py`. After native polling, reminders, and categorization complete, the loop invokes `ExtensionManager.after_fetch_cycle_all()` once; failures are isolated per extension so they can never break polling. Automatic Paisa sync is **not** a per-fetch hook — the lifespan starts each extension's own runtime (`ExtensionManager.startup_all()`), and the Paisa runtime is a coalesced, transaction-driven coordinator (see [Paisa → Auto sync](#auto-sync)). On teardown the lifespan stops the poll loop, then `ExtensionManager.shutdown_all()`.
 3. HTML routes are split by domain under `web/` and aggregated by `web/__init__.py`.
 4. Routes use `core.deps.get_session`, while supporting services live under `services/`.
 5. During email processing the app:
@@ -328,6 +341,7 @@ scripts/
 | `MerchantRule` | `merchant_rules` | Editable substring→category rules; the deterministic layer that skips the LLM for known merchants |
 | `Setting` | `settings` | Small key/value store for app-level settings |
 | `ExtensionRun` | `extension_runs` | Audit/state row for a single extension operation (probe/generate/sync, manual or automatic); generic over `extension_id`, stores no credentials and never duplicates financial rows |
+| `ExtensionSyncState` | `extension_sync_state` | Per-extension current sync-state singleton (Paisa today): trigger-bumped `desired_revision` vs coordinator-advanced `applied_revision`, dirty window, published/remote/healthy hashes, retry backoff, diagnosis state, one-shot force-reload flag, and a single-flight lease. Exactly one row per extension; never stores credentials or duplicates financial rows |
 
 ### Schema Diagram
 
@@ -536,6 +550,27 @@ erDiagram
         text error
     }
 
+    EXTENSION_SYNC_STATE {
+        string extension_id PK
+        int desired_revision
+        int applied_revision
+        datetime first_dirty_at
+        datetime last_dirty_at
+        string last_published_hash
+        string last_remote_hash
+        string last_healthy_hash
+        datetime last_remote_attempt_at
+        datetime next_attempt_at
+        int failure_count
+        string diagnosis_state
+        bool force_reload
+        string lease_owner
+        string lease_token
+        datetime lease_expires_at
+        datetime created_at
+        datetime updated_at
+    }
+
     TRANSACTIONS {
         int id PK
         int email_id FK
@@ -618,6 +653,7 @@ Relationship notes:
 - `balance_snapshots.portfolio_key` is a CAS forward-fill key for investment rows, not a foreign key. Parser/linker hints such as `card_mask` and `account_mask` remain denormalized text.
 - `settings` is intentionally standalone and has no foreign-key links.
 - `extension_runs` is intentionally standalone: `extension_id` is a free-form string matching a registered extension manifest id (today only `paisa`), not a foreign key. It records what an extension did (operation/status/outcome/counts/hashes) and never stores credentials or duplicates financial rows.
+- `extension_sync_state` is likewise a standalone singleton keyed by `extension_id` (a free-form string, today only `paisa`), not a foreign key. It records where each extension's reconciled state is *right now* (desired vs applied revision, dirty window, hashes, retry backoff, diagnosis, lease) — exactly one row per extension, never growing with operation count. `extension_runs` is the per-operation audit log; this row is the per-extension current state.
 - Several foreign keys are nullable (`fetch_rules.source_id`, `emails.source_id`, `emails.rule_id`, and the upload/transaction linkage columns), so rows can exist before the related record is known.
 
 ### Key Constraints
@@ -633,6 +669,7 @@ Relationship notes:
 - `investment_lots` carries a natural unique key `(cas_upload_id, source_ref, instrument_id, acquired_on, reference)` so a parser emitting the same movement twice cannot duplicate a lot. A lot is only created when the source states quantity, per-unit cost, cost basis, currency and acquisition date explicitly and consistently (`quantity * unit_cost == cost_basis` to the penny); value-only holdings and demat movements (CAS prints no cost) are excluded and reported as diagnostics, never fabricated into a lot. Acquisition dates and cost basis are never derived from a current market value.
 - `snapshot_holdings` has nullable investment-detail columns (`instrument_id`, `quantity`, `unit_price`, `currency`, `cost_basis`, `acquired_on`). CAS ingestion still aggregates holdings by asset class for the net-worth breakdown, so these stay NULL on those rows; they are populated only when a holding represents a single instrument the CAS explicitly priced.
 - `extension_runs` has composite lookup indexes on `(extension_id, started_at)` (the hot "most recent runs for this extension" + the automatic-sync debounce lookup) and `(extension_id, status)`, plus `(operation)`, so recent-run and failure queries seek instead of scanning.
+- `extension_sync_state` is a standalone singleton (one row per `extension_id`, today only `paisa`). CHECK constraints require non-negative `desired_revision`/`applied_revision`/`failure_count` and `desired_revision >= applied_revision`. Two lookup indexes — `ix_extension_sync_state_next_attempt` (`next_attempt_at`) and `ix_extension_sync_state_lease_expires` (`lease_expires_at`) — keep the coordinator's "due for retry" and "expired lease" queries seek-shaped. SQLite AFTER triggers on `transactions`/`accounts`/`cards`/`balance_snapshots`/`investment_lots`/`cas_uploads` (insert/update/delete) and on `settings` (paisa.% keys only) atomically bump `desired_revision` and maintain `first_dirty_at`/`last_dirty_at` with **exact post-commit semantics** — the bump shares the dirtying write's transaction, so it commits or rolls back together (a rolled-back savepoint drops only its own bump) and a coordinator never observes a revision for an uncommitted change. A `paisa.%` settings change additionally resets the retry backoff (`failure_count`/`next_attempt_at`/`last_remote_attempt_at`). No triggers exist on `extension_sync_state` or `extension_runs` (recursion guard) or on tables the projection does not read.
 
 ### Schema Migrations
 There is no Alembic. Migrations are handled inline in `init_db()` via `try/except ALTER TABLE` blocks. A one-time migration removes a legacy `uq_transaction_dedup` constraint that was replaced by the partial index.

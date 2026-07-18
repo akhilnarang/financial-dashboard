@@ -306,6 +306,14 @@ class Scenario(NamedTuple):
             # rows exist after a load. Pinning zero lets manifest verify catch a
             # regression that accidentally records extension runs at load time.
             "extension_runs": 0,
+            # The loader seeds exactly one pristine Paisa sync-state singleton
+            # (mirrors production init_db's seed: desired_revision=1,
+            # applied_revision=0, force_reload=1, failure_count=0, every hash/
+            # retry/diagnosis/lease field NULL). Pinning one lets manifest verify
+            # catch a regression that drops the row or creates extras, and keeps
+            # the synthetic DB representative of a freshly-initialized production
+            # DB for downstream read paths.
+            "extension_sync_state": 1,
         }
 
 

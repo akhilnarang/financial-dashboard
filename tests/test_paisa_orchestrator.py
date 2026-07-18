@@ -14,13 +14,19 @@ from financial_dashboard.integrations.paisa import PaisaClient
 from financial_dashboard.services.paisa.config import PaisaProjectionConfig
 from financial_dashboard.services.paisa.orchestrator import (
     GenerateResult,
+    PreflightReport,
     ProbeReport,
+    RemoteSyncReport,
     SyncReport,
     generate,
     manual_sync,
+    preflight,
     preview,
     probe,
+    sync_remote,
 )
+from financial_dashboard.services.paisa.projection import project
+from financial_dashboard.services.paisa.publisher import publish_journal
 
 pytestmark = pytest.mark.anyio
 
@@ -952,3 +958,343 @@ async def test_sync_allows_missing_upstream_backend(session, tmp_path):
     )
     assert report.ok is True
     assert report.outcome == "synced"
+
+
+# ---------------------------------------------------------------------------
+# Staged API: preflight / generate / sync_remote — one projection + one publish,
+# no file write on preflight failure, POST-accepted-vs-diagnosis distinction,
+# and unchanged response semantics versus the composed manual_sync.
+# ---------------------------------------------------------------------------
+
+
+def _install_counters(monkeypatch):
+    """Count projection + publish calls inside the orchestrator module.
+
+    ``generate`` is the only stage that projects (via ``preview``→``project``)
+    or writes (via ``publish_journal``); a correct staged flow must call each
+    exactly once.
+    """
+    proj_calls = {"n": 0}
+    pub_calls = {"n": 0}
+
+    async def counting_project(session, config):
+        proj_calls["n"] += 1
+        return await project(session, config)
+
+    def counting_publish(path, body):
+        pub_calls["n"] += 1
+        return publish_journal(path, body)
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.paisa.orchestrator.project", counting_project
+    )
+    monkeypatch.setattr(
+        "financial_dashboard.services.paisa.orchestrator.publish_journal",
+        counting_publish,
+    )
+    return proj_calls, pub_calls
+
+
+async def test_staged_flow_projects_and_publishes_once(session, tmp_path, monkeypatch):
+    """A coordinator-style staged flow (preflight → generate → sync_remote)
+    projects exactly once and publishes exactly once. The remote stage neither
+    projects nor publishes, and one client is reused across both network stages
+    (caller-owned, closed by the caller)."""
+    await _seed_bank(session)
+    await _seed_txn(session, 1)
+    target = tmp_path / "gen.journal"
+    cfg = _config(generated_path=str(target))
+    proj_calls, pub_calls = _install_counters(monkeypatch)
+
+    client = _mock_client(_config_handler("ledger"))
+    try:
+        pre = await preflight(cfg, client=client)
+        assert isinstance(pre, PreflightReport)
+        assert pre.ok is True
+        assert pre.outcome is None
+        assert pre.capabilities.ledger_cli == "ledger"
+        assert proj_calls["n"] == 0  # preflight never projects
+        assert pub_calls["n"] == 0  # preflight never writes
+        assert not target.exists()
+
+        generated = await generate(session, cfg)
+        assert generated.ok is True
+        assert proj_calls["n"] == 1  # one projection
+        assert pub_calls["n"] == 1  # one publish
+        assert target.exists()
+
+        # Remote stage with the SAME generated report + SAME client: no extra
+        # projection or publish, POST accepted, clean diagnosis.
+        remote = await sync_remote(generated.report, cfg, client=client)
+        assert isinstance(remote, RemoteSyncReport)
+        assert remote.ok is True
+        assert remote.outcome == "synced"
+        assert remote.post_accepted is True
+        assert remote.diagnosis_ok is True
+        assert proj_calls["n"] == 1
+        assert pub_calls["n"] == 1
+    finally:
+        await client.aclose()
+    # Caller-owned client is closed by the caller, not by the stages.
+    assert client._client.is_closed
+
+
+async def test_manual_sync_projects_and_publishes_once(session, tmp_path, monkeypatch):
+    """The composed manual_sync also projects and publishes exactly once."""
+    await _seed_bank(session)
+    await _seed_txn(session, 1)
+    target = tmp_path / "gen.journal"
+    cfg = _config(generated_path=str(target))
+    proj_calls, pub_calls = _install_counters(monkeypatch)
+
+    report = await manual_sync(
+        session, cfg, client=_mock_client(_config_handler("ledger"))
+    )
+    assert report.ok is True
+    assert report.outcome == "synced"
+    assert proj_calls["n"] == 1
+    assert pub_calls["n"] == 1
+    assert target.exists()
+
+
+async def test_preflight_failure_writes_no_file(session, tmp_path, monkeypatch):
+    """A failed preflight (readonly / backend mismatch / unreachable) writes no
+    file and issues no publish — the probe-first contract holds for both the
+    direct preflight entrypoint and the composed manual_sync."""
+    await _seed_bank(session)
+    await _seed_txn(session, 1)
+    target = tmp_path / "gen.journal"
+    cfg = _config(ledger_cli="ledger", generated_path=str(target))
+    _proj_calls, pub_calls = _install_counters(monkeypatch)
+
+    def readonly_handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/config":
+            return httpx.Response(200, json={"config": {"readonly": True}})
+        return httpx.Response(200, json={})
+
+    # Direct preflight: readonly → no file, no publish.
+    pre = await preflight(cfg, client=_mock_client(readonly_handler))
+    assert pre.ok is False
+    assert pre.outcome == "readonly"
+    assert pre.capabilities.readonly is True
+    assert pub_calls["n"] == 0
+    assert not target.exists()
+
+    # Via manual_sync: identical contract.
+    report = await manual_sync(session, cfg, client=_mock_client(readonly_handler))
+    assert report.ok is False
+    assert report.outcome == "readonly"
+    assert pub_calls["n"] == 0
+    assert not target.exists()
+
+
+async def test_preflight_backend_mismatch_writes_no_file(session, tmp_path):
+    """A backend mismatch is caught at preflight, before any file write."""
+    await _seed_bank(session)
+    await _seed_txn(session, 1)
+    target = tmp_path / "gen.journal"
+    cfg = _config(ledger_cli="ledger", generated_path=str(target))
+
+    pre = await preflight(cfg, client=_mock_client(_config_handler("hledger")))
+    assert pre.ok is False
+    assert pre.outcome == "unsupported_backend"
+    assert "does not match" in (pre.reason or "")
+    assert not target.exists()
+
+
+async def test_sync_remote_distinguishes_accepted_post_from_fatal_diagnosis(
+    session, tmp_path
+):
+    """The remote stage reports the POST result separately from the diagnosis
+    result. With an accepted POST but a remaining fatal danger,
+    ``post_accepted`` is True while ``ok`` is False — so a coordinator can stamp
+    the remote hash / advance applied_revision, then record a fatal diagnosis."""
+    await _seed_contra_expense(session)
+    cfg = _config(generated_path=str(tmp_path / "gen.journal"))
+    generated = await generate(session, cfg)
+    assert generated.ok is True
+    assert generated.report is not None
+
+    issues = [
+        {
+            "level": "danger",
+            "summary": "Debit Entry",
+            "details": _debit_details("-50.00", "Expenses:Refund", dt.date(2026, 2, 1)),
+        },
+        {
+            "level": "danger",
+            "summary": "Negative Balance",
+            "details": (
+                "<b>Assets:Bank:Hdfc:Savings</b> account went negative "
+                "(-100.00) on 01 Feb 2026"
+            ),
+        },
+    ]
+    remote = await sync_remote(
+        generated.report, cfg, client=_mock_client(_diag_handler_with_issues(issues))
+    )
+    # POST was accepted, but a fatal diagnosis danger remains.
+    assert remote.post_accepted is True
+    assert remote.ok is False
+    assert remote.outcome == "diagnosis_failed"
+    assert remote.diagnosis_ok is False
+    assert remote.diagnosis_accepted == 1  # the refund Debit Entry
+    assert remote.diagnosis_fatal == 1  # the Negative Balance
+    assert remote.diagnosis_expected == 3
+    assert "Negative Balance" in (remote.reason or "")
+
+
+async def test_sync_remote_accepted_post_but_diagnosis_unknown(session, tmp_path):
+    """POST accepted but the diagnosis endpoint fails: ``post_accepted`` stays
+    True and ``diagnosis_ok`` is None (unknown), so a coordinator may still
+    record the accepted POST and record diagnosis as unknown."""
+    await _seed_bank(session)
+    await _seed_txn(session, 1)
+    cfg = _config(generated_path=str(tmp_path / "gen.journal"))
+    generated = await generate(session, cfg)
+    assert generated.ok is True
+    assert generated.report is not None
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/config":
+            return httpx.Response(200, json={"config": {"ledger_cli": "ledger"}})
+        if req.url.path == "/api/sync":
+            return httpx.Response(200, json={"success": True})
+        if req.url.path == "/api/diagnosis":
+            return httpx.Response(500)  # diagnosis endpoint down
+        return httpx.Response(404)
+
+    remote = await sync_remote(generated.report, cfg, client=_mock_client(handler))
+    assert remote.post_accepted is True
+    assert remote.ok is False
+    assert remote.outcome == "diagnosis_failed"
+    assert remote.diagnosis_ok is None
+    assert remote.diagnosis_expected is None
+    assert remote.diagnosis_accepted is None
+    assert remote.diagnosis_fatal is None
+    assert "diagnosis failed" in (remote.reason or "")
+
+
+async def test_sync_remote_rejected_post_runs_no_diagnosis(session, tmp_path):
+    """A rejected POST (HTTP 200 success=false) is not accepted and diagnosis
+    never runs — ``post_accepted`` is False and ``diagnosis_ok`` is None."""
+    await _seed_bank(session)
+    await _seed_txn(session, 1)
+    cfg = _config(generated_path=str(tmp_path / "gen.journal"))
+    generated = await generate(session, cfg)
+    assert generated.report is not None
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/api/config":
+            return httpx.Response(200, json={"config": {"ledger_cli": "ledger"}})
+        if req.url.path == "/api/sync":
+            return httpx.Response(
+                200, json={"success": False, "message": "parse error at line 3"}
+            )
+        if req.url.path == "/api/diagnosis":
+            raise AssertionError("diagnosis must not run on a rejected POST")
+        return httpx.Response(404)
+
+    remote = await sync_remote(generated.report, cfg, client=_mock_client(handler))
+    assert remote.post_accepted is False
+    assert remote.ok is False
+    assert remote.outcome == "sync_rejected"
+    assert remote.diagnosis_ok is None
+    assert "parse error at line 3" in (remote.reason or "")
+
+
+async def test_staged_flow_response_matches_manual_sync(session, tmp_path):
+    """Response semantics are unchanged by the refactor: the staged composition
+    and the composed manual_sync produce equivalent terminal results (outcome,
+    diagnosis_ok, and the diagnosis counts) for both a healthy and a fatal-
+    diagnosis case."""
+    await _seed_contra_expense(session)
+    fatal_issues = [
+        {
+            "level": "danger",
+            "summary": "Debit Entry",
+            "details": _debit_details("-50.00", "Expenses:Refund", dt.date(2026, 2, 1)),
+        },
+        {
+            "level": "danger",
+            "summary": "Negative Balance",
+            "details": "<b>Assets:Bank</b> went negative (-100.00) on 01 Feb 2026",
+        },
+    ]
+
+    # --- fatal case: manual_sync vs staged ---
+    manual_cfg = _config(generated_path=str(tmp_path / "manual.journal"))
+    manual = await manual_sync(
+        session,
+        manual_cfg,
+        client=_mock_client(_diag_handler_with_issues(fatal_issues)),
+    )
+
+    staged_cfg = _config(generated_path=str(tmp_path / "staged.journal"))
+    client = _mock_client(_diag_handler_with_issues(fatal_issues))
+    try:
+        pre = await preflight(staged_cfg, client=client)
+        assert pre.ok is True
+        generated = await generate(session, staged_cfg)
+        assert generated.report is not None
+        remote = await sync_remote(generated.report, staged_cfg, client=client)
+    finally:
+        await client.aclose()
+
+    assert manual.ok == remote.ok is False
+    assert manual.outcome == remote.outcome == "diagnosis_failed"
+    assert manual.diagnosis_ok == remote.diagnosis_ok is False
+    assert manual.diagnosis_expected == remote.diagnosis_expected
+    assert manual.diagnosis_accepted == remote.diagnosis_accepted
+    assert manual.diagnosis_fatal == remote.diagnosis_fatal == 1
+
+    # --- healthy case: manual_sync vs staged ---
+    healthy_issues = [
+        {
+            "level": "danger",
+            "summary": "Debit Entry",
+            "details": _debit_details("-50.00", "Expenses:Refund", dt.date(2026, 2, 1)),
+        },
+        {
+            "level": "danger",
+            "summary": "Debit Entry",
+            "details": _debit_details(
+                "-2916.11", "Expenses:Cashback Rewards", dt.date(2026, 2, 2)
+            ),
+        },
+        {
+            "level": "danger",
+            "summary": "Debit Entry",
+            "details": _debit_details(
+                "-236.00", "Expenses:Fees Charges", dt.date(2026, 2, 3)
+            ),
+        },
+    ]
+    manual2 = await manual_sync(
+        session,
+        _config(generated_path=str(tmp_path / "manual2.journal")),
+        client=_mock_client(_diag_handler_with_issues(healthy_issues)),
+    )
+    client2 = _mock_client(_diag_handler_with_issues(healthy_issues))
+    try:
+        pre2 = await preflight(
+            _config(generated_path=str(tmp_path / "staged2.journal")), client=client2
+        )
+        assert pre2.ok is True
+        gen2 = await generate(
+            session, _config(generated_path=str(tmp_path / "staged2.journal"))
+        )
+        remote2 = await sync_remote(
+            gen2.report,
+            _config(generated_path=str(tmp_path / "staged2.journal")),
+            client=client2,
+        )
+    finally:
+        await client2.aclose()
+
+    assert manual2.ok == remote2.ok is True
+    assert manual2.outcome == remote2.outcome == "synced"
+    assert manual2.diagnosis_ok == remote2.diagnosis_ok is True
+    assert manual2.diagnosis_expected == remote2.diagnosis_expected == 3
+    assert manual2.diagnosis_accepted == remote2.diagnosis_accepted == 3
+    assert manual2.diagnosis_fatal == remote2.diagnosis_fatal == 0

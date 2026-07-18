@@ -210,6 +210,15 @@ async def load_scenario(
         # run resets + rebuilds.
         async with sessionmaker() as session:
             await _stamp_identity(session, scenario)
+            # Re-stamp the Paisa sync-state singleton to its canonical pristine
+            # values as the final write. The loader uses create_all (no SQLite
+            # triggers), so during a normal synth load no revision bump happens;
+            # but if init_db was invoked on this DB (installing triggers), the
+            # structural + bulk writes above would have bumped desired_revision
+            # non-deterministically. Forcing the row back to pristine here keeps
+            # the seed's recorded state deterministic regardless of trigger
+            # presence — the manifest's expected count is always 1 pristine row.
+            await _stamp_paisa_sync_state(session, scenario)
             await session.commit()
     finally:
         await engine.dispose()
@@ -225,7 +234,9 @@ async def load_scenario(
 #: foreign keys when ``PRAGMA foreign_keys`` happens to be on. The
 #: ``sms_messages`` ↔ ``transactions`` cycle is harmless because every table is
 #: cleared. ``settings`` is included so the stale identity stamp is wiped too;
-#: the load re-stamps it on full success.
+#: the load re-stamps it on full success. ``extension_sync_state`` is wiped so
+#: no stale lease/hash/revision survives a shape upgrade — the load re-seeds the
+#: singleton pristine.
 _RESET_TABLES: tuple[str, ...] = (
     "snapshot_holdings",
     "balance_snapshots",
@@ -244,6 +255,7 @@ _RESET_TABLES: tuple[str, ...] = (
     "categories",
     "email_sources",
     "extension_runs",
+    "extension_sync_state",
     "settings",
 )
 
@@ -318,6 +330,76 @@ async def _stamp_identity(session: AsyncSession, scenario: Scenario) -> None:
         key=GENERATOR_VERSION_SETTING_KEY,
         value=C.GENERATOR_VERSION,
         _pk_name="key",
+    )
+
+
+#: The Paisa singleton's ``extension_id`` — a plain string (no FK to the
+#: manifest registry) so the row is decoupled from the in-memory manifests,
+#: exactly as in production.
+_PAISA_EXTENSION_ID = "paisa"
+
+
+def _paisa_sync_state_timestamp(scenario: Scenario) -> datetime.datetime:
+    """Deterministic timestamp for the pristine Paisa sync-state row.
+
+    Anchored to midnight on the scenario's ``as_of`` so the row is byte-stable
+    across regenerations: the manifest records the row's *count*, not its
+    timestamps, but keeping them deterministic means a DB diff between two loads
+    of the same scenario is empty."""
+    return datetime.datetime.combine(scenario.as_of, datetime.time(0, 0))
+
+
+async def _stamp_paisa_sync_state(session: AsyncSession, scenario: Scenario) -> None:
+    """UPSERT the pristine Paisa sync-state singleton (mirrors production
+    ``init_db``'s seed) with deterministic values.
+
+    Forces the row to its canonical pristine state — ``desired_revision=1``,
+    ``applied_revision=0``, ``force_reload=1``, ``failure_count=0``, every hash
+    / retry / diagnosis / lease field NULL — so the seed always looks like a
+    fresh production init. Run as the final write of :func:`load_scenario`, it
+    erases any ``desired_revision`` churn the structural/bulk writes caused when
+    SQLite triggers happen to be active on this DB (e.g. ``init_db`` was invoked
+    on it). The loader itself uses ``create_all`` (no triggers), so in the
+    normal synth flow the row is seeded pristine and never bumped; this re-stamp
+    is the determinism guarantee for the trigger-active case.
+
+    No trigger exists on ``extension_sync_state`` itself, so this UPSERT never
+    recurses or bumps. ``created_at`` is set only on the initial INSERT and left
+    untouched on subsequent re-stamps (DO UPDATE omits it), so the row's
+    creation timestamp is stable across reruns.
+    """
+    ts = _paisa_sync_state_timestamp(scenario)
+    await session.execute(
+        text(
+            "INSERT INTO extension_sync_state "
+            "(extension_id, desired_revision, applied_revision, "
+            " first_dirty_at, last_dirty_at, force_reload, failure_count, "
+            " last_published_hash, last_remote_hash, last_healthy_hash, "
+            " last_remote_attempt_at, next_attempt_at, diagnosis_state, "
+            " lease_owner, lease_token, lease_expires_at, "
+            " created_at, updated_at) "
+            "VALUES (:eid, 1, 0, :ts, :ts, 1, 0, "
+            "        NULL, NULL, NULL, NULL, NULL, NULL, "
+            "        NULL, NULL, NULL, :ts, :ts) "
+            "ON CONFLICT(extension_id) DO UPDATE SET "
+            " desired_revision = 1, "
+            " applied_revision = 0, "
+            " first_dirty_at = :ts, "
+            " last_dirty_at = :ts, "
+            " force_reload = 1, "
+            " failure_count = 0, "
+            " last_published_hash = NULL, "
+            " last_remote_hash = NULL, "
+            " last_healthy_hash = NULL, "
+            " last_remote_attempt_at = NULL, "
+            " next_attempt_at = NULL, "
+            " diagnosis_state = NULL, "
+            " lease_owner = NULL, "
+            " lease_token = NULL, "
+            " lease_expires_at = NULL, "
+            " updated_at = :ts"
+        ),
+        {"eid": _PAISA_EXTENSION_ID, "ts": ts},
     )
 
 
@@ -974,6 +1056,7 @@ async def count_rows(db_path: str | Path) -> dict[str, int]:
         "snapshot_holdings",
         "investment_lots",
         "extension_runs",
+        "extension_sync_state",
     )
     raw: dict[str, int] = {}
     out: dict[str, int] = {}
@@ -1008,6 +1091,7 @@ async def count_rows(db_path: str | Path) -> dict[str, int]:
         "cas_uploads",
         "investment_lots",
         "extension_runs",
+        "extension_sync_state",
     )
     for key in aligned_keys:
         out[key] = raw.get(key, 0)

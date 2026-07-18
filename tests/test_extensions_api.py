@@ -799,3 +799,48 @@ async def test_sync_now_serializes_outcome(monkeypatch):
     assert isinstance(out, PaisaSyncResponse)
     assert out.ok is False
     assert out.outcome == "readonly"
+
+
+# ---------------------------------------------------------------------------
+# Manual single-flight lease: busy when held, acquire-then-release otherwise
+# ---------------------------------------------------------------------------
+
+
+async def test_manual_sync_returns_busy_when_lease_held(session, monkeypatch):
+    """When the singleton lease is held, a manual sync waits then returns the
+    additive ``busy`` outcome instead of overlapping."""
+    from financial_dashboard.services.paisa import coordinator as coord_mod
+    from financial_dashboard.services.paisa.sync_state import (
+        claim_lease,
+        ensure_sync_state,
+    )
+
+    # Project config so the surface doesn't refuse on mode; sync_now is never
+    # reached because the lease wait elapses first.
+    monkeypatch.setattr(surface, "load_config", lambda: _config())
+
+    await ensure_sync_state(session)
+    await claim_lease(session, owner="other")  # held by someone else
+    await session.commit()
+
+    # sync_now must NOT run when busy.
+    async def boom(s, *, client=None):
+        raise AssertionError("sync_now must not run when lease held")
+
+    monkeypatch.setattr(surface, "sync_now", boom)
+
+    # Shrink the manual wait window so the test is fast.
+    original = coord_mod.claim_manual_lease
+
+    async def fast_claim(s, **kw):
+        kw["wait_seconds"] = 0.1
+        kw["poll_seconds"] = 0.02
+        return await original(s, **kw)
+
+    monkeypatch.setattr(surface, "claim_manual_lease", fast_claim)
+
+    out = await surface.sync_now_audited(session)
+    assert isinstance(out, PaisaSyncResponse)
+    assert out.busy is True
+    assert out.outcome == "busy"
+    assert out.ok is False

@@ -2,6 +2,7 @@
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session as _Session
 
 from financial_dashboard.config import settings
 from financial_dashboard.db.enums import (
@@ -25,6 +26,7 @@ from financial_dashboard.db.models import (
     Email,
     EmailSource,
     ExtensionRun,
+    ExtensionSyncState,
     FetchRule,
     InvestmentLot,
     ManualItem,
@@ -61,6 +63,22 @@ def _set_sqlite_pragmas(dbapi_connection, connection_record) -> None:
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
+# Commit-aware wake hook for in-process coordinators (Paisa). This is a pure
+# latency optimization: a registered wake signal fires on every committed
+# session so a coordinator reacts to a committed change sooner than its 2s
+# poll. It never gates the coordinator and never fails a commit. Registered on
+# the sync ``Session`` class — the class that backs ``AsyncSession`` — so it
+# fires for both sync and async commits app-wide. The import is deferred to the
+# handler body to avoid a db <-> services.paisa import cycle at module-eval
+# time (at commit time the package graph is fully initialized). When no
+# coordinator is registered the fire iterates an empty list — a no-op.
+@event.listens_for(_Session, "after_commit")
+def _signal_commit_wake(session) -> None:  # noqa: ANN001
+    from financial_dashboard.services.paisa.wakeup import _fire_commit_wake
+
+    _fire_commit_wake()
+
+
 async def init_db() -> None:
     await _init_db(engine)
 
@@ -78,6 +96,7 @@ __all__ = [
     "EmailKind",
     "EmailSource",
     "ExtensionRun",
+    "ExtensionSyncState",
     "FetchRule",
     "InvestmentLot",
     "ManualCategory",

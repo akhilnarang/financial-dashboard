@@ -73,7 +73,7 @@ class PaisaConfig(BaseModel):
     fx_rates: list[PaisaFxRateRow] = []
     report_cache_ttl_seconds: int = 60
     auto_sync_enabled: bool = False
-    auto_sync_min_interval_minutes: int = 30
+    auto_sync_min_interval_minutes: int = 1
     notify_sync_failures: bool = False
     project_investments: bool = False
     can_connect: bool
@@ -129,7 +129,7 @@ class PaisaConfigInput(BaseModel):
     fx_rates: list[PaisaFxRateRow] = []
     report_cache_ttl_seconds: int = 60
     auto_sync_enabled: bool = False
-    auto_sync_min_interval_minutes: int = 30
+    auto_sync_min_interval_minutes: int = 1
     notify_sync_failures: bool = False
     project_investments: bool = False
 
@@ -237,6 +237,10 @@ class PaisaGenerateResponse(BaseModel):
     summary: PaisaProjectionSummary | None = None
     publish: PaisaPublishInfo | None = None
     reason: str | None = None
+    #: Additive: True when a manual generate could not acquire the singleton
+    #: lease within the wait window (a coordinator/another manual op held it).
+    #: Default False so older clients keep deserializing.
+    busy: bool = False
 
 
 class PaisaSyncResponse(BaseModel):
@@ -246,6 +250,9 @@ class PaisaSyncResponse(BaseModel):
     summary: PaisaProjectionSummary | None = None
     publish: PaisaPublishInfo | None = None
     diagnosis_ok: bool | None = None
+    #: Additive: True when a manual sync could not acquire the singleton lease
+    #: within the wait window. ``outcome="busy"`` when set. Default False.
+    busy: bool = False
     reason: str | None = None
     #: Classified diagnosis counts (see services.paisa.diagnosis).
     #: ``diagnosis_expected`` is how many ``Debit Entry`` dangers the projection

@@ -468,3 +468,373 @@ async def test_lot_ingestion_is_idempotent_on_rerun(tmp_path):
             assert len(lots) == 1
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Pristine Paisa sync-state singleton (mirrors production init_db's seed)
+# ---------------------------------------------------------------------------
+#
+# Production init_db seeds exactly one pristine ``extension_sync_state`` row
+# (desired_revision=1, applied_revision=0, force_reload=1, failure_count=0,
+# every hash/retry/diagnosis/lease field NULL). The synthetic seed mirrors that
+# so a loaded DB is representative of a freshly-initialized production DB, and
+# downstream read paths see the singleton. The loader re-stamps the row to
+# canonical values as the final write, so the recorded state stays deterministic
+# even when SQLite triggers are active on the DB (init_db installs AFTER triggers
+# on the core tables; the loader itself uses create_all, which installs none).
+
+
+async def _sync_state_row(session):
+    from financial_dashboard.db.models import ExtensionSyncState
+
+    return await session.get(ExtensionSyncState, "paisa")
+
+
+async def test_load_seeds_one_pristine_paisa_sync_state_row(tmp_path):
+    """The loader seeds exactly one pristine Paisa sync-state singleton with
+    the canonical fresh-init values (desired_revision=1, applied_revision=0,
+    force_reload=1, failure_count=0, every hash/retry/diagnosis/lease field
+    NULL), mirroring production init_db."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from scripts.synth.loader import create_synthetic_engine
+
+    db = _synthetic_db(tmp_path)
+    scenario = build_scenario(profile="smoke")
+    await load_scenario(scenario, db)
+    engine = await create_synthetic_engine(db)
+    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with maker() as session:
+            row = await _sync_state_row(session)
+            assert row is not None, "paisa singleton missing"
+            assert row.extension_id == "paisa"
+            assert row.desired_revision == 1
+            assert row.applied_revision == 0
+            assert row.force_reload is True
+            assert row.failure_count == 0
+            # Every hash / retry / diagnosis / lease field is NULL on a fresh seed.
+            for attr in (
+                "last_published_hash",
+                "last_remote_hash",
+                "last_healthy_hash",
+                "last_remote_attempt_at",
+                "next_attempt_at",
+                "diagnosis_state",
+                "lease_owner",
+                "lease_token",
+                "lease_expires_at",
+            ):
+                assert getattr(row, attr) is None, attr
+            # first/last_dirty_at are set (dirty + force_reload on fresh init).
+            assert row.first_dirty_at is not None
+            assert row.last_dirty_at is not None
+            assert row.created_at is not None
+    finally:
+        await engine.dispose()
+
+
+async def test_count_rows_and_scenario_counts_include_sync_state(tmp_path):
+    """count_rows surfaces extension_sync_state and Scenario.counts() pins it
+    at 1, so manifest verify can police a regression that drops the row or
+    creates extras."""
+    db = _synthetic_db(tmp_path)
+    scenario = build_scenario(profile="smoke")
+    expected = scenario.counts()
+    assert expected["extension_sync_state"] == 1
+    await load_scenario(scenario, db)
+    counts = await count_rows(db)
+    assert counts["extension_sync_state"] == 1
+
+
+async def test_db_counts_match_scenario_counts_includes_sync_state(tmp_path):
+    """The db-counts-match-scenario-counts contract now covers the sync-state
+    singleton too (the existing test_db_counts_match_scenario_counts iterates
+    over every key, so this is a belt-and-braces pin of the new key)."""
+    db = _synthetic_db(tmp_path)
+    scenario = build_scenario(profile="golden")
+    await load_scenario(scenario, db)
+    counts = await count_rows(db)
+    assert (
+        counts["extension_sync_state"] == scenario.counts()["extension_sync_state"] == 1
+    )
+
+
+async def test_verify_catches_sync_state_count_regression(tmp_path):
+    """Manifest verify flags a sync-state count regression (row dropped or
+    duplicated) as tamper, exactly like it flags investment_lots/extension_runs
+    drift."""
+    import json
+
+    from scripts.synth.manifest import TamperError, sha256_bytes, verify_manifest
+
+    scenario = build_scenario(profile="smoke")
+    expected = scenario.counts()
+    assert expected["extension_sync_state"] == 1
+
+    out_dir = tmp_path / "corpus"
+    out_dir.mkdir()
+    artefact = b"sentinel-bytes\n"
+    (out_dir / "sentinel.txt").write_bytes(artefact)
+    manifest = {
+        "schema_version": "1",
+        "generator_version": C.GENERATOR_VERSION,
+        "seed": scenario.seed,
+        "as_of": scenario.as_of.isoformat(),
+        "profile": scenario.profile,
+        "expected": dict(sorted(expected.items())),
+        "invariants": {},
+        "artefacts": {
+            "sentinel.txt": {
+                "sha256": sha256_bytes(artefact),
+                "bytes": len(artefact),
+            }
+        },
+    }
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+
+    # Correct count verifies cleanly.
+    verify_manifest(out_dir, db_counts={**expected})
+
+    # Missing row → count 0 → tamper.
+    with pytest.raises(TamperError, match="extension_sync_state"):
+        verify_manifest(out_dir, db_counts={**expected, "extension_sync_state": 0})
+    # Extra row → count 2 → tamper.
+    with pytest.raises(TamperError, match="extension_sync_state"):
+        verify_manifest(out_dir, db_counts={**expected, "extension_sync_state": 2})
+
+
+async def test_rerun_keeps_sync_state_pristine(tmp_path):
+    """A same-shape rerun leaves the pristine row pristine — the final re-stamp
+    is idempotent and adds no second row."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from scripts.synth.loader import create_synthetic_engine
+
+    db = _synthetic_db(tmp_path)
+    scenario = build_scenario(profile="smoke")
+    await load_scenario(scenario, db)
+    await load_scenario(scenario, db)  # idempotent rerun
+
+    engine = await create_synthetic_engine(db)
+    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with maker() as session:
+            row = await _sync_state_row(session)
+            assert row is not None
+            assert row.desired_revision == 1
+            assert row.applied_revision == 0
+            assert row.force_reload is True
+            assert row.failure_count == 0
+            assert row.lease_owner is None
+            assert row.last_remote_hash is None
+            # No second row was created by the rerun.
+            from sqlalchemy import func, select
+
+            from financial_dashboard.db.models import ExtensionSyncState
+
+            total = (
+                await session.execute(
+                    select(func.count()).select_from(ExtensionSyncState)
+                )
+            ).scalar_one()
+            assert total == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_shape_upgrade_reset_wipes_stale_sync_state(tmp_path):
+    """A shape-upgrade load wipes extension_sync_state along with every other
+    loader-owned table, so no stale lease/hash/revision from the prior shape
+    survives the rebuild — the new load re-seeds the singleton pristine."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    db = _synthetic_db(tmp_path)
+    prior = build_scenario(seed=4242, profile="smoke")
+    await load_scenario(prior, db)
+    # Pollute the pristine row with stale coordinator-style fields, as if a
+    # prior run had reconciled, leased, and failed.
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE extension_sync_state SET desired_revision = 99, "
+                    "applied_revision = 98, force_reload = 0, failure_count = 5, "
+                    "last_remote_hash = 'stalehash', lease_owner = 'stale-owner', "
+                    "lease_token = 'stale-token', "
+                    "lease_expires_at = '2035-01-01', "
+                    "diagnosis_state = 'fatal', next_attempt_at = '2035-01-01' "
+                    "WHERE extension_id = 'paisa'"
+                )
+            )
+    finally:
+        await engine.dispose()
+
+    # Shape upgrade: different seed → reset + rebuild.
+    current = build_scenario(seed=9999, profile="smoke")
+    await load_scenario(current, db)
+    await _assert_db_matches_scenario(db, current)
+
+    # The rebuild re-seeded the pristine row — no stale fields survive.
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    try:
+        async with engine.connect() as conn:
+            r = (
+                await conn.execute(
+                    text(
+                        "SELECT desired_revision, applied_revision, force_reload, "
+                        "failure_count, last_remote_hash, last_healthy_hash, "
+                        "lease_owner, lease_token, lease_expires_at, "
+                        "diagnosis_state, next_attempt_at "
+                        "FROM extension_sync_state WHERE extension_id = 'paisa'"
+                    )
+                )
+            ).one()
+            assert tuple(r) == (1, 0, 1, 0, None, None, None, None, None, None, None)
+    finally:
+        await engine.dispose()
+
+
+async def test_restamp_erases_trigger_revision_churn(tmp_path):
+    """If SQLite triggers are active on this DB (e.g. init_db was invoked on
+    it), the structural + bulk writes bump desired_revision non-deterministically.
+    The loader's final re-stamp must force the row back to pristine so the
+    seed's recorded state is deterministic regardless of trigger presence.
+
+    This test simulates the churn directly (many bumps + coordinator pollution),
+    then re-loads the same shape and asserts the re-stamp reset everything to
+    canonical pristine values."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    db = _synthetic_db(tmp_path)
+    scenario = build_scenario(profile="smoke")
+    await load_scenario(scenario, db)
+
+    # Simulate trigger-driven churn: many bumps + coordinator pollution that
+    # a real coordinator run (or init_db's triggers firing on subsequent writes)
+    # would leave behind.
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    try:
+        async with engine.begin() as conn:
+            for _ in range(50):
+                await conn.execute(
+                    text(
+                        "UPDATE extension_sync_state SET "
+                        "desired_revision = desired_revision + 1 "
+                        "WHERE extension_id = 'paisa'"
+                    )
+                )
+            await conn.execute(
+                text(
+                    "UPDATE extension_sync_state SET applied_revision = 7, "
+                    "force_reload = 0, failure_count = 4, "
+                    "last_remote_hash = 'churned', last_healthy_hash = 'wasok', "
+                    "lease_owner = 'coord', lease_token = 'tok', "
+                    "lease_expires_at = '2035-01-01', "
+                    "diagnosis_state = 'accepted', next_attempt_at = '2035-01-01' "
+                    "WHERE extension_id = 'paisa'"
+                )
+            )
+            before = (
+                await conn.execute(
+                    text(
+                        "SELECT desired_revision, applied_revision, force_reload, "
+                        "failure_count FROM extension_sync_state "
+                        "WHERE extension_id = 'paisa'"
+                    )
+                )
+            ).one()
+            assert tuple(before) == (51, 7, 0, 4)
+    finally:
+        await engine.dispose()
+
+    # Same-shape rerun (identity matches → no reset): the final re-stamp must
+    # erase all churn and pollution.
+    await load_scenario(scenario, db)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    try:
+        async with engine.connect() as conn:
+            r = (
+                await conn.execute(
+                    text(
+                        "SELECT desired_revision, applied_revision, force_reload, "
+                        "failure_count, last_remote_hash, last_healthy_hash, "
+                        "lease_owner, lease_token, lease_expires_at, "
+                        "diagnosis_state, next_attempt_at "
+                        "FROM extension_sync_state WHERE extension_id = 'paisa'"
+                    )
+                )
+            ).one()
+            assert tuple(r) == (1, 0, 1, 0, None, None, None, None, None, None, None)
+    finally:
+        await engine.dispose()
+
+
+async def test_init_db_then_load_leaves_pristine_sync_state(tmp_path, monkeypatch):
+    """When production init_db is invoked on the synthetic DB (seeding the
+    singleton + installing the SQLite AFTER triggers) BEFORE the loader runs,
+    the loader's structural + bulk writes bump desired_revision on every insert.
+    The loader's final re-stamp must still leave the row pristine, so the seed
+    is deterministic even under trigger-active conditions.
+
+    This is the real path: it exercises init_db's trigger installation (21
+    AFTER triggers on the core tables + settings) and confirms the loader's
+    re-stamp wins over the resulting churn."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    # init_db warms two runtime caches through the *application's* global engine
+    # at its tail; stub them to no-ops so the schema/migration work runs against
+    # the engine the test owns (mirrors tests/test_paisa_sync_state_schema.py).
+    from financial_dashboard.services import settings as settings_mod
+    from financial_dashboard.services.categorization import merchant_rules
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(settings_mod, "load_all_settings", _noop)
+    monkeypatch.setattr(merchant_rules, "load_merchant_rules", _noop)
+
+    from financial_dashboard.db.init_db import init_db
+
+    db = _synthetic_db(tmp_path, "initdb.db")
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    await init_db(engine)  # seeds pristine row + installs triggers
+    await engine.dispose()
+
+    # The loader runs over the trigger-active DB. Identity is unstamped → reset
+    # + full rebuild; every structural/bulk insert bumps desired_revision.
+    scenario = build_scenario(profile="smoke")
+    await load_scenario(scenario, db)
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+    try:
+        async with engine.connect() as conn:
+            # Triggers really are installed (the precondition for churn).
+            tcount = (
+                await conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                        "AND name LIKE 'ext_sync_dirty_%'"
+                    )
+                )
+            ).scalar_one()
+            assert tcount > 0, "init_db installed no triggers; test setup is wrong"
+            r = (
+                await conn.execute(
+                    text(
+                        "SELECT desired_revision, applied_revision, force_reload, "
+                        "failure_count, last_remote_hash, lease_owner, "
+                        "diagnosis_state, next_attempt_at "
+                        "FROM extension_sync_state WHERE extension_id = 'paisa'"
+                    )
+                )
+            ).one()
+            assert tuple(r) == (1, 0, 1, 0, None, None, None, None)
+    finally:
+        await engine.dispose()

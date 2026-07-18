@@ -174,18 +174,23 @@ PAISA_SETTINGS = MappingProxyType(
             data_type="bool",
             category=PAISA_CATEGORY,
             label="Auto Sync",
-            description="After each fetch cycle, regenerate the include and ask "
-            "Paisa to reload it. Requires project mode. Off by default.",
+            description="When on and in project mode, a coordinator coalesces "
+            "dirtying core changes (transactions/accounts/cards/snapshots/CAS "
+            "lots/paisa.* settings) into one full-journal Paisa reload. "
+            "disabled/connect accumulate dirty state with no I/O. Off by default.",
         ),
         "paisa.auto_sync_min_interval_minutes": SettingDef(
-            default="30",
+            default="1",
             data_type="int",
             category=PAISA_CATEGORY,
-            label="Auto Sync Min Interval (minutes)",
-            description="Minimum minutes between automatic sync attempts, even "
-            "if fetch cycles run more often. Debounces repeated runs — a failed "
-            "attempt is also throttled until this interval elapses, so transient "
-            "failures do not retry every cycle.",
+            label="Auto Sync Min Reload Interval (minutes)",
+            description="Hard minimum minutes between remote Paisa reloads and "
+            "retries — NOT the event debounce. The quiet debounce (5s), max "
+            "dirty latency (30s), 2s state polling, lease/single-flight, and "
+            "1/2/5/10/15-min retry backoff are fixed and not tunable here. "
+            "1 (default) reloads as soon as the coordinator allows; a higher "
+            "value throttles a healthy stream and a failing one alike. "
+            "Existing persisted values are preserved across upgrades.",
         ),
         "paisa.notify_sync_failures": SettingDef(
             default="false",

@@ -46,9 +46,13 @@ async def lifespan(app: FastAPI):
     await start_services()
     fetch_service = FetchService(extension_manager=app.state.extension_manager)
     app.state.fetch_service = fetch_service
-    # Start extension runtimes now that the DB + settings are ready. This is
-    # inert for Paisa (startup never starts Paisa or enables auto-sync); it only
-    # marks runtimes ready to receive after-fetch-cycle hooks from the poll loop.
+    # Start extension runtimes now that the DB + settings are ready. For Paisa
+    # this launches the per-app coordinator task (transaction-driven, bulk-safe
+    # auto-sync). The coordinator only performs I/O when
+    # ``paisa.mode=project`` AND ``paisa.auto_sync_enabled=true``; until then it
+    # polls persisted state and accumulates dirty changes with no network I/O.
+    # The commit-aware wake hook (installed in financial_dashboard.db) lets it
+    # react to a committed change sooner than its 2s poll.
     await app.state.extension_manager.startup_all()
     await fetch_service.start_poll_loop()
 

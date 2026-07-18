@@ -188,6 +188,7 @@
     "email_sources": 3,
     "emails": 62,
     "extension_runs": 0,
+    "extension_sync_state": 1,
     "fetch_rules": 6,
     "investment_lots": 1,
     "manual_items": 7,
@@ -195,7 +196,7 @@
     "statement_uploads": 5,
     "transactions": 59
   },
-  "generator_version": "1.3.1",
+  "generator_version": "1.4.0",
   "invariants": {
     "all_amounts_decimal": true,
     "backend_corpora": [
@@ -206,7 +207,7 @@
     "bulk_txn_id_base": 1000000,
     "fx_rate_count": 4,
     "journal_balanced": true,
-    "scenario_fingerprint": "32e79a3e2901421c",
+    "scenario_fingerprint": "bd0ff7fef477d25b",
     "stable_ids": true
   },
   "profile": "golden",

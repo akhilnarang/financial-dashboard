@@ -25,6 +25,7 @@ generated-path validator mirrors the publisher's safety check without
 materializing anything.
 """
 
+import asyncio
 import datetime
 import json
 import logging
@@ -34,7 +35,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, NamedTuple
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.core.dates import parse_date
 from financial_dashboard.db.models import Account, ExtensionRun
@@ -89,6 +90,7 @@ from financial_dashboard.services.paisa.audit import (
     start_run,
 )
 from financial_dashboard.services.paisa.config import PaisaProjectionConfig, load_config
+from financial_dashboard.services.paisa.coordinator import claim_manual_lease
 from financial_dashboard.services.paisa.orchestrator import (
     GenerateResult,
     PreviewReport,
@@ -105,6 +107,21 @@ from financial_dashboard.services.paisa.renderer import (
 )
 from financial_dashboard.services.paisa.renderers import SUPPORTED_BACKENDS
 from financial_dashboard.services.paisa.report_cache import get_report_cache
+from financial_dashboard.services.paisa.sync_state import (
+    DEFAULT_LEASE_TTL_SECONDS,
+    DIAGNOSIS_ACCEPTED,
+    DIAGNOSIS_FATAL,
+    DIAGNOSIS_HEALTHY,
+    DIAGNOSIS_UNKNOWN,
+    LeaseStaleError,
+    capture_target,
+    heartbeat_lease,
+    record_accepted_post,
+    record_diagnosis,
+    record_pre_post_failure,
+    record_published_hash,
+    release_lease,
+)
 from financial_dashboard.services.settings import (
     get_setting_bool,
     get_setting_int,
@@ -122,6 +139,18 @@ VALID_MODES = ("disabled", "connect", "project")
 #: rates. The config loader coerces anything else back to ``skip``; the save
 #: path accepts both explicit values.
 SUPPORTED_NON_INR_POLICY = ("skip", "priced")
+
+#: Manual-lease heartbeat: a manual generate/sync claims the singleton lease
+#: (TTL 90s) for single-flight exclusion with the automatic coordinator. A
+#: long manual operation (large journal + slow remote POST) could exceed the
+#: TTL; without a heartbeat the lease would expire, the coordinator could
+#: reclaim it mid-operation, and the manual op's token-guarded state writes
+#: would silently fail (issue: remote sync appears coordinated while state
+#: stays stale). The heartbeat extends the lease every interval so a manual
+#: op cannot outlive its lease. The interval is well under the TTL so a
+#: single missed beat does not lose the lease.
+MANUAL_HEARTBEAT_INTERVAL_SECONDS = 20.0
+MANUAL_LEASE_TTL_SECONDS = DEFAULT_LEASE_TTL_SECONDS  # 90s
 
 #: FX/UI helpers --------------------------------------------------------------
 
@@ -768,10 +797,10 @@ def _guard_outcome(outcome: str | None, reason: str | None) -> str | None:
     """Classify a failed manual result as a mode/readiness guard.
 
     Returns the guard outcome token (disabled|connect_only|not_configured) when
-    the run never attempted real work, else ``None``. Mirrors
-    :func:`services.paisa.automation._reason_to_outcome` so an identical guard
-    condition classifies the same way whether triggered manually or
-    automatically. A guard is recorded as STATUS_SKIPPED with no error.
+    the run never attempted real work, else ``None``. Mirrors the coordinator's
+    guard classification so an identical guard condition classifies the same
+    way whether triggered manually or automatically. A guard is recorded as
+    STATUS_SKIPPED with no error.
     """
     text = (outcome or reason or "").strip().lower()
     if not text:
@@ -807,8 +836,9 @@ async def _audited(
     journal text are ever placed in ``details`` — only sanitized summary counts.
 
     A failed result that is actually a mode/readiness guard (disabled /
-    connect_only / not_configured) is recorded as STATUS_SKIPPED with no error so
-    it never appears in ``last_error`` — matching the automatic runtime.
+    connect_only / not_configured) or a transient single-flight ``busy`` (the
+    lease was held) is recorded as STATUS_SKIPPED with no error so it never
+    appears in ``last_error`` — matching the automatic runtime.
     """
     audit_run = await start_run(
         session,
@@ -835,7 +865,9 @@ async def _audited(
     if res.ok:
         status = STATUS_SUCCESS
         error = None
-    elif guard is not None:
+    elif guard is not None or res.outcome == "busy":
+        # A mode/readiness guard or a transient single-flight "busy" is not a
+        # real failure — record it as skipped with no error.
         status = STATUS_SKIPPED
         error = None
     else:
@@ -899,32 +931,204 @@ async def probe_status_audited(
     return await _audited(session, operation=OPERATION_PROBE, trigger=trigger, run=run)
 
 
+async def _safe_release(session: AsyncSession, token: str | None) -> None:
+    """Best-effort release of a held manual lease.
+
+    The lease has a TTL so a failed release is self-healing; a release failure
+    must never break the manual operation's audit/commit path.
+    """
+    if token is None:
+        return
+    try:
+        await release_lease(session, token=token)
+    except Exception:
+        logger.debug("manual lease release failed", exc_info=True)
+
+
+async def _manual_heartbeat_loop(
+    bind,
+    token: str,
+    *,
+    interval: float = MANUAL_HEARTBEAT_INTERVAL_SECONDS,
+    ttl_seconds: int = MANUAL_LEASE_TTL_SECONDS,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Extend a held manual lease every ``interval`` until cancelled.
+
+    Uses a fresh session per beat (derived from the caller's engine ``bind``)
+    so it never contends with the caller's open request-session transaction.
+    A failed beat is logged and swallowed; the loop retries on the next
+    interval. If the lease was reclaimed (stale token) the heartbeat is a
+    no-op (the UPDATE matches no rows) — the caller's subsequent token-guarded
+    state writes will surface the staleness as :class:`LeaseStaleError`.
+
+    Cancel the task (``task.cancel()``) when the manual operation finishes;
+    the loop has no other termination condition by design.
+    """
+    factory = async_sessionmaker(bind, class_=AsyncSession, expire_on_commit=False)
+    try:
+        while True:
+            await sleep(interval)
+            try:
+                async with factory() as hb_session:
+                    await heartbeat_lease(
+                        hb_session, token=token, ttl_seconds=ttl_seconds
+                    )
+                    await hb_session.commit()
+            except Exception:
+                logger.debug("manual lease heartbeat failed", exc_info=True)
+    except asyncio.CancelledError:
+        raise
+
+
+def _start_manual_heartbeat(session: AsyncSession, token: str) -> asyncio.Task:
+    """Start the heartbeat background task for a manual lease claim.
+
+    The returned task must be cancelled (and awaited) when the manual
+    operation finishes — typically in a ``finally`` block — so the heartbeat
+    does not outlive the operation.
+    """
+    return asyncio.create_task(_manual_heartbeat_loop(session.bind, token))
+
+
+async def _stop_manual_heartbeat(task: asyncio.Task) -> None:
+    """Cancel and await a manual heartbeat task, swallowing CancelledError."""
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.debug("manual heartbeat task teardown failed", exc_info=True)
+
+
+def _manual_sync_post_accepted(outcome: str) -> bool:
+    """Whether a manual SyncReport's POST was accepted, inferred from outcome.
+
+    The SyncReport does not expose ``post_accepted`` directly; the orchestrator
+    semantics map ``synced``/``diagnosis_failed`` to an accepted POST, and every
+    other non-guard outcome to a pre-POST/ambiguous failure.
+    """
+    return outcome in ("synced", "diagnosis_failed")
+
+
+async def _apply_manual_sync_state(
+    session: AsyncSession, result: PaisaSyncResponse, token: str
+) -> None:
+    """Update persisted sync-state consistently for a manual sync.
+
+    Manual sync forces a remote reload (always POSTs) using one projection, and
+    advances ``applied`` / stamps the remote + diagnosis state so the automatic
+    worker does not redundantly reload. Guards (disabled/connect_only/
+    not_configured) record no state — no remote attempt happened.
+    """
+    from financial_dashboard.db.models import utc_now
+
+    body_hash = result.publish.body_hash if result.publish else None
+    if body_hash is not None:
+        await record_published_hash(session, body_hash=body_hash, token=token)
+    outcome = result.outcome
+    if outcome in GUARD_OUTCOMES:
+        return
+    target = await capture_target(session)
+    R = target.target_revision
+    if outcome == "synced":
+        await record_accepted_post(
+            session, target_revision=R, remote_hash=body_hash or "", token=token
+        )
+        state = (
+            DIAGNOSIS_ACCEPTED
+            if (result.diagnosis_accepted or 0) > 0
+            else DIAGNOSIS_HEALTHY
+        )
+        await record_diagnosis(
+            session, state=state, healthy_hash=body_hash, token=token
+        )
+    elif outcome == "diagnosis_failed":
+        await record_accepted_post(
+            session, target_revision=R, remote_hash=body_hash or "", token=token
+        )
+        state = DIAGNOSIS_FATAL if result.diagnosis_ok is False else DIAGNOSIS_UNKNOWN
+        await record_diagnosis(session, state=state, token=token)
+    else:
+        # unreachable/sync_rejected/readonly/unsupported_backend/publish_failed:
+        # the row stays dirty; arm backoff.
+        await record_pre_post_failure(session, token=token, now=utc_now())
+
+
 async def generate_now_audited(
     session: AsyncSession, *, trigger: str = "api"
 ) -> PaisaGenerateResponse:
-    """Generate wrapped with an audit row (manual generate only)."""
+    """Generate wrapped with an audit row + the persisted lease single-flight.
+
+    Waits up to 30s for the singleton lease (so a manual generate never
+    overlaps a coordinator reconcile or another manual op). If the wait elapses,
+    returns a typed ``busy`` outcome. Records ``last_published_hash`` only (not
+    remote/applied) — a generate does not imply a remote reload.
+
+    A heartbeat task extends the lease every 20s so a long generate (huge
+    journal) cannot lose the lease mid-operation. A stale-lease state-write
+    failure is surfaced in the audit details (``state_recorded: false``) rather
+    than swallowed, so the audit is truthful.
+    """
 
     async def run() -> _AuditResult:
-        result = await generate_now(session)
-        summary = result.summary
-        emitted = summary.emitted_count if summary else None
-        skipped = len(summary.skipped) if summary else None
-        output_hash = result.publish.body_hash if result.publish else None
-        details = {
-            "emitted_count": emitted,
-            "skipped_count": skipped,
-            "published": result.publish.published if result.publish else None,
-            "output_hash": output_hash,
-        }
-        return _AuditResult(
-            ok=result.ok,
-            reason=result.reason,
-            emitted_count=emitted,
-            skipped_count=skipped,
-            output_hash=output_hash,
-            details=details,
-            result=result,
-        )
+        claim = await claim_manual_lease(session, owner="manual-generate")
+        if not claim.claimed or claim.token is None:
+            cfg = load_config()
+            return _AuditResult(
+                ok=False,
+                reason="lease busy",
+                emitted_count=None,
+                skipped_count=None,
+                output_hash=None,
+                details={"reason": "lease busy"},
+                result=PaisaGenerateResponse(
+                    ok=False, mode=cfg.mode, reason="busy", busy=True
+                ),
+                outcome="busy",
+            )
+        token = claim.token
+        hb_task = _start_manual_heartbeat(session, token)
+        state_recorded = True
+        try:
+            result = await generate_now(session)
+            body_hash = result.publish.body_hash if result.publish else None
+            if result.ok and body_hash is not None:
+                try:
+                    await record_published_hash(
+                        session, body_hash=body_hash, token=token
+                    )
+                except LeaseStaleError:
+                    state_recorded = False
+                    logger.warning("manual generate hash record failed: lease stale")
+                except Exception:
+                    state_recorded = False
+                    logger.warning("manual generate hash record failed", exc_info=True)
+            summary = result.summary
+            emitted = summary.emitted_count if summary else None
+            skipped = len(summary.skipped) if summary else None
+            details = {
+                "emitted_count": emitted,
+                "skipped_count": skipped,
+                "published": result.publish.published if result.publish else None,
+                "output_hash": body_hash,
+            }
+            if not state_recorded:
+                details["state_recorded"] = False
+                details["state_error"] = "lease_stale_or_write_failed"
+            return _AuditResult(
+                ok=result.ok,
+                reason=result.reason,
+                emitted_count=emitted,
+                skipped_count=skipped,
+                output_hash=body_hash,
+                details=details,
+                result=result,
+            )
+        finally:
+            await _stop_manual_heartbeat(hb_task)
+            await _safe_release(session, token)
 
     return await _audited(
         session, operation=OPERATION_GENERATE, trigger=trigger, run=run
@@ -934,35 +1138,86 @@ async def generate_now_audited(
 async def sync_now_audited(
     session: AsyncSession, *, trigger: str = "api"
 ) -> PaisaSyncResponse:
-    """Manual sync wrapped with an audit row (manual sync only)."""
+    """Manual sync wrapped with an audit row + the persisted lease single-flight.
+
+    Waits up to 30s for the singleton lease (no overlap with the coordinator or
+    another manual op); returns a typed ``busy`` outcome if the wait elapses.
+    Forces a remote reload (always POSTs), uses one projection, and updates
+    ``last_published_hash`` / ``last_remote_hash`` / ``applied`` / diagnosis
+    state consistently so the automatic worker does not redundantly reload.
+
+    A heartbeat task extends the lease every 20s so a long sync (large journal
+    + slow remote POST) cannot lose the lease mid-operation and let the
+    coordinator reclaim into overlap. A stale-lease state-write failure is
+    surfaced in the audit details (``state_recorded: false``) rather than
+    swallowed, so the audit never claims a coordinated sync while state
+    remains stale.
+    """
 
     async def run() -> _AuditResult:
-        result = await sync_now(session)
-        summary = result.summary
-        emitted = summary.emitted_count if summary else None
-        skipped = len(summary.skipped) if summary else None
-        output_hash = result.publish.body_hash if result.publish else None
-        details = {
-            "outcome": result.outcome,
-            "emitted_count": emitted,
-            "skipped_count": skipped,
-            "diagnosis_ok": result.diagnosis_ok,
-            "diagnosis_expected": result.diagnosis_expected,
-            "diagnosis_accepted": result.diagnosis_accepted,
-            "diagnosis_fatal": result.diagnosis_fatal,
-            "published": result.publish.published if result.publish else None,
-            "output_hash": output_hash,
-        }
-        return _AuditResult(
-            ok=result.ok,
-            reason=result.reason,
-            emitted_count=emitted,
-            skipped_count=skipped,
-            output_hash=output_hash,
-            details=details,
-            result=result,
-            outcome=result.outcome,
-        )
+        claim = await claim_manual_lease(session, owner="manual-sync")
+        if not claim.claimed or claim.token is None:
+            cfg = load_config()
+            return _AuditResult(
+                ok=False,
+                reason="lease busy",
+                emitted_count=None,
+                skipped_count=None,
+                output_hash=None,
+                details={"reason": "lease busy"},
+                result=PaisaSyncResponse(
+                    ok=False, mode=cfg.mode, outcome="busy", busy=True
+                ),
+                outcome="busy",
+            )
+        token = claim.token
+        hb_task = _start_manual_heartbeat(session, token)
+        state_recorded = True
+        try:
+            result = await sync_now(session)
+            try:
+                await _apply_manual_sync_state(session, result, token)
+            except LeaseStaleError:
+                state_recorded = False
+                logger.warning(
+                    "manual sync state record failed: lease stale; "
+                    "remote POST may have been accepted but local state "
+                    "was not advanced"
+                )
+            except Exception:
+                state_recorded = False
+                logger.warning("manual sync state record failed", exc_info=True)
+            summary = result.summary
+            emitted = summary.emitted_count if summary else None
+            skipped = len(summary.skipped) if summary else None
+            output_hash = result.publish.body_hash if result.publish else None
+            details = {
+                "outcome": result.outcome,
+                "emitted_count": emitted,
+                "skipped_count": skipped,
+                "diagnosis_ok": result.diagnosis_ok,
+                "diagnosis_expected": result.diagnosis_expected,
+                "diagnosis_accepted": result.diagnosis_accepted,
+                "diagnosis_fatal": result.diagnosis_fatal,
+                "published": result.publish.published if result.publish else None,
+                "output_hash": output_hash,
+            }
+            if not state_recorded:
+                details["state_recorded"] = False
+                details["state_error"] = "lease_stale_or_write_failed"
+            return _AuditResult(
+                ok=result.ok,
+                reason=result.reason,
+                emitted_count=emitted,
+                skipped_count=skipped,
+                output_hash=output_hash,
+                details=details,
+                result=result,
+                outcome=result.outcome,
+            )
+        finally:
+            await _stop_manual_heartbeat(hb_task)
+            await _safe_release(session, token)
 
     return await _audited(session, operation=OPERATION_SYNC, trigger=trigger, run=run)
 
@@ -1272,6 +1527,8 @@ async def reconciliation_view(
 
 
 __all__ = [
+    "MANUAL_HEARTBEAT_INTERVAL_SECONDS",
+    "MANUAL_LEASE_TTL_SECONDS",
     "PaisaSaveError",
     "SUPPORTED_NON_INR_POLICY",
     "VALID_MODES",

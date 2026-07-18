@@ -42,6 +42,8 @@ from financial_dashboard.integrations.paisa import (
 from financial_dashboard.schemas.extensions import (
     PaisaConfigInput,
     PaisaFxRateRow,
+    PaisaGenerateResponse,
+    PaisaPublishInfo,
     PaisaSyncResponse,
 )
 from financial_dashboard.services.paisa import surface
@@ -1782,3 +1784,279 @@ async def test_sync_dto_exposes_diagnosis_counts_through_api(
     assert body["diagnosis_expected"] == 2
     assert body["diagnosis_accepted"] == 2
     assert body["diagnosis_fatal"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Manual lease heartbeat + state-write failure surfacing (stress/race)
+# --------------------------------------------------------------------------- #
+
+
+async def test_sync_audited_surfaces_stale_lease_state_write_failure(
+    session, monkeypatch
+):
+    """When the manual sync's token-guarded state writes fail (stale lease),
+    the audit details must record ``state_recorded: false`` rather than
+    swallowing the failure — so the audit never claims a coordinated sync
+    while state remains stale."""
+    import json
+
+    await _seed_bank(session)
+    await _seed_txn(session, 1)
+    _set_config(
+        monkeypatch,
+        _cfg(selected_account_ids=(1,), generated_path="/tmp/paisa-stale.journal"),
+    )
+
+    async def fake_sync(_session, *, client=None):
+        return PaisaSyncResponse(
+            ok=True,
+            mode="project",
+            outcome="synced",
+            summary=None,
+            publish=PaisaPublishInfo(
+                published=True,
+                skipped=False,
+                path="/tmp/paisa-stale.journal",
+                version="3",
+                body_hash="stalebody",
+                bytes_written=10,
+            ),
+            diagnosis_ok=True,
+            reason=None,
+        )
+
+    monkeypatch.setattr(surface, "sync_now", fake_sync)
+
+    # Force the state-write to raise LeaseStaleError.
+    from financial_dashboard.services.paisa.sync_state import LeaseStaleError
+
+    async def boom_state(*_a, **_k):
+        raise LeaseStaleError("paisa", token="stale", reason="stale_token")
+
+    monkeypatch.setattr(surface, "_apply_manual_sync_state", boom_state)
+
+    result = await surface.sync_now_audited(session, trigger="api")
+    assert result.ok is True  # the POST was accepted (remote perspective)
+
+    runs = await recent_runs(session, extension_id="paisa", operation=OPERATION_SYNC)
+    run = runs[0]
+    details = json.loads(run.details) if run.details else {}
+    assert details["state_recorded"] is False
+    assert details["state_error"] == "lease_stale_or_write_failed"
+
+
+async def test_generate_audited_surfaces_stale_lease_hash_write_failure(
+    session, monkeypatch, tmp_path
+):
+    """Same property for manual generate: a stale-lease hash write is surfaced
+    in details, not swallowed."""
+    import json
+
+    await _seed_bank(session)
+    await _seed_txn(session, 1)
+    _set_config(
+        monkeypatch,
+        _cfg(selected_account_ids=(1,), generated_path=str(tmp_path / "g.journal")),
+    )
+
+    async def fake_generate(_session):
+        return PaisaGenerateResponse(
+            ok=True,
+            mode="project",
+            summary=None,
+            publish=PaisaPublishInfo(
+                published=True,
+                skipped=False,
+                path=str(tmp_path / "g.journal"),
+                version="3",
+                body_hash="genbody",
+                bytes_written=10,
+            ),
+            reason=None,
+        )
+
+    monkeypatch.setattr(surface, "generate_now", fake_generate)
+
+    from financial_dashboard.services.paisa.sync_state import LeaseStaleError
+
+    async def boom_hash(*_a, **_k):
+        raise LeaseStaleError("paisa", token="stale", reason="stale_token")
+
+    monkeypatch.setattr(surface, "record_published_hash", boom_hash)
+
+    await surface.generate_now_audited(session, trigger="api")
+    runs = await recent_runs(
+        session, extension_id="paisa", operation=OPERATION_GENERATE
+    )
+    details = json.loads(runs[0].details) if runs[0].details else {}
+    assert details["state_recorded"] is False
+
+
+async def test_manual_heartbeat_extends_lease_during_long_sync(tmp_path):
+    """The heartbeat loop extends a held lease; a stale token is a no-op.
+
+    Verified directly against the heartbeat primitive: after one beat the
+    lease expiry is pushed out by the TTL. This is the mechanism that keeps a
+    long manual operation (large journal + slow POST) from losing its lease to
+    the automatic coordinator. Uses a file-based WAL DB so the heartbeat's
+    fresh session observes the caller's committed lease."""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from financial_dashboard.db.models import Base
+    from financial_dashboard.services.paisa import surface as surf
+    from financial_dashboard.services.paisa.sync_state import (
+        claim_lease,
+        ensure_sync_state,
+        read_sync_state,
+    )
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'hb.db'}")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
+        async with factory() as s:
+            await ensure_sync_state(s)
+            claim = await claim_lease(s, owner="manual-test")
+            await s.commit()
+        assert claim.claimed
+        token = claim.token
+
+        async with factory() as s:
+            snap_before = await read_sync_state(s)
+        assert snap_before.lease_expires_at is not None
+        original_expiry = snap_before.lease_expires_at
+
+        # Run one heartbeat iteration with a tiny sleep; cancel after it fires.
+        beat_done = asyncio.Event()
+
+        async def tiny_sleep(_s):
+            beat_done.set()
+            await asyncio.sleep(10)  # block so we cancel mid-wait
+
+        task = asyncio.create_task(
+            surf._manual_heartbeat_loop(engine, token, interval=0.001, sleep=tiny_sleep)
+        )
+        await asyncio.wait_for(beat_done.wait(), timeout=2.0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        async with factory() as s:
+            snap_after = await read_sync_state(s)
+        assert snap_after.lease_expires_at is not None
+        # The heartbeat pushed the expiry out (it renewed with now + ttl).
+        assert snap_after.lease_expires_at >= original_expiry
+        # The token is unchanged (heartbeat extends, never re-mints).
+        assert snap_after.lease_token == token
+    finally:
+        await engine.dispose()
+
+
+async def test_manual_lease_polling_commits_running_audit_row(tmp_path, monkeypatch):
+    """claim_manual_lease commits the session, so the 'running' audit row
+    started by _audited is committed (observable) before the operation
+    finishes. This is by design: a crash leaves a 'running' row, not a silent
+    loss. Uses a file-based DB so a fresh observer session sees the committed
+    row."""
+
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from financial_dashboard.db.models import Base, ExtensionRun
+    from financial_dashboard.services.paisa import surface as surf
+    from financial_dashboard.services.paisa.config import PaisaProjectionConfig
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'preempt.db'}")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
+
+        cfg = PaisaProjectionConfig(
+            mode="project",
+            base_url="http://127.0.0.1:7500",
+            external_url="",
+            allow_remote=False,
+            auth_username="",
+            auth_password="",
+            generated_path="/tmp/paisa-preempt.journal",
+            selected_account_ids=(1,),
+            cutover_date=dt.date(2026, 1, 1),
+            account_mappings={},
+            category_mappings={},
+            non_inr_policy="skip",
+            request_timeout_seconds=15,
+        )
+        monkeypatch.setattr(surf, "load_config", lambda: cfg)
+
+        captured = {"running_committed": False}
+
+        async def fake_generate(_session):
+            # While the generate is "running", check if there's a committed
+            # 'running' row visible from a *fresh* session (proving it was
+            # committed by claim_manual_lease, not just pending).
+            async with factory() as fresh:
+                rows = (
+                    (
+                        await fresh.execute(
+                            select(ExtensionRun).where(
+                                ExtensionRun.extension_id == "paisa",
+                                ExtensionRun.status == "running",
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                captured["running_committed"] = len(rows) > 0
+            return PaisaGenerateResponse(
+                ok=True,
+                mode="project",
+                summary=None,
+                publish=PaisaPublishInfo(
+                    published=True,
+                    skipped=False,
+                    path="/tmp/paisa-preempt.journal",
+                    version="3",
+                    body_hash="preempt",
+                    bytes_written=10,
+                ),
+                reason=None,
+            )
+
+        monkeypatch.setattr(surf, "generate_now", fake_generate)
+
+        async with factory() as session:
+            result = await surf.generate_now_audited(session, trigger="api")
+            assert result.ok is True
+
+        assert captured["running_committed"] is True
+
+        # The final audit row is completed and committed.
+        async with factory() as s:
+            from financial_dashboard.services.paisa.audit import recent_runs
+
+            runs = await recent_runs(
+                s, extension_id="paisa", operation=OPERATION_GENERATE
+            )
+            assert len(runs) == 1
+            assert runs[0].status == STATUS_SUCCESS
+    finally:
+        await engine.dispose()

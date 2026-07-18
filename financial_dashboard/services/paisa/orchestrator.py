@@ -25,6 +25,23 @@ client meet a request boundary. Its contract with the rest of the dashboard:
   ``connect``/``probe`` works regardless of backend: a connectivity check never
   implies a write.
 
+Staged API (for a coordinator that drives one projection + one publish per
+sync attempt):
+
+* :func:`preflight` — mode/readiness gates, then the remote capability/backend/
+  readonly checks, *before* any projection or file write. Session-free, so a
+  coordinator can preflight before opening a session to generate.
+* :func:`generate` — project + publish exactly once (the only stage that
+  projects or writes the include).
+* :func:`sync_remote` — POST ``/api/sync`` + diagnosis against an
+  already-generated/already-published :class:`ProjectionReport`. Neither
+  projects nor publishes; it reports the POST outcome (``post_accepted``) and
+  the diagnosis outcome separately so a coordinator can stamp the remote hash /
+  advance ``applied_revision`` on an accepted POST even when diagnosis is fatal
+  or could not run.
+* :func:`manual_sync` — composes the three into the same :class:`SyncReport`
+  the route layer has always consumed (one projection, one publish).
+
 The functions are service-first (no HTTP) so routes can be layered on later.
 """
 
@@ -114,6 +131,46 @@ class SyncReport(NamedTuple):
     outcome: SyncOutcome
     preview: ProjectionReport | None
     publish: PublishResult | None
+    diagnosis_ok: bool | None
+    reason: str | None
+    diagnosis_expected: int | None = None
+    diagnosis_accepted: int | None = None
+    diagnosis_fatal: int | None = None
+
+
+class PreflightReport(NamedTuple):
+    """Result of the pre-publish preflight: mode/readiness gates, then the
+    remote capability/backend/readonly checks — with no projection and no file
+    write.
+
+    Runs *before* :func:`generate`. A non-ok preflight carries the terminal
+    ``outcome`` (disabled/connect_only/not_configured/readonly/
+    unsupported_backend/unreachable); an ok preflight reports ``outcome=None``
+    (preflight is a pre-stage, not a sync outcome). ``capabilities`` is
+    populated whenever the probe reached ``/api/config``.
+    """
+
+    ok: bool
+    outcome: SyncOutcome | None
+    capabilities: PaisaCapabilities | None
+    reason: str | None
+
+
+class RemoteSyncReport(NamedTuple):
+    """Result of the remote POST + diagnosis stage (no projection, no publish).
+
+    The file is already on disk from the caller's :func:`generate`; this stage
+    POSTs ``/api/sync`` (Paisa reloads that include) and then verifies with
+    diagnosis. ``post_accepted`` and ``diagnosis_ok`` are reported separately so
+    a coordinator can record an accepted POST — advance ``applied_revision`` and
+    stamp ``last_remote_hash`` — even when the diagnosis that follows is fatal
+    (``diagnosis_ok=False``) or could not run (``diagnosis_ok=None``). ``ok`` is
+    True only when the POST was accepted AND diagnosis came back healthy.
+    """
+
+    ok: bool
+    outcome: SyncOutcome
+    post_accepted: bool
     diagnosis_ok: bool | None
     reason: str | None
     diagnosis_expected: int | None = None
@@ -237,7 +294,7 @@ async def generate(
 
 
 # ---------------------------------------------------------------------------
-# Manual sync (network, requires project mode)
+# Client builder + mode-gate helper
 # ---------------------------------------------------------------------------
 
 
@@ -259,184 +316,219 @@ def _write_blocked_reason(config: PaisaProjectionConfig) -> str:
     return "connect_only"
 
 
-async def manual_sync(
-    session: AsyncSession,
+# ---------------------------------------------------------------------------
+# Preflight — pre-publish remote checks (no projection, no file write)
+# ---------------------------------------------------------------------------
+
+
+async def preflight(
     config: PaisaProjectionConfig,
     *,
     client: PaisaClient | None = None,
-) -> SyncReport:
-    """Probe, write, POST sync, and verify — without ever mutating core rows.
+) -> PreflightReport:
+    """Pre-publish remote preflight: mode/readiness gates, then the remote
+    capability / backend / readonly checks — with no projection and no file
+    write.
 
-    Requires ``project`` mode. ``client`` is injectable for tests (e.g. an
-    :class:`httpx.MockTransport`-backed client). When omitted, a fresh client is
-    built from the config and closed when the call returns.
+    This is the gate a coordinator runs *before* generating/publishing: a
+    readonly Paisa would acknowledge ``/api/sync`` with fake success, and a
+    backend mismatch (ledger output into an hledger instance) cannot be
+    corrected after the fact, so both are caught here, upstream of any write.
+    The local gates (mode / readiness / generated_path) run first and never
+    touch the network.
+
+    Session-free, so a coordinator can preflight before opening a session to
+    generate. When ``client`` is omitted a fresh client is built from the config
+    and closed when the call returns; when supplied the caller owns it — a
+    coordinator reuses one client across :func:`preflight` and
+    :func:`sync_remote`. Never returns a live client.
     """
     if not config.can_project:
         outcome: SyncOutcome = (
             "disabled" if config.mode == "disabled" else "connect_only"
         )
-        return SyncReport(
+        return PreflightReport(
             ok=False,
             outcome=outcome,
-            preview=None,
-            publish=None,
-            diagnosis_ok=None,
+            capabilities=None,
             reason=_write_blocked_reason(config),
         )
     if not config.ready_to_project:
-        return SyncReport(
+        return PreflightReport(
             ok=False,
             outcome="not_configured",
-            preview=None,
-            publish=None,
-            diagnosis_ok=None,
+            capabilities=None,
             reason="cutover date or selected accounts missing",
         )
     if not config.generated_path:
-        return SyncReport(
+        return PreflightReport(
             ok=False,
             outcome="not_configured",
-            preview=None,
-            publish=None,
-            diagnosis_ok=None,
+            capabilities=None,
             reason="generated_path not configured",
         )
 
     owns_client = client is None
     if client is None:
         client = _build_client(config)
-
     try:
-        return await _do_sync(session, config, client)
+        # Probe capabilities FIRST. A readonly instance would fake-sync, and an
+        # hledger backend cannot consume our ledger output — both must be caught
+        # before we write a file or POST anything.
+        try:
+            capabilities = await client.fetch_config()
+        except PaisaError as exc:
+            if exc.code in (
+                "unreachable",
+                "http_error",
+                "bad_json",
+                "redirect_disallowed",
+            ):
+                return PreflightReport(
+                    ok=False,
+                    outcome="unreachable",
+                    capabilities=None,
+                    reason=f"could not reach Paisa: {exc.message}",
+                )
+            return PreflightReport(
+                ok=False,
+                outcome="unreachable",
+                capabilities=None,
+                reason=f"config probe failed ({exc.code}): {exc.message}",
+            )
+
+        if capabilities.readonly:
+            return PreflightReport(
+                ok=False,
+                outcome="readonly",
+                capabilities=capabilities,
+                reason="Paisa is readonly; /api/sync would report fake success.",
+            )
+        # The configured backend must be supported, and the upstream Paisa
+        # instance must actually be that backend — ledger output does not parse
+        # as hledger/beancount, and vice versa. A missing upstream ledger_cli
+        # (older Paisa, or a version that does not report it) is tolerated so
+        # connectivity still works; a *present but differing* backend is a hard
+        # mismatch.
+        configured_backend = validate_backend(config.ledger_cli)
+        upstream = capabilities.ledger_cli
+        if upstream and upstream.strip().lower() != configured_backend:
+            return PreflightReport(
+                ok=False,
+                outcome="unsupported_backend",
+                capabilities=capabilities,
+                reason=(
+                    f"Paisa ledger_cli={upstream!r} does not match configured "
+                    f"{configured_backend!r}; only {list(SUPPORTED_BACKENDS)} are "
+                    f"supported and the upstream must equal the configured backend."
+                ),
+            )
+
+        return PreflightReport(
+            ok=True,
+            outcome=None,
+            capabilities=capabilities,
+            reason=None,
+        )
     finally:
         if owns_client:
             await client.aclose()
 
 
-async def _do_sync(
-    session: AsyncSession,
+# ---------------------------------------------------------------------------
+# Remote stage — POST /api/sync + diagnosis (no projection, no publish)
+# ---------------------------------------------------------------------------
+
+
+async def sync_remote(
+    report: ProjectionReport,
     config: PaisaProjectionConfig,
-    client: PaisaClient,
-) -> SyncReport:
-    # 1. Probe capabilities FIRST. A readonly instance would fake-sync, and an
-    #    hledger backend cannot consume our ledger output — both must be caught
-    #    before we write a file or POST anything.
+    *,
+    client: PaisaClient | None = None,
+) -> RemoteSyncReport:
+    """Remote POST + diagnosis stage against an already-generated /
+    already-published report.
+
+    The caller's :func:`generate` has already projected and written the include
+    file; this stage POSTs ``/api/sync`` (Paisa reloads that include) and then
+    verifies with diagnosis, classifying contra-expense ``Debit Entry`` dangers
+    the projection provably generated as expected. Neither projects nor
+    publishes — call it with the same :class:`ProjectionReport` ``generate``
+    returned (``gen.report``) so the diagnosis is classified against exactly the
+    postings on disk.
+
+    The POST result (``post_accepted``) and the diagnosis result
+    (``diagnosis_ok``) are reported separately so a coordinator can record an
+    accepted POST — advance ``applied_revision`` and stamp ``last_remote_hash``
+    — even when the diagnosis that follows is fatal or could not run. ``ok`` is
+    True only when the POST was accepted AND diagnosis came back healthy.
+
+    When ``client`` is omitted a fresh client is built and closed on return;
+    when supplied the caller owns it (reuse one client across :func:`preflight`
+    and this stage). Never returns a live client.
+    """
+    owns_client = client is None
+    if client is None:
+        client = _build_client(config)
     try:
-        capabilities = await client.fetch_config()
-    except PaisaError as exc:
-        if exc.code in ("unreachable", "http_error", "bad_json", "redirect_disallowed"):
-            return SyncReport(
-                ok=False,
-                outcome="unreachable",
-                preview=None,
-                publish=None,
-                diagnosis_ok=None,
-                reason=f"could not reach Paisa: {exc.message}",
-            )
-        return SyncReport(
-            ok=False,
-            outcome="unreachable",
-            preview=None,
-            publish=None,
-            diagnosis_ok=None,
-            reason=f"config probe failed ({exc.code}): {exc.message}",
-        )
+        return await _do_sync_remote(report, client)
+    finally:
+        if owns_client:
+            await client.aclose()
 
-    if capabilities.readonly:
-        return SyncReport(
-            ok=False,
-            outcome="readonly",
-            preview=None,
-            publish=None,
-            diagnosis_ok=None,
-            reason="Paisa is readonly; /api/sync would report fake success.",
-        )
-    # The configured backend must be supported, and the upstream Paisa instance
-    # must actually be that backend — ledger output does not parse as hledger/
-    # beancount, and vice versa. A missing upstream ledger_cli (older Paisa, or
-    # a version that does not report it) is tolerated so connectivity still
-    # works; a *present but differing* backend is a hard mismatch.
-    configured_backend = validate_backend(config.ledger_cli)
-    upstream = capabilities.ledger_cli
-    if upstream and upstream.strip().lower() != configured_backend:
-        return SyncReport(
-            ok=False,
-            outcome="unsupported_backend",
-            preview=None,
-            publish=None,
-            diagnosis_ok=None,
-            reason=(
-                f"Paisa ledger_cli={upstream!r} does not match configured "
-                f"{configured_backend!r}; only {list(SUPPORTED_BACKENDS)} are "
-                f"supported and the upstream must equal the configured backend."
-            ),
-        )
 
-    # 2. Project + write the include. Core rows are untouched by both steps.
-    generated = await generate(session, config)
-    if not generated.ok or generated.report is None:
-        outcome: SyncOutcome = (
-            "publish_failed" if generated.publish is None else "sync_rejected"
-        )
-        return SyncReport(
-            ok=False,
-            outcome=outcome,
-            preview=generated.report,
-            publish=generated.publish,
-            diagnosis_ok=None,
-            reason=generated.reason,
-        )
-
-    # 3. POST the exact sync payload. Accepted requires 2xx AND success=true.
+async def _do_sync_remote(
+    report: ProjectionReport,
+    client: PaisaClient,
+) -> RemoteSyncReport:
+    # POST the exact sync payload. Accepted requires 2xx AND success=true.
     try:
         sync_result = await client.sync_journal()
     except PaisaError as exc:
-        return SyncReport(
+        return RemoteSyncReport(
             ok=False,
             outcome="unreachable" if exc.code == "unreachable" else "sync_rejected",
-            preview=generated.report,
-            publish=generated.publish,
+            post_accepted=False,
             diagnosis_ok=None,
             reason=f"sync failed ({exc.code}): {exc.message}",
         )
     if not sync_result.accepted:
         reason = sync_result.reason or f"HTTP {sync_result.status_code}"
-        return SyncReport(
+        return RemoteSyncReport(
             ok=False,
             outcome="sync_rejected",
-            preview=generated.report,
-            publish=generated.publish,
+            post_accepted=False,
             diagnosis_ok=None,
             reason=f"/api/sync rejected: {reason}",
         )
 
-    # 4. Verify with diagnosis. Contra-expense ``Debit Entry`` dangers the
-    #    projection provably generated are *expected* and downgraded (our
-    #    canonical semantics post refunds/cashback/reversals as negative
-    #    Expenses so they net). Anything unmatched — an extra/unknown Debit
-    #    Entry, an operator-authored negative Expenses posting, or any other
-    #    danger kind (Negative Balance, …) — stays fatal and fails the sync.
-    #    The probe path is never touched: it still surfaces raw diagnosis.
+    # Verify with diagnosis. Contra-expense ``Debit Entry`` dangers the
+    # projection provably generated are *expected* and downgraded (our canonical
+    # semantics post refunds/cashback/reversals as negative Expenses so they
+    # net). Anything unmatched — an extra/unknown Debit Entry, an
+    # operator-authored negative Expenses posting, or any other danger kind
+    # (Negative Balance, …) — stays fatal. The probe path is never touched: it
+    # still surfaces raw diagnosis. The POST was accepted regardless of the
+    # diagnosis outcome, so a coordinator may stamp the remote hash first.
     try:
         diagnosis = await client.diagnosis()
     except PaisaError as exc:
         # The sync was accepted but we could not verify. The file is written;
-        # report a soft failure rather than claiming success.
-        return SyncReport(
+        # report a soft failure rather than claiming success. post_accepted
+        # stays True so the coordinator can still record the accepted POST.
+        return RemoteSyncReport(
             ok=False,
             outcome="diagnosis_failed",
-            preview=generated.report,
-            publish=generated.publish,
+            post_accepted=True,
             diagnosis_ok=None,
             reason=f"diagnosis failed ({exc.code}): {exc.message}",
         )
-    classified = classify_diagnosis(diagnosis, generated.report.entries)
+    classified = classify_diagnosis(diagnosis, report.entries)
     if classified.fatal_count > 0:
-        return SyncReport(
+        return RemoteSyncReport(
             ok=False,
             outcome="diagnosis_failed",
-            preview=generated.report,
-            publish=generated.publish,
+            post_accepted=True,
             diagnosis_ok=False,
             diagnosis_expected=classified.expected_count,
             diagnosis_accepted=classified.accepted_count,
@@ -445,14 +537,87 @@ async def _do_sync(
             or f"{classified.fatal_count} unresolved diagnosis danger(s)",
         )
 
-    return SyncReport(
+    return RemoteSyncReport(
         ok=True,
         outcome="synced",
-        preview=generated.report,
-        publish=generated.publish,
+        post_accepted=True,
         diagnosis_ok=True,
         diagnosis_expected=classified.expected_count,
         diagnosis_accepted=classified.accepted_count,
         diagnosis_fatal=0,
         reason=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Manual sync (network, requires project mode) — composes the stages
+# ---------------------------------------------------------------------------
+
+
+async def manual_sync(
+    session: AsyncSession,
+    config: PaisaProjectionConfig,
+    *,
+    client: PaisaClient | None = None,
+) -> SyncReport:
+    """Probe, write, POST sync, and verify — without ever mutating core rows.
+
+    Composes the staged API: :func:`preflight` (remote capability/backend/
+    readonly, plus the mode/readiness gates — no file write on failure), then
+    :func:`generate` (project + publish exactly once), then :func:`sync_remote`
+    (POST + diagnosis using that same generated report). The result is shaped
+    into the same :class:`SyncReport` the route layer has always consumed, so
+    public response semantics are unchanged: one projection, one publish.
+
+    Requires ``project`` mode. ``client`` is injectable for tests (e.g. an
+    :class:`httpx.MockTransport`-backed client). When omitted, a fresh client is
+    built from the config and closed when the call returns.
+    """
+    owns_client = client is None
+    if client is None:
+        client = _build_client(config)
+
+    try:
+        pre = await preflight(config, client=client)
+        if not pre.ok:
+            # Every failed preflight carries a terminal outcome (None only on
+            # the ok path); capabilities are not part of the SyncReport surface.
+            assert pre.outcome is not None
+            return SyncReport(
+                ok=False,
+                outcome=pre.outcome,
+                preview=None,
+                publish=None,
+                diagnosis_ok=None,
+                reason=pre.reason,
+            )
+
+        generated = await generate(session, config)
+        if not generated.ok or generated.report is None:
+            outcome: SyncOutcome = (
+                "publish_failed" if generated.publish is None else "sync_rejected"
+            )
+            return SyncReport(
+                ok=False,
+                outcome=outcome,
+                preview=generated.report,
+                publish=generated.publish,
+                diagnosis_ok=None,
+                reason=generated.reason,
+            )
+
+        remote = await sync_remote(generated.report, config, client=client)
+        return SyncReport(
+            ok=remote.ok,
+            outcome=remote.outcome,
+            preview=generated.report,
+            publish=generated.publish,
+            diagnosis_ok=remote.diagnosis_ok,
+            reason=remote.reason,
+            diagnosis_expected=remote.diagnosis_expected,
+            diagnosis_accepted=remote.diagnosis_accepted,
+            diagnosis_fatal=remote.diagnosis_fatal,
+        )
+    finally:
+        if owns_client:
+            await client.aclose()

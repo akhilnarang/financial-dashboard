@@ -228,10 +228,10 @@
                 <div class="fields-row">
                     <label class="field" style="flex-direction: row; align-items: center; gap: 0.5rem; font-weight: 500;">
                         <input type="checkbox" name="auto_sync_enabled" value="true" {% if config.auto_sync_enabled %}checked{% endif %}>
-                        Auto sync after fetch (requires project mode)
+                        Auto sync (coalesced; requires project mode)
                     </label>
                     <label class="field">
-                        Auto Sync Min Interval (minutes)
+                        Min Reload Interval (minutes)
                         <input type="number" name="auto_sync_min_interval_minutes" value="{{ config.auto_sync_min_interval_minutes }}" min="1">
                     </label>
                     <label class="field">
@@ -239,6 +239,9 @@
                         <input type="number" name="report_cache_ttl_seconds" value="{{ config.report_cache_ttl_seconds }}" min="0">
                     </label>
                 </div>
+                <p class="text-sm text-muted" style="margin: 0.75rem 0 0;">
+                    When auto sync is on, a coordinator coalesces dirtying core changes (new/edited transactions, accounts, cards, snapshots, CAS lots, or <code class="include-line">paisa.*</code> settings) into one full-journal Paisa reload — there is no per-transaction/partial sync API, so a bulk statement import (one outer commit) is one bump and one coalesced reload. Fixed, non-tunable timings: 5s quiet debounce, 30s max dirty latency, 2s state polling, lease/single-flight, 1/2/5/10/15-min retry backoff, and a six-hour force reload. <code class="include-line">disabled</code>/<code class="include-line">connect</code> accumulate dirty state with no I/O; the min-reload interval is a hard floor between remote reloads and retries only (not the debounce).
+                </p>
                 <label class="field" style="flex-direction: row; align-items: center; gap: 0.5rem; font-weight: 500; margin-top: 0.75rem;">
                     <input type="checkbox" name="notify_sync_failures" value="true" {% if config.notify_sync_failures %}checked{% endif %}>
                     Notify on auto-sync failure via Telegram (requires Telegram configured). Repeated identical failures are deduped.

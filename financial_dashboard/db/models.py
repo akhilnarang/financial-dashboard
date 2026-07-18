@@ -412,6 +412,112 @@ class Setting(Base):
     )
 
 
+class ExtensionSyncState(Base):
+    """Per-extension persistent sync-state row (generic; Paisa today).
+
+    A singleton keyed by ``extension_id`` that records where an extension's
+    reconciled state is relative to the core data it derives from. SQLite
+    triggers installed by :mod:`financial_dashboard.db.init_db` atomically bump
+    ``desired_revision`` and maintain ``first_dirty_at``/``last_dirty_at``
+    whenever any of the core tables the Paisa projection reads changes, so a
+    coordinator can detect drift cheaply (``desired_revision >
+    applied_revision``) without re-deriving anything. The coordinator owns the
+    remaining fields — it writes ``applied_revision`` plus the hash / retry /
+    diagnosis / lease fields as it reconciles.
+
+    No foreign keys to extension manifests: ``extension_id`` is a plain
+    string (today the literal ``"paisa"``), so this row is decoupled from the
+    in-memory manifest registry and survives a manifest being renamed or
+    removed without orphaning a FK. ``extension_runs`` is the per-operation
+    audit log; this row is the per-extension *current* state — exactly one
+    row per extension, never growing with operation count.
+
+    desired_revision       monotonically incremented by triggers; the tip
+                           revision of the core data
+    applied_revision       last revision the coordinator successfully pushed
+                           to / verified against the remote
+    first_dirty_at         when the current dirty window opened (cleared by
+                           the coordinator on a successful reconcile); NULL
+                           while the row is in sync
+    last_dirty_at          last time a dirtying change landed
+    last_published_hash    hash of the last body this dashboard generated
+                           and wrote to its owned include file
+    last_remote_hash       hash the remote Paisa reported the last time we
+                           asked it what it currently has loaded
+    last_healthy_hash      hash at which the remote last passed a health/
+                           diagnosis check (the last known-good)
+    last_remote_attempt_at when the coordinator last tried to talk to the
+                           remote (success or failure)
+    next_attempt_at        earliest next attempt, raised on failure to
+                           implement exponential backoff
+    failure_count          consecutive remote failures since the last success
+    diagnosis_state        short machine token summarizing the last diagnosis
+                           outcome (``healthy`` | ``accepted`` | ``fatal`` …);
+                           free-form so the diagnosis layer can extend it
+    force_reload           one-shot forcing flag — set by migration on first
+                           boot so the next enabled coordinator reconciles
+                           even with no observable drift; cleared by the
+                           coordinator after a successful reconcile
+    lease_owner/lease_token/lease_expires_at
+                           distributed-coordination lease for the singleton
+                           (single coordinator owns it while unexpired)
+    created_at/updated_at  row bookkeeping
+    """
+
+    __tablename__ = "extension_sync_state"
+
+    extension_id: Mapped[str] = mapped_column(String, primary_key=True)
+    desired_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    applied_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    first_dirty_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    last_dirty_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    last_published_hash: Mapped[str | None] = mapped_column(String)
+    last_remote_hash: Mapped[str | None] = mapped_column(String)
+    last_healthy_hash: Mapped[str | None] = mapped_column(String)
+    last_remote_attempt_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    next_attempt_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    failure_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    diagnosis_state: Mapped[str | None] = mapped_column(String)
+    force_reload: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="1"
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String)
+    lease_token: Mapped[str | None] = mapped_column(String)
+    lease_expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utc_now)
+    updated_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, default=utc_now, onupdate=utc_now
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "desired_revision >= 0", name="ck_extension_sync_state_desired_nonneg"
+        ),
+        CheckConstraint(
+            "applied_revision >= 0", name="ck_extension_sync_state_applied_nonneg"
+        ),
+        CheckConstraint(
+            "failure_count >= 0", name="ck_extension_sync_state_failure_nonneg"
+        ),
+        CheckConstraint(
+            "desired_revision >= applied_revision",
+            name="ck_extension_sync_state_desired_gte_applied",
+        ),
+        # Both support the coordinator's hot lookups: "which extensions are
+        # due for retry" and "which leased rows have expired". Single-row
+        # cardinality today (one Paisa), but the indexes keep those queries
+        # seek-shaped as more extensions arrive.
+        Index("ix_extension_sync_state_next_attempt", "next_attempt_at"),
+        Index("ix_extension_sync_state_lease_expires", "lease_expires_at"),
+    )
+
+
 class ExtensionRun(Base):
     """Audit/state row for a single extension operation (generic, not Paisa-specific).
 

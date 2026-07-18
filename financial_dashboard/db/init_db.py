@@ -5,6 +5,80 @@ from sqlalchemy import text
 from financial_dashboard.db.models import Base
 
 
+#: Core tables whose changes dirty an extension's reconciled projection.
+#: Every INSERT/UPDATE/DELETE on each bumps ``extension_sync_state.desired_revision``
+#: so a coordinator can detect drift without re-deriving the projection.
+_EXTENSION_SYNC_TRIGGER_TABLES = (
+    "transactions",
+    "accounts",
+    "cards",
+    "balance_snapshots",
+    "investment_lots",
+    "cas_uploads",
+)
+
+
+def _extension_sync_bump_body(*, reset_backoff: bool) -> str:
+    """SQL fragment that bumps desired_revision + manages dirty timestamps.
+
+    ``reset_backoff`` additionally clears the retry fields so a Paisa config
+    change is retried immediately rather than waiting out a stale backoff.
+    """
+    fragment = (
+        "UPDATE extension_sync_state "
+        "SET desired_revision = desired_revision + 1, "
+        "first_dirty_at = COALESCE(first_dirty_at, CURRENT_TIMESTAMP), "
+        "last_dirty_at = CURRENT_TIMESTAMP, "
+        "updated_at = CURRENT_TIMESTAMP"
+    )
+    if reset_backoff:
+        fragment += (
+            ", failure_count = 0, next_attempt_at = NULL, last_remote_attempt_at = NULL"
+        )
+    return fragment
+
+
+def _build_extension_sync_state_trigger_ddl() -> list[str]:
+    """Return the CREATE TRIGGER statements that keep extension_sync_state dirty.
+
+    Each statement is ``CREATE TRIGGER IF NOT EXISTS`` so re-running ``init_db``
+    is safe (re-boot is the common path). Every trigger is an AFTER row trigger,
+    so:
+
+    * the bump runs inside the triggering statement's transaction and rolls
+      back with it (and with any enclosing SAVEPOINT) — a rolled-back write
+      leaves ``desired_revision`` untouched;
+    * ``INSERT ... ON CONFLICT DO NOTHING`` / ``INSERT OR IGNORE`` that inserts
+      no row does not fire the AFTER trigger, so a conflict-no-op never bumps;
+    * the singleton row is updated in-place; if it is missing the UPDATE
+      matches zero rows (no failure, no recursion).
+
+    No trigger is installed on ``extension_sync_state`` or ``extension_runs``
+    themselves, so a coordinator's direct writes to this row never recurse.
+    The settings trigger additionally filters to ``paisa.%`` keys via a
+    NEW/OLD reference, so non-Paisa settings writes never dirty the state —
+    and a settings change also resets the retry backoff so a config fix is
+    retried immediately. SQLite only: on other dialects the table still
+    exists (built by ``create_all``) but no triggers are installed.
+    """
+    statements: list[str] = []
+    bump = _extension_sync_bump_body(reset_backoff=False)
+    for table in _EXTENSION_SYNC_TRIGGER_TABLES:
+        for verb in ("INSERT", "UPDATE", "DELETE"):
+            statements.append(
+                f"CREATE TRIGGER IF NOT EXISTS ext_sync_dirty_{table}_{verb.lower()} "
+                f"AFTER {verb} ON {table} BEGIN {bump} WHERE extension_id = 'paisa'; END"
+            )
+    bump_settings = _extension_sync_bump_body(reset_backoff=True)
+    for verb, ref in (("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")):
+        statements.append(
+            f"CREATE TRIGGER IF NOT EXISTS ext_sync_dirty_settings_{verb.lower()} "
+            f"AFTER {verb} ON settings BEGIN {bump_settings} "
+            f"WHERE extension_id = 'paisa' AND {ref}.key LIKE 'paisa.%'; END"
+        )
+    return statements
+
+
 async def init_db(engine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -451,6 +525,38 @@ async def init_db(engine) -> None:
                 await conn.execute(
                     text(f"ALTER TABLE snapshot_holdings ADD COLUMN {_col} {_type}")
                 )
+
+        # --- Extension sync-state: Paisa singleton + dirty-revision triggers ---
+        # ``create_all`` builds extension_sync_state on fresh + legacy DBs (it
+        # only creates missing tables). Idempotently seed the Paisa singleton
+        # row dirty (desired_revision=1, applied_revision=0) and force_reload=1
+        # so the next enabled coordinator reconciles once, even with no
+        # observable drift yet. ON CONFLICT DO NOTHING leaves a coordinator-
+        # owned row authoritative — migration never overwrites a row a
+        # coordinator has already touched (so re-boot does not re-force a
+        # reconcile after the first one succeeded).
+        await conn.execute(
+            text(
+                "INSERT INTO extension_sync_state "
+                "(extension_id, desired_revision, applied_revision, "
+                " first_dirty_at, last_dirty_at, force_reload, failure_count, "
+                " created_at, updated_at) "
+                "VALUES ('paisa', 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+                "        1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(extension_id) DO NOTHING"
+            )
+        )
+
+        # Install the SQLite triggers LAST in this block, after every column
+        # ALTER and data backfill above has run un-tracked. That keeps the
+        # migration's own UPDATEs (e.g. category_method backfill) from firing
+        # them, so a legacy DB does not accumulate spurious bumps during its
+        # first migration pass — only writes after this point dirty the state.
+        # Non-SQLite: the table exists, triggers are a SQLite implementation
+        # detail and are skipped (coordinators fall back to always-reconcile).
+        if conn.dialect.name == "sqlite":
+            for _ddl in _build_extension_sync_state_trigger_ddl():
+                await conn.execute(text(_ddl))
 
     async with engine.begin() as conn:
         # Seed the generic built-in merchant rules (INSERT OR IGNORE, idempotent).
