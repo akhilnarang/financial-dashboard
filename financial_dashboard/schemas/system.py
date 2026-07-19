@@ -1,6 +1,6 @@
-from typing import Literal, NamedTuple
+from typing import Annotated, Literal, NamedTuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AppRevisionResult(NamedTuple):
@@ -48,6 +48,8 @@ class SystemInfoResponse(BaseModel):
 
 HealthStatus = Literal["ok", "degraded", "unavailable"]
 DatabaseBackend = Literal["sqlite", "other"]
+ForeignKeyCheckStatus = Literal["ok", "violations", "unavailable", "unsupported"]
+SQLiteSchemaName = Annotated[str, Field(min_length=1, max_length=256)]
 SQLiteJournalMode = Literal[
     "delete", "truncate", "persist", "memory", "wal", "off", "unknown"
 ]
@@ -59,6 +61,13 @@ SQLiteQuickCheckSource = Literal["live", "cache", "unavailable"]
 class DiagnosticScalarResult(NamedTuple):
     value: object | None
     succeeded: bool
+
+
+class SQLiteForeignKeyCheckRow(NamedTuple):
+    child_table: object
+    child_row_id: object
+    parent_table: object
+    fk_constraint_index: object
 
 
 class QuickCheckDiagnosticResult(NamedTuple):
@@ -85,3 +94,19 @@ class DatabaseHealth(BaseModel):
 class SystemHealthResponse(BaseModel):
     status: HealthStatus
     database: DatabaseHealth
+
+
+class ForeignKeyViolation(BaseModel):
+    child_table: SQLiteSchemaName
+    child_row_id: int | None
+    parent_table: SQLiteSchemaName
+    fk_constraint_index: Annotated[int, Field(ge=0)]
+
+
+class ForeignKeyCheckResponse(BaseModel):
+    status: ForeignKeyCheckStatus
+    backend: DatabaseBackend
+    returned_count: Annotated[int, Field(ge=0, le=500)]
+    limit: Annotated[int, Field(ge=1, le=500)]
+    truncated: bool
+    violations: Annotated[list[ForeignKeyViolation], Field(max_length=500)]

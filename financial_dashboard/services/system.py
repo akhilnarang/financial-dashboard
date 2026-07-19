@@ -21,6 +21,23 @@ _SQLITE_FOREIGN_KEYS = text("PRAGMA foreign_keys")
 _SQLITE_BUSY_TIMEOUT = text("PRAGMA busy_timeout")
 _SQLITE_SYNCHRONOUS = text("PRAGMA synchronous")
 _SQLITE_QUICK_CHECK = text("PRAGMA quick_check(1)")
+_SQLITE_FOREIGN_KEY_CHECK = text(
+    """
+    SELECT
+        "table" AS child_table,
+        rowid AS child_row_id,
+        parent AS parent_table,
+        fkid AS fk_constraint_index
+    FROM pragma_foreign_key_check
+    ORDER BY
+        "table" COLLATE BINARY ASC,
+        rowid ASC,
+        parent COLLATE BINARY ASC,
+        fkid ASC
+    LIMIT :fetch_limit
+    """
+)
+_SQLITE_SCHEMA_NAME_MAX_LENGTH = 256
 _QUICK_CHECK_TTL_SECONDS = 5 * 60.0
 
 logger = logging.getLogger(__name__)
@@ -91,6 +108,127 @@ def _database_engine(session: AsyncSession) -> Engine:
 
 def _database_backend(engine: Engine) -> system_schemas.DatabaseBackend:
     return "sqlite" if engine.dialect.name == "sqlite" else "other"
+
+
+def _empty_foreign_key_check_response(
+    *,
+    status: system_schemas.ForeignKeyCheckStatus,
+    backend: system_schemas.DatabaseBackend,
+    limit: int,
+) -> system_schemas.ForeignKeyCheckResponse:
+    return system_schemas.ForeignKeyCheckResponse(
+        status=status,
+        backend=backend,
+        returned_count=0,
+        limit=limit,
+        truncated=False,
+        violations=[],
+    )
+
+
+def _safe_sqlite_schema_name(value: object) -> str:
+    """Bound schema identifiers and replace characters unsafe for JSON output."""
+    if not isinstance(value, str) or not value:
+        return "[invalid]"
+
+    normalized = "".join(
+        character if character.isprintable() else "�" for character in value
+    )
+    return normalized[:_SQLITE_SCHEMA_NAME_MAX_LENGTH] or "[invalid]"
+
+
+def _foreign_key_violation(
+    row: system_schemas.SQLiteForeignKeyCheckRow,
+) -> system_schemas.ForeignKeyViolation | None:
+    row_id = row.child_row_id
+    if row_id is not None and (not isinstance(row_id, int) or isinstance(row_id, bool)):
+        return None
+
+    constraint_index = row.fk_constraint_index
+    if (
+        not isinstance(constraint_index, int)
+        or isinstance(constraint_index, bool)
+        or constraint_index < 0
+    ):
+        return None
+
+    return system_schemas.ForeignKeyViolation(
+        child_table=_safe_sqlite_schema_name(row.child_table),
+        child_row_id=row_id,
+        parent_table=_safe_sqlite_schema_name(row.parent_table),
+        fk_constraint_index=constraint_index,
+    )
+
+
+async def get_system_foreign_key_check(
+    session: AsyncSession,
+    *,
+    limit: int,
+) -> system_schemas.ForeignKeyCheckResponse:
+    """Return a bounded, redacted summary of SQLite foreign-key violations."""
+    try:
+        backend = _database_backend(_database_engine(session))
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "Could not identify database backend for foreign-key check: %s", exc
+        )
+        return _empty_foreign_key_check_response(
+            status="unavailable",
+            backend="other",
+            limit=limit,
+        )
+
+    if backend != "sqlite":
+        return _empty_foreign_key_check_response(
+            status="unsupported",
+            backend="other",
+            limit=limit,
+        )
+
+    with session.no_autoflush:
+        try:
+            result = await session.execute(
+                _SQLITE_FOREIGN_KEY_CHECK,
+                {"fetch_limit": limit + 1},
+                execution_options={"autoflush": False},
+            )
+            rows = result.mappings().all()
+        except SQLAlchemyError as exc:
+            logger.warning("SQLite foreign-key check failed: %s", exc)
+            return _empty_foreign_key_check_response(
+                status="unavailable",
+                backend="sqlite",
+                limit=limit,
+            )
+
+    violations: list[system_schemas.ForeignKeyViolation] = []
+    for result_row in rows[:limit]:
+        violation = _foreign_key_violation(
+            system_schemas.SQLiteForeignKeyCheckRow(
+                child_table=result_row["child_table"],
+                child_row_id=result_row["child_row_id"],
+                parent_table=result_row["parent_table"],
+                fk_constraint_index=result_row["fk_constraint_index"],
+            )
+        )
+        if violation is None:
+            logger.warning("SQLite foreign-key check returned malformed metadata")
+            return _empty_foreign_key_check_response(
+                status="unavailable",
+                backend="sqlite",
+                limit=limit,
+            )
+        violations.append(violation)
+
+    truncated = len(rows) > limit
+    return system_schemas.ForeignKeyCheckResponse(
+        status="violations" if violations else "ok",
+        backend="sqlite",
+        returned_count=len(violations),
+        limit=limit,
+        truncated=truncated,
+        violations=violations,
+    )
 
 
 async def _diagnostic_scalar(
