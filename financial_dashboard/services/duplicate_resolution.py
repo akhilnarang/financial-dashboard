@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db import Email, FetchRule, Transaction
+from financial_dashboard.db import Account, Card, Email, FetchRule, Transaction
 from financial_dashboard.db.enums import EmailKind
 from financial_dashboard.integrations.email.body import load_or_fetch_raw_email
 from financial_dashboard.schemas.emails import (
@@ -33,6 +33,14 @@ from financial_dashboard.services.email_attachments import (
 )
 from financial_dashboard.services.emails import _process_email_full
 from financial_dashboard.services.linker import build_link_context, link_transaction
+from financial_dashboard.services.settings import (
+    get_telegram_chat_id,
+    should_notify_transactions,
+)
+from financial_dashboard.services.telegram import (
+    build_account_label,
+    send_enrichment_notification,
+)
 from financial_dashboard.services.txn_merge import (
     DUP_DEFER_PREFIX,
     EnrichmentDiff,
@@ -339,6 +347,9 @@ async def resolve_email_duplicate(
                 diff=_response_diff(evaluation.diff),
             )
 
+    should_notify = should_notify_transactions()
+    response: DuplicateResolutionResponse | None = None
+    notification: tuple[int, EnrichmentDiff, dict] | None = None
     try:
         async with session.begin():
             # This must be the first DB operation in the transaction. Existing
@@ -384,13 +395,15 @@ async def resolve_email_duplicate(
                 link_transaction(link_context, evaluation.target)
                 await session.flush()
 
-            # Explicit resolution intentionally only attaches/enriches. It does
-            # not replay payment checks or transaction notifications.
+            # Explicit resolution only attaches/enriches. It does not replay
+            # payment checks, transaction-created notifications, or
+            # disambiguation prompts. A field-level enrichment notification is
+            # queued below and sent only after this transaction commits.
             evaluation.email.status = "parsed"
             evaluation.email.error = None
             await session.flush()
             after = _state(evaluation.target)
-            return DuplicateResolutionResponse(
+            response = DuplicateResolutionResponse(
                 mode="applied",
                 email_id=email_id,
                 transaction_id=evaluation.target.id,
@@ -400,6 +413,32 @@ async def resolve_email_duplicate(
                 after=after,
                 diff=_response_diff(applied_diff),
             )
+            if should_notify and applied_diff.changed_fields:
+                account = (
+                    await session.get(Account, evaluation.target.account_id)
+                    if evaluation.target.account_id
+                    else None
+                )
+                card = (
+                    await session.get(Card, evaluation.target.card_id)
+                    if evaluation.target.card_id
+                    else None
+                )
+                notification = (
+                    evaluation.target.id,
+                    applied_diff,
+                    {
+                        "bank": evaluation.target.bank,
+                        "direction": evaluation.target.direction,
+                        "amount": evaluation.target.amount,
+                        "counterparty": evaluation.target.counterparty,
+                        "transaction_date": evaluation.target.transaction_date,
+                        "transaction_time": evaluation.target.transaction_time,
+                        "card_mask": evaluation.target.card_mask,
+                        "account_label": build_account_label(account, card),
+                        "channel": evaluation.target.channel,
+                    },
+                )
     except TransactionSlotConflict as exc:
         raise DuplicateResolutionError(
             409, "Selected transaction already has an email attached"
@@ -408,3 +447,17 @@ async def resolve_email_duplicate(
         raise DuplicateResolutionError(
             409, "Duplicate resolution conflicts with current transaction state"
         ) from exc
+
+    # The context manager above has committed successfully. Keep network I/O out
+    # of the DB transaction and never emit for a rolled-back or conflicting apply.
+    if notification is not None:
+        txn_id, diff, txn_info = notification
+        await send_enrichment_notification(
+            txn_id,
+            diff,
+            get_telegram_chat_id(),
+            source="email",
+            txn_info=txn_info,
+        )
+    assert response is not None
+    return response

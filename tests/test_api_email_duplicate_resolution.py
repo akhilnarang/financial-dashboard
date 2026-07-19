@@ -15,7 +15,7 @@ from financial_dashboard.db import Account, Base, Email, FetchRule, Transaction
 from financial_dashboard.integrations.email.body import RawEmailLoadResult
 from financial_dashboard.schemas.emails import DuplicateResolutionRequest
 from financial_dashboard.services.emails import ProcessedEmailParse
-from financial_dashboard.services.txn_merge import DUP_DEFER_NOTE
+from financial_dashboard.services.txn_merge import DUP_DEFER_NOTE, EnrichmentDiff
 
 
 RAW_EMAIL = b"synthetic-rfc822-message"
@@ -174,6 +174,13 @@ async def test_preview_is_default_and_has_no_side_effects(client, session, monke
     email, target = await _seed_deferred(session)
     email_id, target_id = email.id, target.id
     _patch_current_parse(monkeypatch, _parsed_txn())
+    from financial_dashboard.services import duplicate_resolution as service
+
+    enrichment_notification = AsyncMock()
+    monkeypatch.setattr(service, "should_notify_transactions", lambda: True)
+    monkeypatch.setattr(
+        service, "send_enrichment_notification", enrichment_notification
+    )
     original_fetched_at = email.fetched_at
     original_created_at = target.created_at
     assert original_fetched_at is not None
@@ -214,6 +221,7 @@ async def test_preview_is_default_and_has_no_side_effects(client, session, monke
     assert stored_target.enriched_at is None
     assert stored_target.created_at == original_created_at.replace(tzinfo=None)
     assert stored_target.counterparty is None
+    enrichment_notification.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -232,12 +240,31 @@ async def test_apply_enriches_existing_row_atomically_without_payment_or_duplica
     email_id, target_id, account_id = email.id, target.id, account.id
     _patch_current_parse(monkeypatch, _parsed_txn())
 
+    from financial_dashboard.services import duplicate_resolution as service
     from financial_dashboard.services import reminders, telegram
 
     payment_check = AsyncMock()
-    notification = AsyncMock()
+    created_notification = AsyncMock()
+    notification_args = None
+
+    async def capture_enrichment_notification(*args, **kwargs):
+        nonlocal notification_args
+        # The send must happen after the transaction context has committed.
+        assert not session.in_transaction()
+        stored_email = await session.get(Email, email_id)
+        stored_target = await session.get(Transaction, target_id)
+        assert stored_email is not None and stored_email.status == "parsed"
+        assert stored_target is not None and stored_target.email_id == email_id
+        notification_args = (args, kwargs)
+
+    enrichment_notification = AsyncMock(side_effect=capture_enrichment_notification)
     monkeypatch.setattr(reminders, "check_payment_received", payment_check)
-    monkeypatch.setattr(telegram, "send_transaction_notification", notification)
+    monkeypatch.setattr(telegram, "send_transaction_notification", created_notification)
+    monkeypatch.setattr(service, "should_notify_transactions", lambda: True)
+    monkeypatch.setattr(service, "get_telegram_chat_id", lambda: 987654)
+    monkeypatch.setattr(
+        service, "send_enrichment_notification", enrichment_notification
+    )
 
     preview = await client.post(
         f"/api/emails/{email_id}/resolve-duplicate",
@@ -273,7 +300,94 @@ async def test_apply_enriches_existing_row_atomically_without_payment_or_duplica
     assert stored_target.category_method == "manual"
     assert stored_target.note == "keep this note"
     payment_check.assert_not_awaited()
-    notification.assert_not_awaited()
+    created_notification.assert_not_awaited()
+    expected_diff = EnrichmentDiff(
+        filled={
+            "counterparty": "Synthetic Shop",
+            "account_mask": "XX0123",
+            "balance": Decimal("900.00"),
+            "raw_description": "Synthetic purchase description",
+        },
+        overwritten={
+            "transaction_time": (
+                datetime.time(10, 5),
+                datetime.time(10, 4),
+            ),
+            "reference_number": ("0123", "FULLREF0123"),
+            "channel": ("upi", "online"),
+        },
+    )
+    assert notification_args == (
+        (target_id, expected_diff, 987654),
+        {
+            "source": "email",
+            "txn_info": {
+                "bank": "testbank",
+                "direction": "debit",
+                "amount": Decimal("42.15"),
+                "counterparty": "Synthetic Shop",
+                "transaction_date": datetime.date(2030, 1, 2),
+                "transaction_time": datetime.time(10, 4),
+                "card_mask": None,
+                "account_label": "Synthetic checking",
+                "channel": "online",
+            },
+        },
+    )
+
+
+@pytest.mark.anyio
+async def test_noop_apply_does_not_send_enrichment_notification(
+    client, session, monkeypatch
+):
+    email, target = await _seed_deferred(session)
+    parsed = _parsed_txn()
+    for field in (
+        "transaction_date",
+        "transaction_time",
+        "counterparty",
+        "card_mask",
+        "account_mask",
+        "reference_number",
+        "channel",
+        "balance",
+        "raw_description",
+    ):
+        setattr(target, field, parsed[field])
+    await session.commit()
+    email_id, target_id = email.id, target.id
+    _patch_current_parse(monkeypatch, parsed)
+
+    from financial_dashboard.services import duplicate_resolution as service
+
+    enrichment_notification = AsyncMock()
+    monkeypatch.setattr(service, "should_notify_transactions", lambda: True)
+    monkeypatch.setattr(
+        service, "send_enrichment_notification", enrichment_notification
+    )
+
+    preview = await client.post(
+        f"/api/emails/{email_id}/resolve-duplicate",
+        json={"transaction_id": target_id},
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["diff"]["changed_fields"] == []
+
+    applied = await client.post(
+        f"/api/emails/{email_id}/resolve-duplicate",
+        json={
+            "transaction_id": target_id,
+            "apply": True,
+            "preview_token": preview.json()["preview_token"],
+        },
+    )
+
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["diff"]["changed_fields"] == []
+    session.expire_all()
+    assert (await session.get(Email, email_id)).status == "parsed"
+    assert (await session.get(Transaction, target_id)).email_id == email_id
+    enrichment_notification.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -325,6 +439,13 @@ async def test_apply_rejects_stale_preview_token(client, session, monkeypatch):
     email, target = await _seed_deferred(session)
     email_id, target_id = email.id, target.id
     _patch_current_parse(monkeypatch, _parsed_txn())
+    from financial_dashboard.services import duplicate_resolution as service
+
+    enrichment_notification = AsyncMock()
+    monkeypatch.setattr(service, "should_notify_transactions", lambda: True)
+    monkeypatch.setattr(
+        service, "send_enrichment_notification", enrichment_notification
+    )
     preview = await client.post(
         f"/api/emails/{email_id}/resolve-duplicate",
         json={"transaction_id": target_id},
@@ -347,6 +468,52 @@ async def test_apply_rejects_stale_preview_token(client, session, monkeypatch):
     session.expire_all()
     assert (await session.get(Email, email_id)).status == "skipped"
     assert (await session.get(Transaction, target_id)).email_id is None
+    enrichment_notification.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_apply_rollback_does_not_send_enrichment_notification(
+    client, session, monkeypatch
+):
+    email, target = await _seed_deferred(session)
+    email_id, target_id = email.id, target.id
+    _patch_current_parse(monkeypatch, _parsed_txn())
+
+    from financial_dashboard.services import duplicate_resolution as service
+
+    enrichment_notification = AsyncMock()
+    monkeypatch.setattr(service, "should_notify_transactions", lambda: True)
+    monkeypatch.setattr(
+        service, "send_enrichment_notification", enrichment_notification
+    )
+    preview = await client.post(
+        f"/api/emails/{email_id}/resolve-duplicate",
+        json={"transaction_id": target_id},
+    )
+    original_apply = service.apply_transaction_enrichment
+
+    async def apply_with_drift(*args, **kwargs):
+        await original_apply(*args, **kwargs)
+        return EnrichmentDiff()
+
+    monkeypatch.setattr(service, "apply_transaction_enrichment", apply_with_drift)
+    response = await client.post(
+        f"/api/emails/{email_id}/resolve-duplicate",
+        json={
+            "transaction_id": target_id,
+            "apply": True,
+            "preview_token": preview.json()["preview_token"],
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    session.expire_all()
+    stored_email = await session.get(Email, email_id)
+    stored_target = await session.get(Transaction, target_id)
+    assert stored_email.status == "skipped"
+    assert stored_target.email_id is None
+    assert stored_target.counterparty is None
+    enrichment_notification.assert_not_awaited()
 
 
 @pytest.mark.anyio
