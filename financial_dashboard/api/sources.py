@@ -1,7 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
+"""Operational endpoints for configured email sources."""
 
-from financial_dashboard.core.deps import get_session
+from typing import Annotated
+
+from fastapi import APIRouter, Path
+
+from financial_dashboard.core.deps import SessionDep
+from financial_dashboard.exceptions import NotFoundException
+from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.schemas.sources import SourceTestResponse
 from financial_dashboard.services.sources import (
     SourceNotFoundError,
@@ -11,12 +16,13 @@ from financial_dashboard.services.sources import (
 router = APIRouter()
 
 
-@router.post("/sources/{source_id}/test", response_model=SourceTestResponse)
+@router.post("/sources/{source_id}/test")
 async def test_source(
-    source_id: int,
-    session: AsyncSession = Depends(get_session),
+    source_id: Annotated[DatabaseId, Path()],
+    session: SessionDep,
 ) -> SourceTestResponse:
+    """Test one configured provider without returning stored credentials."""
     try:
         return await test_source_connectivity(session, source_id)
     except SourceNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise NotFoundException(detail=str(exc)) from exc

@@ -4,7 +4,9 @@ import datetime
 from decimal import Decimal
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
+
+from financial_dashboard.schemas.common import DatabaseId, DatabaseIdBatch
 
 
 class ReparseEmailResponse(BaseModel):
@@ -32,7 +34,7 @@ PreviewToken = Annotated[
 class DuplicateResolutionRequest(BaseModel):
     """Preview by default; applying requires the token returned by a preview."""
 
-    transaction_id: Annotated[int, Field(ge=1, le=9_223_372_036_854_775_807)]
+    transaction_id: DatabaseId
     apply: bool = False
     preview_token: PreviewToken | None = None
 
@@ -148,16 +150,7 @@ class EmailRawResponse(BaseModel):
 
 
 class EmailBatchRequest(BaseModel):
-    ids: Annotated[list[int], Field(min_length=1, max_length=100)]
-
-    @field_validator("ids")
-    @classmethod
-    def validate_ids(cls, values: list[int]) -> list[int]:
-        if any(value < 1 or value > 9_223_372_036_854_775_807 for value in values):
-            raise ValueError("ids must fit positive database integers")
-        if len(set(values)) != len(values):
-            raise ValueError("ids must be unique")
-        return values
+    ids: DatabaseIdBatch
 
 
 class EmailBatchResponse(BaseModel):

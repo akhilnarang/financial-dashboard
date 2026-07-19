@@ -443,31 +443,6 @@ async def test_embedded_memory_mode_is_typed_unsupported_via_api():
     await engine.dispose()
 
 
-async def test_non_sqlite_backend_is_generic(backup_api, monkeypatch):
-    client, session, engine, database_path = backup_api
-    monkeypatch.setattr(engine.sync_engine.dialect, "name", "private-vendor")
-
-    post = await client.post("/api/system/backups")
-    listing = await client.get("/api/system/backups")
-
-    assert post.json() == {
-        "status": "unsupported",
-        "backend": "other",
-        "backup": None,
-    }
-    assert listing.json() == {
-        "status": "unsupported",
-        "backend": "other",
-        "returned_count": 0,
-        "limit": 50,
-        "truncated": False,
-        "backups": [],
-    }
-    _assert_no_paths(post.json(), database_path)
-    _assert_no_paths(listing.json(), database_path)
-    assert not session.in_transaction()
-
-
 async def test_online_backup_progress_deadline_is_fast_and_closes_connections(
     tmp_path, monkeypatch
 ):

@@ -445,12 +445,10 @@ async def test_source_lists_do_not_autoflush(client, session):
     ("method", "path", "json"),
     [
         ("GET", "/api/sms/0", None),
-        ("GET", "/api/sms/9223372036854775808", None),
         ("GET", "/api/sms?limit=101", None),
         ("GET", "/api/sms?date_from=2030-01-03&date_to=2030-01-02", None),
         ("POST", "/api/sms/batch", {"ids": [1, 1]}),
         ("GET", "/api/emails/0", None),
-        ("GET", "/api/emails/9223372036854775808", None),
         ("GET", "/api/emails?limit=101", None),
         ("GET", "/api/emails?date_from=2030-01-03&date_to=2030-01-02", None),
         ("POST", "/api/emails/batch", {"ids": []}),

@@ -2,7 +2,9 @@ import datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
+
+from financial_dashboard.schemas.common import DatabaseIdBatch
 
 
 class StatementAccountLink(BaseModel):
@@ -89,16 +91,7 @@ class BankStatementDetailResponse(BankStatementRead):
 
 
 class StatementBatchRequest(BaseModel):
-    ids: Annotated[list[int], Field(min_length=1, max_length=100)]
-
-    @field_validator("ids")
-    @classmethod
-    def validate_ids(cls, values: list[int]) -> list[int]:
-        if any(value < 1 or value > 9_223_372_036_854_775_807 for value in values):
-            raise ValueError("ids must fit positive database integers")
-        if len(set(values)) != len(values):
-            raise ValueError("ids must be unique")
-        return values
+    ids: DatabaseIdBatch
 
 
 class CcStatementBatchResponse(BaseModel):

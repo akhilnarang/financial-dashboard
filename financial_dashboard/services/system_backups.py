@@ -23,6 +23,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.schemas import system as system_schemas
+from financial_dashboard.services.database import database_engine
 
 _BACKUP_DIRECTORY_NAME = "backups"
 _BACKUP_FILE_NAME = "backup.sqlite3"
@@ -83,17 +84,6 @@ class BackupTimeoutError(Exception):
 class SQLiteUriTarget(NamedTuple):
     path_text: str
     query: dict[str, str]
-
-
-def _database_engine(session: AsyncSession) -> Engine:
-    bind = session.get_bind()
-    if isinstance(bind, Engine):
-        return bind
-    return bind.engine
-
-
-def _database_backend(engine: Engine) -> system_schemas.DatabaseBackend:
-    return "sqlite" if engine.dialect.name == "sqlite" else "other"
 
 
 def _scalar_url_query(engine: Engine) -> dict[str, str] | None:
@@ -811,16 +801,27 @@ def _list_backups_for_database(
 def _empty_list_response(
     *,
     status: system_schemas.BackupListStatus,
-    backend: system_schemas.DatabaseBackend,
     limit: int,
 ) -> system_schemas.SystemBackupListResponse:
+    """Build an empty SQLite backup-list response."""
     return system_schemas.SystemBackupListResponse(
         status=status,
-        backend=backend,
+        backend="sqlite",
         returned_count=0,
         limit=limit,
         truncated=False,
         backups=[],
+    )
+
+
+def _empty_create_response(
+    status: system_schemas.BackupCreateStatus,
+) -> system_schemas.SystemBackupCreateResponse:
+    """Build an empty SQLite backup-creation response."""
+    return system_schemas.SystemBackupCreateResponse(
+        status=status,
+        backend="sqlite",
+        backup=None,
     )
 
 
@@ -831,23 +832,17 @@ async def list_system_backups(
 ) -> system_schemas.SystemBackupListResponse:
     """List bounded sidecar metadata without opening backup database files."""
     try:
-        engine = _database_engine(session)
-        backend = _database_backend(engine)
+        engine = database_engine(session)
     except Exception as exc:
-        logger.exception(
-            "Could not identify the database backend for backup listing: %s", exc
-        )
-        return _empty_list_response(status="unavailable", backend="other", limit=limit)
-
-    if backend != "sqlite":
-        return _empty_list_response(status="unsupported", backend="other", limit=limit)
+        logger.exception("Could not identify the database for backup listing: %s", exc)
+        return _empty_list_response(status="unavailable", limit=limit)
 
     database = _sqlite_file_database(engine)
     if database is None:
-        return _empty_list_response(status="unsupported", backend="sqlite", limit=limit)
+        return _empty_list_response(status="unsupported", limit=limit)
 
     if not _backup_list_admission.acquire(blocking=False):
-        return _empty_list_response(status="busy", backend="sqlite", limit=limit)
+        return _empty_list_response(status="busy", limit=limit)
 
     try:
         try:
@@ -877,11 +872,7 @@ async def list_system_backups(
             result = outcome.result
         except Exception as exc:
             logger.exception("System backup listing failed: %s", exc)
-            return _empty_list_response(
-                status="unavailable",
-                backend="sqlite",
-                limit=limit,
-            )
+            return _empty_list_response(status="unavailable", limit=limit)
 
         return system_schemas.SystemBackupListResponse(
             status="ok",
@@ -900,39 +891,17 @@ async def create_system_backup(
 ) -> system_schemas.SystemBackupCreateResponse:
     """Create, verify, hash, and atomically publish one online SQLite backup."""
     try:
-        engine = _database_engine(session)
-        backend = _database_backend(engine)
+        engine = database_engine(session)
     except Exception as exc:
-        logger.exception(
-            "Could not identify the database backend for backup creation: %s", exc
-        )
-        return system_schemas.SystemBackupCreateResponse(
-            status="unavailable",
-            backend="other",
-            backup=None,
-        )
-
-    if backend != "sqlite":
-        return system_schemas.SystemBackupCreateResponse(
-            status="unsupported",
-            backend="other",
-            backup=None,
-        )
+        logger.exception("Could not identify the database for backup creation: %s", exc)
+        return _empty_create_response("unavailable")
 
     database = _sqlite_file_database(engine)
     if database is None:
-        return system_schemas.SystemBackupCreateResponse(
-            status="unsupported",
-            backend="sqlite",
-            backup=None,
-        )
+        return _empty_create_response("unsupported")
 
     if not _backup_admission.acquire(blocking=False):
-        return system_schemas.SystemBackupCreateResponse(
-            status="busy",
-            backend="sqlite",
-            backup=None,
-        )
+        return _empty_create_response("busy")
 
     try:
         try:
@@ -964,11 +933,7 @@ async def create_system_backup(
             backup = outcome.backup
         except Exception as exc:
             logger.exception("System backup creation failed: %s", exc)
-            return system_schemas.SystemBackupCreateResponse(
-                status="unavailable",
-                backend="sqlite",
-                backup=None,
-            )
+            return _empty_create_response("unavailable")
 
         return system_schemas.SystemBackupCreateResponse(
             status="created",

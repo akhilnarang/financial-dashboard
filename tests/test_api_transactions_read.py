@@ -282,7 +282,6 @@ async def test_transaction_reads_do_not_autoflush(client, session):
     ("path", "method", "payload"),
     [
         ("/api/transactions/0", "get", None),
-        ("/api/transactions/9223372036854775808", "get", None),
         ("/api/transactions?limit=101", "get", None),
         (
             "/api/transactions?date_from=2030-01-03&date_to=2030-01-02",
@@ -291,11 +290,6 @@ async def test_transaction_reads_do_not_autoflush(client, session):
         ),
         ("/api/transactions/batch", "post", {"ids": []}),
         ("/api/transactions/batch", "post", {"ids": [1, 1]}),
-        (
-            "/api/transactions/batch",
-            "post",
-            {"ids": [9223372036854775808]},
-        ),
     ],
 )
 async def test_transaction_reads_validate_bounds(client, path, method, payload):

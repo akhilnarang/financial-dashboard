@@ -263,9 +263,8 @@ async def test_account_detail_returns_404(client):
     assert response.json() == {"detail": "Account not found"}
 
 
-@pytest.mark.parametrize("account_id", ["0", "9223372036854775808"])
-async def test_account_detail_validates_database_id_range(client, account_id):
-    response = await client.get(f"/api/accounts/{account_id}")
+async def test_account_detail_validates_positive_id(client):
+    response = await client.get("/api/accounts/0")
     assert response.status_code == 422
 
 

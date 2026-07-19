@@ -359,7 +359,6 @@ async def test_statement_reads_do_not_autoflush(client, session):
     ("method", "path", "payload"),
     [
         ("GET", "/api/statements/cc/0", None),
-        ("GET", "/api/statements/cc/9223372036854775808", None),
         ("GET", "/api/statements/cc?limit=101", None),
         (
             "GET",

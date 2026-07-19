@@ -1,10 +1,14 @@
+"""Bounded CC and bank statement queries for the JSON API."""
+
 import datetime
 import json
+from typing import NamedTuple
 
 from sqlalchemy import case, func, select
+from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.core.masks import mask_last4
+from financial_dashboard.core.masks import display_mask
 from financial_dashboard.db import (
     Account,
     BankStatementUpload,
@@ -12,6 +16,7 @@ from financial_dashboard.db import (
     Transaction,
 )
 from financial_dashboard.schemas import statements as statement_schemas
+from financial_dashboard.services.read_helpers import order_batch
 
 _METADATA_LIMIT = 1_000
 _VALUE_LIMIT = 256
@@ -21,20 +26,25 @@ _RECONCILIATION_LIMIT = 1_000_000
 _TRANSACTION_ID_LIMIT = 100
 
 
+class _StatementPage(NamedTuple):
+    """Projected rows and total count for one statement page."""
+
+    rows: list[Row]
+    total_count: int
+
+
 def _text(column, label: str, limit: int = _VALUE_LIMIT):
+    """Build a bounded text projection with a stable result label."""
     return func.substr(column, 1, limit).label(label)
 
 
 def _truncated(column, label: str, limit: int):
+    """Build the truncation flag paired with a bounded text projection."""
     return case((func.length(column) > limit, True), else_=False).label(label)
 
 
-def _safe_mask(value: str | None) -> str | None:
-    last_digits = mask_last4(value, partial=True)
-    return f"XXXX{last_digits}" if last_digits else None
-
-
 def _account(row) -> statement_schemas.StatementAccountLink | None:
+    """Map optional projected account columns to a provenance link."""
     if row.linked_account_id is None:
         return None
     return statement_schemas.StatementAccountLink(
@@ -46,6 +56,7 @@ def _account(row) -> statement_schemas.StatementAccountLink | None:
 
 
 def _common_columns(model, *, error_limit: int):
+    """Build columns shared by CC and bank statement summaries."""
     return (
         model.id,
         model.account_id,
@@ -69,6 +80,7 @@ def _common_columns(model, *, error_limit: int):
 
 
 def _cc_columns(*, error_limit: int):
+    """Build the bounded CC statement projection."""
     return (
         *_common_columns(StatementUpload, error_limit=error_limit),
         _text(StatementUpload.source_kind, "source_kind", 64),
@@ -90,6 +102,7 @@ def _cc_columns(*, error_limit: int):
 
 
 def _bank_columns(*, error_limit: int):
+    """Build the bounded bank statement projection."""
     return (
         *_common_columns(BankStatementUpload, error_limit=error_limit),
         func.substr(BankStatementUpload.account_number, -4, 4).label("account_number"),
@@ -111,6 +124,7 @@ def _bank_columns(*, error_limit: int):
 
 
 def _cc_read(row) -> statement_schemas.CcStatementRead:
+    """Map one projected CC statement to its summary schema."""
     return statement_schemas.CcStatementRead(
         id=row.id,
         account_id=row.account_id,
@@ -128,7 +142,7 @@ def _cc_read(row) -> statement_schemas.CcStatementRead:
         created_at=row.created_at,
         account=_account(row),
         source_kind=row.source_kind,
-        card_mask=_safe_mask(row.card_number),
+        card_mask=display_mask(row.card_number),
         statement_name=row.statement_name,
         statement_name_truncated=bool(row.statement_name_truncated),
         due_date=row.due_date,
@@ -142,6 +156,7 @@ def _cc_read(row) -> statement_schemas.CcStatementRead:
 
 
 def _bank_read(row) -> statement_schemas.BankStatementRead:
+    """Map one projected bank statement to its summary schema."""
     return statement_schemas.BankStatementRead(
         id=row.id,
         account_id=row.account_id,
@@ -158,7 +173,7 @@ def _bank_read(row) -> statement_schemas.BankStatementRead:
         error_truncated=bool(row.error_truncated),
         created_at=row.created_at,
         account=_account(row),
-        account_mask=_safe_mask(row.account_number),
+        account_mask=display_mask(row.account_number),
         account_holder_name=row.account_holder_name,
         account_holder_name_truncated=bool(row.account_holder_name_truncated),
         opening_balance=row.opening_balance,
@@ -179,6 +194,7 @@ def _filters(
     date_from: datetime.datetime | None,
     date_to: datetime.datetime | None,
 ) -> list:
+    """Build exact-match clauses shared by both statement kinds."""
     clauses = []
     if statement_id is not None:
         clauses.append(model.id == statement_id)
@@ -197,6 +213,61 @@ def _filters(
     return clauses
 
 
+def _account_join(model):
+    """Join a statement model to its optional account projection."""
+    return model.__table__.outerjoin(Account.__table__, Account.id == model.account_id)
+
+
+async def _statement_page(
+    session: AsyncSession,
+    model,
+    columns,
+    clauses: list,
+    *,
+    limit: int,
+    offset: int,
+) -> _StatementPage:
+    """Execute the shared count and stable page queries for a statement model."""
+    with session.no_autoflush:
+        total_count = await session.scalar(
+            select(func.count(model.id))
+            .where(*clauses)
+            .execution_options(autoflush=False)
+        )
+        rows = (
+            await session.execute(
+                select(*columns)
+                .select_from(_account_join(model))
+                .where(*clauses)
+                .order_by(model.id.desc())
+                .offset(offset)
+                .limit(limit)
+                .execution_options(autoflush=False)
+            )
+        ).all()
+    return _StatementPage(list(rows), total_count or 0)
+
+
+async def _statement_batch_rows(
+    session: AsyncSession,
+    model,
+    columns,
+    ids: list[int],
+) -> list[Row]:
+    """Execute the shared explicit-ID query for a statement model."""
+    with session.no_autoflush:
+        return list(
+            (
+                await session.execute(
+                    select(*columns)
+                    .select_from(_account_join(model))
+                    .where(model.id.in_(ids))
+                    .execution_options(autoflush=False)
+                )
+            ).all()
+        )
+
+
 async def list_cc_statements(
     session: AsyncSession,
     *,
@@ -210,6 +281,7 @@ async def list_cc_statements(
     date_from: datetime.datetime | None,
     date_to: datetime.datetime | None,
 ) -> statement_schemas.CcStatementListResponse:
+    """Return one stable page of CC statement summaries."""
     clauses = _filters(
         StatementUpload,
         statement_id=statement_id,
@@ -220,31 +292,19 @@ async def list_cc_statements(
         date_from=date_from,
         date_to=date_to,
     )
-    joined = StatementUpload.__table__.outerjoin(
-        Account.__table__, Account.id == StatementUpload.account_id
+    page = await _statement_page(
+        session,
+        StatementUpload,
+        _cc_columns(error_limit=_LIST_ERROR_LIMIT),
+        clauses,
+        limit=limit,
+        offset=offset,
     )
-    with session.no_autoflush:
-        total = await session.scalar(
-            select(func.count(StatementUpload.id))
-            .where(*clauses)
-            .execution_options(autoflush=False)
-        )
-        rows = (
-            await session.execute(
-                select(*_cc_columns(error_limit=_LIST_ERROR_LIMIT))
-                .select_from(joined)
-                .where(*clauses)
-                .order_by(StatementUpload.id.desc())
-                .offset(offset)
-                .limit(limit)
-                .execution_options(autoflush=False)
-            )
-        ).all()
-    items = [_cc_read(row) for row in rows]
+    items = [_cc_read(row) for row in page.rows]
     return statement_schemas.CcStatementListResponse(
         items=items,
         returned_count=len(items),
-        total_count=total or 0,
+        total_count=page.total_count,
         limit=limit,
         offset=offset,
     )
@@ -263,6 +323,7 @@ async def list_bank_statements(
     date_from: datetime.datetime | None,
     date_to: datetime.datetime | None,
 ) -> statement_schemas.BankStatementListResponse:
+    """Return one stable page of bank statement summaries."""
     clauses = _filters(
         BankStatementUpload,
         statement_id=statement_id,
@@ -273,37 +334,26 @@ async def list_bank_statements(
         date_from=date_from,
         date_to=date_to,
     )
-    joined = BankStatementUpload.__table__.outerjoin(
-        Account.__table__, Account.id == BankStatementUpload.account_id
+    page = await _statement_page(
+        session,
+        BankStatementUpload,
+        _bank_columns(error_limit=_LIST_ERROR_LIMIT),
+        clauses,
+        limit=limit,
+        offset=offset,
     )
-    with session.no_autoflush:
-        total = await session.scalar(
-            select(func.count(BankStatementUpload.id))
-            .where(*clauses)
-            .execution_options(autoflush=False)
-        )
-        rows = (
-            await session.execute(
-                select(*_bank_columns(error_limit=_LIST_ERROR_LIMIT))
-                .select_from(joined)
-                .where(*clauses)
-                .order_by(BankStatementUpload.id.desc())
-                .offset(offset)
-                .limit(limit)
-                .execution_options(autoflush=False)
-            )
-        ).all()
-    items = [_bank_read(row) for row in rows]
+    items = [_bank_read(row) for row in page.rows]
     return statement_schemas.BankStatementListResponse(
         items=items,
         returned_count=len(items),
-        total_count=total or 0,
+        total_count=page.total_count,
         limit=limit,
         offset=offset,
     )
 
 
 def _valid_id(value) -> int | None:
+    """Accept positive integer IDs from untrusted reconciliation JSON."""
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
     return None
@@ -314,6 +364,7 @@ def _reconciliation_summary(
     data_length: int | None,
     imported_ids: list[int],
 ) -> statement_schemas.StatementReconciliationSummary:
+    """Extract bounded transaction IDs and counts from stored reconciliation JSON."""
     imported_truncated = len(imported_ids) > _TRANSACTION_ID_LIMIT
     if data_length is None:
         status = "absent"
@@ -371,22 +422,43 @@ def _reconciliation_summary(
     )
 
 
+async def _statement_detail_row(
+    session: AsyncSession,
+    model,
+    columns,
+    statement_id: int,
+) -> Row | None:
+    """Load one summary plus reconciliation JSON only when it is bounded."""
+    return (
+        await session.execute(
+            select(
+                *columns,
+                func.length(model.reconciliation_data).label("reconciliation_length"),
+                case(
+                    (
+                        func.length(model.reconciliation_data) <= _RECONCILIATION_LIMIT,
+                        model.reconciliation_data,
+                    )
+                ).label("reconciliation_data"),
+            )
+            .select_from(_account_join(model))
+            .where(model.id == statement_id)
+            .execution_options(autoflush=False)
+        )
+    ).one_or_none()
+
+
 async def _imported_ids(
     session: AsyncSession,
-    *,
-    cc_id: int | None = None,
-    bank_id: int | None = None,
+    link_column,
+    statement_id: int,
 ) -> list[int]:
-    clause = (
-        Transaction.statement_upload_id == cc_id
-        if cc_id is not None
-        else Transaction.bank_statement_upload_id == bank_id
-    )
+    """Load transaction IDs canonically linked to one statement upload."""
     return list(
         (
             await session.scalars(
                 select(Transaction.id)
-                .where(clause)
+                .where(link_column == statement_id)
                 .order_by(Transaction.id)
                 .limit(_TRANSACTION_ID_LIMIT + 1)
                 .execution_options(autoflush=False)
@@ -399,33 +471,21 @@ async def get_cc_statement_detail(
     session: AsyncSession,
     statement_id: int,
 ) -> statement_schemas.CcStatementDetailResponse | None:
-    joined = StatementUpload.__table__.outerjoin(
-        Account.__table__, Account.id == StatementUpload.account_id
-    )
+    """Return one CC statement with bounded reconciliation evidence."""
     with session.no_autoflush:
-        row = (
-            await session.execute(
-                select(
-                    *_cc_columns(error_limit=_DETAIL_ERROR_LIMIT),
-                    func.length(StatementUpload.reconciliation_data).label(
-                        "reconciliation_length"
-                    ),
-                    case(
-                        (
-                            func.length(StatementUpload.reconciliation_data)
-                            <= _RECONCILIATION_LIMIT,
-                            StatementUpload.reconciliation_data,
-                        )
-                    ).label("reconciliation_data"),
-                )
-                .select_from(joined)
-                .where(StatementUpload.id == statement_id)
-                .execution_options(autoflush=False)
-            )
-        ).one_or_none()
+        row = await _statement_detail_row(
+            session,
+            StatementUpload,
+            _cc_columns(error_limit=_DETAIL_ERROR_LIMIT),
+            statement_id,
+        )
         if row is None:
             return None
-        imported_ids = await _imported_ids(session, cc_id=statement_id)
+        imported_ids = await _imported_ids(
+            session,
+            Transaction.statement_upload_id,
+            statement_id,
+        )
     summary = _cc_read(row)
     return statement_schemas.CcStatementDetailResponse(
         **summary.model_dump(),
@@ -441,33 +501,21 @@ async def get_bank_statement_detail(
     session: AsyncSession,
     statement_id: int,
 ) -> statement_schemas.BankStatementDetailResponse | None:
-    joined = BankStatementUpload.__table__.outerjoin(
-        Account.__table__, Account.id == BankStatementUpload.account_id
-    )
+    """Return one bank statement with bounded reconciliation evidence."""
     with session.no_autoflush:
-        row = (
-            await session.execute(
-                select(
-                    *_bank_columns(error_limit=_DETAIL_ERROR_LIMIT),
-                    func.length(BankStatementUpload.reconciliation_data).label(
-                        "reconciliation_length"
-                    ),
-                    case(
-                        (
-                            func.length(BankStatementUpload.reconciliation_data)
-                            <= _RECONCILIATION_LIMIT,
-                            BankStatementUpload.reconciliation_data,
-                        )
-                    ).label("reconciliation_data"),
-                )
-                .select_from(joined)
-                .where(BankStatementUpload.id == statement_id)
-                .execution_options(autoflush=False)
-            )
-        ).one_or_none()
+        row = await _statement_detail_row(
+            session,
+            BankStatementUpload,
+            _bank_columns(error_limit=_DETAIL_ERROR_LIMIT),
+            statement_id,
+        )
         if row is None:
             return None
-        imported_ids = await _imported_ids(session, bank_id=statement_id)
+        imported_ids = await _imported_ids(
+            session,
+            Transaction.bank_statement_upload_id,
+            statement_id,
+        )
     summary = _bank_read(row)
     return statement_schemas.BankStatementDetailResponse(
         **summary.model_dump(),
@@ -483,22 +531,17 @@ async def get_cc_statements_by_ids(
     session: AsyncSession,
     ids: list[int],
 ) -> statement_schemas.CcStatementBatchResponse:
-    joined = StatementUpload.__table__.outerjoin(
-        Account.__table__, Account.id == StatementUpload.account_id
+    """Return CC summaries in requested ID order and report missing IDs."""
+    rows = await _statement_batch_rows(
+        session,
+        StatementUpload,
+        _cc_columns(error_limit=_LIST_ERROR_LIMIT),
+        ids,
     )
-    with session.no_autoflush:
-        rows = (
-            await session.execute(
-                select(*_cc_columns(error_limit=_LIST_ERROR_LIMIT))
-                .select_from(joined)
-                .where(StatementUpload.id.in_(ids))
-                .execution_options(autoflush=False)
-            )
-        ).all()
-    by_id = {row.id: _cc_read(row) for row in rows}
+    ordered = order_batch(ids, {row.id: _cc_read(row) for row in rows})
     return statement_schemas.CcStatementBatchResponse(
-        items=[by_id[row_id] for row_id in ids if row_id in by_id],
-        missing_ids=[row_id for row_id in ids if row_id not in by_id],
+        items=ordered.items,
+        missing_ids=ordered.missing_ids,
     )
 
 
@@ -506,20 +549,15 @@ async def get_bank_statements_by_ids(
     session: AsyncSession,
     ids: list[int],
 ) -> statement_schemas.BankStatementBatchResponse:
-    joined = BankStatementUpload.__table__.outerjoin(
-        Account.__table__, Account.id == BankStatementUpload.account_id
+    """Return bank summaries in requested ID order and report missing IDs."""
+    rows = await _statement_batch_rows(
+        session,
+        BankStatementUpload,
+        _bank_columns(error_limit=_LIST_ERROR_LIMIT),
+        ids,
     )
-    with session.no_autoflush:
-        rows = (
-            await session.execute(
-                select(*_bank_columns(error_limit=_LIST_ERROR_LIMIT))
-                .select_from(joined)
-                .where(BankStatementUpload.id.in_(ids))
-                .execution_options(autoflush=False)
-            )
-        ).all()
-    by_id = {row.id: _bank_read(row) for row in rows}
+    ordered = order_batch(ids, {row.id: _bank_read(row) for row in rows})
     return statement_schemas.BankStatementBatchResponse(
-        items=[by_id[row_id] for row_id in ids if row_id in by_id],
-        missing_ids=[row_id for row_id in ids if row_id not in by_id],
+        items=ordered.items,
+        missing_ids=ordered.missing_ids,
     )

@@ -1,23 +1,21 @@
 import asyncio
 import logging
-from unittest.mock import AsyncMock
-
 import pytest
 from sqlalchemy import event, inspect
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.db.models import Account
-from financial_dashboard.services import system as system_service
+from financial_dashboard.services import database as database_service
 
 pytestmark = pytest.mark.anyio
 
 
 @pytest.fixture(autouse=True)
 def _reset_quick_check_cache():
-    system_service._reset_quick_check_cache()
+    database_service._reset_quick_check_cache()
     yield
-    system_service._reset_quick_check_cache()
+    database_service._reset_quick_check_cache()
 
 
 class _ScalarResult:
@@ -125,7 +123,7 @@ async def test_system_health_quick_check_is_single_flight_per_engine(
     bind = session.bind
     assert bind is not None
     session_maker = async_sessionmaker(bind, expire_on_commit=False)
-    original_quick_check = system_service._execute_quick_check
+    original_quick_check = database_service._execute_quick_check
     original_get_bind = AsyncSession.get_bind
     original_session_execute = AsyncSession.execute
     quick_check_calls = 0
@@ -141,7 +139,7 @@ async def test_system_health_quick_check_is_single_flight_per_engine(
         await release_first.wait()
         return await original_quick_check(health_session)
 
-    monkeypatch.setattr(system_service, "_execute_quick_check", delayed_quick_check)
+    monkeypatch.setattr(database_service, "_execute_quick_check", delayed_quick_check)
 
     async with session_maker() as first_session, session_maker() as second_session:
 
@@ -158,9 +156,9 @@ async def test_system_health_quick_check_is_single_flight_per_engine(
         monkeypatch.setattr(AsyncSession, "get_bind", observe_get_bind)
         monkeypatch.setattr(AsyncSession, "execute", observe_execute)
 
-        first = asyncio.create_task(system_service.get_system_health(first_session))
+        first = asyncio.create_task(database_service.get_system_health(first_session))
         await first_started.wait()
-        second = asyncio.create_task(system_service.get_system_health(second_session))
+        second = asyncio.create_task(database_service.get_system_health(second_session))
         await second_started.wait()
         await asyncio.sleep(0)
 
@@ -192,7 +190,7 @@ async def test_system_health_connectivity_failure_is_typed_and_sanitized(
         return await original_execute(self, statement, *args, **kwargs)
 
     monkeypatch.setattr(AsyncSession, "execute", fail_connectivity)
-    with caplog.at_level(logging.WARNING, logger=system_service.__name__):
+    with caplog.at_level(logging.WARNING, logger=database_service.__name__):
         response = await client.get("/api/system/health")
 
     assert response.status_code == 200
@@ -216,7 +214,7 @@ async def test_system_health_connectivity_failure_is_typed_and_sanitized(
     assert any(
         secret_detail in record.getMessage()
         for record in caplog.records
-        if record.name == system_service.__name__
+        if record.name == database_service.__name__
     )
 
 
@@ -242,7 +240,7 @@ async def test_system_health_sqlite_diagnostic_failure_is_fail_fast_and_sanitize
         return await original_execute(self, statement, *args, **kwargs)
 
     monkeypatch.setattr(AsyncSession, "execute", poison_after_foreign_keys)
-    with caplog.at_level(logging.WARNING, logger=system_service.__name__):
+    with caplog.at_level(logging.WARNING, logger=database_service.__name__):
         response = await client.get("/api/system/health")
 
     assert response.status_code == 200
@@ -263,7 +261,7 @@ async def test_system_health_sqlite_diagnostic_failure_is_fail_fast_and_sanitize
     assert any(
         secret_detail in record.getMessage()
         for record in caplog.records
-        if record.name == system_service.__name__
+        if record.name == database_service.__name__
     )
 
 
@@ -328,29 +326,6 @@ async def test_system_health_quick_check_execution_failure_is_unavailable_and_re
     assert retried_sqlite["quick_check"] == "ok"
     assert retried_sqlite["quick_check_source"] == "live"
     assert quick_check_calls == 2
-
-
-async def test_system_health_non_sqlite_backend_is_generic(
-    client, session, monkeypatch
-):
-    bind = session.get_bind()
-    monkeypatch.setattr(bind.dialect, "name", "highly-sensitive-vendor-name")
-    sqlite_diagnostics = AsyncMock()
-    monkeypatch.setattr(system_service, "_sqlite_diagnostics", sqlite_diagnostics)
-
-    response = await client.get("/api/system/health")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "ok",
-        "database": {
-            "backend": "other",
-            "connected": True,
-            "sqlite": None,
-        },
-    }
-    assert "highly-sensitive-vendor-name" not in response.text
-    sqlite_diagnostics.assert_not_awaited()
 
 
 async def test_system_health_openapi_uses_inferred_typed_response(client):

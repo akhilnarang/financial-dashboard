@@ -1,3 +1,5 @@
+"""Bounded email source and raw-body queries for the JSON API."""
+
 import datetime
 import logging
 
@@ -18,6 +20,7 @@ from financial_dashboard.integrations.email.body import (
     load_or_fetch_raw_email,
 )
 from financial_dashboard.schemas import emails as email_schemas
+from financial_dashboard.services.read_helpers import bound_text, order_batch
 
 _LIST_ERROR_LIMIT = 1_000
 _HEADER_LIMIT = 1_000
@@ -31,12 +34,15 @@ logger = logging.getLogger(__name__)
 
 
 class EmailRawReadError(Exception):
+    """A sanitized raw-email failure and its intended HTTP status."""
+
     def __init__(self, status_code: int, message: str) -> None:
         super().__init__(message)
         self.status_code = status_code
 
 
 def _raw_load_reason(error: str | None) -> str:
+    """Classify a loader error without retaining paths or credential details."""
     normalized = (error or "").lower()
     if "no source/remote id" in normalized:
         return "missing-source-metadata"
@@ -51,13 +57,8 @@ def _raw_load_reason(error: str | None) -> str:
     return "loader-failed"
 
 
-def _bounded_text(value: str | None, limit: int) -> tuple[str | None, bool]:
-    if value is None or len(value) <= limit:
-        return value, False
-    return value[:limit], True
-
-
 def _email_columns():
+    """Build the bounded SQL projection shared by email summary reads."""
     return (
         Email.id,
         Email.provider,
@@ -92,6 +93,7 @@ async def _load_links(
     dict[int, list[email_schemas.EmailStatementLink]],
     set[int],
 ]:
+    """Load capped transaction and statement links for several emails."""
     if not email_ids:
         return {}, set(), {}, set()
 
@@ -227,6 +229,7 @@ def _summary(
     statements_truncated: set[int],
     detail_error: tuple[str | None, bool] | None = None,
 ) -> email_schemas.EmailRead:
+    """Map one projected email row and its capped links to a schema."""
     error, error_truncated = (
         detail_error
         if detail_error is not None
@@ -275,6 +278,7 @@ def _filters(
     date_to: datetime.datetime | None,
     query: str | None,
 ) -> list:
+    """Build email clauses, correlating all transaction filters to one row."""
     clauses = []
     if email_id is not None:
         clauses.append(Email.id == email_id)
@@ -328,6 +332,7 @@ async def list_emails(
     date_to: datetime.datetime | None,
     query: str | None,
 ) -> email_schemas.EmailListResponse:
+    """Return one stable email metadata page without raw bodies or provider IDs."""
     clauses = _filters(
         email_id=email_id,
         source_id=source_id,
@@ -388,6 +393,7 @@ async def get_email_detail(
     session: AsyncSession,
     email_id: int,
 ) -> email_schemas.EmailDetailResponse | None:
+    """Return one email's bounded metadata and source provenance."""
     base_join = Email.__table__.outerjoin(
         FetchRule.__table__, FetchRule.id == Email.rule_id
     )
@@ -409,7 +415,7 @@ async def get_email_detail(
         )
         links = await _load_links(session, [email_id])
 
-    error = _bounded_text(full_error, _DETAIL_ERROR_LIMIT)
+    error = bound_text(full_error, _DETAIL_ERROR_LIMIT)
     summary = _summary(
         row,
         transactions=links[0],
@@ -418,8 +424,8 @@ async def get_email_detail(
         statements_truncated=links[3],
         detail_error=error,
     )
-    message_id, message_id_truncated = _bounded_text(row.message_id, _DETAIL_ID_LIMIT)
-    remote_id, remote_id_truncated = _bounded_text(row.remote_id, _DETAIL_ID_LIMIT)
+    message_id, message_id_truncated = bound_text(row.message_id, _DETAIL_ID_LIMIT)
+    remote_id, remote_id_truncated = bound_text(row.remote_id, _DETAIL_ID_LIMIT)
     assert message_id is not None
     return email_schemas.EmailDetailResponse(
         **summary.model_dump(),
@@ -434,6 +440,7 @@ async def get_emails_by_ids(
     session: AsyncSession,
     ids: list[int],
 ) -> email_schemas.EmailBatchResponse:
+    """Return summaries in requested ID order and report missing IDs."""
     base_join = Email.__table__.outerjoin(
         FetchRule.__table__, FetchRule.id == Email.rule_id
     )
@@ -457,9 +464,10 @@ async def get_emails_by_ids(
         )
         for row in rows
     }
+    ordered = order_batch(ids, by_id)
     return email_schemas.EmailBatchResponse(
-        items=[by_id[row_id] for row_id in ids if row_id in by_id],
-        missing_ids=[row_id for row_id in ids if row_id not in by_id],
+        items=ordered.items,
+        missing_ids=ordered.missing_ids,
     )
 
 
@@ -467,6 +475,7 @@ async def get_email_raw(
     session: AsyncSession,
     email_id: int,
 ) -> email_schemas.EmailRawResponse:
+    """Load and extract one bounded raw email body without mutating its row."""
     with session.no_autoflush:
         email = await session.get(Email, email_id)
     if email is None:
@@ -506,7 +515,7 @@ async def get_email_raw(
         content_type = "text/html"
     if body is None:
         raise EmailRawReadError(422, "Raw email has no readable body")
-    bounded_body, truncated = _bounded_text(body, _RAW_BODY_LIMIT)
+    bounded_body, truncated = bound_text(body, _RAW_BODY_LIMIT)
     assert bounded_body is not None
     return email_schemas.EmailRawResponse(
         email_id=email_id,

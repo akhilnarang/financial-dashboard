@@ -2,7 +2,9 @@ import datetime
 from decimal import Decimal
 from typing import Annotated
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
+
+from financial_dashboard.schemas.common import DatabaseId, DatabaseIdBatch
 
 
 class TransactionNoteUpdate(BaseModel):
@@ -28,8 +30,8 @@ class TransactionRelinkUpdate(BaseModel):
     the corresponding link. If only ``card_id`` is given, the service
     derives ``account_id`` from the card's owning account."""
 
-    account_id: int | None = None
-    card_id: int | None = None
+    account_id: DatabaseId | None = None
+    card_id: DatabaseId | None = None
 
 
 class TransactionRelinkResponse(BaseModel):
@@ -128,16 +130,7 @@ class TransactionDetailResponse(TransactionRead):
 
 
 class TransactionBatchRequest(BaseModel):
-    ids: Annotated[list[int], Field(min_length=1, max_length=100)]
-
-    @field_validator("ids")
-    @classmethod
-    def validate_ids(cls, values: list[int]) -> list[int]:
-        if any(value < 1 or value > 9_223_372_036_854_775_807 for value in values):
-            raise ValueError("ids must fit positive database integers")
-        if len(set(values)) != len(values):
-            raise ValueError("ids must be unique")
-        return values
+    ids: DatabaseIdBatch
 
 
 class TransactionBatchResponse(BaseModel):

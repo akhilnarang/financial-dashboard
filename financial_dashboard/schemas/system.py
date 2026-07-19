@@ -48,8 +48,8 @@ class SystemInfoResponse(BaseModel):
 
 
 HealthStatus = Literal["ok", "degraded", "unavailable"]
-DatabaseBackend = Literal["sqlite", "other"]
-ForeignKeyCheckStatus = Literal["ok", "violations", "unavailable", "unsupported"]
+DatabaseBackend = Literal["sqlite"]
+ForeignKeyCheckStatus = Literal["ok", "violations", "unavailable"]
 SQLiteSchemaName = Annotated[str, Field(min_length=1, max_length=256)]
 SQLiteJournalMode = Literal[
     "delete", "truncate", "persist", "memory", "wal", "off", "unknown"

@@ -1,13 +1,15 @@
-"""Email JSON endpoints."""
+"""Read and duplicate-resolution endpoints for email source records."""
 
 import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, Path, Query, Response
 
-from financial_dashboard.core.deps import get_session
+from financial_dashboard.api.query import inclusive_datetime_bounds
+from financial_dashboard.core.deps import SessionDep
+from financial_dashboard.exceptions import ApiException, NotFoundException
 from financial_dashboard.schemas import emails as email_schemas
+from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.schemas.emails import (
     DuplicateResolutionRequest,
     DuplicateResolutionResponse,
@@ -25,30 +27,30 @@ from financial_dashboard.services.email_reads import (
 )
 
 router = APIRouter()
-_DB_ID_MAX = 9_223_372_036_854_775_807
 
 
 @router.get("/emails")
 async def emails_list(
+    session: SessionDep,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
-    email_id: Annotated[int | None, Query(ge=1, le=_DB_ID_MAX)] = None,
-    source_id: Annotated[int | None, Query(ge=1, le=_DB_ID_MAX)] = None,
-    rule_id: Annotated[int | None, Query(ge=1, le=_DB_ID_MAX)] = None,
+    email_id: Annotated[DatabaseId | None, Query()] = None,
+    source_id: Annotated[DatabaseId | None, Query()] = None,
+    rule_id: Annotated[DatabaseId | None, Query()] = None,
     provider: Annotated[str | None, Query(min_length=1, max_length=32)] = None,
     status: Annotated[str | None, Query(min_length=1, max_length=32)] = None,
     bank: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
     email_kind: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
-    transaction_id: Annotated[int | None, Query(ge=1, le=_DB_ID_MAX)] = None,
+    transaction_id: Annotated[DatabaseId | None, Query()] = None,
     parser_type: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     direction: Annotated[str | None, Query(min_length=1, max_length=16)] = None,
     date_from: datetime.date | None = None,
     date_to: datetime.date | None = None,
     query: Annotated[str | None, Query(alias="q", min_length=1, max_length=128)] = None,
-    session: AsyncSession = Depends(get_session),
 ) -> email_schemas.EmailListResponse:
-    if date_from is not None and date_to is not None and date_from > date_to:
-        raise HTTPException(status_code=422, detail="date_from must not exceed date_to")
+    """List a bounded page of email metadata without raw message bodies."""
+    date_bounds = inclusive_datetime_bounds(date_from, date_to)
+
     return await list_emails(
         session,
         limit=limit,
@@ -63,12 +65,8 @@ async def emails_list(
         transaction_id=transaction_id,
         parser_type=parser_type,
         direction=direction,
-        date_from=datetime.datetime.combine(date_from, datetime.time.min)
-        if date_from is not None
-        else None,
-        date_to=datetime.datetime.combine(date_to, datetime.time.max)
-        if date_to is not None
-        else None,
+        date_from=date_bounds.start,
+        date_to=date_bounds.end,
         query=query,
     )
 
@@ -76,44 +74,48 @@ async def emails_list(
 @router.post("/emails/batch")
 async def emails_batch(
     payload: email_schemas.EmailBatchRequest,
-    session: AsyncSession = Depends(get_session),
+    session: SessionDep,
 ) -> email_schemas.EmailBatchResponse:
+    """Return email summaries for an ordered, explicit set of IDs."""
     return await get_emails_by_ids(session, payload.ids)
 
 
 @router.get("/emails/{email_id}/raw")
 async def email_raw(
-    email_id: Annotated[int, Path(ge=1, le=_DB_ID_MAX)],
+    email_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: AsyncSession = Depends(get_session),
+    session: SessionDep,
 ) -> email_schemas.EmailRawResponse:
+    """Load one bounded raw email body without allowing response caching."""
     response.headers["Cache-Control"] = "no-store"
     try:
         return await get_email_raw(session, email_id)
     except EmailRawReadError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise ApiException(status_code=exc.status_code, detail=str(exc)) from exc
 
 
 @router.get("/emails/{email_id}")
 async def email_detail(
-    email_id: Annotated[int, Path(ge=1, le=_DB_ID_MAX)],
+    email_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: AsyncSession = Depends(get_session),
+    session: SessionDep,
 ) -> email_schemas.EmailDetailResponse:
+    """Return one email's bounded metadata and linked provenance."""
     response.headers["Cache-Control"] = "no-store"
-    email = await get_email_detail(session, email_id)
-    if email is None:
-        raise HTTPException(status_code=404, detail="Email not found")
-    return email
+    if email := await get_email_detail(session, email_id):
+        return email
+
+    raise NotFoundException(detail="Email not found")
 
 
 @router.post("/emails/{email_id}/resolve-duplicate")
 async def resolve_duplicate(
-    email_id: Annotated[int, Path(ge=1, le=_DB_ID_MAX)],
+    email_id: Annotated[DatabaseId, Path()],
     payload: DuplicateResolutionRequest,
-    session: AsyncSession = Depends(get_session),
+    session: SessionDep,
 ) -> DuplicateResolutionResponse:
+    """Preview or apply explicit enrichment of a deferred duplicate email."""
     try:
         return await resolve_email_duplicate(session, email_id, payload)
     except DuplicateResolutionError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise ApiException(status_code=exc.status_code, detail=str(exc)) from exc

@@ -1,3 +1,5 @@
+"""Bounded SMS source queries for the JSON API."""
+
 import datetime
 
 from sqlalchemy import case, func, select
@@ -5,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import SmsMessage, Transaction
 from financial_dashboard.schemas import sms as sms_schemas
+from financial_dashboard.services.read_helpers import order_batch
 
 _METADATA_LIMIT = 1_000
 _LIST_ERROR_LIMIT = 1_000
@@ -13,6 +16,7 @@ _ATTACHMENT_LIMIT = 100
 
 
 def _summary_columns(*, error_limit: int = _LIST_ERROR_LIMIT):
+    """Build the bounded SQL projection shared by SMS reads."""
     return (
         SmsMessage.id,
         func.substr(SmsMessage.bank, 1, _METADATA_LIMIT).label("bank"),
@@ -40,6 +44,7 @@ def _summary_columns(*, error_limit: int = _LIST_ERROR_LIMIT):
 
 
 def _summary(row) -> sms_schemas.SmsRead:
+    """Map one projected SMS row to its summary schema."""
     transaction = (
         sms_schemas.SmsTransactionLink(
             id=row.transaction_id,
@@ -76,6 +81,7 @@ def _filters(
     date_from: datetime.datetime | None,
     date_to: datetime.datetime | None,
 ) -> list:
+    """Build exact-match clauses for optional SMS filters."""
     clauses = []
     if sms_id is not None:
         clauses.append(SmsMessage.id == sms_id)
@@ -107,6 +113,7 @@ async def list_sms(
     date_from: datetime.datetime | None,
     date_to: datetime.datetime | None,
 ) -> sms_schemas.SmsListResponse:
+    """Return one stable SMS metadata page without raw bodies."""
     clauses = _filters(
         sms_id=sms_id,
         bank=bank,
@@ -151,6 +158,7 @@ async def get_sms_detail(
     session: AsyncSession,
     sms_id: int,
 ) -> sms_schemas.SmsDetailResponse | None:
+    """Return one SMS with bounded body, error, and transaction links."""
     base_join = SmsMessage.__table__.outerjoin(
         Transaction.__table__, Transaction.id == SmsMessage.transaction_id
     )
@@ -196,6 +204,7 @@ async def get_sms_by_ids(
     session: AsyncSession,
     ids: list[int],
 ) -> sms_schemas.SmsBatchResponse:
+    """Return summaries in requested ID order and report missing IDs."""
     base_join = SmsMessage.__table__.outerjoin(
         Transaction.__table__, Transaction.id == SmsMessage.transaction_id
     )
@@ -208,8 +217,8 @@ async def get_sms_by_ids(
                 .execution_options(autoflush=False)
             )
         ).all()
-    by_id = {row.id: _summary(row) for row in rows}
+    ordered = order_batch(ids, {row.id: _summary(row) for row in rows})
     return sms_schemas.SmsBatchResponse(
-        items=[by_id[row_id] for row_id in ids if row_id in by_id],
-        missing_ids=[row_id for row_id in ids if row_id not in by_id],
+        items=ordered.items,
+        missing_ids=ordered.missing_ids,
     )

@@ -1,13 +1,11 @@
 import logging
-from unittest.mock import AsyncMock
-
 import pytest
 from sqlalchemy import event, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import Account, Base, Card
-from financial_dashboard.services import system as system_service
+from financial_dashboard.services import database as database_service
 
 pytestmark = pytest.mark.anyio
 
@@ -197,7 +195,7 @@ async def test_foreign_key_check_failure_is_sanitized(client, monkeypatch, caplo
         raise SQLAlchemyError(secret_detail)
 
     monkeypatch.setattr(AsyncSession, "execute", fail_check)
-    with caplog.at_level(logging.WARNING, logger=system_service.__name__):
+    with caplog.at_level(logging.WARNING, logger=database_service.__name__):
         response = await client.get("/api/system/foreign-key-check?limit=9")
 
     assert response.status_code == 200
@@ -213,31 +211,8 @@ async def test_foreign_key_check_failure_is_sanitized(client, monkeypatch, caplo
     assert any(
         secret_detail in record.getMessage()
         for record in caplog.records
-        if record.name == system_service.__name__
+        if record.name == database_service.__name__
     )
-
-
-async def test_foreign_key_check_non_sqlite_backend_is_generic(
-    client, session, monkeypatch
-):
-    bind = session.get_bind()
-    monkeypatch.setattr(bind.dialect, "name", "highly-sensitive-vendor-name")
-    execute = AsyncMock(side_effect=AssertionError("database query was not expected"))
-    monkeypatch.setattr(session, "execute", execute)
-
-    response = await client.get("/api/system/foreign-key-check?limit=4")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "unsupported",
-        "backend": "other",
-        "returned_count": 0,
-        "limit": 4,
-        "truncated": False,
-        "violations": [],
-    }
-    assert "highly-sensitive-vendor-name" not in response.text
-    execute.assert_not_awaited()
 
 
 async def test_foreign_key_check_openapi_uses_inferred_typed_response(client):
@@ -264,12 +239,8 @@ async def test_foreign_key_check_openapi_uses_inferred_typed_response(client):
         "ok",
         "violations",
         "unavailable",
-        "unsupported",
     }
-    assert set(response_model["properties"]["backend"]["enum"]) == {
-        "sqlite",
-        "other",
-    }
+    assert response_model["properties"]["backend"]["const"] == "sqlite"
     violation_model = document["components"]["schemas"]["ForeignKeyViolation"]
     assert {
         item.get("type")

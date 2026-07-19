@@ -6,6 +6,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, Field, field_validator
 
+from financial_dashboard.schemas.common import DatabaseIdBatch
+
 
 class SmsIngestRequest(BaseModel):
     bank: str
@@ -69,16 +71,7 @@ class SmsDetailResponse(SmsRead):
 
 
 class SmsBatchRequest(BaseModel):
-    ids: Annotated[list[int], Field(min_length=1, max_length=100)]
-
-    @field_validator("ids")
-    @classmethod
-    def validate_ids(cls, values: list[int]) -> list[int]:
-        if any(value < 1 or value > 9_223_372_036_854_775_807 for value in values):
-            raise ValueError("ids must fit positive database integers")
-        if len(set(values)) != len(values):
-            raise ValueError("ids must be unique")
-        return values
+    ids: DatabaseIdBatch
 
 
 class SmsBatchResponse(BaseModel):
