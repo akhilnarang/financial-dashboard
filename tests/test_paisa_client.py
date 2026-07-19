@@ -117,6 +117,26 @@ def test_validate_normalizes_path_prefix():
     assert v.display == "http://127.0.0.1/paisa"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:not-a-port",
+        "http://127.0.0.1:65536",
+        "http://127.0.0.1:-1",
+    ],
+)
+def test_validate_malformed_port_is_typed_error(url):
+    with pytest.raises(PaisaError) as exc:
+        validate_base_url(url, allow_remote=False)
+    assert exc.value.code == "invalid_port"
+
+
+def test_validate_normalizes_host_case_and_default_port():
+    a = validate_base_url("HTTP://LOCALHOST:80/", allow_remote=False)
+    b = validate_base_url("http://localhost", allow_remote=False)
+    assert a.display == b.display == "http://localhost/"
+
+
 def test_default_base_url_is_canonical_loopback_7500():
     # The official default port is 7500 (cmd/serve.go). A regression here would
     # silently point the client at the wrong port.

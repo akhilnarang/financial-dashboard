@@ -22,11 +22,14 @@ from financial_dashboard.core.templating import get_templates
 from financial_dashboard.extensions import BUILTIN_EXTENSIONS
 from financial_dashboard.schemas.extensions import PaisaConfigInput
 from financial_dashboard.services.paisa import surface
+from financial_dashboard.services.paisa.renderers.beancount import quote_string
 
 logger = logging.getLogger(__name__)
 
 templates = get_templates()
 router = APIRouter()
+
+_SETUP_PATH_PLACEHOLDER = "/absolute/path/to/financial-dashboard.journal"
 
 
 def _manifests(request: FastAPIRequest):
@@ -87,12 +90,18 @@ async def _paisa_context(session: AsyncSession, request: FastAPIRequest) -> dict
         logger.warning("Paisa preview on page render failed: %s", exc, exc_info=True)
         preview_payload = {"ok": False, "reason": str(exc)}
 
+    setup_path = cfg.generated_path or _SETUP_PATH_PLACEHOLDER
+    setup_include_line = f"include {setup_path}"
+    if cfg.ledger_cli == "beancount":
+        setup_include_line = f"include {quote_string(setup_path)}"
+
     return {
         "active_page": "extensions",
         "config": cfg.model_dump(),
         "accounts": [a.model_dump() for a in choices.accounts],
         "preview": preview_payload,
         "safe_link": surface.safe_link(),
+        "setup_include_line": setup_include_line,
         "flash": {
             "saved": request.query_params.get("saved"),
             "generated": request.query_params.get("generated"),

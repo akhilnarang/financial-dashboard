@@ -88,14 +88,24 @@ function render(data) {
         // only renders when it carries a nonzero/meaningful value so an empty
         // projection shows nothing.
         const diag = [];
+        diag.push(['Net-worth scope', (d.net_worth_scope_complete ? 'complete' : 'INCOMPLETE') + ' · CAS ' + d.cas_portfolio_count + ' (' + d.cas_investment_scope + ')' + ' · manual assets ' + d.manual_asset_count + ' · manual liabilities ' + d.manual_liability_count]);
+        if ((d.cas_portfolio_labels || []).length) {
+            diag.push(['CAS portfolio labels', d.cas_portfolio_labels.join(', ')]);
+        }
+        if ((d.manual_asset_labels || []).length || (d.manual_liability_labels || []).length) {
+            diag.push(['Manual sources outside projection', (d.manual_asset_labels || []).concat(d.manual_liability_labels || []).join(', ')]);
+        }
         if (d.card_payments) {
-            diag.push(['Card payments', d.card_payments_resolved + ' resolved · ' + d.card_payments_unresolved + ' unresolved (generic clearing)']);
+            diag.push(['Card payments', d.card_payments_resolved + ' resolved · ' + d.card_payments_unresolved + ' unresolved (generic clearing) · ' + d.card_payments_ambiguous_mask + ' ambiguous exact mask']);
         }
         if (d.imprecise_count) {
             diag.push(['Imprecise categories', d.imprecise_count + ' (emi_loan/cash_withdrawal → conservative Expenses clearing)']);
         }
         if (d.investment_lot_count || d.investment_funding_remapped || (d.investment_funding_unresolved || []).length) {
             diag.push(['Investment lots', d.investment_lot_count + ' projected · ' + d.investment_funding_remapped + ' funding-remapped · ' + (d.investment_funding_unresolved || []).length + ' suppressed']);
+        }
+        if (d.investment_current_valuation_count) {
+            diag.push(['CAS valuation', d.investment_current_valuation_count + ' source positions · ' + d.investment_market_price_count + ' market prices · ' + d.investment_value_only_count + ' value-only/outside lots · ' + d.investment_quantity_mismatch_count + ' quantity mismatch · ' + d.investment_missing_market_price_count + ' missing price · ' + (d.investment_market_price_conflicts || []).length + ' conflicts suppressed']);
         }
         if (d.projected_foreign_count || d.missing_fx_rate_count) {
             diag.push(['Foreign currency', d.projected_foreign_count + ' projected (' + (d.source_currencies || []).join(', ') + ') · ' + d.missing_fx_rate_count + ' missing rate']);

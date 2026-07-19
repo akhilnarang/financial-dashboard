@@ -46,8 +46,9 @@ from financial_dashboard.services.cashflow.scope import CARD_ACCOUNT_TYPES
 from financial_dashboard.services.categorization.slugs import (
     CREDIT_CARD_ACCOUNT_TYPE,
 )
-from financial_dashboard.services.paisa.config import load_config
+from financial_dashboard.services.paisa.config import PaisaProjectionConfig, load_config
 from financial_dashboard.services.paisa.orchestrator import preview
+from financial_dashboard.services.paisa.projection import _resolve_account
 from financial_dashboard.services.paisa.renderers.base import CARD_PAYMENT_CLEARING
 
 logger = logging.getLogger(__name__)
@@ -93,17 +94,22 @@ _CLEARING_KEY = _norm_account(CARD_PAYMENT_CLEARING)
 
 
 class _ProjectedDelta(NamedTuple):
-    """The projected INR delta for one ledger account, plus whether the
-    projection also carried foreign-commodity legs for it.
+    """The projected INR delta and excluded foreign posting counts for one
+    ledger account.
 
-    ``has_foreign_commodity`` is true when at least one posting under the account
-    was denominated in a non-INR commodity. The displayed ``amount`` is the INR
-    leg only (the reconciliation is an INR view); no FX conversion is performed,
-    so the foreign legs are excluded rather than silently added or guessed.
+    The displayed ``amount`` is always the INR leg only (the reconciliation is
+    an INR view). ``foreign_posting_counts`` is sorted by commodity so the
+    exclusion diagnostic is stable regardless of projection entry order. No FX
+    conversion is performed, so foreign legs are excluded rather than silently
+    added or guessed.
     """
 
     amount: Decimal
-    has_foreign_commodity: bool
+    foreign_posting_counts: tuple[tuple[str, int], ...]
+
+    @property
+    def has_foreign_commodity(self) -> bool:
+        return bool(self.foreign_posting_counts)
 
 
 def _q(value: Decimal) -> Decimal:
@@ -148,8 +154,28 @@ def _projection_diag(report) -> PaisaReconcileProjectionDiag | None:
         card_payments=report.card_payments,
         card_payments_resolved=report.card_payments_resolved,
         card_payments_unresolved=report.card_payments_unresolved,
+        card_payments_ambiguous_mask=report.card_payments_ambiguous_mask,
         investment_funding_remapped=report.investment_funding_remapped,
         investment_funding_unresolved=list(report.investment_funding_unresolved),
+        investment_current_valuation_count=report.investment_current_valuation_count,
+        investment_market_price_count=report.investment_market_price_count,
+        investment_market_price_conflicts=list(
+            report.investment_market_price_conflicts
+        ),
+        investment_value_only_count=report.investment_value_only_count,
+        investment_quantity_mismatch_count=(report.investment_quantity_mismatch_count),
+        investment_missing_market_price_count=(
+            report.investment_missing_market_price_count
+        ),
+        investment_valuation_sources=list(report.investment_valuation_sources),
+        cas_portfolio_count=report.cas_portfolio_count,
+        cas_portfolio_labels=list(report.cas_portfolio_labels),
+        cas_investment_scope=report.cas_investment_scope,
+        manual_asset_count=report.manual_asset_count,
+        manual_asset_labels=list(report.manual_asset_labels),
+        manual_liability_count=report.manual_liability_count,
+        manual_liability_labels=list(report.manual_liability_labels),
+        net_worth_scope_complete=report.net_worth_scope_complete,
         kind_counts=dict(report.kind_counts),
         projected_foreign_count=report.projected_foreign_count,
         source_currencies=list(report.source_currencies),
@@ -171,21 +197,33 @@ def _balance_by_posting_account(report) -> dict[str, _ProjectedDelta]:
     omission is never mistaken for completeness.
     """
     totals: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    posting_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for entry in report.entries:
         for posting in entry.postings:
-            totals[posting.account][posting.commodity] += Decimal(posting.amount)
-    # Collapse to the per-account INR total; a non-INR commodity total is
-    # surfaced only if there is no INR column, so a purely-foreign account still
-    # reports a number rather than 0. The foreign flag is set whenever any
-    # non-INR commodity appeared, regardless of whether an INR column exists.
+            raw_commodity = posting.commodity
+            commodity = (
+                "INR"
+                if raw_commodity is None or not str(raw_commodity).strip()
+                else str(raw_commodity).strip()
+            )
+            totals[posting.account][commodity] += Decimal(posting.amount)
+            posting_counts[posting.account][commodity] += 1
+    # Collapse to the per-account INR total. Foreign-only activity contributes
+    # zero: it must never be dimensionally added to an INR opening. Keep sorted
+    # foreign posting counts solely for the explicit exclusion diagnostic.
     out: dict[str, _ProjectedDelta] = {}
     for account, by_ccy in totals.items():
-        has_foreign = any(ccy != "INR" for ccy in by_ccy)
-        if "INR" in by_ccy:
-            amount = by_ccy["INR"]
-        else:
-            amount = next(iter(by_ccy.values()))
-        out[account] = _ProjectedDelta(amount=amount, has_foreign_commodity=has_foreign)
+        foreign_counts = tuple(
+            sorted(
+                (commodity, count)
+                for commodity, count in posting_counts[account].items()
+                if commodity != "INR"
+            )
+        )
+        out[account] = _ProjectedDelta(
+            amount=by_ccy.get("INR", Decimal("0")),
+            foreign_posting_counts=foreign_counts,
+        )
     return out
 
 
@@ -206,18 +244,15 @@ def _latest_snapshots(
     return best
 
 
-def _resolve_ledger_name(
-    account_id: int, openings, mappings: dict[str, str]
-) -> str | None:
-    """The ledger name a dashboard account projects to: an explicit mapping
-    wins, otherwise the projection's resolved (default) name from its opening."""
-    mapped = mappings.get(str(account_id))
-    if mapped:
-        return mapped
-    for ob in openings or ():
-        if ob.account_id == account_id:
-            return ob.account_name
-    return None
+def _resolve_ledger_name(account: Account, config: PaisaProjectionConfig) -> str:
+    """Return the exact account name the configured projection resolves.
+
+    Account declarations exist independently of opening balances, so resolving
+    through the projection's own kind/backend-aware helper keeps accounts with
+    no opening visible. Operator mappings retain the same precedence and strict
+    backend validation they have during an actual projection.
+    """
+    return _resolve_account(account, config.account_mappings, config.ledger_cli).name
 
 
 def _paisa_balance_for(
@@ -258,20 +293,15 @@ def _paisa_balance_for(
     return (None, False)
 
 
-def _suggested_mapping(account: Account, openings) -> str | None:
+def _suggested_mapping(account: Account, config: PaisaProjectionConfig) -> str:
     """Deterministic preview-only suggested mapping for an unmapped account.
 
-    Prefers the projection's own resolved (default) name when the account has an
-    opening; otherwise derives a stable ``Assets:Bank:<Bank>:<Label>``-style
-    leaf. This is a *preview* only — it is never written without an explicit
-    accept through the normal config-save path."""
-    for ob in openings or ():
-        if ob.account_id == account.id:
-            return ob.account_name
-    bank = " ".join((account.bank or "").split()) or "Bank"
-    label = " ".join((account.label or "").split()) or "Account"
-    label = label.replace(":", " ")
-    return f"Assets:Bank:{bank}:{label}"
+    The suggestion is the projection's default for this account kind and
+    backend, resolved with an empty mapping set. It is a *preview* only — it is
+    never written without an explicit accept through the normal config-save
+    path.
+    """
+    return _resolve_account(account, {}, config.ledger_cli).name
 
 
 async def build_reconciliation(
@@ -363,9 +393,7 @@ async def build_reconciliation(
 
     for account in accounts:
         aid = account.id
-        mapped_to = _resolve_ledger_name(
-            aid, report.openings if report else None, config.account_mappings
-        )
+        mapped_to = _resolve_ledger_name(account, config)
         is_liability = _account_is_liability(account.type)
 
         # Native snapshot cell.
@@ -432,9 +460,14 @@ async def build_reconciliation(
                 # commodity postings are excluded because no FX conversion is
                 # performed. Surface the gap explicitly rather than implying the
                 # number is complete.
+                foreign_diagnostics = ", ".join(
+                    f"{commodity}={count}"
+                    for commodity, count in info.foreign_posting_counts
+                )
                 notes.append(
-                    "projected balance shown in INR only; foreign-commodity legs "
-                    "are excluded (no FX conversion)"
+                    "projected balance shown in INR only; foreign-commodity "
+                    f"postings excluded: {foreign_diagnostics}; "
+                    "no FX conversion performed"
                 )
             if (
                 is_liability
@@ -505,10 +538,7 @@ async def build_reconciliation(
                     account_id=aid,
                     bank=account.bank,
                     label=account.label,
-                    suggested_mapping=_suggested_mapping(
-                        account, report.openings if report else None
-                    )
-                    or "",
+                    suggested_mapping=_suggested_mapping(account, config),
                 )
             )
 

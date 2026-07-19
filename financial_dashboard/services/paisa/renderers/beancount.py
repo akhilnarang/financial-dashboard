@@ -13,7 +13,8 @@ family in three ways this module honors:
   directive listing the commodities it may hold; a commodity must be declared
   with a dated ``commodity`` directive. The renderer derives both from the
   document's postings/openings so the file is self-contained and valid.
-* Payees and transaction notes are double-quoted and ``"`` is escaped.
+* String values are double-quoted, with backslashes escaped before quotes so
+  Beancount cannot consume a source backslash as an escape sequence.
 
 A priced foreign entry posts both legs in the foreign commodity (balanced in
 that currency) and a ``<date> price <CCY> <rate> INR`` directive lets beancount
@@ -115,9 +116,16 @@ def normalize_default_account(name: str) -> str:
     return validate(out)
 
 
-def _quote(text: str) -> str:
-    """Double-quote and escape a payee/note for a beancount string field."""
-    return '"' + text.replace('"', '\\"') + '"'
+def quote_string(text: str) -> str:
+    """Render ``text`` as a Beancount string literal.
+
+    Backslashes must be escaped *before* quotes. Otherwise a source value such
+    as ``C:\\new\\file`` is parsed with ``\\n``/``\\f`` escapes and no longer
+    has the same value, while an unknown escape silently loses its backslash.
+    This helper is used for every data-derived Beancount string position.
+    """
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _account_currencies(doc: LedgerDocument) -> dict[str, set[str]]:
@@ -282,7 +290,7 @@ def _meta_lines(meta, indent_level: int = 1) -> list[str]:
     one per line, lowercase keys, quoted string values. ``indent_level`` 1 =
     entry-level (4 spaces, before postings), 2 = posting-level (8 spaces)."""
     indent = _POSTING_INDENT * indent_level
-    return [f'{indent}{k}: "{v}"' for k, v in meta]
+    return [f"{indent}{k}: {quote_string(v)}" for k, v in meta]
 
 
 def _txn_meta_or_comment(entry: ProjectedEntry) -> list[str]:
@@ -294,7 +302,7 @@ def _txn_meta_or_comment(entry: ProjectedEntry) -> list[str]:
     out: list[str] = []
     txn_comment = ", ".join(str(t) for t in entry.txn_ids)
     if txn_comment:
-        out.append(f'{_POSTING_INDENT}txn: "{txn_comment}"')
+        out.append(f"{_POSTING_INDENT}txn: {quote_string(txn_comment)}")
     if entry.meta:
         out.extend(_meta_lines(entry.meta, indent_level=1))
     return out
@@ -325,9 +333,9 @@ def _render_entry(entry: ProjectedEntry) -> list[str]:
     note = sanitize_text(entry.note)[:160] if entry.note else ""
     header = f"{entry.date.isoformat()} *"
     if payee:
-        header += f" {_quote(payee)}"
+        header += f" {quote_string(payee)}"
     if note:
-        header += f" {_quote(note)}"
+        header += f" {quote_string(note)}"
     lines: list[str] = [header]
     # Entry-level metadata (txn + dashboard_* keys) before postings.
     lines.extend(_txn_meta_or_comment(entry))
@@ -373,7 +381,7 @@ def _render_lot(lot: InvestmentLotEntry) -> list[str]:
     )
     qty_text = base.fmt_lot_decimal(lot.quantity)
     unit_text = base.fmt_lot_decimal(lot.unit_cost)
-    header = f'{lot.acquired_on.isoformat()} * "{payee}"'
+    header = f"{lot.acquired_on.isoformat()} * {quote_string(payee)}"
     # The equity leg is the exact full-precision negative product so it cancels
     # the asset leg's cost (``quantity × unit_cost``) to the penny AND to full
     # precision — bean-check rejects a sub-cent imbalance. The stored 2-dp
@@ -404,4 +412,4 @@ def _render_lot(lot: InvestmentLotEntry) -> list[str]:
     return lines
 
 
-__all__ = ["normalize_default_account", "render_document", "validate"]
+__all__ = ["normalize_default_account", "quote_string", "render_document", "validate"]

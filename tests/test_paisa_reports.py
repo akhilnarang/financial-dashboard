@@ -292,6 +292,43 @@ async def test_cache_ttl_zero_always_fetches_but_coalesces():
     assert cache.upstream_calls == 2
 
 
+async def test_cache_ttl_zero_coalesces_only_while_fetch_is_in_flight():
+    cache = PaisaReportCache()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow_fetch():
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return f"result-{calls}"
+
+    tasks = [
+        asyncio.create_task(cache.read("budget", ttl_seconds=0, fetch=slow_fetch))
+        for _ in range(10)
+    ]
+    await started.wait()
+    # Let every created reader join while the one fetch is deliberately held.
+    await asyncio.sleep(0)
+    release.set()
+    results = await asyncio.gather(*tasks)
+
+    assert [result.value for result in results] == ["result-1"] * 10
+    assert all(result.hit is False for result in results)
+    assert calls == cache.upstream_calls == 1
+    assert cache.size == 0
+
+    # The completed value was not retained: a later caller performs a new
+    # upstream read rather than reusing the finished in-flight task.
+    later = await cache.read("budget", ttl_seconds=0, fetch=slow_fetch)
+    assert later.value == "result-2"
+    assert later.hit is False
+    assert calls == cache.upstream_calls == 2
+    assert cache.size == 0
+
+
 async def test_cache_coalesces_concurrent_readers_into_one_call():
     cache = PaisaReportCache()
     started = 0
@@ -459,6 +496,83 @@ async def test_report_cache_hit_marks_cached(monkeypatch):
     assert second.cached is True
     cache = surface.get_report_cache(state)
     assert cache.upstream_calls == 1
+
+
+def test_report_cache_key_uses_normalized_connection_identity_without_secret():
+    base = _cfg(
+        mode="connect",
+        base_url="HTTP://LOCALHOST:80/",
+        auth_username="alice",
+        auth_password="correct horse battery staple",
+        ledger_cli="ledger",
+    )
+    key = surface._report_cache_key(base, REPORT_BUDGET)
+    equivalent = surface._report_cache_key(
+        _cfg(
+            mode="connect",
+            base_url="http://localhost",
+            auth_username="alice",
+            auth_password="correct horse battery staple",
+            ledger_cli="LEDGER",
+        ),
+        REPORT_BUDGET,
+    )
+    assert key == equivalent
+    assert key.base_url == "http://localhost/"
+    assert key.auth_username == "alice"
+    assert "correct horse battery staple" not in repr(key)
+
+    switches = [
+        _cfg(**{**base._asdict(), "base_url": "http://localhost:7500"}),
+        _cfg(**{**base._asdict(), "auth_username": "bob"}),
+        _cfg(**{**base._asdict(), "auth_password": "different-secret"}),
+        _cfg(**{**base._asdict(), "ledger_cli": "beancount"}),
+    ]
+    assert all(surface._report_cache_key(cfg, REPORT_BUDGET) != key for cfg in switches)
+
+
+async def test_report_config_switch_never_serves_prior_instance_cache(monkeypatch):
+    current = _cfg(
+        mode="connect",
+        base_url="http://127.0.0.1:7500",
+        auth_username="alice",
+        auth_password="first-secret",
+        ledger_cli="ledger",
+    )
+    monkeypatch.setattr(surface, "load_config", lambda: current)
+    calls = 0
+
+    async def fetch(config, report):
+        nonlocal calls
+        calls += 1
+        payload = dict(BUDGET_PAYLOAD)
+        payload["checkingBalance"] = str(calls)
+        return normalize_report(report, payload)
+
+    monkeypatch.setattr(surface, "_fetch_report", fetch)
+    state = _AppState()
+
+    first = await surface.report_summary(state, REPORT_BUDGET)
+    assert first.budget is not None
+    assert first.budget.checking_balance == "1.00"
+
+    configs = [
+        _cfg(**{**current._asdict(), "base_url": "http://127.0.0.1:7501"}),
+        _cfg(**{**current._asdict(), "auth_username": "bob"}),
+        _cfg(**{**current._asdict(), "auth_password": "second-secret"}),
+        _cfg(**{**current._asdict(), "ledger_cli": "beancount"}),
+    ]
+    for expected, config in enumerate(configs, start=2):
+        current = config
+        summary = await surface.report_summary(state, REPORT_BUDGET)
+        assert summary.cached is False
+        assert summary.budget is not None
+        assert summary.budget.checking_balance == f"{expected}.00"
+
+    assert calls == 5
+    repeated = await surface.report_summary(state, REPORT_BUDGET)
+    assert repeated.cached is True
+    assert calls == 5
 
 
 async def test_report_via_route_returns_typed_json_on_failure(monkeypatch):

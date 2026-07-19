@@ -117,7 +117,10 @@ def validate_base_url(raw: str, *, allow_remote: bool) -> ValidatedURL:
         raise PaisaError("invalid_url", "Paisa base URL is empty.")
     text = raw.strip()
 
-    parsed = urllib.parse.urlsplit(text)
+    try:
+        parsed = urllib.parse.urlsplit(text)
+    except ValueError as exc:
+        raise PaisaError("invalid_url", "Paisa base URL is malformed.") from exc
     scheme = parsed.scheme.lower()
     if scheme not in ALLOWED_SCHEMES:
         raise PaisaError(
@@ -142,6 +145,14 @@ def validate_base_url(raw: str, *, allow_remote: bool) -> ValidatedURL:
     if not host:
         raise PaisaError("missing_host", "Paisa base URL has no host.")
     host = host.lower()
+    # ``SplitResult.port`` is a validating property: malformed/non-numeric and
+    # out-of-range ports raise ValueError when accessed. Convert that stdlib
+    # exception into the client's typed validation boundary so a bad setting is
+    # reported as a config error rather than escaping as a route-level 500.
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise PaisaError("invalid_port", "Paisa base URL has an invalid port.") from exc
 
     path = parsed.path or ""
     segments: list[str] = []
@@ -170,13 +181,21 @@ def validate_base_url(raw: str, *, allow_remote: bool) -> ValidatedURL:
                 "projection requires https.",
             )
 
-    display = urllib.parse.urlunsplit(
-        (scheme, parsed.netloc, path_prefix or "/", "", "")
+    # Canonicalize the authority instead of preserving ``parsed.netloc``:
+    # hostname casing and explicit default ports do not identify different
+    # Paisa instances. IPv6 literals need brackets when reconstructed.
+    display_host = f"[{host}]" if ":" in host else host
+    default_port = 80 if scheme == "http" else 443
+    authority = (
+        display_host
+        if port is None or port == default_port
+        else f"{display_host}:{port}"
     )
+    display = urllib.parse.urlunsplit((scheme, authority, path_prefix or "/", "", ""))
     return ValidatedURL(
         scheme=scheme,
         host=host,
-        port=parsed.port,
+        port=port,
         path_prefix=path_prefix,
         is_loopback=loopback,
         display=display,

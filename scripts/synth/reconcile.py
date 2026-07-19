@@ -32,6 +32,7 @@ class _DbTxn(NamedTuple):
     direction: str
     counterparty: str | None
     reference_number: str | None
+    card_mask: str | None
 
 
 def _db_standins(scenario_txns: Sequence, *, account_pk: int) -> list[_DbTxn]:
@@ -49,6 +50,7 @@ def _db_standins(scenario_txns: Sequence, *, account_pk: int) -> list[_DbTxn]:
                 direction=t.direction,
                 counterparty=t.counterparty,
                 reference_number=t.reference_number,
+                card_mask=t.card_mask,
             )
         )
     return out
@@ -97,6 +99,7 @@ def reconcile_cc_offline(
     fidelity-boundary fallback).
     """
     try:
+        from financial_dashboard.core.masks import normalize_mask
         from financial_dashboard.services.statements.cc import reconcile_statement
     except Exception:  # noqa: BLE001 — fidelity boundary
         return None
@@ -121,8 +124,11 @@ def reconcile_cc_offline(
         overall_reward_points=0,
     )
     db = _db_standins(scenario_txns, account_pk=account_pk)
+    account_card_masks = list(
+        dict.fromkeys(mask for txn in db if (mask := normalize_mask(txn.card_mask)))
+    )
     try:
-        return reconcile_statement(parsed, db, account_pk)
+        return reconcile_statement(parsed, db, account_pk, account_card_masks)
     except Exception:  # noqa: BLE001 — fidelity boundary
         return None
 

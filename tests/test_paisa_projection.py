@@ -106,7 +106,7 @@ async def _txn(
     await session.flush()
 
 
-async def _snapshot(session, account_id, date, value, *, kind="asset"):
+async def _snapshot(session, account_id, date, value, *, kind="asset", currency="INR"):
     session.add(
         BalanceSnapshot(
             account_id=account_id,
@@ -121,6 +121,7 @@ async def _snapshot(session, account_id, date, value, *, kind="asset"):
             source=SnapshotSource.bank_statement.value
             if kind == "asset"
             else SnapshotSource.cc_statement.value,
+            currency=currency,
         )
     )
     await session.flush()
@@ -227,6 +228,68 @@ async def test_opening_falls_back_to_transaction_balance(session):
     assert report.openings
     assert report.openings[0].source == "transaction_balance"
     assert report.openings[0].amount == Decimal("90000.00")
+
+
+async def test_opening_ignores_newer_foreign_snapshot(session):
+    """An explicit foreign snapshot can never be relabelled as an INR opening."""
+    bank = await _bank(session)
+    await _snapshot(session, bank.id, dt.date(2025, 11, 30), "90000.00", currency="INR")
+    await _snapshot(session, bank.id, dt.date(2025, 12, 31), "1000.00", currency="USD")
+
+    report = await project(session, _config())
+
+    assert len(report.openings) == 1
+    assert report.openings[0].amount == Decimal("90000.00")
+    assert report.openings[0].as_of == dt.date(2025, 11, 30)
+
+
+async def test_foreign_snapshot_uses_only_inr_running_balance_fallback(session):
+    bank = await _bank(session)
+    await _snapshot(session, bank.id, dt.date(2025, 12, 31), "1000.00", currency="EUR")
+    await _txn(
+        session,
+        account_id=bank.id,
+        direction="credit",
+        amount="1",
+        date=dt.date(2025, 12, 30),
+        category="salary",
+        currency="USD",
+        balance="1111.00",
+    )
+    await _txn(
+        session,
+        account_id=bank.id,
+        direction="credit",
+        amount="1",
+        date=dt.date(2025, 12, 29),
+        category="salary",
+        currency="INR",
+        balance="88000.00",
+    )
+
+    report = await project(session, _config())
+
+    assert report.openings[0].source == "transaction_balance"
+    assert report.openings[0].amount == Decimal("88000.00")
+
+
+async def test_no_inr_snapshot_or_running_balance_emits_no_opening(session):
+    bank = await _bank(session)
+    await _snapshot(session, bank.id, dt.date(2025, 12, 31), "1000.00", currency="USD")
+    await _txn(
+        session,
+        account_id=bank.id,
+        direction="credit",
+        amount="1",
+        date=dt.date(2025, 12, 30),
+        category="salary",
+        currency="USD",
+        balance="1111.00",
+    )
+
+    report = await project(session, _config())
+
+    assert report.openings == ()
 
 
 async def test_liability_opening_negated(session):

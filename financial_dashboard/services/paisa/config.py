@@ -43,7 +43,7 @@ amount is never emitted labelled INR.
 """
 
 import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException
 from typing import Literal, NamedTuple
 
 from financial_dashboard.core.dates import parse_date
@@ -257,10 +257,15 @@ def _parse_fx_rates(raw: object) -> dict[str, tuple[FxRate, ...]]:
                 continue
             try:
                 rate = Decimal(str(rate_raw))
-            except InvalidOperation, ValueError, TypeError:
+                # Check finiteness before quantizing: Infinity/NaN quantization
+                # itself signals InvalidOperation. Extremely large exponents
+                # can signal InvalidOperation/Overflow, while tiny positive
+                # values can quantize to zero; all are invalid stored quotes.
+                if not rate.is_finite() or rate <= 0:
+                    continue
+                rate = rate.quantize(Decimal("0.0001"))
+            except DecimalException, OverflowError, ValueError, TypeError:
                 continue
-            # Quantize to 4 dp for a stable render; reject non-positive.
-            rate = rate.quantize(Decimal("0.0001"))
             if not rate.is_finite() or rate <= 0:
                 continue
             parsed.append(FxRate(date=date, rate=rate))

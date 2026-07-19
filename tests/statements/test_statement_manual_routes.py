@@ -8,6 +8,7 @@ bad row cannot abort the whole upload. Also covers mark-paid / mark-unpaid
 
 import datetime
 import io
+import json
 from decimal import Decimal
 
 import pytest
@@ -169,18 +170,20 @@ async def test_manual_bank_upload_imports_missing(maker, monkeypatch, tmp_path):
 
 
 @pytest.mark.anyio
-async def test_manual_bank_upload_duplicate_does_not_abort_batch(
+async def test_manual_bank_upload_holds_back_same_ref_contention(
     maker, monkeypatch, tmp_path
 ):
-    """Regression: previously the manual bank upload had no SAVEPOINT around
-    its import loop, so one duplicate row aborted the entire upload. Now it
-    uses the same per-row tolerant helper as the email path — the good rows
-    commit and the duplicate is tagged."""
+    """Manual upload applies the same ambiguity guard as every import path.
+
+    Same-reference contenders are never auto-imported, while a clean row still
+    commits. ``test_manual_cc_upload_duplicate_tolerated`` above retains direct
+    simulated ``IntegrityError`` / SAVEPOINT coverage.
+    """
     import financial_dashboard.web.bank_statements as bank_routes
 
     monkeypatch.setattr(bank_routes, "STATEMENTS_DIR", tmp_path)
     acc_id = await h.add_bank_account(maker)
-    # Pre-existing row that a stmt row will collide with by ref.
+    # Pre-existing row that both statement contenders can claim by ref.
     async with maker() as session:
         session.add(
             Transaction(
@@ -198,14 +201,14 @@ async def test_manual_bank_upload_duplicate_does_not_abort_batch(
     parsed = h.bank_parsed(
         account_number="1234567890",
         transactions=[
-            # First stmt row matches the pre-existing by ref.
+            # Both rows can claim the pre-existing row by ref.
             h.bank_txn(
                 date="02/07/2026",
                 amount="500.00",
                 reference_number="MANUALDUP",
                 narration="matched",
             ),
-            # Second reuses the ref → missing → import collides → duplicate.
+            # Statement order cannot choose a safe winner.
             h.bank_txn(
                 date="03/07/2026",
                 amount="500.00",
@@ -236,10 +239,14 @@ async def test_manual_bank_upload_duplicate_does_not_abort_batch(
 
     async with maker() as session:
         upload = (await session.execute(select(BankStatementUpload))).scalars().one()
-        # The clean row imported; the duplicate was skipped, NOT aborted.
+        # The clean row imported; both ambiguous contenders were held back.
         assert upload.imported_count == 1
-        assert "1 duplicate" in (upload.error or "")
-        # Pre-existing + clean import = 2 rows (duplicate not inserted).
+        recon = json.loads(upload.reconciliation_data)
+        ambiguous = [entry for entry in recon["missing"] if entry.get("ambiguous")]
+        assert len(ambiguous) == 2
+        assert all("ambiguous" in entry["import_error"] for entry in ambiguous)
+        assert upload.error is None
+        # Pre-existing + clean import = 2 rows (contenders not inserted).
         txns = (await session.execute(select(Transaction))).scalars().all()
         assert len(txns) == 2
 

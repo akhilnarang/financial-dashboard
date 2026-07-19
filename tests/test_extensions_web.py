@@ -8,6 +8,8 @@ is verified by monkeypatching at the service boundary.
 """
 
 import datetime as dt
+import html
+import re
 from decimal import Decimal
 from urllib.parse import parse_qs, urlsplit
 
@@ -20,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import financial_dashboard.config as config_mod
 import financial_dashboard.services.settings as settings_mod
 from financial_dashboard.db import Base, Setting
-from financial_dashboard.db.models import Account, Transaction
+from financial_dashboard.db.models import Account, ManualItem, Transaction
 from financial_dashboard.integrations.paisa import PaisaClient
 from financial_dashboard.services.extensions import ExtensionManager
 from financial_dashboard.services.paisa import surface
@@ -147,6 +149,86 @@ async def test_paisa_page_renders_config_accounts_preview(client, session):
     # The password field is present but never carries a value (redacted).
     assert 'name="auth_password"' in text
     assert 'value="s3cret"' not in text
+
+
+async def test_paisa_page_prominently_names_incomplete_networth_scope(
+    client, session, monkeypatch
+):
+    await _seed_bank(session, id=1)
+    session.add(
+        ManualItem(
+            id=9,
+            name="Private Property",
+            kind="asset",
+            category="real_estate",
+            active=True,
+        )
+    )
+    await session.commit()
+    monkeypatch.setattr(surface, "load_config", lambda: _config())
+
+    response = await client.get("/extensions/paisa")
+
+    assert response.status_code == 200
+    assert "Net-worth projection scope" in response.text
+    assert "Incomplete — Paisa is not a full native net-worth view." in response.text
+    assert "1 outside projection" in response.text
+    assert "9: Private Property" in response.text
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        (
+            "ledger",
+            'include /tmp/C:\\Users\\Analyst\\new "Q1" <unsafe>&.journal',
+        ),
+        (
+            "hledger",
+            'include /tmp/C:\\Users\\Analyst\\new "Q1" <unsafe>&.journal',
+        ),
+        (
+            "beancount",
+            'include "/tmp/C:\\\\Users\\\\Analyst\\\\new \\"Q1\\" <unsafe>&.journal"',
+        ),
+    ],
+)
+async def test_paisa_setup_include_uses_backend_syntax_and_html_escaping(
+    client, monkeypatch, backend, expected
+):
+    generated_path = '/tmp/C:\\Users\\Analyst\\new "Q1" <unsafe>&.journal'
+    monkeypatch.setattr(
+        surface,
+        "load_config",
+        lambda: _config(
+            mode="disabled", generated_path=generated_path, ledger_cli=backend
+        ),
+    )
+
+    response = await client.get("/extensions/paisa")
+
+    assert response.status_code == 200
+    match = re.search(
+        r'<pre class="journal-pre" id="paisa-include-instruction"[^>]*>(.*?)</pre>',
+        response.text,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    assert html.unescape(match.group(1)) == expected
+    assert "<unsafe>" not in match.group(1)
+
+
+async def test_paisa_setup_include_switches_with_dom_text_only(client):
+    response = await client.get("/extensions/paisa")
+
+    assert response.status_code == 200
+    assert "ledgerCli.value === 'beancount'" in response.text
+    assert "includeLine.textContent = 'include ' + renderedPath" in response.text
+    assert "includeLine.innerHTML" not in response.text
+    assert (
+        "document.getElementById('paisa-ledger-cli').addEventListener('change', "
+        "updateSetupInclude)" in response.text
+    )
 
 
 async def test_paisa_page_shows_selected_accounts_checked(client, session):
@@ -311,6 +393,85 @@ async def test_config_save_mappings_parsed_from_rows(client, session, settings_d
     assert (
         settings_mod._cache.get("paisa.category_mappings")
         == '{"groceries": "Expenses:Food"}'
+    )
+
+
+@pytest.mark.parametrize("backend", ["ledger", "hledger"])
+async def test_web_save_accepts_ledger_family_mapping_spaces(
+    client, settings_db, backend
+):
+    form = {
+        "mode": "connect",
+        "base_url": "http://127.0.0.1:7500",
+        "request_timeout_seconds": "15",
+        "ledger_cli": backend,
+        "account_mapping_key": ["1"],
+        "account_mapping_value": ["Assets:Bank:Savings Account"],
+        "category_mapping_key": ["groceries"],
+        "category_mapping_value": ["Expenses:Food And Dining"],
+    }
+
+    response = await client.post("/extensions/paisa", data=form, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert settings_mod._cache["paisa.ledger_cli"] == backend
+    assert settings_mod._cache["paisa.account_mappings"] == (
+        '{"1": "Assets:Bank:Savings Account"}'
+    )
+
+
+@pytest.mark.parametrize(
+    ("account_name", "error_detail"),
+    [
+        ("Assets:Bank:Savings Account", "must not contain spaces"),
+        ("Asset:Bank:SavingsAccount", "beancount root"),
+    ],
+)
+async def test_web_save_rejects_beancount_invalid_account_mapping(
+    client, settings_db, account_name, error_detail
+):
+    form = {
+        "mode": "connect",
+        "base_url": "http://127.0.0.1:7500",
+        "auth_username": "must-not-save",
+        "request_timeout_seconds": "15",
+        "ledger_cli": "beancount",
+        "account_mapping_key": ["1"],
+        "account_mapping_value": [account_name],
+        "category_mapping_key": ["groceries"],
+        "category_mapping_value": ["Expenses:FoodAndDining"],
+    }
+
+    response = await client.post("/extensions/paisa", data=form, follow_redirects=False)
+
+    assert response.status_code == 422
+    assert "Account Mappings" in response.text
+    assert error_detail in response.text
+    assert "paisa.ledger_cli" not in settings_mod._cache
+    assert "paisa.auth_username" not in settings_mod._cache
+
+
+async def test_web_save_accepts_valid_beancount_operator_mappings(client, settings_db):
+    form = {
+        "mode": "connect",
+        "base_url": "http://127.0.0.1:7500",
+        "request_timeout_seconds": "15",
+        "ledger_cli": "beancount",
+        "account_mapping_key": ["1"],
+        "account_mapping_value": ["Assets:Bank:SavingsAccount"],
+        "category_mapping_key": ["groceries"],
+        "category_mapping_value": ["Expenses:FoodAndDining"],
+    }
+
+    response = await client.post("/extensions/paisa", data=form, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert settings_mod._cache["paisa.ledger_cli"] == "beancount"
+    assert settings_mod._cache["paisa.account_mappings"] == (
+        '{"1": "Assets:Bank:SavingsAccount"}'
+    )
+    assert settings_mod._cache["paisa.category_mappings"] == (
+        '{"groceries": "Expenses:FoodAndDining"}'
     )
 
 

@@ -300,11 +300,216 @@ async def test_reconciliation_mapping_suggestions_are_preview_only(
     resp = await build_reconciliation(session, asset_report=None, liability_report=None)
     assert any(s.account_id == 1 for s in resp.suggestions)
     sug = next(s for s in resp.suggestions if s.account_id == 1)
-    assert sug.suggested_mapping  # deterministic default
+    assert sug.suggested_mapping == "Assets:Bank:Hdfc:Savings"
     # And it must NOT have been written as a mapping.
-    assert "1" not in {r.mapped_to for r in resp.accounts if r.mapped_to}
+    assert recon_mod.load_config().account_mappings == {}
     # The build never persists anything.
     assert len((await session.execute(select(Account))).scalars().all()) == 1
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        ("ledger", "Assets:Bank:Hdfc:Savings Account"),
+        ("hledger", "Assets:Bank:Hdfc:Savings Account"),
+        ("beancount", "Assets:Bank:Hdfc:SavingsAccount"),
+    ],
+)
+async def test_reconciliation_resolves_bank_default_without_opening(
+    session, monkeypatch, backend, expected
+):
+    session.add(
+        Account(
+            id=1,
+            bank="hdfc",
+            label="savings_account",
+            type="bank_account",
+        )
+    )
+    await session.flush()
+    await _seed_txn(session, 1)
+    _set_config(
+        monkeypatch,
+        _cfg(selected_account_ids=(1,), ledger_cli=backend, account_mappings={}),
+    )
+
+    resp = await build_reconciliation(session, asset_report=None, liability_report=None)
+
+    row = resp.accounts[0]
+    assert row.mapped_to == expected
+    assert row.opening_available is False
+    assert row.projected_available is True
+    assert row.projected_balance == "-10.00"
+    assert [suggestion.suggested_mapping for suggestion in resp.suggestions] == [
+        expected
+    ]
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        ("ledger", "Liabilities:Card:Hdfc:Rewards Card"),
+        ("hledger", "Liabilities:Card:Hdfc:Rewards Card"),
+        ("beancount", "Liabilities:Card:Hdfc:RewardsCard"),
+    ],
+)
+async def test_reconciliation_resolves_liability_default_without_opening(
+    session, monkeypatch, backend, expected
+):
+    session.add(
+        Account(
+            id=2,
+            bank="hdfc",
+            label="rewards_card",
+            type="credit_card",
+        )
+    )
+    await session.flush()
+    session.add(
+        Transaction(
+            account_id=2,
+            bank="hdfc",
+            email_type="cc_debit_purchase",
+            direction="debit",
+            amount=Decimal("25.00"),
+            transaction_date=dt.date(2026, 2, 1),
+            category="groceries",
+            counterparty="Store",
+        )
+    )
+    await session.flush()
+    _set_config(
+        monkeypatch,
+        _cfg(selected_account_ids=(2,), ledger_cli=backend, account_mappings={}),
+    )
+
+    resp = await build_reconciliation(session, asset_report=None, liability_report=None)
+
+    row = resp.accounts[0]
+    assert row.mapped_to == expected
+    assert row.opening_available is False
+    assert row.projected_available is True
+    assert row.projected_balance == "25.00"
+    assert [suggestion.suggested_mapping for suggestion in resp.suggestions] == [
+        expected
+    ]
+
+
+@pytest.mark.parametrize(
+    ("backend", "expected"),
+    [
+        ("ledger", "Assets:Bank:Hdfc Bank:Salary Plus Cash Account"),
+        ("hledger", "Assets:Bank:Hdfc Bank:Salary Plus Cash Account"),
+        ("beancount", "Assets:Bank:HdfcBank:SalaryPlusCashAccount"),
+    ],
+)
+async def test_reconciliation_suggestion_sanitizes_invalid_label_characters(
+    session, monkeypatch, backend, expected
+):
+    session.add(
+        Account(
+            id=1,
+            bank="hdfc;:{bank}",
+            label="salary_plus;\n{cash}:account",
+            type="bank_account",
+        )
+    )
+    await session.flush()
+    _set_config(
+        monkeypatch,
+        _cfg(selected_account_ids=(1,), ledger_cli=backend, account_mappings={}),
+    )
+
+    resp = await build_reconciliation(session, asset_report=None, liability_report=None)
+
+    assert resp.accounts[0].mapped_to == expected
+    assert resp.suggestions[0].suggested_mapping == expected
+    assert all(char not in expected for char in ";\n{}")
+
+
+async def test_reconciliation_explicit_mapping_wins_and_only_unmapped_is_suggested(
+    session, monkeypatch
+):
+    await _seed_bank(session, id=1)
+    await _seed_card(session, id=2)
+    explicit = "Assets:Operator:Selected"
+    _set_config(
+        monkeypatch,
+        _cfg(
+            selected_account_ids=(2, 1),
+            account_mappings={"1": explicit},
+            ledger_cli="beancount",
+        ),
+    )
+
+    resp = await build_reconciliation(session, asset_report=None, liability_report=None)
+
+    assert [(row.account_id, row.mapped_to) for row in resp.accounts] == [
+        (1, explicit),
+        (2, "Liabilities:Card:Hdfc:Card"),
+    ]
+    assert [suggestion.account_id for suggestion in resp.suggestions] == [2]
+    assert resp.suggestions[0].suggested_mapping == "Liabilities:Card:Hdfc:Card"
+
+
+async def test_reconciliation_explicit_parent_mapping_rolls_up_direct_children_only(
+    session, monkeypatch
+):
+    await _seed_bank(session)
+    await _seed_txn(session, 1)
+    parent = "Assets:Bank:Hdfc"
+    _set_config(
+        monkeypatch,
+        _cfg(selected_account_ids=(1,), account_mappings={"1": parent}),
+    )
+
+    resp = await build_reconciliation(
+        session,
+        asset_report=_assets(
+            (f"{parent}:Checking", "30.00"),
+            (f"{parent}:Savings", "70.00"),
+            (f"{parent}:Savings:Reserve", "900.00"),
+            ("Assets:Bank:Hdfcx:Savings", "800.00"),
+        ),
+        liability_report=_liabs(),
+        upstream_available=True,
+    )
+
+    row = resp.accounts[0]
+    assert row.mapped_to == parent
+    assert row.paisa_available is True
+    assert row.paisa_balance == "100.00"
+    assert row.delta == "-110.00"
+    assert resp.suggestions == []
+
+
+async def test_reconciliation_account_resolution_output_is_deterministic(
+    session, monkeypatch
+):
+    await _seed_bank(session, id=1)
+    await _seed_card(session, id=2)
+    _set_config(
+        monkeypatch,
+        _cfg(
+            selected_account_ids=(2, 1),
+            account_mappings={},
+            ledger_cli="beancount",
+        ),
+    )
+
+    first = await build_reconciliation(
+        session, asset_report=None, liability_report=None
+    )
+    second = await build_reconciliation(
+        session, asset_report=None, liability_report=None
+    )
+
+    assert first.model_dump() == second.model_dump()
+    assert [suggestion.account_id for suggestion in first.suggestions] == [1, 2]
+    assert [suggestion.suggested_mapping for suggestion in first.suggestions] == [
+        "Assets:Bank:Hdfc:Savings",
+        "Liabilities:Card:Hdfc:Card",
+    ]
 
 
 async def test_reconciliation_disabled_mode_labels_reason(session, monkeypatch):
@@ -360,24 +565,59 @@ def _fake_report(*entries):
     )
 
 
-def test_balance_by_posting_account_flags_foreign_commodity():
+def test_balance_by_posting_account_foreign_only_contributes_zero_inr():
+    totals = _balance_by_posting_account(
+        _fake_report([("Assets:Bank:Fx", "-7", "USD")])
+    )
+
+    fx = totals["Assets:Bank:Fx"]
+    assert fx.amount == Decimal("0")
+    assert fx.has_foreign_commodity is True
+    assert fx.foreign_posting_counts == (("USD", 1),)
+
+
+def test_balance_by_posting_account_multiple_foreign_is_order_independent():
+    account = "Assets:Bank:Fx"
+    forward = _balance_by_posting_account(
+        _fake_report(
+            [(account, "-7", "USD")],
+            [(account, "-5", "EUR")],
+            [(account, "-3", "USD")],
+        )
+    )[account]
+    reverse = _balance_by_posting_account(
+        _fake_report(
+            [(account, "-3", "USD")],
+            [(account, "-5", "EUR")],
+            [(account, "-7", "USD")],
+        )
+    )[account]
+
+    assert forward == reverse
+    assert forward.amount == Decimal("0")
+    assert forward.foreign_posting_counts == (("EUR", 1), ("USD", 2))
+
+
+def test_balance_by_posting_account_mixed_uses_inr_and_blank_as_inr():
     report = _fake_report(
         [("Assets:Bank:Inr", "-10", "INR")],
-        [("Assets:Bank:Mix", "-10", "INR"), ("Assets:Bank:Mix", "-5", "USD")],
-        [("Assets:Bank:Fx", "-7", "USD")],
+        [
+            ("Assets:Bank:Mix", "-10", "INR"),
+            ("Assets:Bank:Mix", "2", None),
+            ("Assets:Bank:Mix", "3", ""),
+            ("Assets:Bank:Mix", "-5", "USD"),
+        ],
     )
     totals = _balance_by_posting_account(report)
     inr = totals["Assets:Bank:Inr"]
     assert inr.amount == Decimal("-10")
     assert inr.has_foreign_commodity is False
-    # Mixed account: only the INR leg is surfaced, but the foreign flag is set.
+    assert inr.foreign_posting_counts == ()
+    # Mixed account: INR + legacy blank commodities only; USD is excluded.
     mix = totals["Assets:Bank:Mix"]
-    assert mix.amount == Decimal("-10")
+    assert mix.amount == Decimal("-5")
     assert mix.has_foreign_commodity is True
-    # Foreign-only account: no INR column → the foreign total is shown.
-    fx = totals["Assets:Bank:Fx"]
-    assert fx.amount == Decimal("-7")
-    assert fx.has_foreign_commodity is True
+    assert mix.foreign_posting_counts == (("USD", 1),)
 
 
 async def test_reconciliation_notes_foreign_commodity_excluded(session, monkeypatch):
@@ -427,9 +667,212 @@ async def test_reconciliation_notes_foreign_commodity_excluded(session, monkeypa
     assert row.projected_available is True
     # INR leg only (opening 1000 − INR spend 10); the USD leg is excluded.
     assert row.projected_balance == "990.00"
-    assert row.note is not None
-    assert "foreign-commodity" in row.note.lower()
-    assert "no FX conversion" in row.note
+    assert row.note == (
+        "projected balance shown in INR only; foreign-commodity postings "
+        "excluded: USD=1; no FX conversion performed"
+    )
+
+
+async def test_reconciliation_usd_only_leaves_inr_opening_and_delta_unchanged(
+    session, monkeypatch
+):
+    await _seed_bank(session)
+    session.add(
+        BalanceSnapshot(
+            account_id=1,
+            kind="asset",
+            category="bank_balance",
+            as_of_date=dt.date(2025, 12, 31),
+            value=Decimal("1000.00"),
+            source="statement",
+            currency="INR",
+        )
+    )
+    await session.flush()
+    session.add(
+        Transaction(
+            account_id=1,
+            bank="hdfc",
+            email_type="test_account_transaction",
+            direction="debit",
+            amount=Decimal("10.00"),
+            currency="USD",
+            transaction_date=dt.date(2026, 2, 1),
+            category="groceries",
+            counterparty="Store",
+        )
+    )
+    await session.flush()
+    mapped_to = "Assets:Bank:Hdfc:Savings"
+    _set_config(
+        monkeypatch,
+        _cfg(
+            selected_account_ids=(1,),
+            account_mappings={"1": mapped_to},
+            non_inr_policy="priced",
+            fx_rates={"USD": (FxRate(CUTOVER, Decimal("83.0000")),)},
+        ),
+    )
+
+    resp = await build_reconciliation(
+        session,
+        asset_report=_assets((mapped_to, "1000.00")),
+        liability_report=_liabs(),
+        upstream_available=True,
+    )
+    row = next(r for r in resp.accounts if r.account_id == 1)
+    assert row.projected_balance == "1000.00"
+    assert row.delta == "0.00"
+
+
+@pytest.mark.parametrize(
+    "currencies",
+    [("USD", "EUR", "USD"), ("USD", "USD", "EUR")],
+)
+async def test_reconciliation_foreign_note_is_sorted_and_order_independent(
+    session, monkeypatch, currencies
+):
+    await _seed_bank(session)
+    session.add(
+        BalanceSnapshot(
+            account_id=1,
+            kind="asset",
+            category="bank_balance",
+            as_of_date=dt.date(2025, 12, 31),
+            value=Decimal("1000.00"),
+            source="statement",
+            currency="INR",
+        )
+    )
+    await session.flush()
+    for day, currency in enumerate(currencies, start=1):
+        session.add(
+            Transaction(
+                account_id=1,
+                bank="hdfc",
+                email_type="test_account_transaction",
+                direction="debit",
+                amount=Decimal("10.00"),
+                currency=currency,
+                transaction_date=dt.date(2026, 2, day),
+                category="groceries",
+                counterparty="Store",
+            )
+        )
+    await session.flush()
+    _set_config(
+        monkeypatch,
+        _cfg(
+            selected_account_ids=(1,),
+            account_mappings={"1": "Assets:Bank:Hdfc:Savings"},
+            non_inr_policy="priced",
+            fx_rates={
+                "EUR": (FxRate(CUTOVER, Decimal("90.0000")),),
+                "USD": (FxRate(CUTOVER, Decimal("83.0000")),),
+            },
+        ),
+    )
+
+    resp = await build_reconciliation(session, asset_report=None, liability_report=None)
+    row = next(r for r in resp.accounts if r.account_id == 1)
+    assert row.projected_balance == "1000.00"
+    assert row.note == (
+        "projected balance shown in INR only; foreign-commodity postings "
+        "excluded: EUR=1, USD=2; no FX conversion performed"
+    )
+
+
+async def test_reconciliation_foreign_only_liability_preserves_sign(
+    session, monkeypatch
+):
+    await _seed_card(session)
+    session.add(
+        BalanceSnapshot(
+            account_id=2,
+            kind="liability",
+            category="credit_card_balance",
+            as_of_date=dt.date(2025, 12, 31),
+            value=Decimal("1000.00"),
+            source="statement",
+            currency="INR",
+        )
+    )
+    await session.flush()
+    session.add(
+        Transaction(
+            account_id=2,
+            bank="hdfc",
+            email_type="cc_debit_purchase",
+            direction="debit",
+            amount=Decimal("10.00"),
+            currency="USD",
+            transaction_date=dt.date(2026, 2, 1),
+            category="groceries",
+            counterparty="Store",
+        )
+    )
+    await session.flush()
+    mapped_to = "Liabilities:Card:Hdfc:Card"
+    _set_config(
+        monkeypatch,
+        _cfg(
+            selected_account_ids=(2,),
+            account_mappings={"2": mapped_to},
+            non_inr_policy="priced",
+            fx_rates={"USD": (FxRate(CUTOVER, Decimal("83.0000")),)},
+        ),
+    )
+
+    resp = await build_reconciliation(
+        session,
+        asset_report=_assets(),
+        liability_report=_liabs((mapped_to, "1000.00")),
+        upstream_available=True,
+    )
+    row = next(r for r in resp.accounts if r.account_id == 2)
+    assert row.projected_balance == "1000.00"
+    assert row.delta == "0.00"
+    assert "excluded: USD=1; no FX conversion performed" in (row.note or "")
+
+
+async def test_reconciliation_foreign_only_without_opening_starts_at_zero(
+    session, monkeypatch
+):
+    await _seed_bank(session)
+    session.add(
+        Transaction(
+            account_id=1,
+            bank="hdfc",
+            email_type="test_account_transaction",
+            direction="debit",
+            amount=Decimal("10.00"),
+            currency="USD",
+            transaction_date=dt.date(2026, 2, 1),
+            category="groceries",
+            counterparty="Store",
+        )
+    )
+    await session.flush()
+    _set_config(
+        monkeypatch,
+        _cfg(
+            selected_account_ids=(1,),
+            account_mappings={"1": "Assets:Bank:Hdfc:Savings"},
+            non_inr_policy="priced",
+            fx_rates={"USD": (FxRate(CUTOVER, Decimal("83.0000")),)},
+        ),
+    )
+
+    resp = await build_reconciliation(session, asset_report=None, liability_report=None)
+    row = next(r for r in resp.accounts if r.account_id == 1)
+    assert row.opening_available is False
+    assert row.projected_balance == "0.00"
+    assert row.note == (
+        "no reliable pre-cutover snapshot or running balance; projected balance "
+        "starts from zero (opening not invented); projected balance shown in INR "
+        "only; foreign-commodity postings excluded: USD=1; no FX conversion "
+        "performed"
+    )
 
 
 async def test_reconciliation_no_foreign_note_for_inr_only(session, monkeypatch):
@@ -522,6 +965,21 @@ async def test_fx_rejects_bad_date(session):
     )
     assert result.ok is False
     assert any("FX Rates" in e for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    "rate",
+    ["NaN", "sNaN", "Infinity", "-Infinity", "1e999999", "1e-999999"],
+)
+async def test_fx_rejects_non_finite_and_extreme_rate_as_validation_error(
+    session, rate
+):
+    result = await surface.save_config(
+        session,
+        _input(fx_rates=[PaisaFxRateRow(currency="USD", date="2026-01-01", rate=rate)]),
+    )
+    assert result.ok is False
+    assert any("FX Rates" in error for error in result.errors)
 
 
 async def test_fx_drops_empty_rows(session, settings_db):

@@ -363,11 +363,13 @@ class InvestmentLot(Base):
     never fabricated into a lot here. Acquisition dates and cost basis are
     never derived from a current market value.
 
-    Re-ingestion of the same CAS period deletes the prior upload (and its
-    lots) first, so the ``(cas_upload_id, source_ref, instrument_id,
-    acquired_on, reference)`` natural key only needs to deduplicate within a
-    single upload; the application-level ingest also dedupes in memory because
-    SQLite treats multiple NULLs as distinct in a UNIQUE constraint.
+    Re-ingestion of the same CAS period deletes the prior upload (and its lots)
+    first. ``source_occurrence`` preserves source multiplicity when two
+    otherwise identical acquisition facts occur in one statement; the unique
+    key prevents retrying normalization from inserting that occurrence twice.
+    Cross-upload overlap is intentionally retained here as source provenance
+    and canonicalized by :mod:`financial_dashboard.services.investments` at
+    read time.
     """
 
     __tablename__ = "investment_lots"
@@ -386,6 +388,9 @@ class InvestmentLot(Base):
     source_ref: Mapped[str] = mapped_column(String, nullable=False)
     transaction_type: Mapped[str | None] = mapped_column(String, nullable=True)
     reference: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_occurrence: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, default=utc_now)
 
     __table_args__ = (
@@ -395,6 +400,7 @@ class InvestmentLot(Base):
             "instrument_id",
             "acquired_on",
             "reference",
+            "source_occurrence",
             name="uq_investment_lot_natural",
         ),
         Index("ix_investment_lots_upload", "cas_upload_id"),

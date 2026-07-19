@@ -228,11 +228,10 @@ async def test_retry_bank_scoped_date_range(maker, monkeypatch, tmp_path):
 
 
 @pytest.mark.anyio
-async def test_retry_bank_duplicate_tolerated(
+async def test_retry_bank_holds_back_same_ref_contention(
     maker, statements_dir, monkeypatch, tmp_path
 ):
-    """Retry import must be SAVEPOINT-tolerant — one duplicate row must not
-    abort the retry's whole import batch."""
+    """Retry holds back same-reference contenders but imports a clean row."""
     import financial_dashboard.services.statements.bank as bank_module
     from financial_dashboard.services.statements import shared as shared_module
 
@@ -241,8 +240,7 @@ async def test_retry_bank_duplicate_tolerated(
     pdf.write_bytes(b"%PDF fake")
     upload_id = await _seed_bank_upload(maker, acc_id, file_path=str(pdf))
 
-    # Pre-existing row on the account that the statement will also carry —
-    # but via a second same-ref stmt row so reconcile leaves one missing.
+    # Pre-existing row on the account that both statement rows can claim.
     async with maker() as session:
         session.add(
             Transaction(
@@ -288,7 +286,11 @@ async def test_retry_bank_duplicate_tolerated(
     async with maker() as session:
         upload = await session.get(BankStatementUpload, upload_id)
         assert upload.imported_count == 1
-        assert "1 duplicate" in (upload.error or "")
+        recon = json.loads(upload.reconciliation_data)
+        ambiguous = [entry for entry in recon["missing"] if entry.get("ambiguous")]
+        assert len(ambiguous) == 2
+        assert all("ambiguous" in entry["import_error"] for entry in ambiguous)
+        assert upload.error is None
         txns = (await session.execute(select(Transaction))).scalars().all()
-        # Pre-existing + matched (same row) + the good import = 2 rows total.
+        # Pre-existing + the good import = 2 rows; contenders were held back.
         assert len(txns) == 2

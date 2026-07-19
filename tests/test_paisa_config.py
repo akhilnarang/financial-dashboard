@@ -86,6 +86,15 @@ def test_parse_accepts_numeric_rate_values():
     assert fx["USD"][0].rate == Decimal("83.0000")
 
 
+@pytest.mark.parametrize(
+    "rate",
+    ["NaN", "sNaN", "Infinity", "-Infinity", "1e999999", "1e-999999"],
+)
+def test_parse_drops_non_finite_and_extreme_rates(rate):
+    fx = _parse_fx_rates({"USD": [{"date": "2026-01-01", "rate": rate}]})
+    assert fx == {}
+
+
 def test_parse_empty_and_garbage_return_empty():
     assert _parse_fx_rates({}) == {}
     assert _parse_fx_rates("nope") == {}  # type: ignore[arg-type]

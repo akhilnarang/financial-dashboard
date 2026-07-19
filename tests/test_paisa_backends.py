@@ -48,6 +48,7 @@ from financial_dashboard.services.paisa.renderers.base import (
     ProjectedEntry,
     UnbalancedEntry,
     commodity_token,
+    sanitize_text,
 )
 
 pytestmark = pytest.mark.anyio
@@ -309,6 +310,42 @@ def test_beancount_quotes_and_escapes_payee_and_note():
     # Payee and note are double-quoted; embedded quotes are escaped.
     assert '"Acme \\"Quoted\\" Co"' in txn
     assert '"a \\"note\\" with quotes"' in txn
+
+
+def test_beancount_string_values_round_trip_backslashes_quotes_and_controls():
+    """Every data-derived quoted field preserves identity through Beancount.
+
+    Payee/narration controls are sanitized before quoting; literal backslashes
+    (including Windows-like paths) and quotes then survive ``load_string``
+    exactly. Metadata uses the same quoting path rather than interpolating a
+    value directly into a string literal.
+    """
+    from beancount import loader
+    from beancount.core.data import Transaction
+
+    raw_payee = 'Acme\\Branch "Desk"\nSecond\tFloor\rNorth'
+    raw_note = 'Receipt C:\\new\\forms\\invoice "final".pdf\nverified\tcopy'
+    raw_meta = 'C:\\Users\\Analyst\\reports\\Q1 "final".bean'
+    entry = ProjectedEntry(
+        date=datetime.date(2026, 2, 1),
+        payee=raw_payee,
+        txn_ids=(42,),
+        postings=(
+            LedgerPosting(EXPENSE, Decimal("10.00")),
+            LedgerPosting(BANK, Decimal("-10.00")),
+        ),
+        note=raw_note,
+        meta=(("dashboard_reference", raw_meta),),
+    )
+
+    journal = render_document(_doc(entries=[entry]), "beancount")
+    entries, errors, _options = loader.load_string(journal)
+
+    assert errors == [], errors
+    transaction = next(item for item in entries if isinstance(item, Transaction))
+    assert transaction.payee == sanitize_text(raw_payee)
+    assert transaction.narration == sanitize_text(raw_note)
+    assert transaction.meta["dashboard_reference"] == raw_meta
 
 
 def test_beancount_rejects_space_in_account_override():

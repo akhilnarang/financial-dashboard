@@ -15,6 +15,7 @@ counterparty enrichment; notifications threshold branch without network.
 """
 
 import datetime
+import json
 from decimal import Decimal
 
 import pytest
@@ -1057,10 +1058,15 @@ async def test_bank_non_password_parse_error_raises(maker, statements_dir, monke
 
 
 @pytest.mark.anyio
-async def test_bank_duplicate_ref_tolerated(maker, statements_dir, monkeypatch):
-    """A second statement row sharing a ref already consumed by the first
-    reconciles to *missing* and then hits the global ``uq_transactions_ref``
-    index on import — it must be tagged duplicate, not abort the batch."""
+async def test_bank_same_ref_contention_is_held_back(
+    maker, statements_dir, monkeypatch
+):
+    """Two statement rows reaching the same DB reference are ambiguous.
+
+    Neither contender may be auto-imported; an unrelated clean row still
+    imports. The different-account collision test below retains the real
+    ``IntegrityError`` / SAVEPOINT coverage.
+    """
     import financial_dashboard.services.statements.bank as bank_module
 
     acc_id = await h.add_bank_account(maker)
@@ -1080,16 +1086,14 @@ async def test_bank_duplicate_ref_tolerated(maker, statements_dir, monkeypatch):
 
     parsed = h.bank_parsed(
         transactions=[
-            # First stmt row matches the pre-existing DB row by ref.
+            # Both rows can claim the pre-existing DB row by reference.
             h.bank_txn(
                 date="02/07/2026",
                 amount="500.00",
                 reference_number="DUPREF",
                 narration="first",
             ),
-            # Second stmt row reuses the same ref → no unconsumed candidate,
-            # falls to missing, then import collides with the global unique
-            # index on (bank, reference_number, direction).
+            # Neither statement-order winner is safe, so both are held back.
             h.bank_txn(
                 date="03/07/2026",
                 amount="700.00",
@@ -1109,16 +1113,21 @@ async def test_bank_duplicate_ref_tolerated(maker, statements_dir, monkeypatch):
     )
     raw = h.email_with_pdf(subject="Account statement")
     result = await process_bank_statement_email("hdfc", raw, "Account statement")
-    assert result["matched"] == 1
+    assert result["matched"] == 0
     assert result["imported"] == 1
-    assert result["duplicates"] == 1
+    assert result["duplicates"] == 0
 
     async with maker() as session:
-        # Pre-existing + the one new import = 2 (the duplicate was NOT inserted).
+        # Pre-existing + the unrelated clean import = 2; neither contender
+        # was inserted.
         txns = (await session.execute(select(Transaction))).scalars().all()
         assert len(txns) == 2
         upload = (await session.execute(select(BankStatementUpload))).scalars().one()
-        assert "1 duplicate" in (upload.error or "")
+        recon = json.loads(upload.reconciliation_data)
+        ambiguous = [entry for entry in recon["missing"] if entry.get("ambiguous")]
+        assert len(ambiguous) == 2
+        assert all("ambiguous" in entry["import_error"] for entry in ambiguous)
+        assert upload.error is None
 
 
 @pytest.mark.anyio

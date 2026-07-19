@@ -826,7 +826,8 @@ def _assert_sign_and_metadata_contract(
     card_payment = by_id[plan.card_payment_id]
     assert card_payment.meta["dashboard_kind"] == "card_payment"
     assert card_payment.meta["dashboard_card_resolution"] == "resolved"
-    assert card_payment.meta["dashboard_card_ids"] == f"{CARD_ID}|3"
+    assert card_payment.meta["dashboard_card_ids"] == str(CARD_ID)
+    assert card_payment.meta["dashboard_account_ids"] == "1|3"
     assert any(
         account == "Liabilities:CreditCard:ICICI" and amount > 0
         for account, amount, _commodity in card_payment.postings

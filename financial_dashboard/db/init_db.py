@@ -1,8 +1,11 @@
 """Database initialization and inline migrations."""
 
-from sqlalchemy import text
+from sqlalchemy import Table, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import Base
+from financial_dashboard.db.models import Base, InvestmentLot
+
+_INVESTMENT_LOT_BACKFILL_MARKER = "migrations.investment_lots_backfill_v1"
 
 
 #: Core tables whose changes dirty an extension's reconciled projection.
@@ -79,11 +82,96 @@ def _build_extension_sync_state_trigger_ddl() -> list[str]:
     return statements
 
 
+async def _ensure_investment_lot_occurrence(conn) -> None:
+    """Upgrade the interim lot table to occurrence-preserving uniqueness.
+
+    SQLite cannot drop the old table-level UNIQUE constraint, so an existing
+    pre-occurrence table is rebuilt through SQLAlchemy's current table metadata.
+    No table references ``investment_lots``; its CAS foreign key and rows are
+    copied unchanged with occurrence zero.
+    """
+    try:
+        await conn.execute(
+            text("SELECT source_occurrence FROM investment_lots LIMIT 0")
+        )
+        return
+    except Exception:
+        pass
+
+    if conn.dialect.name != "sqlite":
+        await conn.execute(
+            text(
+                "ALTER TABLE investment_lots ADD COLUMN "
+                "source_occurrence INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+        return
+
+    await conn.execute(
+        text("ALTER TABLE investment_lots RENAME TO investment_lots_legacy_occurrence")
+    )
+    await conn.execute(text("DROP INDEX IF EXISTS ix_investment_lots_upload"))
+    await conn.execute(text("DROP INDEX IF EXISTS ix_investment_lots_instrument"))
+    lot_table = InvestmentLot.__table__
+    assert isinstance(lot_table, Table)
+    await conn.run_sync(lambda sync_conn: lot_table.create(sync_conn, checkfirst=False))
+    await conn.execute(
+        text(
+            "INSERT INTO investment_lots "
+            "(id, cas_upload_id, instrument_id, instrument_name, quantity, "
+            " unit_cost, cost_basis, currency, acquired_on, source_ref, "
+            " transaction_type, reference, source_occurrence, created_at) "
+            "SELECT id, cas_upload_id, instrument_id, instrument_name, quantity, "
+            "       unit_cost, cost_basis, currency, acquired_on, source_ref, "
+            "       transaction_type, reference, 0, created_at "
+            "FROM investment_lots_legacy_occurrence"
+        )
+    )
+    await conn.execute(text("DROP TABLE investment_lots_legacy_occurrence"))
+
+
+async def _backfill_legacy_investment_lots(conn) -> None:
+    """Run the one-time, idempotent CAS raw-payload lot backfill."""
+    async with AsyncSession(
+        bind=conn,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
+    ) as session:
+        marker = (
+            await session.execute(
+                text("SELECT 1 FROM settings WHERE key = :key"),
+                {"key": _INVESTMENT_LOT_BACKFILL_MARKER},
+            )
+        ).first()
+        if marker is not None:
+            return
+        from financial_dashboard.services.investments import backfill_investment_lots
+
+        await backfill_investment_lots(session)
+        await session.execute(
+            text("INSERT INTO settings (key, value) VALUES (:key, '1')"),
+            {"key": _INVESTMENT_LOT_BACKFILL_MARKER},
+        )
+        await session.commit()
+
+
 async def init_db(engine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
     async with engine.begin() as conn:
+        # ``settings`` predates its ORM bookkeeping column on deployed
+        # databases.  Upgrade it before any migration marker is read/written:
+        # the CAS-lot backfill below uses a marker in this table, and startup's
+        # later ``load_all_settings()`` selects the complete Setting model.
+        # Keeping this inline/column-probe style matches the rest of this file
+        # and makes repeated boots idempotent.
+        try:
+            await conn.execute(text("SELECT updated_at FROM settings LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE settings ADD COLUMN updated_at DATETIME")
+            )
         try:
             await conn.execute(text("SELECT note FROM transactions LIMIT 0"))
         except Exception:
@@ -508,7 +596,19 @@ async def init_db(engine) -> None:
         # per-asset-class aggregated rows; the columns are added so a future
         # instrument-level holding can record them. The new investment_lots
         # table is created by ``create_all`` (it only creates missing tables),
-        # so it needs no ALTER here.
+        # then upgraded/backfilled below before dirty triggers are installed.
+        # A prior boot may already have installed the lot triggers, so remove
+        # those three inside this same migration transaction. They are recreated
+        # LAST below; the upgrade's own row copies/inserts therefore do not look
+        # like user data changes, while rollback restores the prior trigger set.
+        if conn.dialect.name == "sqlite":
+            for _verb in ("insert", "update", "delete"):
+                await conn.execute(
+                    text(
+                        f"DROP TRIGGER IF EXISTS ext_sync_dirty_investment_lots_{_verb}"
+                    )
+                )
+        await _ensure_investment_lot_occurrence(conn)
         for _col, _type in (
             ("instrument_id", "VARCHAR"),
             ("quantity", "NUMERIC(20,6)"),
@@ -525,6 +625,12 @@ async def init_db(engine) -> None:
                 await conn.execute(
                     text(f"ALTER TABLE snapshot_holdings ADD COLUMN {_col} {_type}")
                 )
+
+        # Existing installations already preserve source-complete CAS payloads
+        # but predate normalized lots. Parse each once through the exact normal
+        # no-fabrication service. The service skips existing fact/occurrence rows
+        # and isolates malformed uploads; the marker makes later boots O(1).
+        await _backfill_legacy_investment_lots(conn)
 
         # --- Extension sync-state: Paisa singleton + dirty-revision triggers ---
         # ``create_all`` builds extension_sync_state on fresh + legacy DBs (it

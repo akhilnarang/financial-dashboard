@@ -32,12 +32,14 @@ cache at all, so disabled guarantees zero upstream calls.
 import asyncio
 import logging
 import time
+from collections.abc import Hashable
 from typing import Any, Awaitable, Callable, NamedTuple
 
 logger = logging.getLogger(__name__)
 
-#: Hard cap on distinct cached report kinds. There are only 5 supported report
-#: kinds today, so this is a generous safety bound against a future leak.
+#: Hard cap on cached report/connection identities. Connection settings are
+#: part of the key, so this bound also prevents repeated config switches from
+#: growing the cache without limit.
 DEFAULT_MAX_ENTRIES = 64
 
 
@@ -65,6 +67,17 @@ class _CachedEntry:
         self.fetched_monotonic = fetched_monotonic
 
 
+class _InFlight:
+    __slots__ = ("task", "retain")
+
+    def __init__(self, task: asyncio.Task[Any], retain: bool) -> None:
+        self.task = task
+        # If any same-key reader has TTL=0, that generation must not leave a
+        # completed entry behind. The task still remains shareable while it is
+        # running.
+        self.retain = retain
+
+
 class PaisaReportCache:
     """Per-application TTL cache with concurrent-request coalescing.
 
@@ -74,65 +87,98 @@ class PaisaReportCache:
     """
 
     def __init__(self, *, max_entries: int = DEFAULT_MAX_ENTRIES) -> None:
-        self._entries: dict[str, _CachedEntry] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._entries: dict[Hashable, _CachedEntry] = {}
+        self._inflight: dict[Hashable, _InFlight] = {}
         self._guard = asyncio.Lock()
         self._max = max(1, max_entries)
         #: Number of upstream fetch calls actually made (test/diagnostics hook).
         self.upstream_calls: int = 0
 
-    async def _get_lock(self, key: str) -> asyncio.Lock:
-        # Locks are created lazily and never removed: there are only as many as
-        # distinct keys, bounded by the report-kind set, so this never leaks.
+    async def _fetch_once(
+        self,
+        key: Hashable,
+        fetch: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Run one upstream fetch and remove its in-flight marker on finish."""
+        self.upstream_calls += 1
+        try:
+            value = await fetch()
+        except BaseException:
+            current_task = asyncio.current_task()
+            async with self._guard:
+                current = self._inflight.get(key)
+                if current is not None and current.task is current_task:
+                    self._inflight.pop(key, None)
+            raise
+
+        current_task = asyncio.current_task()
         async with self._guard:
-            lock = self._locks.get(key)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._locks[key] = lock
-            return lock
+            current = self._inflight.get(key)
+            if current is not None and current.task is current_task:
+                # Publish a completed cacheable value before dropping the
+                # in-flight marker. There is no gap where a later reader could
+                # see neither and start a duplicate fetch.
+                if current.retain:
+                    self._entries[key] = _CachedEntry(value, time.monotonic())
+                    self._evict_if_needed()
+                # Removal happens before the task becomes done, so a later
+                # caller can never reuse a completed TTL=0 result.
+                self._inflight.pop(key, None)
+        return value
 
     async def read(
         self,
-        key: str,
+        key: Hashable,
         ttl_seconds: int,
         fetch: Callable[[], Awaitable[Any]],
     ) -> CacheRead:
         """Return a cached value for ``key`` if fresh, else call ``fetch`` once.
 
-        Concurrent readers of the same ``key`` share one in-flight ``fetch`` via
-        a per-key lock. ``ttl_seconds <= 0`` disables caching (always fetch),
-        but coalescing still applies. ``fetch`` may raise; the exception is not
-        cached and propagates to all waiters of this call.
+        Concurrent readers of the same ``key`` share one in-flight ``fetch``.
+        ``ttl_seconds <= 0`` disables completed-result retention but not that
+        in-flight sharing. ``fetch`` may raise; the exception is not cached and
+        propagates to every waiter that joined that call.
 
         The returned :class:`CacheRead` carries the value plus a ``hit`` flag
         that is ``True`` only when the value was served from a fresh cache
-        entry (no upstream call). ``hit`` is decided under the per-key lock, so
-        it is immune to the cross-key race a shared-counter snapshot would
-        have: a concurrent read of a *different* key cannot flip this caller's
-        ``hit``. Under coalescing, the first reader to acquire the lock fetches
-        (``hit=False``) and the readers waiting behind it observe the freshly
-        stored entry (``hit=True``).
+        entry or joined a cacheable in-flight generation (no additional
+        upstream call). TTL=0 readers always report ``hit=False`` because no
+        completed cache value is retained. The decision is per key and cannot
+        be flipped by a concurrent different-key request.
         """
-        lock = await self._get_lock(key)
-        async with lock:
-            ttl = max(0, int(ttl_seconds))
+        ttl = max(0, int(ttl_seconds))
+        async with self._guard:
             entry = self._entries.get(key)
             now = time.monotonic()
             if ttl > 0 and entry is not None and (now - entry.fetched_monotonic) < ttl:
                 return CacheRead(value=entry.value, hit=True)
-            value = await fetch()
-            self.upstream_calls += 1
-            if ttl > 0:
-                self._entries[key] = _CachedEntry(value, now)
-                self._evict_if_needed()
-            return CacheRead(value=value, hit=False)
+
+            if ttl <= 0:
+                # A runtime switch to TTL=0 must not leave an older completed
+                # entry available if TTL is later re-enabled.
+                self._entries.pop(key, None)
+
+            flight = self._inflight.get(key)
+            joined = flight is not None
+            if flight is None:
+                task = asyncio.create_task(self._fetch_once(key, fetch))
+                flight = _InFlight(task, retain=ttl > 0)
+                self._inflight[key] = flight
+            elif ttl <= 0:
+                flight.retain = False
+
+        # Shield the shared operation from one disconnected/cancelled waiter;
+        # other concurrent readers must still receive the one upstream result.
+        value = await asyncio.shield(flight.task)
+
+        return CacheRead(value=value, hit=joined and ttl > 0 and flight.retain)
 
     def _evict_if_needed(self) -> None:
         # Only invoked when an entry was just added, so the dict is non-empty.
         if len(self._entries) <= self._max:
             return
         # Evict the entry with the oldest fetch time (LRU-ish by freshness).
-        oldest_key: str | None = None
+        oldest_key: Hashable | None = None
         oldest_time = float("inf")
         for k, e in self._entries.items():
             if e.fetched_monotonic < oldest_time:
@@ -141,7 +187,7 @@ class PaisaReportCache:
         if oldest_key is not None:
             self._entries.pop(oldest_key, None)
 
-    def invalidate(self, key: str | None = None) -> None:
+    def invalidate(self, key: Hashable | None = None) -> None:
         """Drop one key, or the whole cache when ``key`` is None."""
         if key is None:
             self._entries.clear()

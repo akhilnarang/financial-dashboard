@@ -327,6 +327,66 @@ async def test_save_rejects_invalid_ledger_name_in_mappings(session):
     assert any("Account Mappings" in e for e in result.errors)
 
 
+@pytest.mark.parametrize(
+    ("backend", "account_name", "category_name"),
+    [
+        ("ledger", "Assets:Bank:Savings Account", "Expenses:Food And Dining"),
+        ("hledger", "Assets:Bank:Savings Account", "Expenses:Food And Dining"),
+        ("beancount", "Assets:Bank:SavingsAccount", "Expenses:FoodAndDining"),
+    ],
+)
+async def test_api_save_accepts_backend_valid_operator_mappings(
+    client, settings_db, backend, account_name, category_name
+):
+    payload = _valid_input(
+        ledger_cli=backend,
+        account_mappings={"1": account_name},
+        category_mappings={"groceries": category_name},
+    ).model_dump()
+
+    response = await client.post("/api/extensions/paisa/config", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["config"]["ledger_cli"] == backend
+    assert body["config"]["account_mappings"] == {"1": account_name}
+    assert body["config"]["category_mappings"] == {"groceries": category_name}
+
+
+async def test_api_beancount_rejects_ledger_valid_mapping_without_partial_save(
+    client, settings_db
+):
+    ledger_mapping = "Assets:Bank:Savings Account"
+    initial = _valid_input(
+        ledger_cli="ledger",
+        auth_username="before",
+        account_mappings={"1": ledger_mapping},
+    ).model_dump()
+    saved = await client.post("/api/extensions/paisa/config", json=initial)
+    assert saved.json()["ok"] is True
+
+    invalid = _valid_input(
+        ledger_cli="beancount",
+        auth_username="must-not-save",
+        account_mappings={"1": ledger_mapping},
+    ).model_dump()
+    response = await client.post("/api/extensions/paisa/config", json=invalid)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert any(
+        "Account Mappings" in error and "must not contain spaces" in error
+        for error in body["errors"]
+    )
+    assert settings_mod._cache["paisa.ledger_cli"] == "ledger"
+    assert settings_mod._cache["paisa.auth_username"] == "before"
+    assert settings_mod._cache["paisa.account_mappings"] == (
+        '{"1": "Assets:Bank:Savings Account"}'
+    )
+
+
 async def test_save_rejects_invalid_external_url_scheme(session):
     result = await surface.save_config(
         session, _valid_input(external_url="javascript:alert(1)")
@@ -756,6 +816,12 @@ async def test_generate_now_serializes_publish(monkeypatch, tmp_path):
         skipped=(),
         cutover_date=CUTOVER,
         account_ids=(),
+        cas_portfolio_count=1,
+        cas_portfolio_labels=("PAN-SCOPE",),
+        cas_investment_scope="excluded",
+        manual_asset_count=1,
+        manual_asset_labels=("9: Private Property",),
+        net_worth_scope_complete=False,
     )
 
     # generate() is the orchestrator's own; its internals (preview, publish)
@@ -780,6 +846,10 @@ async def test_generate_now_serializes_publish(monkeypatch, tmp_path):
     assert out.ok is True
     assert out.publish.skipped is False
     assert out.publish.body_hash == "abc"
+    assert out.summary.cas_portfolio_count == 1
+    assert out.summary.cas_investment_scope == "excluded"
+    assert out.summary.manual_asset_labels == ["9: Private Property"]
+    assert out.summary.net_worth_scope_complete is False
 
 
 async def test_sync_now_serializes_outcome(monkeypatch):

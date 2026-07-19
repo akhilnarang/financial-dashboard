@@ -17,7 +17,7 @@ Operating model (see AGENTS.md for the full rationale):
   event debounce or max latency. Settings changes reset the retry backoff via
   the SQLite trigger.
 * **Single flight / lease**: a reconcile claims the persisted singleton lease
-  atomically (one of N coordinators wins), heartbeats it during a long remote
+  atomically (one of N coordinators wins), heartbeats it throughout the whole
   attempt, and releases it on finish. A 90s TTL + fencing token guard every
   state mutation; a 120s overall timeout bounds one attempt. State transactions
   are short (claim, capture, each completion step) — the projection read
@@ -411,7 +411,12 @@ class PaisaCoordinator:
             # the recovery/test case where an administrator removed the row.
             if snapshot is None:
                 snapshot = await ensure_sync_state(session, now=now)
-            await session.commit()
+                await session.commit()
+            else:
+                # A SELECT-only transaction must never call commit: the global
+                # after_commit listener would wake this coordinator from its
+                # own poll and turn a clean, caught-up row into a tight loop.
+                await session.rollback()
         if snapshot is None:
             return
 
@@ -459,6 +464,9 @@ class PaisaCoordinator:
             return  # another coordinator owns it; back off silently
 
         token = claim.token
+        # The lease protects every potentially slow stage, not only the remote
+        # POST: preflight and projection/publication may also exceed the TTL.
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop(token))
         result = AttemptResult(
             attempted=True,
             status=STATUS_FAILURE,
@@ -469,15 +477,18 @@ class PaisaCoordinator:
             error=None,
             notify_failure=False,
         )
-        # Prior automatic run, for notify dedupe.
-        async with self._session_factory() as session:
-            previous = await last_run(
-                session, extension_id=EXTENSION_PAISA, operation=OPERATION_AUTOMATIC
-            )
-            previous_fp = _notify_fp_from_run(previous)
-            await session.rollback()
-
+        previous_fp: str | None = None
         try:
+            # Prior automatic run, for notify dedupe.
+            async with self._session_factory() as session:
+                previous = await last_run(
+                    session,
+                    extension_id=EXTENSION_PAISA,
+                    operation=OPERATION_AUTOMATIC,
+                )
+                previous_fp = _notify_fp_from_run(previous)
+                await session.rollback()
+
             result = await asyncio.wait_for(
                 self._run_attempt_stages(config, token, force_remote=force_remote),
                 timeout=self._attempt_timeout,
@@ -523,6 +534,14 @@ class PaisaCoordinator:
                 notify_failure=True,
             )
         finally:
+            # Stop renewal before releasing so this attempt can never renew a
+            # lease after its terminal success/error/cancellation cleanup.
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError, Exception:
+                pass
+
             # Always release our lease so a peer can pick up immediately.
             try:
                 async with self._session_factory() as session:
@@ -666,7 +685,7 @@ class PaisaCoordinator:
             # 5. Decide remote: hash-noop (skip) vs POST+diagnosis.
             async with self._session_factory() as session:
                 snap = await read_sync_state(session)
-                await session.commit()
+                await session.rollback()
 
             if snap is None:
                 # The singleton vanished mid-run (admin reset); abandon. The
@@ -701,10 +720,9 @@ class PaisaCoordinator:
                     notify_failure=False,
                 )
 
-            # 6. POST + diagnosis under heartbeat (long attempt safety).
-            remote = await self._post_with_heartbeat(
-                client, generated.report, config, token=token
-            )
+            # 6. POST + diagnosis. The attempt-wide heartbeat started directly
+            #    after the lease claim and remains active through this stage.
+            remote = await self._sync_remote(generated.report, config, client=client)
 
             return await self._record_remote_outcome(
                 token,
@@ -722,33 +740,8 @@ class PaisaCoordinator:
                 except Exception:
                     logger.debug("client close failed", exc_info=True)
 
-    async def _post_with_heartbeat(
-        self,
-        client: PaisaClient,
-        report,
-        config: PaisaProjectionConfig,
-        *,
-        token: str,
-    ) -> RemoteSyncReport:
-        """Run the remote POST+diagnosis while heartbeating the lease.
-
-        A heartbeat task extends the lease every ~20s so a slow generate/POST
-        on a large journal does not lose the lease mid-attempt. The overall
-        attempt timeout (caller) bounds the whole reconcile; this bounds the
-        remote stage to the lease TTL window via heartbeats.
-        """
-        heartbeat_task = asyncio.create_task(self._heartbeat_loop(token))
-        try:
-            return await self._sync_remote(report, config, client=client)
-        finally:
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError, Exception:
-                pass
-
     async def _heartbeat_loop(self, token: str) -> None:
-        """Extend the held lease every heartbeat interval until cancelled."""
+        """Extend the attempt's held lease until outer cleanup cancels it."""
         try:
             while True:
                 await self._sleep(self._heartbeat_interval)

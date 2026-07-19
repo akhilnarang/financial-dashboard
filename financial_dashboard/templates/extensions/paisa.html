@@ -110,12 +110,12 @@
                     </label>
                     <label class="field">
                         Generated Include Path
-                        <input type="text" name="generated_path" value="{{ config.generated_path }}" placeholder="/absolute/path/to/financial-dashboard.journal">
+                        <input type="text" name="generated_path" id="paisa-generated-path" value="{{ config.generated_path }}" placeholder="/absolute/path/to/financial-dashboard.journal">
                     </label>
                 </div>
                 <label class="field" style="flex-direction: row; align-items: center; gap: 0.5rem; font-weight: 500; margin-top: 0.75rem;">
                     <input type="checkbox" name="project_investments" value="true" {% if config.project_investments %}checked{% endif %}>
-                    Project investment lots (project mode only; emits CAS lots as cost-basis openings)
+                    Project CAS investment lots (project mode only; acquisition cost stays on lots and latest explicit CAS NAV is emitted separately as market price)
                 </label>
                 <p class="text-sm text-muted" style="margin: 0.5rem 0 0;">
                     Absolute path to the file this dashboard writes. The parent directory must already exist; it is never created for you.
@@ -261,7 +261,7 @@
             <p class="text-sm" style="margin: 0 0 0.5rem;">
                 Add this single line to your main Paisa journal file once. The dashboard overwrites the generated file on every generate/sync; Paisa picks it up on reload.
             </p>
-            <pre class="journal-pre" style="background: var(--surface-inset); padding: 0.6rem; border-radius: 6px; margin: 0;">include {{ config.generated_path if config.generated_path else '/absolute/path/to/financial-dashboard.journal' }}</pre>
+            <pre class="journal-pre" id="paisa-include-instruction" data-placeholder="/absolute/path/to/financial-dashboard.journal" style="background: var(--surface-inset); padding: 0.6rem; border-radius: 6px; margin: 0;">{{ setup_include_line }}</pre>
         </article>
 
         <article class="card" style="margin-bottom: 1rem;">
@@ -279,6 +279,25 @@
             </div>
         </article>
 
+        {% if preview.ok and preview.summary %}
+        {% set s = preview.summary %}
+        <article class="card" style="margin-bottom: 1rem; border-left: 4px solid {% if s.net_worth_scope_complete %}var(--success){% else %}var(--warning){% endif %};">
+            <h3 style="margin: 0 0 0.5rem; font-size: 1.05rem;">Net-worth projection scope</h3>
+            <p class="text-sm" style="margin: 0 0 0.5rem;">
+                <strong>{% if s.net_worth_scope_complete %}Complete for active non-account sources.{% else %}Incomplete — Paisa is not a full native net-worth view.{% endif %}</strong>
+                The account picker selects only Account rows; CAS and manual sources are listed explicitly below.
+            </p>
+            <dl class="text-sm text-muted" style="margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 0.75rem;">
+                <dt>CAS portfolios</dt>
+                <dd>{{ s.cas_portfolio_count }} · investment scope <strong>{{ s.cas_investment_scope }}</strong>{% if s.cas_portfolio_labels %} · {{ s.cas_portfolio_labels|join(', ') }}{% endif %}</dd>
+                <dt>Manual assets</dt>
+                <dd>{{ s.manual_asset_count }} outside projection{% if s.manual_asset_labels %} · {{ s.manual_asset_labels|join(', ') }}{% endif %}</dd>
+                <dt>Manual liabilities</dt>
+                <dd>{{ s.manual_liability_count }} outside projection{% if s.manual_liability_labels %} · {{ s.manual_liability_labels|join(', ') }}{% endif %}</dd>
+            </dl>
+        </article>
+        {% endif %}
+
         <article class="card">
             <h3 style="margin: 0 0 0.5rem; font-size: 1.05rem;">Preview Diagnostics</h3>
             {% if preview.ok and preview.summary %}
@@ -287,10 +306,10 @@
                 {{ preview.summary.emitted_count }} entr{{ 'y' if preview.summary.emitted_count == 1 else 'ies' }} ·
                 {{ preview.summary.self_transfer_pairs }} self-transfer pair{{ '' if preview.summary.self_transfer_pairs == 1 else 's' }} ·
                 {{ preview.summary.card_payments }} card payment{{ '' if preview.summary.card_payments == 1 else 's' }}
-                {%- if preview.summary.card_payments %} ({{ preview.summary.card_payments_resolved }} resolved · {{ preview.summary.card_payments_unresolved }} unresolved){%- endif %}
+                {%- if preview.summary.card_payments %} ({{ preview.summary.card_payments_resolved }} resolved · {{ preview.summary.card_payments_unresolved }} unresolved{% if preview.summary.card_payments_ambiguous_mask %}, {{ preview.summary.card_payments_ambiguous_mask }} ambiguous exact mask{% endif %}){%- endif %}
             </p>
             {% set s = preview.summary %}
-            {% if s.imprecise_count or s.investment_lot_count or s.investment_funding_remapped or s.investment_funding_unresolved or s.projected_foreign_count or s.missing_fx_rate_count or s.kind_counts %}
+            {% if s.imprecise_count or s.investment_lot_count or s.investment_funding_remapped or s.investment_funding_unresolved or s.investment_current_valuation_count or s.projected_foreign_count or s.missing_fx_rate_count or s.kind_counts %}
             <details style="margin: 0 0 0.5rem;">
                 <summary class="text-sm" style="cursor: pointer;">Computed diagnostics</summary>
                 <dl class="text-sm text-muted" style="margin: 0.5rem 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 0.75rem;">
@@ -298,10 +317,13 @@
                     <dt>Imprecise categories</dt><dd>{{ s.imprecise_count }} (emi_loan/cash_withdrawal posted to a conservative Expenses clearing)</dd>
                     {%- endif %}
                     {%- if s.card_payments %}
-                    <dt>Card payments</dt><dd>{{ s.card_payments_resolved }} resolved · {{ s.card_payments_unresolved }} unresolved (generic clearing)</dd>
+                    <dt>Card payments</dt><dd>{{ s.card_payments_resolved }} resolved · {{ s.card_payments_unresolved }} unresolved (generic clearing){% if s.card_payments_ambiguous_mask %} · {{ s.card_payments_ambiguous_mask }} ambiguous exact mask{% endif %}</dd>
                     {%- endif %}
                     {%- if s.investment_lot_count or s.investment_funding_remapped or s.investment_funding_unresolved %}
                     <dt>Investment lots</dt><dd>{{ s.investment_lot_count }} projected · {{ s.investment_funding_remapped }} bank leg(s) funding-remapped · {{ s.investment_funding_unresolved|length }} lot(s) suppressed as funding-unresolved</dd>
+                    {%- endif %}
+                    {%- if s.investment_current_valuation_count %}
+                    <dt>CAS valuation</dt><dd>{{ s.investment_current_valuation_count }} identity-preserved source position(s) · {{ s.investment_market_price_count }} current market price(s) emitted · {{ s.investment_value_only_count }} value-only/outside surviving lots · {{ s.investment_quantity_mismatch_count }} current-vs-lot quantity mismatch(es) · {{ s.investment_missing_market_price_count }} missing explicit unit price · {{ s.investment_market_price_conflicts|length }} conflicting commodity/date price(s) suppressed{% if s.investment_market_price_conflicts %} ({{ s.investment_market_price_conflicts|join(', ') }}){% endif %}</dd>
                     {%- endif %}
                     {%- if s.projected_foreign_count or s.missing_fx_rate_count %}
                     <dt>Foreign currency</dt><dd>{{ s.projected_foreign_count }} projected entr{{ 'y' if s.projected_foreign_count == 1 else 'ies' }} ({{ s.source_currencies|join(', ') }}) · {{ s.missing_fx_rate_count }} skipped for missing rate</dd>
@@ -373,6 +395,26 @@ document.getElementById('paisa-config-form').addEventListener('submit', function
     btn.textContent = 'Saving…';
     btn.disabled = true;
 });
+
+// Keep the setup instruction in sync with the selected renderer and path.
+// Assign through textContent only: a generated path is text, never markup.
+function quoteBeancountString(value) {
+    return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+}
+
+function updateSetupInclude() {
+    const ledgerCli = document.getElementById('paisa-ledger-cli');
+    const generatedPath = document.getElementById('paisa-generated-path');
+    const includeLine = document.getElementById('paisa-include-instruction');
+    const path = generatedPath.value.trim() || includeLine.dataset.placeholder;
+    const renderedPath = ledgerCli.value === 'beancount'
+        ? quoteBeancountString(path)
+        : path;
+    includeLine.textContent = 'include ' + renderedPath;
+}
+
+document.getElementById('paisa-ledger-cli').addEventListener('change', updateSetupInclude);
+document.getElementById('paisa-generated-path').addEventListener('input', updateSetupInclude);
 
 // Status is fetched client-side so a down/slow Paisa never blocks the render.
 // The badge is built with DOM APIs (createElement/classList/replaceChildren)

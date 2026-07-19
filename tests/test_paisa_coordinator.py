@@ -18,8 +18,8 @@ Coverage (one test per contract bullet):
   calls remote even clean.
 * single flight / lease: two coordinators claim → one winner; crash/expired
   lease recovery; stale fencing token rejected; commit during active sync →
-  follow-up run; heartbeat not asserted here directly but exercised via a slow
-  remote stage.
+  follow-up run; heartbeat spans blocked preflight/generation and is stopped on
+  success, error, or cancellation.
 * backoff: a pre-POST failure arms the deterministic schedule.
 * manual vs automatic never overlap (shared lease).
 * restart with pending state reconciles.
@@ -41,6 +41,9 @@ from financial_dashboard.db.init_db import init_db
 from financial_dashboard.db.models import Transaction
 from financial_dashboard.services.paisa.audit import (
     OPERATION_AUTOMATIC,
+    OPERATION_GENERATE,
+    OPERATION_SYNC,
+    STATUS_FAILURE,
     recent_runs,
 )
 from financial_dashboard.services.paisa.coordinator import (
@@ -179,15 +182,6 @@ class FakeClock:
         self.t += delta
 
 
-def _no_sleep(_seconds: float):
-    """A sleep coroutine that returns immediately (tests never wait)."""
-
-    async def _sleep(_s):
-        return None
-
-    return _sleep(_seconds)
-
-
 async def _preflight_ok(cfg, *, client=None):
     return PreflightReport(
         ok=True,
@@ -263,7 +257,7 @@ def _make_coordinator(
     return PaisaCoordinator(
         session_factory=factory,
         now=clock,
-        sleep=_no_sleep,
+        sleep=asyncio.sleep,
         preflight_fn=preflight_fn or _preflight_ok,
         generate_fn=generate_fn or _default_generate,
         sync_remote_fn=sync_remote_fn or _default_sync_remote,
@@ -622,6 +616,80 @@ async def test_remote_failure_retries_unchanged_file(factory):
     assert snap2.failure_count == 0
 
 
+@pytest.mark.usefixtures("settings_paisa")
+async def test_last_remote_hash_gates_hash_noop_until_remote_acceptance(factory):
+    """Persisted ``last_remote_hash`` (not ``last_published_hash``) gates the
+    hash-noop skip. Regression for the old automation.py skip-unchanged bug
+    where a locally-published include that the remote never accepted could be
+    suppressed on the next attempt.
+
+    Sequence (one constant body hash ``H`` across every generate):
+
+    1. Attempt 1 — preflight OK, generate publishes ``H`` (so
+       ``last_published_hash == H``), POST rejected (``sync_rejected``).
+       ``last_remote_hash`` must stay ``None`` and the row must stay dirty.
+    2. Attempt 2 (past backoff) — preflight OK, generate re-publishes the
+       byte-identical ``H``, POST must NOT be skipped (no hash-noop: the
+       remote never accepted ``H``); this attempt POST is accepted.
+       ``last_remote_hash == H`` only now.
+    3. Attempt 3 (a fresh dirty event, identical bytes ``H``) — now the
+       hash-noop IS allowed to advance ``applied`` without a POST, because
+       that exact hash was remotely accepted.
+    """
+    clock = FakeClock(datetime.datetime(2026, 1, 1, 12, 0, tzinfo=_TZ))
+    await _dirty(factory, clock, n=1)
+    clock.advance(DEFAULT_QUIET_DEBOUNCE + datetime.timedelta(seconds=1))
+
+    body_hash = "the-one-hash"
+    gen = AsyncMock(return_value=_gen_result(body_hash=body_hash))
+    # POST sequence: rejected first, accepted second. The third attempt must
+    # never reach the POST stage (hash-noop), so any third call is a bug.
+    remote_results = [
+        _remote_result(
+            post_accepted=False,
+            diagnosis_ok=None,
+            outcome="sync_rejected",
+            reason="503",
+        ),
+        _remote_result(post_accepted=True, diagnosis_ok=True, outcome="synced"),
+        AssertionError("must NOT POST on hash-noop after remote acceptance"),
+    ]
+    remote = AsyncMock(side_effect=remote_results)
+    c = _make_coordinator(factory, clock, generate_fn=gen, sync_remote_fn=remote)
+
+    # Attempt 1: POST rejected. Remote hash must NOT be recorded; publish hash IS.
+    await c._tick()
+    assert remote.await_count == 1
+    snap = await _snapshot(factory)
+    assert snap.last_published_hash == body_hash  # publish checkpoint recorded
+    assert snap.last_remote_hash is None  # remote never accepted
+    assert snap.desired_revision > snap.applied_revision  # still dirty
+    assert snap.failure_count == 1  # backoff armed
+
+    # Attempt 2 (past the 1-min backoff): retry the SAME body. Hash-noop must
+    # NOT fire because last_remote_hash is still None.
+    clock.advance(datetime.timedelta(minutes=2))
+    await c._tick()
+    assert remote.await_count == 2  # retried identical bytes — no skip
+    snap2 = await _snapshot(factory)
+    assert snap2.last_remote_hash == body_hash  # only NOW remotely accepted
+    assert snap2.applied_revision >= snap2.desired_revision  # caught up
+    assert snap2.failure_count == 0  # backoff cleared
+
+    # Attempt 3: a fresh dirty event with identical bytes. Hash-noop is now
+    # allowed (remote has exactly this hash), so the POST must NOT be called.
+    # Advance past both the 1-min remote floor (the last remote attempt was
+    # attempt 2) and the debounce so the tick is eligible.
+    await _dirty(factory, clock, n=1)
+    clock.advance(datetime.timedelta(minutes=2))
+    await c._tick()
+    assert remote.await_count == 2  # no third POST — hash-noop advanced applied
+    snap3 = await _snapshot(factory)
+    assert snap3.applied_revision >= snap3.desired_revision  # advanced via hash-noop
+    # The remote hash is unchanged (no new acceptance was needed).
+    assert snap3.last_remote_hash == body_hash
+
+
 # --------------------------------------------------------------------------- #
 # Accepted POST + fatal diagnosis → no reload loop
 # --------------------------------------------------------------------------- #
@@ -898,6 +966,66 @@ async def test_manual_lease_wait_returns_busy_when_held(factory):
     assert claim.reason == "busy"
 
 
+@pytest.mark.usefixtures("settings_paisa")
+@pytest.mark.parametrize(
+    ("operation", "audit_operation"),
+    [
+        ("generate", OPERATION_GENERATE),
+        ("sync", OPERATION_SYNC),
+    ],
+)
+async def test_manual_exception_releases_persisted_lease_immediately(
+    factory, monkeypatch, operation, audit_operation
+):
+    """A failed manual call does not strand its committed lease for the TTL.
+
+    ``_audited`` commits the running row before I/O, and the manual claim also
+    commits. The exception cleanup must therefore roll back failed request
+    state and release via a separate committed short transaction. A zero-wait
+    claimant immediately after the exception proves reclaim does not depend on
+    the 90-second expiry. Audit failure finalization must still survive.
+    """
+    from financial_dashboard.services.paisa import surface
+    from financial_dashboard.services.paisa.sync_state import release_lease
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError(f"{operation} exploded")
+
+    if operation == "generate":
+        monkeypatch.setattr(surface, "generate_now", boom)
+        audited_call = surface.generate_now_audited
+    else:
+        monkeypatch.setattr(surface, "sync_now", boom)
+        audited_call = surface.sync_now_audited
+
+    async with factory() as session:
+        with pytest.raises(RuntimeError, match=f"{operation} exploded"):
+            await audited_call(session, trigger="test")
+
+    released = await _snapshot(factory)
+    assert released.lease_token is None
+    assert released.lease_owner is None
+    assert released.lease_expires_at is None
+
+    async with factory() as session:
+        reclaimed = await claim_manual_lease(
+            session, owner="immediate-reclaimer", wait_seconds=0
+        )
+        assert reclaimed.claimed is True
+        assert reclaimed.token is not None
+        await release_lease(session, token=reclaimed.token)
+        await session.commit()
+
+    async with factory() as session:
+        rows = await recent_runs(
+            session, extension_id="paisa", operation=audit_operation
+        )
+    assert rows[0].status == STATUS_FAILURE
+    assert rows[0].outcome == "error"
+    assert rows[0].completed_at is not None
+    assert f"{operation} exploded" in (rows[0].error or "")
+
+
 # --------------------------------------------------------------------------- #
 # Audit + notification (dedupe, truthful notify_sent)
 # --------------------------------------------------------------------------- #
@@ -1023,6 +1151,67 @@ async def test_no_audit_spam_for_noop_ticks(factory):
     assert await _autowrite_count(factory) == 0
 
 
+@pytest.mark.usefixtures("settings_paisa")
+async def test_clean_runtime_polls_without_self_wake_or_writes(factory, monkeypatch):
+    """A caught-up runtime tick rolls its SELECT back instead of committing it.
+
+    The global ``after_commit`` hook wakes every running coordinator. If the
+    eligibility read commits, the worker wakes itself after every clean tick
+    and spins without honoring the poll interval. Exercise the real background
+    loop and wake registry: two ticks must be separated by a real poll sleep,
+    with no singleton mutation, seed, projection, or audit write.
+    """
+    clock = FakeClock(datetime.datetime(2026, 1, 1, 12, 0, tzinfo=_TZ))
+    before = await _snapshot(factory)
+    generated = AsyncMock(side_effect=AssertionError("caught-up row must stay idle"))
+    ensure = AsyncMock(wraps=coord_mod.ensure_sync_state)
+    monkeypatch.setattr(coord_mod, "ensure_sync_state", ensure)
+
+    coordinator = PaisaCoordinator(
+        session_factory=factory,
+        now=clock,
+        sleep=asyncio.sleep,
+        preflight_fn=_preflight_ok,
+        generate_fn=generated,
+        sync_remote_fn=_default_sync_remote,
+        min_interval_minutes_fn=lambda: 1,
+        client_factory=lambda cfg: _FakeClient(),
+        poll_interval=0.05,
+    )
+    original_tick = coordinator._tick
+    tick_times: list[float] = []
+    first_tick = asyncio.Event()
+    second_tick = asyncio.Event()
+    third_tick = asyncio.Event()
+
+    async def counted_tick():
+        tick_times.append(asyncio.get_running_loop().time())
+        await original_tick()
+        first_tick.set()
+        if len(tick_times) >= 2:
+            second_tick.set()
+        if len(tick_times) >= 3:
+            third_tick.set()
+
+    monkeypatch.setattr(coordinator, "_tick", counted_tick)
+    await coordinator.start()
+    try:
+        await asyncio.wait_for(first_tick.wait(), timeout=1)
+        await asyncio.wait_for(second_tick.wait(), timeout=1)
+        await asyncio.wait_for(third_tick.wait(), timeout=1)
+        assert all(
+            later - earlier >= 0.04
+            for earlier, later in zip(tick_times[:2], tick_times[1:3], strict=True)
+        )
+    finally:
+        await coordinator.stop()
+
+    ensure.assert_not_awaited()
+    generated.assert_not_called()
+    assert await _snapshot(factory) == before
+    assert await _autowrite_count(factory) == 0
+
+
 # --------------------------------------------------------------------------- #
 # Commit wake integration (real loop, tiny poll)
 # --------------------------------------------------------------------------- #
@@ -1048,7 +1237,7 @@ async def test_commit_wakes_idle_coordinator(factory, monkeypatch):
     c = PaisaCoordinator(
         session_factory=factory,
         now=clock,
-        sleep=_no_sleep,
+        sleep=asyncio.sleep,
         generate_fn=gen,
         sync_remote_fn=remote,
         preflight_fn=_preflight_ok,
@@ -1086,17 +1275,32 @@ async def test_no_trigger_io_before_commit(factory):
 
 
 @pytest.mark.usefixtures("settings_paisa")
-async def test_real_commit_fires_wake_through_listener(factory):
+async def test_real_commit_fires_wake_through_listener(factory, monkeypatch):
     """A committed change on any session fires the global after_commit listener,
     which signals the coordinator's registered wake event (the commit-driven
     fast path). Verifies the wakeup registry ↔ coordinator wiring end to end."""
     clock = FakeClock(datetime.datetime(2026, 1, 1, 12, 0, tzinfo=_TZ))
     c = _make_coordinator(factory, clock)
+    c._poll_interval = 10
+    original_tick = c._tick
+    tick_count = 0
+    initial_tick = asyncio.Event()
+    commit_tick = asyncio.Event()
+
+    async def counted_tick():
+        nonlocal tick_count
+        tick_count += 1
+        await original_tick()
+        initial_tick.set()
+        if tick_count >= 2:
+            commit_tick.set()
+
+    monkeypatch.setattr(c, "_tick", counted_tick)
     await c.start()
     try:
-        # The coordinator is now in its poll wait with its wake signal
-        # registered. A real commit on the factory fires the listener → signal.
-        c._event.clear()
+        # Wait for the initial tick to finish, leaving the coordinator in its
+        # ten-second poll wait with the wake signal registered.
+        await asyncio.wait_for(initial_tick.wait(), timeout=1)
         async with factory() as s:
             s.add(
                 Transaction(
@@ -1108,12 +1312,10 @@ async def test_real_commit_fires_wake_through_listener(factory):
                 )
             )
             await s.commit()
-        # call_soon_threadsafe schedules the set; let the loop drain it.
-        for _ in range(50):
-            await asyncio.sleep(0.005)
-            if c._event.is_set():
-                break
-        assert c._event.is_set()  # the commit woke the coordinator
+        # The commit wake is consumed by the run loop, so assert the observable
+        # effect: a second tick starts well before the ten-second poll timeout.
+        await asyncio.wait_for(commit_tick.wait(), timeout=1)
+        assert tick_count == 2
     finally:
         await c.stop()
 
@@ -1337,53 +1539,145 @@ async def test_savepoint_rollback_drops_only_its_own_bump(factory):
 
 
 # --------------------------------------------------------------------------- #
-# Stress: >lease-TTL manual operation cannot overlap (heartbeat keeps lease)
+# Stress: the automatic heartbeat protects every long attempt stage
 # --------------------------------------------------------------------------- #
 
 
 @pytest.mark.usefixtures("settings_paisa")
-async def test_long_manual_operation_keeps_lease_via_heartbeat(factory):
-    """Simulate a manual operation that exceeds the lease TTL. Without a
-    heartbeat, the lease would expire and the coordinator could reclaim into
-    overlap. With the heartbeat (tested here via the coordinator's own
-    _post_with_heartbeat + _heartbeat_loop), the lease stays valid.
+@pytest.mark.parametrize(
+    ("blocked_stage", "terminal"),
+    [
+        ("preflight", "success"),
+        ("generation", "success"),
+        ("preflight", "error"),
+        ("generation", "cancel"),
+    ],
+)
+async def test_attempt_heartbeat_spans_stages_and_cleans_up(
+    factory, blocked_stage, terminal
+):
+    """Preflight/generation stay single-flight beyond the original lease TTL.
 
-    This exercises the coordinator's heartbeat path directly: a 'remote POST'
-    that sleeps past the TTL while the heartbeat loop extends the lease, then a
-    second coordinator that tries to claim finds it held."""
+    A controlled heartbeat renews once before the original expiry, then the
+    fake clock moves beyond that original expiry. A peer still cannot claim or
+    publish. Success, an unexpected stage error, and task cancellation all stop
+    the heartbeat and release the lease immediately.
+    """
     clock = FakeClock(datetime.datetime(2026, 1, 1, 12, 0, tzinfo=_TZ))
     await _dirty(factory, clock, n=1)
     clock.advance(DEFAULT_QUIET_DEBOUNCE + datetime.timedelta(seconds=1))
 
-    from financial_dashboard.services.paisa.sync_state import (
-        read_sync_state,
-    )
+    entered = asyncio.Event()
+    release_stage = asyncio.Event()
+    heartbeat_waiting = asyncio.Event()
+    second_heartbeat_sleep = asyncio.Event()
+    heartbeat_cancelled = asyncio.Event()
+    heartbeat_pulses: asyncio.Queue[None] = asyncio.Queue()
+    heartbeat_sleep_calls = 0
 
-    hb_calls = {"count": 0}
+    async def controlled_heartbeat_sleep(_seconds):
+        nonlocal heartbeat_sleep_calls
+        heartbeat_sleep_calls += 1
+        heartbeat_waiting.set()
+        if heartbeat_sleep_calls >= 2:
+            second_heartbeat_sleep.set()
+        try:
+            await heartbeat_pulses.get()
+        except asyncio.CancelledError:
+            heartbeat_cancelled.set()
+            raise
 
-    async def slow_sync(report, cfg, *, client=None):
-        # Simulate a slow POST: the real heartbeat loop (using the coordinator's
-        # _sleep = _no_sleep) fires immediately and extends the lease. We
-        # verify the lease is still held by reading the singleton.
-        async with factory() as s:
-            snap = await read_sync_state(s)
-            await s.rollback()
-        assert snap.lease_token is not None  # lease still held during the POST
-        hb_calls["count"] += 1
+    async def block_selected_stage(stage):
+        if blocked_stage != stage:
+            return
+        entered.set()
+        await release_stage.wait()
+        if terminal == "error":
+            raise RuntimeError(f"blocked {stage} failed")
+
+    async def staged_preflight(cfg, *, client=None):
+        await block_selected_stage("preflight")
+        return await _preflight_ok(cfg, client=client)
+
+    async def staged_generate(session, cfg):
+        await block_selected_stage("generation")
+        return _gen_result(body_hash=f"{blocked_stage}-{terminal}")
+
+    async def successful_remote(report, cfg, *, client=None):
         return _remote_result()
 
-    gen = AsyncMock(return_value=_gen_result())
-    c = _make_coordinator(
-        factory,
-        clock,
-        generate_fn=gen,
-        sync_remote_fn=slow_sync,
-        heartbeat_interval=0.001,  # fire immediately in tests
+    coordinator = PaisaCoordinator(
+        session_factory=factory,
+        owner=f"blocked-{blocked_stage}-{terminal}",
+        now=clock,
+        sleep=controlled_heartbeat_sleep,
+        preflight_fn=staged_preflight,
+        generate_fn=staged_generate,
+        sync_remote_fn=successful_remote,
+        min_interval_minutes_fn=lambda: 1,
+        client_factory=lambda cfg: _FakeClient(),
+        heartbeat_interval=1,
+        lease_ttl=2,
     )
-    await c._tick()
-    assert hb_calls["count"] == 1  # the POST ran to completion
-    snap = await _snapshot(factory)
-    assert snap.applied_revision >= snap.desired_revision  # caught up
+    tick_task = asyncio.create_task(coordinator._tick())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    await asyncio.wait_for(heartbeat_waiting.wait(), timeout=1)
+
+    initial = await _snapshot(factory)
+    assert initial.lease_token is not None
+    assert initial.lease_expires_at is not None
+    original_expiry = initial.lease_expires_at
+
+    # Renew before the original TTL expires, then move past that original TTL.
+    clock.advance(datetime.timedelta(seconds=1))
+    heartbeat_pulses.put_nowait(None)
+    await asyncio.wait_for(second_heartbeat_sleep.wait(), timeout=1)
+    renewed = await _snapshot(factory)
+    assert renewed.lease_expires_at is not None
+    assert renewed.lease_expires_at > original_expiry
+    clock.advance(datetime.timedelta(seconds=1, milliseconds=500))
+    assert clock() > original_expiry
+    assert clock() < renewed.lease_expires_at
+
+    peer_preflight = AsyncMock(side_effect=AssertionError("peer must not claim"))
+    peer_generate = AsyncMock(side_effect=AssertionError("peer must not publish"))
+    peer = PaisaCoordinator(
+        session_factory=factory,
+        owner="blocked-stage-peer",
+        now=clock,
+        sleep=asyncio.sleep,
+        preflight_fn=peer_preflight,
+        generate_fn=peer_generate,
+        sync_remote_fn=_default_sync_remote,
+        min_interval_minutes_fn=lambda: 1,
+        client_factory=lambda cfg: _FakeClient(),
+        heartbeat_interval=1,
+        lease_ttl=2,
+    )
+    await peer._tick()
+    peer_preflight.assert_not_called()
+    peer_generate.assert_not_called()
+
+    if terminal == "cancel":
+        tick_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(tick_task, timeout=2)
+    else:
+        release_stage.set()
+        await asyncio.wait_for(tick_task, timeout=2)
+
+    await asyncio.wait_for(heartbeat_cancelled.wait(), timeout=1)
+    released = await _snapshot(factory)
+    assert released.lease_owner is None
+    assert released.lease_token is None
+    assert released.lease_expires_at is None
+
+    stopped_call_count = heartbeat_sleep_calls
+    heartbeat_pulses.put_nowait(None)
+    await asyncio.sleep(0)
+    assert heartbeat_sleep_calls == stopped_call_count
+    expected_audits = 0 if terminal == "cancel" else 1
+    assert await _autowrite_count(factory) == expected_audits
 
 
 # --------------------------------------------------------------------------- #

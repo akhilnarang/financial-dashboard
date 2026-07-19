@@ -27,10 +27,11 @@ materializing anything.
 
 import asyncio
 import datetime
+import hashlib
 import json
 import logging
 import urllib.parse
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException
 from pathlib import Path
 from typing import Any, Awaitable, Callable, NamedTuple
 
@@ -104,6 +105,7 @@ from financial_dashboard.services.paisa.reconciliation import build_reconciliati
 from financial_dashboard.services.paisa.renderer import (
     InvalidAccountName,
     validate_account_name,
+    validate_backend,
 )
 from financial_dashboard.services.paisa.renderers import SUPPORTED_BACKENDS
 from financial_dashboard.services.paisa.report_cache import get_report_cache
@@ -154,7 +156,7 @@ MANUAL_LEASE_TTL_SECONDS = DEFAULT_LEASE_TTL_SECONDS  # 90s
 
 #: FX/UI helpers --------------------------------------------------------------
 
-_Q2 = Decimal("0.01")
+_Q4 = Decimal("0.0001")
 
 
 def _fx_rates_to_rows(cfg: PaisaProjectionConfig) -> list[PaisaFxRateRow]:
@@ -318,12 +320,14 @@ def _validate_generated_path(path: str) -> str:
     return path
 
 
-def _validate_mappings(raw: dict[str, str], label: str) -> dict[str, str]:
+def _validate_mappings(raw: dict[str, str], label: str, backend: str) -> dict[str, str]:
     """Validate a {key: ledger-account-name} mapping.
 
     Keys are stringified; values must pass :func:`validate_account_name` so a
-    malformed override can never reach the journal. An invalid name raises
-    :class:`PaisaSaveError` with a field-prefixed message.
+    malformed override can never reach the journal. Validation uses the
+    renderer backend being saved, exactly as projection will later validate an
+    operator override. An invalid name raises :class:`PaisaSaveError` with a
+    field-prefixed message.
     """
     out: dict[str, str] = {}
     for key, value in raw.items():
@@ -332,7 +336,7 @@ def _validate_mappings(raw: dict[str, str], label: str) -> dict[str, str]:
         if not key_text or not value_text:
             continue
         try:
-            validate_account_name(value_text)
+            validate_account_name(value_text, backend)
         except InvalidAccountName as exc:
             raise PaisaSaveError(
                 [f"{label}: {key_text!r} → {value_text!r}: {exc}"]
@@ -378,7 +382,7 @@ def _validate_fx_rates(rows: list[PaisaFxRateRow]) -> str:
             )
         try:
             rate = Decimal(rate_text)
-        except InvalidOperation, ValueError:
+        except DecimalException, OverflowError, ValueError:
             raise PaisaSaveError(
                 [f"FX Rates: {ccy} {date_text} rate {rate_text!r} is not a number"]
             )
@@ -388,9 +392,23 @@ def _validate_fx_rates(rows: list[PaisaFxRateRow]) -> str:
                     f"FX Rates: {ccy} {date_text} rate must be positive, got {rate_text!r}"
                 ]
             )
-        bucket.setdefault(ccy, {})[date.isoformat()] = str(
-            rate.quantize(Decimal("0.0001"))
-        )
+        try:
+            quantized = rate.quantize(_Q4)
+        except DecimalException, OverflowError:
+            raise PaisaSaveError(
+                [
+                    f"FX Rates: {ccy} {date_text} rate {rate_text!r} "
+                    "is outside the supported range"
+                ]
+            )
+        if not quantized.is_finite() or quantized <= 0:
+            raise PaisaSaveError(
+                [
+                    f"FX Rates: {ccy} {date_text} rate {rate_text!r} "
+                    "is outside the supported range"
+                ]
+            )
+        bucket.setdefault(ccy, {})[date.isoformat()] = str(quantized)
 
     nested: dict[str, list[dict[str, str]]] = {}
     for ccy, by_date in sorted(bucket.items()):
@@ -488,24 +506,46 @@ async def save_config(
     else:
         updates["paisa.project_since"] = project_since
 
-    # --- mappings ---------------------------------------------------------
-    try:
-        account_mappings = _validate_mappings(
-            dict(data.account_mappings or {}), "Account Mappings"
+    # --- ledger backend ---------------------------------------------------
+    # validate_backend coerces an unknown value to ledger at load time; the save
+    # path rejects an unknown value outright so the operator is told rather than
+    # silently downgraded, and a manual sync's upstream-backend match check has a
+    # trustworthy configured value to compare against. Resolve this before
+    # mappings so valid inputs are checked with the exact renderer grammar that
+    # projection will use; an invalid backend never falls through to Ledger's
+    # default grammar and produce misleading mapping results.
+    raw_ledger_cli = (data.ledger_cli or "").strip()
+    ledger_cli = validate_backend(raw_ledger_cli)
+    backend_valid = raw_ledger_cli.lower() in SUPPORTED_BACKENDS
+    if not backend_valid:
+        errors.append(
+            f"Ledger CLI Backend must be one of: {', '.join(SUPPORTED_BACKENDS)}."
         )
-    except PaisaSaveError as exc:
-        errors.extend(exc.errors)
-        account_mappings = {}
-    updates["paisa.account_mappings"] = json.dumps(account_mappings)
+    else:
+        updates["paisa.ledger_cli"] = ledger_cli
 
-    try:
-        category_mappings = _validate_mappings(
-            dict(data.category_mappings or {}), "Category Mappings"
-        )
-    except PaisaSaveError as exc:
-        errors.extend(exc.errors)
-        category_mappings = {}
-    updates["paisa.category_mappings"] = json.dumps(category_mappings)
+    # --- mappings ---------------------------------------------------------
+    # Do not validate against validate_backend's Ledger fallback when the raw
+    # backend itself is invalid. The backend field error above is authoritative,
+    # and no settings are written when any validation error exists.
+    if backend_valid:
+        try:
+            account_mappings = _validate_mappings(
+                dict(data.account_mappings or {}), "Account Mappings", ledger_cli
+            )
+        except PaisaSaveError as exc:
+            errors.extend(exc.errors)
+            account_mappings = {}
+        updates["paisa.account_mappings"] = json.dumps(account_mappings)
+
+        try:
+            category_mappings = _validate_mappings(
+                dict(data.category_mappings or {}), "Category Mappings", ledger_cli
+            )
+        except PaisaSaveError as exc:
+            errors.extend(exc.errors)
+            category_mappings = {}
+        updates["paisa.category_mappings"] = json.dumps(category_mappings)
 
     # --- non-INR policy (skip | priced) ----------------------------------
     policy = (data.non_inr_policy or "skip").strip().lower()
@@ -513,19 +553,6 @@ async def save_config(
         errors.append("Non-INR Policy must be one of: skip, priced.")
     else:
         updates["paisa.non_inr_policy"] = policy
-
-    # --- ledger backend ---------------------------------------------------
-    # validate_backend coerces an unknown value to ledger at load time; the save
-    # path rejects an unknown value outright so the operator is told rather than
-    # silently downgraded, and a manual sync's upstream-backend match check has a
-    # trustworthy configured value to compare against.
-    ledger_cli = (data.ledger_cli or "").strip().lower()
-    if ledger_cli not in SUPPORTED_BACKENDS:
-        errors.append(
-            f"Ledger CLI Backend must be one of: {', '.join(SUPPORTED_BACKENDS)}."
-        )
-    else:
-        updates["paisa.ledger_cli"] = ledger_cli
 
     # --- FX rates (priced policy) ----------------------------------------
     # Deterministic currency/date/rate rows; only positive Decimal rates are
@@ -684,9 +711,29 @@ def _projection_summary(report) -> PaisaProjectionSummary | None:
         imprecise_count=report.imprecise_count,
         card_payments_resolved=report.card_payments_resolved,
         card_payments_unresolved=report.card_payments_unresolved,
+        card_payments_ambiguous_mask=report.card_payments_ambiguous_mask,
         investment_lot_count=report.investment_lot_count,
         investment_funding_remapped=report.investment_funding_remapped,
         investment_funding_unresolved=list(report.investment_funding_unresolved),
+        investment_current_valuation_count=report.investment_current_valuation_count,
+        investment_market_price_count=report.investment_market_price_count,
+        investment_market_price_conflicts=list(
+            report.investment_market_price_conflicts
+        ),
+        investment_value_only_count=report.investment_value_only_count,
+        investment_quantity_mismatch_count=(report.investment_quantity_mismatch_count),
+        investment_missing_market_price_count=(
+            report.investment_missing_market_price_count
+        ),
+        investment_valuation_sources=list(report.investment_valuation_sources),
+        cas_portfolio_count=report.cas_portfolio_count,
+        cas_portfolio_labels=list(report.cas_portfolio_labels),
+        cas_investment_scope=report.cas_investment_scope,
+        manual_asset_count=report.manual_asset_count,
+        manual_asset_labels=list(report.manual_asset_labels),
+        manual_liability_count=report.manual_liability_count,
+        manual_liability_labels=list(report.manual_liability_labels),
+        net_worth_scope_complete=report.net_worth_scope_complete,
         kind_counts=dict(report.kind_counts),
         projected_foreign_count=report.projected_foreign_count,
         missing_fx_rate_count=report.missing_fx_rate_count,
@@ -828,38 +875,68 @@ async def _audited(
 ) -> Any:
     """Wrap a manual operation with a start/complete audit row and commit.
 
-    ``run`` returns an :class:`_AuditResult` carrying the ok flag, outcome
-    token, reason, emitted/skipped counts, output hash, the safe details payload,
-    and the result DTO. The audit row is completed even when ``run`` raises
-    (status=failure, outcome=error) and the exception is re-raised after commit
-    so the route's failure-isolation path still runs. No credentials and no raw
-    journal text are ever placed in ``details`` — only sanitized summary counts.
+    The running row is persisted in a **short transaction** (``start_run`` +
+    commit) *before* ``run`` is invoked. This is mandatory for SQLite writer
+    lock hygiene: ``start_run`` flushes an INSERT, so without an intervening
+    commit the writer lock would be held across all of ``run``'s network,
+    projection, and file I/O — a manual probe would block every concurrent
+    core write for the duration of the upstream call. Committing the running
+    row up front also means a crash during ``run`` leaves an observable
+    ``running`` row (not a silently lost one).
+
+    After ``run`` returns (success or exception), the row is reloaded by id
+    and finalized in a separate transaction. ``run`` returns an
+    :class:`_AuditResult` carrying the ok flag, outcome token, reason,
+    emitted/skipped counts, output hash, the safe details payload, and the
+    result DTO. The audit row is completed even when ``run`` raises
+    (status=failure, outcome=error) and the exception is re-raised after the
+    finalize+commit so the route's failure-isolation path still runs. No
+    credentials and no raw journal text are ever placed in ``details`` — only
+    sanitized summary counts.
 
     A failed result that is actually a mode/readiness guard (disabled /
     connect_only / not_configured) or a transient single-flight ``busy`` (the
     lease was held) is recorded as STATUS_SKIPPED with no error so it never
     appears in ``last_error`` — matching the automatic runtime.
     """
+    # 1. Persist the running row in a SHORT transaction so it (a) survives a
+    #    crash mid-run (observable audit) and (b) does NOT hold a writer lock
+    #    during run()'s network/projection/file I/O. Capture the id so the row
+    #    can be reloaded/finalized in a separate transaction after run().
     audit_run = await start_run(
         session,
         extension_id="paisa",
         operation=operation,
         trigger=trigger,
     )
-    details: Any = None
+    run_id = audit_run.id
+    await session.commit()
+
+    # 2. Run the operation with no audit transaction held. Any session state
+    #    mutations run() makes (e.g. a manual sync's record_accepted_post) land
+    #    in a fresh transaction and commit together with the finalize below.
     try:
         res = await run()
     except Exception as exc:
-        await complete_run(
+        # 3a. Failure: roll back any partial state from run() so the
+        #     audit-failure commit persists only the audit row's terminal
+        #     fields (state mutations from a partially-completed run would be
+        #     ambiguous). Then finalize the audit row by id in a fresh
+        #     transaction and re-raise so the route's isolation still runs.
+        try:
+            await session.rollback()
+        except Exception:
+            logger.debug("rollback before audit-failure finalize failed", exc_info=True)
+        await _finalize_run_by_id(
             session,
-            audit_run,
+            run_id,
             status=STATUS_FAILURE,
             outcome="error",
-            details=details,
             error=sanitize_error(f"{type(exc).__name__}: {exc}"),
         )
-        await session.commit()
         raise
+
+    # 3b. Success: classify the result and finalize the audit row.
     guard = None if res.ok else _guard_outcome(res.outcome, res.reason)
     outcome_token = res.outcome or guard or _safe_outcome(res.reason, operation)
     if res.ok:
@@ -873,9 +950,9 @@ async def _audited(
     else:
         status = STATUS_FAILURE
         error = sanitize_error(res.reason)
-    await complete_run(
+    await _finalize_run_by_id(
         session,
-        audit_run,
+        run_id,
         status=status,
         outcome=outcome_token,
         emitted_count=res.emitted_count,
@@ -884,8 +961,50 @@ async def _audited(
         details=res.details,
         error=error,
     )
-    await session.commit()
     return res.result
+
+
+async def _finalize_run_by_id(
+    session: AsyncSession,
+    run_id: int,
+    *,
+    status: str,
+    outcome: str | None = None,
+    emitted_count: int | None = None,
+    skipped_count: int | None = None,
+    output_hash: str | None = None,
+    details: Any = None,
+    error: str | None = None,
+) -> None:
+    """Reload an audit run by id and finalize it, then commit.
+
+    The running row was committed in a prior short transaction (``start_run``
+    + commit) so it survives a crash mid-run. Reloading by id (rather than
+    holding the ORM object across ``run``) keeps the finalize robust to
+    intervening commit/expiry/refresh of the original object — only the
+    persisted id matters. ``complete_run`` is idempotent on ``completed_at``
+    so a redundant finalize is a no-op w.r.t. the finish time. Pending state
+    mutations in the caller's session (e.g. a manual sync's
+    ``record_accepted_post``) commit atomically with the audit finalization.
+    """
+    run = await session.get(ExtensionRun, run_id)
+    if run is None:
+        # Should not happen unless the row was deleted externally; log and
+        # swallow so the audit path never masks the original operation result.
+        logger.error("audit run id=%s vanished before finalization", run_id)
+        return
+    await complete_run(
+        session,
+        run,
+        status=status,
+        outcome=outcome,
+        emitted_count=emitted_count,
+        skipped_count=skipped_count,
+        output_hash=output_hash,
+        details=details,
+        error=error,
+    )
+    await session.commit()
 
 
 class _AuditResult(NamedTuple):
@@ -943,6 +1062,40 @@ async def _safe_release(session: AsyncSession, token: str | None) -> None:
         await release_lease(session, token=token)
     except Exception:
         logger.debug("manual lease release failed", exc_info=True)
+
+
+async def _safe_release_after_exception(
+    session: AsyncSession, token: str | None
+) -> None:
+    """Roll back failed request state, then release the lease durably.
+
+    ``_audited`` persists its running row before invoking the manual operation.
+    Consequently a generate/sync exception reaches this helper with a lease
+    claim that was already committed, while the request session may contain
+    partial state from the failed operation. Releasing on that same session is
+    unsafe: ``_audited`` must roll the partial state back, which would also roll
+    the release back and strand the lease until its 90-second TTL.
+
+    End the failed request transaction first, then release with a fresh session
+    and an explicit short commit. Both steps are best-effort so cleanup never
+    masks the operation's original exception; the TTL remains the final crash
+    safety fallback.
+    """
+    if token is None:
+        return
+    try:
+        await session.rollback()
+    except Exception:
+        logger.debug("rollback before manual lease release failed", exc_info=True)
+    factory = async_sessionmaker(
+        session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    try:
+        async with factory() as release_session:
+            await release_lease(release_session, token=token)
+            await release_session.commit()
+    except Exception:
+        logger.debug("committed manual lease release failed", exc_info=True)
 
 
 async def _manual_heartbeat_loop(
@@ -1013,14 +1166,20 @@ def _manual_sync_post_accepted(outcome: str) -> bool:
 
 
 async def _apply_manual_sync_state(
-    session: AsyncSession, result: PaisaSyncResponse, token: str
+    session: AsyncSession,
+    result: PaisaSyncResponse,
+    token: str,
+    *,
+    target_revision: int,
 ) -> None:
     """Update persisted sync-state consistently for a manual sync.
 
     Manual sync forces a remote reload (always POSTs) using one projection, and
-    advances ``applied`` / stamps the remote + diagnosis state so the automatic
-    worker does not redundantly reload. Guards (disabled/connect_only/
-    not_configured) record no state — no remote attempt happened.
+    advances ``applied`` only through the revision captured before projection /
+    generation / POST, then stamps the remote + diagnosis state. A core write
+    committed while the sync is in flight therefore remains dirty for a
+    follow-up reconcile. Guards (disabled/connect_only/not_configured) record no
+    state — no remote attempt happened.
     """
     from financial_dashboard.db.models import utc_now
 
@@ -1030,11 +1189,12 @@ async def _apply_manual_sync_state(
     outcome = result.outcome
     if outcome in GUARD_OUTCOMES:
         return
-    target = await capture_target(session)
-    R = target.target_revision
     if outcome == "synced":
         await record_accepted_post(
-            session, target_revision=R, remote_hash=body_hash or "", token=token
+            session,
+            target_revision=target_revision,
+            remote_hash=body_hash or "",
+            token=token,
         )
         state = (
             DIAGNOSIS_ACCEPTED
@@ -1046,7 +1206,10 @@ async def _apply_manual_sync_state(
         )
     elif outcome == "diagnosis_failed":
         await record_accepted_post(
-            session, target_revision=R, remote_hash=body_hash or "", token=token
+            session,
+            target_revision=target_revision,
+            remote_hash=body_hash or "",
+            token=token,
         )
         state = DIAGNOSIS_FATAL if result.diagnosis_ok is False else DIAGNOSIS_UNKNOWN
         await record_diagnosis(session, state=state, token=token)
@@ -1091,6 +1254,7 @@ async def generate_now_audited(
         token = claim.token
         hb_task = _start_manual_heartbeat(session, token)
         state_recorded = True
+        failed = False
         try:
             result = await generate_now(session)
             body_hash = result.publish.body_hash if result.publish else None
@@ -1126,9 +1290,15 @@ async def generate_now_audited(
                 details=details,
                 result=result,
             )
+        except Exception:
+            failed = True
+            raise
         finally:
             await _stop_manual_heartbeat(hb_task)
-            await _safe_release(session, token)
+            if failed:
+                await _safe_release_after_exception(session, token)
+            else:
+                await _safe_release(session, token)
 
     return await _audited(
         session, operation=OPERATION_GENERATE, trigger=trigger, run=run
@@ -1173,10 +1343,20 @@ async def sync_now_audited(
         token = claim.token
         hb_task = _start_manual_heartbeat(session, token)
         state_recorded = True
+        failed = False
         try:
+            # Capture the exact revision this manual run is about to project
+            # before any generation/file/remote work. End the read transaction
+            # immediately: SQLite must not retain a snapshot across the slow
+            # stage, and completion must never absorb a concurrent dirty bump.
+            target = await capture_target(session)
+            R = target.target_revision
+            await session.commit()
             result = await sync_now(session)
             try:
-                await _apply_manual_sync_state(session, result, token)
+                await _apply_manual_sync_state(
+                    session, result, token, target_revision=R
+                )
             except LeaseStaleError:
                 state_recorded = False
                 logger.warning(
@@ -1215,9 +1395,15 @@ async def sync_now_audited(
                 result=result,
                 outcome=result.outcome,
             )
+        except Exception:
+            failed = True
+            raise
         finally:
             await _stop_manual_heartbeat(hb_task)
-            await _safe_release(session, token)
+            if failed:
+                await _safe_release_after_exception(session, token)
+            else:
+                await _safe_release(session, token)
 
     return await _audited(session, operation=OPERATION_SYNC, trigger=trigger, run=run)
 
@@ -1289,6 +1475,45 @@ async def audit_view(
 
 def _ttl_seconds() -> int:
     return max(0, get_setting_int("paisa.report_cache_ttl_seconds", 60))
+
+
+class _ReportCacheKey(NamedTuple):
+    """Secret-free identity for one report response source.
+
+    Report kind alone is insufficient: the app can switch between Paisa
+    instances or credentials while an old entry is still fresh. The base URL is
+    canonicalized by the same validator the client uses; the effective auth
+    username is explicit, while the credential itself appears only as a
+    one-way fingerprint. The configured backend is included because switching
+    journal backends changes the upstream dataset/config interpretation.
+    """
+
+    report: str
+    base_url: str
+    auth_username: str
+    credential_fingerprint: str
+    ledger_cli: str
+
+
+def _report_cache_key(config: PaisaProjectionConfig, report: str) -> _ReportCacheKey:
+    validated = validate_base_url(config.base_url, allow_remote=config.allow_remote)
+    username = config.auth_username
+    # Paisa sends X-Auth only when username is non-empty. Ignore a dormant
+    # password in that case so the key models the effective request identity.
+    password = config.auth_password if username else ""
+    credential_fingerprint = hashlib.sha256(
+        b"financial-dashboard:paisa-report-cache\0"
+        + username.encode("utf-8")
+        + b"\0"
+        + password.encode("utf-8")
+    ).hexdigest()
+    return _ReportCacheKey(
+        report=report,
+        base_url=validated.display,
+        auth_username=username,
+        credential_fingerprint=credential_fingerprint,
+        ledger_cli=(config.ledger_cli or "").strip().lower(),
+    )
 
 
 async def _fetch_report(config: PaisaProjectionConfig, report: str):
@@ -1474,7 +1699,8 @@ async def report_summary(app_state: Any, report: str) -> PaisaReportSummary:
     # snapshot would have (a concurrent different-key read can no longer flip
     # this caller's cached flag).
     try:
-        result = await cache.read(report, ttl, lambda: _fetch_report(config, report))
+        key = _report_cache_key(config, report)
+        result = await cache.read(key, ttl, lambda: _fetch_report(config, report))
     except PaisaError as exc:
         return PaisaReportSummary(ok=False, report=report, reason=exc.code)
     except Exception as exc:  # noqa: BLE001 — optional-extension isolation
@@ -1497,16 +1723,18 @@ async def reconciliation_view(
         cache = get_report_cache(app_state)
         ttl = _ttl_seconds()
         try:
+            asset_key = _report_cache_key(config, REPORT_ASSETS_BALANCE)
+            liability_key = _report_cache_key(config, REPORT_LIABILITIES)
             asset_report = (
                 await cache.read(
-                    REPORT_ASSETS_BALANCE,
+                    asset_key,
                     ttl,
                     lambda: _fetch_report(config, REPORT_ASSETS_BALANCE),
                 )
             ).value
             liability_report = (
                 await cache.read(
-                    REPORT_LIABILITIES,
+                    liability_key,
                     ttl,
                     lambda: _fetch_report(config, REPORT_LIABILITIES),
                 )

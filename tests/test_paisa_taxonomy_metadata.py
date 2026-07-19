@@ -655,8 +655,9 @@ async def test_beancount_card_payment_resolved_meta_identity(session):
     )
     assert txn.meta["dashboard_card_resolution"] == "resolved"
     assert txn.meta["dashboard_txn_ids"] == "txn-1"
-    # The card_id (10) and the resolved card account id (2) both trace.
-    assert "10" in txn.meta["dashboard_card_ids"].split("|")
+    # Card and Account primary-key spaces remain separate.
+    assert txn.meta["dashboard_card_ids"] == "10"
+    assert txn.meta["dashboard_account_ids"] == "1|2"
     # The specific card liability is the first posting.
     liability = txn.postings[0].account
     assert liability.startswith("Liabilities:Card:"), liability
@@ -985,6 +986,9 @@ async def test_card_payment_resolved_by_card_id(session):
     liability = entry.postings[0].account
     assert liability == "Liabilities:Card:Icici:Platinum"
     assert "dashboard_card_resolution: resolved" in report.journal
+    meta = dict(entry.meta)
+    assert meta["dashboard_card_ids"] == "10"
+    assert meta["dashboard_account_ids"] == "1|2"
 
 
 async def test_card_payment_resolved_by_exact_mask(session):
@@ -1061,6 +1065,96 @@ async def test_card_payment_never_fuzzy_matches(session):
     )
     report = await project(session, _config(selected_account_ids=(1, 2)))
     assert report.card_payments_unresolved == 1
+
+
+async def test_card_payment_ambiguous_exact_mask_uses_generic_clearing(session):
+    """A duplicate exact mask across selected cards is ambiguous, never
+    query-order/last-write-wins resolution."""
+    bank = await _bank(session, id=1)
+    await _card(session, id=2, bank="icici", label="Platinum")
+    await _card(session, id=3, bank="hdfc", label="Regalia")
+    session.add_all(
+        [
+            Card(id=10, account_id=2, card_mask="4567"),
+            Card(id=11, account_id=3, card_mask="4567"),
+        ]
+    )
+    await session.flush()
+    await _txn(
+        session,
+        account_id=bank.id,
+        direction="debit",
+        amount="5000.00",
+        date=dt.date(2026, 2, 1),
+        category="credit_card_payment",
+        card_mask="4567",
+        id=1,
+    )
+
+    report = await project(session, _config(selected_account_ids=(1, 2, 3)))
+
+    entry = report.entries[0]
+    assert entry.postings[0].account == "Liabilities:Credit Card"
+    assert dict(entry.meta)["dashboard_card_resolution"] == "ambiguous_mask"
+    assert dict(entry.meta)["dashboard_card_ids"] == "none"
+    assert dict(entry.meta)["dashboard_account_ids"] == "1"
+    assert report.card_payments_unresolved == 1
+    assert report.card_payments_ambiguous_mask == 1
+
+
+async def test_explicit_selected_card_id_wins_over_ambiguous_mask(session):
+    bank = await _bank(session, id=1)
+    await _card(session, id=2, bank="icici", label="Platinum")
+    await _card(session, id=3, bank="hdfc", label="Regalia")
+    session.add_all(
+        [
+            Card(id=10, account_id=2, card_mask="4567"),
+            Card(id=11, account_id=3, card_mask="4567"),
+        ]
+    )
+    await session.flush()
+    await _txn(
+        session,
+        account_id=bank.id,
+        direction="debit",
+        amount="5000.00",
+        date=dt.date(2026, 2, 1),
+        category="credit_card_payment",
+        card_id=11,
+        card_mask="4567",
+        id=1,
+    )
+
+    report = await project(session, _config(selected_account_ids=(1, 2, 3)))
+
+    assert report.entries[0].postings[0].account == "Liabilities:Card:Hdfc:Regalia"
+    assert dict(report.entries[0].meta)["dashboard_card_ids"] == "11"
+    assert report.card_payments_resolved == 1
+    assert report.card_payments_ambiguous_mask == 0
+
+
+async def test_card_metadata_separates_card_and_account_id_spaces(session):
+    """Numerical collisions cannot put an Account.id under dashboard_card_ids."""
+    bank = await _bank(session, id=1)
+    await _card(session, id=10, bank="icici", label="Collision")
+    session.add(Card(id=2, account_id=10, card_mask="2222"))
+    await session.flush()
+    await _txn(
+        session,
+        account_id=bank.id,
+        direction="debit",
+        amount="5000.00",
+        date=dt.date(2026, 2, 1),
+        category="credit_card_payment",
+        card_mask="2222",
+        id=1,
+    )
+
+    report = await project(session, _config(selected_account_ids=(1, 10)))
+
+    meta = dict(report.entries[0].meta)
+    assert meta["dashboard_card_ids"] == "2"
+    assert meta["dashboard_account_ids"] == "1|10"
 
 
 async def test_card_side_payment_remains_explicit_skip(session):

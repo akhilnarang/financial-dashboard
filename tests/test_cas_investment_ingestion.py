@@ -195,13 +195,14 @@ async def test_force_replace_recreates_lots(session):
     assert lots[0].reference == "TXN002"
 
 
-async def test_duplicate_transaction_within_one_payload_yields_one_lot(session):
+async def test_identical_transactions_within_one_payload_preserve_multiplicity(session):
     txn = _mf_purchase()
     payload = _payload_with_transactions(txn, txn)
     await ingest_cas_payload(session, payload)
     await session.flush()
     lots = (await session.execute(select(InvestmentLot))).scalars().all()
-    assert len(lots) == 1
+    assert len(lots) == 2
+    assert sorted(lot.source_occurrence for lot in lots) == [0, 1]
 
 
 # ---------------------------------------------------------------------------
