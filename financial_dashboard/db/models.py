@@ -148,7 +148,7 @@ class StatementUpload(Base):
         Integer, ForeignKey("accounts.id"), nullable=False
     )
     email_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("emails.id"), nullable=True
+        Integer, ForeignKey("emails.id"), nullable=True, index=True
     )
     bank: Mapped[str] = mapped_column(String, nullable=False)
     filename: Mapped[str] = mapped_column(String, nullable=False)
@@ -190,7 +190,7 @@ class BankStatementUpload(Base):
         Integer, ForeignKey("accounts.id"), nullable=False
     )
     email_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("emails.id"), nullable=True
+        Integer, ForeignKey("emails.id"), nullable=True, index=True
     )
     bank: Mapped[str] = mapped_column(String, nullable=False)
     filename: Mapped[str] = mapped_column(String, nullable=False)
@@ -220,7 +220,7 @@ class CasUpload(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("emails.id"), nullable=True
+        Integer, ForeignKey("emails.id"), nullable=True, index=True
     )
     portfolio_key: Mapped[str] = mapped_column(String, nullable=False)
     depository_source: Mapped[str] = mapped_column(String, nullable=False)
@@ -346,7 +346,9 @@ class Transaction(Base):
     __tablename__ = "transactions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    email_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("emails.id"))
+    email_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("emails.id"), index=True
+    )
     account_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("accounts.id"), nullable=True
     )
@@ -392,7 +394,7 @@ class Transaction(Base):
     last_notified_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
     notify_attempts: Mapped[int | None] = mapped_column(Integer, default=0)
     sms_message_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("sms_messages.id"), nullable=True
+        Integer, ForeignKey("sms_messages.id"), nullable=True, index=True
     )
     source: Mapped[str | None] = mapped_column(String)
     notified_channel: Mapped[str | None] = mapped_column(String)
@@ -442,7 +444,7 @@ class SmsMessage(Base):
         String, nullable=False, default="pending", server_default="pending"
     )
     transaction_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("transactions.id"), nullable=True
+        Integer, ForeignKey("transactions.id"), nullable=True, index=True
     )
     parse_error: Mapped[str | None] = mapped_column(Text)
     parsed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
