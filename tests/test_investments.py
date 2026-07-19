@@ -13,6 +13,11 @@ import pytest
 from sqlalchemy import select
 
 from financial_dashboard.db.models import CasUpload, InvestmentLot
+from financial_dashboard.services.investment_transactions import _classify_transaction
+from financial_dashboard.services.investment_types import (
+    LotClassificationResult,
+    LotExtractionResult,
+)
 from financial_dashboard.services.investments import (
     CAS_CURRENCY,
     create_investment_lots,
@@ -22,6 +27,7 @@ from financial_dashboard.services.investments import (
     get_complete_lots,
     get_current_valuations,
     get_incomplete_reasons,
+    get_latest_payload,
     get_latest_values,
     get_positions,
 )
@@ -52,7 +58,9 @@ def _mf_purchase(**overrides) -> dict:
 
 
 def test_complete_mf_purchase_becomes_a_lot():
-    lots, excluded = extract_lots_from_payload({"transactions": [_mf_purchase()]})
+    extracted = extract_lots_from_payload({"transactions": [_mf_purchase()]})
+    assert isinstance(extracted, LotExtractionResult)
+    lots, excluded = extracted
     assert excluded == []
     assert len(lots) == 1
     lot = lots[0]
@@ -65,6 +73,17 @@ def test_complete_mf_purchase_becomes_a_lot():
     assert lot.acquired_on == datetime.date(2026, 1, 15)
     assert lot.transaction_type == "purchase"
     assert lot.reference == "TXN001"
+
+
+def test_transaction_classification_result_is_named_and_tuple_compatible():
+    classified = _classify_transaction(_mf_purchase())
+
+    assert isinstance(classified, LotClassificationResult)
+    lot, exclusion = classified
+    assert classified.lot is lot
+    assert classified.exclusion is exclusion
+    assert lot is not None
+    assert exclusion is None
 
 
 def test_switch_in_is_an_acquisition_type():
@@ -696,6 +715,15 @@ async def _upload(session, *, payload_txns, statement_date="2026-04-30"):
     return upload
 
 
+async def test_read_services_ignore_valid_non_object_json_payloads(session):
+    upload = await _upload(session, payload_txns=[])
+    upload.raw_holdings_json = "[]"
+    await session.flush()
+
+    assert await get_latest_payload(session) is None
+    assert await get_incomplete_reasons(session) == []
+
+
 async def test_create_investment_lots_persists_complete_lots(session):
     upload = await _upload(
         session,
@@ -710,11 +738,14 @@ async def test_create_investment_lots_persists_complete_lots(session):
             ),
         ],
     )
-    created, excluded = await create_investment_lots(
+    result = await create_investment_lots(
         session, cas_upload_id=upload.id, payload={"transactions": []}
     )
+    created, excluded = result
     # payload passed here has no transactions -> nothing created from it; the
     # persisted rows above come from a direct call instead.
+    assert result.created == created
+    assert result.exclusions is excluded
     assert created == 0
     lots, _ = extract_lots_from_payload(
         {

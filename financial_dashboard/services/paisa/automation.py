@@ -41,33 +41,23 @@ DEFAULT_MIN_INTERVAL_MINUTES = 1
 class PaisaAutomationRuntime:
     """Implements :class:`~financial_dashboard.extensions.base.ExtensionRuntime`.
 
-    Construct with no args in production (it resolves the shared
-    ``async_session`` lazily so importing this module is side-effect-free).
-    Tests inject an ``async_sessionmaker`` and optional coordinator seams to
-    keep the worker deterministic and fast.
+    Production composition passes the application-owned ``async_session``
+    factory explicitly. Tests may additionally inject a coordinator to keep the
+    worker deterministic and fast.
     """
 
     extension_id = "paisa"
 
     def __init__(
         self,
-        session_factory: async_sessionmaker | None = None,
+        session_factory: async_sessionmaker,
         *,
         coordinator: PaisaCoordinator | None = None,
     ) -> None:
-        self._session_factory: async_sessionmaker | None = session_factory
+        self._session_factory = session_factory
         # When provided, use this coordinator verbatim (tests inject one with
-        # fake seams). Otherwise build one at startup from the resolved factory.
+        # fake seams). Otherwise build one at startup from the injected factory.
         self._coordinator: PaisaCoordinator | None = coordinator
-
-    def _resolve_session_factory(self) -> async_sessionmaker:
-        # Lazy import: keeps module import free of a DB/engine touch and breaks
-        # the import cycle with financial_dashboard.db at construction time.
-        if self._session_factory is None:
-            from financial_dashboard.db import async_session
-
-            self._session_factory = async_session
-        return self._session_factory
 
     @property
     def coordinator(self) -> PaisaCoordinator | None:
@@ -87,16 +77,11 @@ class PaisaAutomationRuntime:
         auto-sync.
         """
         if self._coordinator is None:
-            self._coordinator = PaisaCoordinator(
-                session_factory=self._resolve_session_factory()
-            )
-        try:
-            await self._coordinator.start()
-        except Exception:
-            # A second startup (coordinator already running) or a transient
-            # error must never break the lifespan. Log and move on; the next
-            # tick / wake will retry.
-            logger.exception("Paisa coordinator startup failed; continuing")
+            self._coordinator = PaisaCoordinator(session_factory=self._session_factory)
+        # ExtensionManager owns lifecycle failure isolation. Propagate a start
+        # failure so it does not mark this runtime as running when no worker was
+        # actually launched.
+        await self._coordinator.start()
 
     async def shutdown(self) -> None:
         """Cancel and await the coordinator task, then drop the reference."""

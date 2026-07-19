@@ -14,8 +14,18 @@ they aren't actionable import failures (the row was already malformed before
 the savepoint).
 """
 
+from typing import NamedTuple
 
-def import_skip_summary(recon: dict) -> tuple[int, int, str | None]:
+
+class ImportSkipSummary(NamedTuple):
+    """Duplicate/error counts and the corresponding upload error message."""
+
+    duplicate_count: int
+    error_count: int
+    error_message: str | None
+
+
+def import_skip_summary(recon: dict) -> ImportSkipSummary:
     """Count duplicate / unexpected-error skips and build an ``error`` blurb.
 
     Args:
@@ -43,4 +53,4 @@ def import_skip_summary(recon: dict) -> tuple[int, int, str | None]:
             f"Skipped {', '.join(details)} row(s) during auto-import; "
             "see reconciliation details."
         )
-    return duplicate_count, error_count, error_msg
+    return ImportSkipSummary(duplicate_count, error_count, error_msg)

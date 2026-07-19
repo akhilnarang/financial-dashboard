@@ -28,6 +28,7 @@ from financial_dashboard.integrations.paisa import (
 )
 from financial_dashboard.services.paisa import surface
 from financial_dashboard.services.paisa.report_cache import PaisaReportCache
+from financial_dashboard.services.paisa.reporting import PaisaReportService
 
 pytestmark = pytest.mark.anyio
 
@@ -455,6 +456,24 @@ async def test_cache_same_key_hit_flag_survives_concurrent_other_key_fetch():
 
 class _AppState:
     """Minimal stand-in for Starlette's app.state (attributes)."""
+
+
+async def test_report_service_uses_injected_cache_and_fetcher():
+    calls: list[str] = []
+
+    async def fetch(config, report):
+        calls.append(report)
+        return normalize_report(report, BUDGET_PAYLOAD)
+
+    service = PaisaReportService(PaisaReportCache(), fetch_report_fn=fetch)
+    config = _cfg(mode="connect")
+
+    first = await service.report_summary(config, REPORT_BUDGET, ttl_seconds=60)
+    second = await service.report_summary(config, REPORT_BUDGET, ttl_seconds=60)
+
+    assert first.ok and first.cached is False
+    assert second.ok and second.cached is True
+    assert calls == [REPORT_BUDGET]
 
 
 async def test_report_disabled_mode_makes_no_upstream_calls(monkeypatch):

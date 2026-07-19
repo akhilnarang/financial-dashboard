@@ -11,6 +11,7 @@ backwards-compatible FetchService construction.
 import asyncio
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from financial_dashboard.extensions import (
     EXTENSION_CONTRACT_VERSION,
@@ -159,6 +160,16 @@ def test_register_runtime_rejects_extension_id_mismatch():
     manager = ExtensionManager(reg)
     with pytest.raises(ValueError, match="does not match"):
         manager.register_runtime("a", FakeRuntime("b"))
+
+
+def test_register_runtime_rejects_duplicate_without_replacing_original():
+    manager, runtimes = _manager_with("a")
+    replacement = FakeRuntime("a")
+
+    with pytest.raises(ValueError, match="already registered"):
+        manager.register_runtime("a", replacement)
+
+    assert manager.get_runtime("a") is runtimes["a"]
 
 
 def test_runtimes_preserve_manifest_registration_order():
@@ -397,7 +408,7 @@ def test_fetch_service_accepts_manager():
 
 
 def test_bootstrap_extensions_attaches_paisa_runtime():
-    manager = bootstrap_extensions()
+    manager = bootstrap_extensions(session_factory=async_sessionmaker())
     assert manager.get_runtime("paisa") is not None
     assert manager.get_runtime("paisa").extension_id == "paisa"
     snap = {s.id: s for s in manager.status()}
@@ -407,10 +418,12 @@ def test_bootstrap_extensions_attaches_paisa_runtime():
 async def test_bootstrap_manager_lifecycle_is_safe():
     # startup/shutdown of the real Paisa runtime must be no-ops (no network,
     # no auto-sync kick) and not raise.
-    manager = bootstrap_extensions()
+    session_factory = async_sessionmaker()
+    manager = bootstrap_extensions(session_factory=session_factory)
     await manager.startup_all()
     snap = {s.id: s for s in manager.status()}
     assert snap["paisa"].running is True
+    assert manager.get_runtime("paisa").coordinator.session_factory is session_factory
     await manager.shutdown_all()
     snap = {s.id: s for s in manager.status()}
     assert snap["paisa"].running is False

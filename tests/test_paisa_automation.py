@@ -18,7 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 import financial_dashboard.services.settings as settings_mod
 from financial_dashboard.db.models import Base
+from financial_dashboard.extensions import PAISA_EXTENSION
+from financial_dashboard.extensions.registry import ExtensionRegistry
+from financial_dashboard.services.extensions import ExtensionManager
 from financial_dashboard.services.paisa.automation import PaisaAutomationRuntime
+from financial_dashboard.services.paisa.coordinator import PaisaCoordinator
 
 pytestmark = pytest.mark.anyio
 
@@ -124,6 +128,31 @@ async def test_double_startup_starts_one_task(factory):
     await rt.startup()  # idempotent: no second task
     assert rt.coordinator._task is task1
     await rt.shutdown()
+
+
+async def test_manager_does_not_mark_runtime_running_when_coordinator_start_fails(
+    factory, monkeypatch
+):
+    coordinator = PaisaCoordinator(session_factory=factory)
+
+    async def fail_start() -> None:
+        raise RuntimeError("coordinator start failed")
+
+    monkeypatch.setattr(coordinator, "start", fail_start)
+    runtime = PaisaAutomationRuntime(
+        session_factory=factory,
+        coordinator=coordinator,
+    )
+    registry = ExtensionRegistry()
+    registry.register(PAISA_EXTENSION)
+    manager = ExtensionManager(registry)
+    manager.register_runtime("paisa", runtime)
+
+    await manager.startup_all()
+
+    assert runtime.coordinator is coordinator
+    status = {item.id: item for item in manager.status()}
+    assert status["paisa"].running is False
 
 
 # --------------------------------------------------------------------------- #

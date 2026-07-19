@@ -48,7 +48,7 @@ from typing import Any, Awaitable, Callable, NamedTuple
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from financial_dashboard.db.models import utc_now
+from financial_dashboard.db.models import ExtensionRun, utc_now
 from financial_dashboard.integrations.paisa import PaisaClient
 from financial_dashboard.services.paisa.audit import (
     OPERATION_AUTOMATIC,
@@ -201,11 +201,11 @@ def _failure_fingerprint(outcome: str, error: str | None) -> str:
     return digest.hexdigest()[:16]
 
 
-def _notify_fp_from_run(run: Any) -> str | None:
+def _notify_fp_from_run(run: ExtensionRun | None) -> str | None:
     """Read the persisted notification fingerprint from a prior run's details."""
     import json
 
-    if run is None or not getattr(run, "details", None):
+    if run is None or not run.details:
         return None
     try:
         decoded = json.loads(run.details)

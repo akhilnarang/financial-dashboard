@@ -172,7 +172,7 @@ def test_paisa_manifest_shape():
 
 
 def test_bootstrap_extensions_returns_manager_with_paisa():
-    manager = bootstrap_extensions()
+    manager = bootstrap_extensions(session_factory=async_sessionmaker())
     assert isinstance(manager, ExtensionManager)
     assert manager.get("paisa") is not None
     assert "paisa" in manager

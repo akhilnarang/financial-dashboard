@@ -667,7 +667,7 @@ async def _load_structural(
             as_of_date=snap.as_of,
             value=snap.current,
             source=SnapshotSource.manual,
-            currency=getattr(snap, "currency", "INR"),
+            currency=snap.currency,
         )
 
 
@@ -962,19 +962,17 @@ async def _chunked_insert(session: AsyncSession, table, rows: list[dict]) -> int
     var_budget = 900
     adaptive = max(1, var_budget // max(num_cols, 1))
     chunk_size = min(CHUNK_SIZE, adaptive)
-    total_landed = 0
+    before = (
+        await session.execute(text(f"SELECT COUNT(*) FROM {table.name}"))
+    ).scalar_one()
     for start in range(0, len(rows), chunk_size):
         chunk = rows[start : start + chunk_size]
-        before = (
-            await session.execute(text(f"SELECT COUNT(*) FROM {table.name}"))
-        ).scalar_one()
         stmt = sqlite_insert(table).values(chunk).on_conflict_do_nothing()
         await session.execute(stmt)
-        after = (
-            await session.execute(text(f"SELECT COUNT(*) FROM {table.name}"))
-        ).scalar_one()
-        total_landed += max(0, after - before)
-    return total_landed
+    after = (
+        await session.execute(text(f"SELECT COUNT(*) FROM {table.name}"))
+    ).scalar_one()
+    return max(0, after - before)
 
 
 def _message_id(stable_txn_id: str) -> str:

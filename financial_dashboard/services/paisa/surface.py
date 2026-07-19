@@ -27,7 +27,6 @@ materializing anything.
 
 import asyncio
 import datetime
-import hashlib
 import json
 import logging
 import urllib.parse
@@ -42,16 +41,8 @@ from financial_dashboard.core.dates import parse_date
 from financial_dashboard.db.models import Account, ExtensionRun
 from financial_dashboard.extensions import ExtensionManifest
 from financial_dashboard.integrations.paisa import (
-    PaisaAssetsBalanceReport,
     PaisaClient,
     PaisaError,
-    PaisaLiabilitiesReport,
-    REPORT_ALLOCATION,
-    REPORT_ASSETS_BALANCE,
-    REPORT_BUDGET,
-    REPORT_INCOME_STATEMENT,
-    REPORT_LIABILITIES,
-    REPORT_RECURRING,
     validate_base_url,
 )
 from financial_dashboard.schemas.extensions import (
@@ -102,6 +93,14 @@ from financial_dashboard.services.paisa.orchestrator import (
     probe,
 )
 from financial_dashboard.services.paisa.reconciliation import build_reconciliation
+from financial_dashboard.services.paisa.reporting import (
+    DTO_REPORT_KINDS,
+    PaisaReportService,
+    ReportCacheKey,
+    fetch_report as _fetch_report_impl,
+    report_cache_key,
+    report_to_dto,
+)
 from financial_dashboard.services.paisa.renderer import (
     InvalidAccountName,
     validate_account_name,
@@ -238,7 +237,7 @@ def _config_to_dto(cfg: PaisaProjectionConfig) -> PaisaConfig:
         ),
         auto_sync_enabled=get_setting_bool("paisa.auto_sync_enabled", False),
         auto_sync_min_interval_minutes=max(
-            1, get_setting_int("paisa.auto_sync_min_interval_minutes", 30)
+            1, get_setting_int("paisa.auto_sync_min_interval_minutes", 1)
         ),
         notify_sync_failures=get_setting_bool("paisa.notify_sync_failures", False),
         project_investments=cfg.project_investments,
@@ -1477,280 +1476,49 @@ def _ttl_seconds() -> int:
     return max(0, get_setting_int("paisa.report_cache_ttl_seconds", 60))
 
 
-class _ReportCacheKey(NamedTuple):
-    """Secret-free identity for one report response source.
-
-    Report kind alone is insufficient: the app can switch between Paisa
-    instances or credentials while an old entry is still fresh. The base URL is
-    canonicalized by the same validator the client uses; the effective auth
-    username is explicit, while the credential itself appears only as a
-    one-way fingerprint. The configured backend is included because switching
-    journal backends changes the upstream dataset/config interpretation.
-    """
-
-    report: str
-    base_url: str
-    auth_username: str
-    credential_fingerprint: str
-    ledger_cli: str
+_DTO_REPORT_KINDS = DTO_REPORT_KINDS
 
 
-def _report_cache_key(config: PaisaProjectionConfig, report: str) -> _ReportCacheKey:
-    validated = validate_base_url(config.base_url, allow_remote=config.allow_remote)
-    username = config.auth_username
-    # Paisa sends X-Auth only when username is non-empty. Ignore a dormant
-    # password in that case so the key models the effective request identity.
-    password = config.auth_password if username else ""
-    credential_fingerprint = hashlib.sha256(
-        b"financial-dashboard:paisa-report-cache\0"
-        + username.encode("utf-8")
-        + b"\0"
-        + password.encode("utf-8")
-    ).hexdigest()
-    return _ReportCacheKey(
-        report=report,
-        base_url=validated.display,
-        auth_username=username,
-        credential_fingerprint=credential_fingerprint,
-        ledger_cli=(config.ledger_cli or "").strip().lower(),
-    )
+def _report_cache_key(config: PaisaProjectionConfig, report: str) -> ReportCacheKey:
+    """Compatibility wrapper for the former surface-private helper."""
+    return report_cache_key(config, report)
+
+
+def _report_to_dto(report: str, payload: Any) -> PaisaReportSummary:
+    """Compatibility wrapper for the former surface-private DTO adapter."""
+    return report_to_dto(report, payload)
 
 
 async def _fetch_report(config: PaisaProjectionConfig, report: str):
-    """Build a transient client from config, fetch + normalize one report, close.
-
-    Never returns a raw upstream payload — the normalizer in
-    :mod:`integrations.paisa` runs before anything leaves the client."""
-    client = PaisaClient(
-        base_url=config.base_url,
-        allow_remote=config.allow_remote,
-        auth_username=config.auth_username,
-        auth_password=config.auth_password,
-        timeout_seconds=float(config.request_timeout_seconds or 15),
-    )
-    try:
-        return await client.fetch_report(report)
-    finally:
-        await client.aclose()
-
-
-def _money(rows) -> list:
-    return [{"account": r.account, "amount": r.amount} for r in rows]
-
-
-#: The exhaustive set of report kinds :func:`_report_to_dto` can shape into a
-#: DTO — the five report-page endpoints. ``assets_balance`` is deliberately
-#: NOT here: it flows through ``reconciliation_view``, never the report page.
-#: This single set is the source of truth for both the route guard in
-#: :func:`report_summary` and the branches in :func:`_report_to_dto`, so adding
-#: a kind requires extending the set AND adding a branch — a future kind that
-#: forgets the branch hits the assertion below instead of silently falling
-#: through to a generic ``ValueError``.
-_DTO_REPORT_KINDS: frozenset[str] = frozenset(
-    {
-        REPORT_BUDGET,
-        REPORT_ALLOCATION,
-        REPORT_RECURRING,
-        REPORT_INCOME_STATEMENT,
-        REPORT_LIABILITIES,
-    }
-)
-
-
-def _report_to_dto(report: str, payload) -> PaisaReportSummary:
-    """Convert the integrations NamedTuple into the schema Pydantic DTO.
-
-    The two layers are deliberately separate types (a core-type change can never
-    silently reshape a JSON response), so this is the single place they meet.
-    Exhaustive over :data:`_DTO_REPORT_KINDS`: anything else (``assets_balance``,
-    an unknown kind, a typo) is an invariant violation raised as an
-    :class:`AssertionError`, never a fall-through ``ValueError`` that a caller
-    could mistake for normal control flow.
-    """
-    from financial_dashboard.schemas.extensions import (
-        PaisaAllocationReport,
-        PaisaAllocationTarget,
-        PaisaBudgetMonth,
-        PaisaBudgetReport,
-        PaisaIncomeStatementPeriod,
-        PaisaIncomeStatementReport,
-        PaisaLiabilitiesReport,
-        PaisaLiabilityBreakdown,
-        PaisaRecurringReport,
-        PaisaRecurringSequence,
-    )
-
-    if report == REPORT_BUDGET:
-        return PaisaReportSummary(
-            ok=True,
-            report=report,
-            budget=PaisaBudgetReport(
-                months=[
-                    PaisaBudgetMonth(
-                        month=m.month,
-                        forecast=m.forecast,
-                        actual=m.actual,
-                        available_this_month=m.available_this_month,
-                        end_of_month_balance=m.end_of_month_balance,
-                    )
-                    for m in payload.months
-                ],
-                checking_balance=payload.checking_balance,
-                available_for_budgeting=payload.available_for_budgeting,
-            ),
-        )
-    if report == REPORT_ALLOCATION:
-        return PaisaReportSummary(
-            ok=True,
-            report=report,
-            allocation=PaisaAllocationReport(
-                targets=[
-                    PaisaAllocationTarget(
-                        name=t.name,
-                        target_percent=t.target_percent,
-                        current_percent=t.current_percent,
-                    )
-                    for t in payload.targets
-                ],
-                aggregate_accounts=_money(payload.aggregate_accounts),
-            ),
-        )
-    if report == REPORT_RECURRING:
-        return PaisaReportSummary(
-            ok=True,
-            report=report,
-            recurring=PaisaRecurringReport(
-                sequences=[
-                    PaisaRecurringSequence(
-                        key=s.key,
-                        period=s.period,
-                        interval_days=s.interval_days,
-                        count=s.count,
-                    )
-                    for s in payload.sequences
-                ]
-            ),
-        )
-    if report == REPORT_INCOME_STATEMENT:
-        return PaisaReportSummary(
-            ok=True,
-            report=report,
-            income_statement=PaisaIncomeStatementReport(
-                periods=[
-                    PaisaIncomeStatementPeriod(
-                        period=p.period,
-                        starting_balance=p.starting_balance,
-                        ending_balance=p.ending_balance,
-                        income=_money(p.income),
-                        interest=_money(p.interest),
-                        expenses=_money(p.expenses),
-                        tax=_money(p.tax),
-                        pnl=_money(p.pnl),
-                    )
-                    for p in payload.periods
-                ]
-            ),
-        )
-    if report == REPORT_LIABILITIES:
-        return PaisaReportSummary(
-            ok=True,
-            report=report,
-            liabilities=PaisaLiabilitiesReport(
-                breakdowns=[
-                    PaisaLiabilityBreakdown(
-                        group=b.group,
-                        drawn_amount=b.drawn_amount,
-                        repaid_amount=b.repaid_amount,
-                        interest_amount=b.interest_amount,
-                        balance_amount=b.balance_amount,
-                        apr=b.apr,
-                    )
-                    for b in payload.breakdowns
-                ]
-            ),
-        )
-    # Unreachable for any report in _DTO_REPORT_KINDS (every member has a
-    # branch above). Reaching here means routing/branch drift — an invariant
-    # violation, raised as AssertionError so it cannot be mistaken for normal
-    # control flow the way a ValueError fall-through could.
-    raise AssertionError(
-        f"_report_to_dto got unsupported report {report!r}; expected one of "
-        f"{sorted(_DTO_REPORT_KINDS)}"
-    )
+    """Compatibility seam for tests and callers that patch report fetching."""
+    return await _fetch_report_impl(config, report)
 
 
 async def report_summary(app_state: Any, report: str) -> PaisaReportSummary:
-    """Fetch one curated report through the per-app TTL cache.
-
-    Disabled mode → no calls, typed ``ok=False`` body. A failure (network/HTTP)
-    is shaped into ``ok=False`` with a reason, never a 500, so the report page
-    degrades gracefully. ``cached=True`` marks a cache hit.
-    """
-    if report not in _DTO_REPORT_KINDS:
-        return PaisaReportSummary(ok=False, report=report, reason="unsupported_report")
-    config = load_config()
-    if not config.can_connect:
-        return PaisaReportSummary(ok=False, report=report, reason="disabled")
-
-    cache = get_report_cache(app_state)
-    ttl = _ttl_seconds()
-    # ``hit`` is decided under the per-key lock inside read(), so it is atomic
-    # per key and immune to the cross-key race a shared-counter before/after
-    # snapshot would have (a concurrent different-key read can no longer flip
-    # this caller's cached flag).
-    try:
-        key = _report_cache_key(config, report)
-        result = await cache.read(key, ttl, lambda: _fetch_report(config, report))
-    except PaisaError as exc:
-        return PaisaReportSummary(ok=False, report=report, reason=exc.code)
-    except Exception as exc:  # noqa: BLE001 — optional-extension isolation
-        return PaisaReportSummary(ok=False, report=report, reason=str(exc))
-    dto = _report_to_dto(report, result.value)
-    dto.cached = result.hit
-    return dto
+    """Fetch one curated report through the injected application service."""
+    service = PaisaReportService(
+        get_report_cache(app_state),
+        fetch_report_fn=_fetch_report,
+        reconciliation_builder=build_reconciliation,
+    )
+    return await service.report_summary(
+        load_config(), report, ttl_seconds=_ttl_seconds()
+    )
 
 
 async def reconciliation_view(
     session: AsyncSession, app_state: Any
 ) -> PaisaReconcileResponse:
-    """Build the reconciliation view, pulling curated upstream balances through
-    the per-app cache. Read-only; never writes a core row."""
-    config = load_config()
-    asset_report: PaisaAssetsBalanceReport | None = None
-    liability_report: PaisaLiabilitiesReport | None = None
-    upstream_available = False
-    if config.can_connect:
-        cache = get_report_cache(app_state)
-        ttl = _ttl_seconds()
-        try:
-            asset_key = _report_cache_key(config, REPORT_ASSETS_BALANCE)
-            liability_key = _report_cache_key(config, REPORT_LIABILITIES)
-            asset_report = (
-                await cache.read(
-                    asset_key,
-                    ttl,
-                    lambda: _fetch_report(config, REPORT_ASSETS_BALANCE),
-                )
-            ).value
-            liability_report = (
-                await cache.read(
-                    liability_key,
-                    ttl,
-                    lambda: _fetch_report(config, REPORT_LIABILITIES),
-                )
-            ).value
-            upstream_available = True
-        except PaisaError:
-            upstream_available = False
-        except Exception:  # noqa: BLE001 — optional-extension isolation
-            logger.warning("Paisa reconciliation upstream read failed", exc_info=True)
-            upstream_available = False
-
-    return await build_reconciliation(
+    """Build the read-only reconciliation view through the report service."""
+    service = PaisaReportService(
+        get_report_cache(app_state),
+        fetch_report_fn=_fetch_report,
+        reconciliation_builder=build_reconciliation,
+    )
+    return await service.reconciliation_view(
         session,
-        asset_report=asset_report,
-        liability_report=liability_report,
-        upstream_available=upstream_available,
+        load_config(),
+        ttl_seconds=_ttl_seconds(),
     )
 
 
