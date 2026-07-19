@@ -28,7 +28,7 @@ function of the scenario — deterministic, no I/O.
 
 import hashlib
 import json
-from typing import Iterable
+from typing import Iterable, Protocol
 
 from scripts.synth import constants as C
 from scripts.synth.models import Scenario
@@ -60,12 +60,16 @@ def _fold_transaction(h: hashlib._Hash, t) -> None:  # noqa: SLF001
     h.update((t.review_status or "").encode())
 
 
-def _fold_stable_ids(h: hashlib._Hash, kind: str, items: Iterable) -> None:  # noqa: SLF001
-    for x in items:
-        sid = getattr(x, "stable_id", None)
-        if sid is not None:
-            h.update(kind.encode())
-            h.update(sid.encode())
+class _HasStableId(Protocol):
+    stable_id: str
+
+
+def _fold_stable_ids(
+    h: hashlib._Hash, kind: str, items: Iterable[_HasStableId]
+) -> None:  # noqa: SLF001
+    for item in items:
+        h.update(kind.encode())
+        h.update(item.stable_id.encode())
 
 
 def scenario_fingerprint(scenario: Scenario) -> str:
@@ -101,9 +105,7 @@ def scenario_fingerprint(scenario: Scenario) -> str:
     _fold_stable_ids(h, "st", scenario.statement_uploads)
     _fold_stable_ids(h, "e", scenario.emails)
     _fold_stable_ids(h, "sm", scenario.sms)
-    _fold_stable_ids(h, "sn", scenario.account_snapshots)
     _fold_stable_ids(h, "oe", scenario.orphan_emails)
-    _fold_stable_ids(h, "fx", scenario.fx_rates)
     return h.hexdigest()
 
 

@@ -21,6 +21,8 @@ import logging
 from collections.abc import Iterator
 from typing import NamedTuple
 
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
 from financial_dashboard.extensions import (
     ExtensionManifest,
     ExtensionRegistry,
@@ -83,11 +85,16 @@ class ExtensionManager:
 
         ``ext_id`` must be a registered manifest id and ``runtime.extension_id``
         must match it, so a runtime can never be attached to the wrong manifest.
-        Registering twice for the same id replaces the prior runtime (the
-        bootstrap path is single-threaded and idempotent in intent).
+        A second runtime for the same id is rejected: silently replacing one
+        would lose lifecycle ownership of the original runtime and make the
+        manager's running status refer to the wrong object.
         """
         if ext_id not in self._registry:
             raise ValueError(f"Cannot attach runtime: unknown extension {ext_id!r}")
+        if ext_id in self._runtimes:
+            raise ValueError(
+                f"Cannot attach runtime: runtime already registered for {ext_id!r}"
+            )
         # ``extension_id`` is part of the ExtensionRuntime protocol. Direct
         # attribute access — the protocol guarantees it; let AttributeError
         # surface for a non-conforming object.
@@ -182,22 +189,25 @@ class ExtensionManager:
         )
 
 
-def bootstrap_extensions() -> ExtensionManager:
+def bootstrap_extensions(*, session_factory: async_sessionmaker) -> ExtensionManager:
     """Build a manager, register builtin manifests+settings, attach runtimes.
 
     Contributed settings land in the process-wide SETTINGS_REGISTRY (idempotent
     across restarts), so this must run before ``load_all_settings()``. Runtime
-    construction is side-effect-free (no settings reads, no DB) — runtimes defer
-    all work to their lifecycle hooks — so attaching them here is safe even
-    though settings are not loaded yet.
+    construction is side-effect-free (no settings reads or DB I/O) and receives
+    the application-owned session factory explicitly. Runtimes defer all work
+    to their lifecycle hooks, so attaching them here is safe even though
+    settings are not loaded yet.
     """
     manager = ExtensionManager()
     register_builtin_extensions(manager.registry)
-    _register_builtin_runtimes(manager)
+    _register_builtin_runtimes(manager, session_factory=session_factory)
     return manager
 
 
-def _register_builtin_runtimes(manager: ExtensionManager) -> None:
+def _register_builtin_runtimes(
+    manager: ExtensionManager, *, session_factory: async_sessionmaker
+) -> None:
     """Attach the first-party runtimes. No dynamic discovery.
 
     Function-local import keeps the extension-framework layer free of a
@@ -208,7 +218,9 @@ def _register_builtin_runtimes(manager: ExtensionManager) -> None:
     if "paisa" in manager:
         from financial_dashboard.services.paisa.automation import PaisaAutomationRuntime
 
-        manager.register_runtime("paisa", PaisaAutomationRuntime())
+        manager.register_runtime(
+            "paisa", PaisaAutomationRuntime(session_factory=session_factory)
+        )
 
 
 __all__ = [

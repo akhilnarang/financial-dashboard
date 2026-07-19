@@ -201,12 +201,8 @@ def compute_coverage(scenario: Scenario) -> frozenset[str]:
     # synthetic axis. The production self-transfer reference rule fires on a
     # paired self-transfer at load time (category_method='rule'), so the
     # presence of a paired self-transfer exercises the rule axis too.
-    methods = {
-        getattr(t, "category_method", None)
-        for t in txns
-        if getattr(t, "category_method", None)
-    }
-    if any(getattr(t, "category_method", None) in (None, "synthetic") for t in txns):
+    methods = {t.category_method for t in txns if t.category_method}
+    if any(t.category_method in (None, "synthetic") for t in txns):
         present.add("cat.method_synthetic")
     for m in methods:
         key = {
@@ -318,7 +314,7 @@ def compute_coverage(scenario: Scenario) -> frozenset[str]:
         present.add("stmt.bank_matched")
     if any(s.closing_balance for s in bank_stmts):
         present.add("stmt.bank_closing")
-    if any(getattr(s, "reconciliation_data", None) for s in scenario.statement_uploads):
+    if any(s.reconciliation_data for s in scenario.statement_uploads):
         present.add("stmt.reconcile_offline")
 
     # --- net-worth / CAS / manual ------------------------------------------
@@ -332,10 +328,7 @@ def compute_coverage(scenario: Scenario) -> frozenset[str]:
         present.add("net.cas_reconciled")
     if any(not cas.portfolio_ok for cas in scenario.cas_uploads):
         present.add("net.cas_unreconciled")
-    if any(
-        getattr(snap, "note", None) == "complete_lot"
-        for snap in scenario.account_snapshots
-    ):
+    if any(snap.note == "complete_lot" for snap in scenario.account_snapshots):
         present.add("net.lot_complete")
     if scenario.investment_lots >= 1:
         present.add("net.lot_complete")
@@ -363,9 +356,7 @@ def compute_coverage(scenario: Scenario) -> frozenset[str]:
         for snap in scenario.account_snapshots
     ):
         present.add("net.cc_zero_snapshot")
-    if any(
-        getattr(snap, "currency", "INR") != "INR" for snap in scenario.account_snapshots
-    ):
+    if any(snap.currency != "INR" for snap in scenario.account_snapshots):
         present.add("net.non_inr_snapshot_excluded")
     snap_months = {snap.as_of.replace(day=1) for snap in scenario.account_snapshots}
     if len(snap_months) >= 2:

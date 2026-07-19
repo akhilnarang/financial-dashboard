@@ -1,6 +1,8 @@
-"""Investment service: source-faithful lot classification and read queries.
+"""Investment persistence/read service and compatibility facade.
 
-CAS payloads are modeled here **without fabrication.** A capital-gains lot is
+Pure CAS transaction handling lives in :mod:`investment_transactions`; its
+public values and functions are re-exported here so existing callers keep the
+original service API. CAS payloads are modeled **without fabrication.** A lot is
 only ever built from an explicit acquisition fact — an instrument id, a
 quantity, a per-unit cost, a cost basis, a currency and an acquisition date
 that are all present in the source and mutually consistent. Anything less is
@@ -34,62 +36,39 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.dates import parse_date
 from financial_dashboard.db.models import CasUpload, InvestmentLot
+from financial_dashboard.services.investment_transactions import (
+    CAS_CURRENCY as CAS_CURRENCY,
+    _classify_transaction,
+    _normalized_ref,
+    _normalized_reference,
+    _to_decimal,
+    _txn_isin,
+    extract_lots_from_payload as extract_lots_from_payload,
+    resolve_lot_consumption as resolve_lot_consumption,
+    unresolved_disposal_instruments as unresolved_disposal_instruments,
+)
+from financial_dashboard.services.investment_types import (
+    CompleteLot as CompleteLot,
+    CreateInvestmentLotsResult as CreateInvestmentLotsResult,
+    LotClassificationResult as LotClassificationResult,
+    LotConsumption as LotConsumption,
+    LotExclusion as LotExclusion,
+    LotExtractionResult as LotExtractionResult,
+    LotKey as LotKey,
+)
 
 logger = logging.getLogger(__name__)
 
-#: CAS is an Indian depository statement; every amount it prints is INR. That
-#: is a fact about the document, not a fabricated currency.
-CAS_CURRENCY = "INR"
 
-#: Ingestion agreement tolerance between the reported ``amount`` and the
-#: full-precision ``units * nav``. CAS prints units/nav at limited precision, so
-#: the printed amount is a rounding of the true product and a sub-penny
-#: disagreement is unavoidable display noise. A discrepancy of a full paisa or
-#: more means the three printed numbers are mutually inconsistent beyond
-#: rounding and the lot is excluded. The bound is **exclusive**: a difference of
-#: exactly ``0.01`` is rejected (it cannot arise from a single 2dp rounding),
-#: which closes the former 1-paisa grey zone that emitted lots whose stored
-#: cost basis disagreed with their ``units * nav``.
-_LOT_AGREEMENT_TOLERANCE = Decimal("0.01")
-
-#: MF transaction_type substrings (lowercased) that denote an acquisition. The
-#: CAS parser emits free-form type strings, so these are matched as substrings;
-#: an unknown/blank type is treated as ambiguous and excluded conservatively
-#: rather than guessed.
-_ACQUISITION_TYPES = ("purchase", "switch_in", "switch-in", "buy", "allotment")
-
-#: transaction_type substrings that denote a disposal — never a lot.
-_DISPOSAL_TYPES = ("redemption", "switch_out", "switch-out", "sell", "sold")
-
-
-class CompleteLot(NamedTuple):
-    """Constructor-ready fields for a complete :class:`InvestmentLot`.
-
-    Every field is an explicit, validated source fact. Returned by
-    :func:`extract_lots_from_payload` and turned into ORM rows by
-    :func:`create_investment_lots`.
-    """
-
-    instrument_id: str
-    instrument_name: str
-    quantity: Decimal
-    unit_cost: Decimal
-    cost_basis: Decimal
-    currency: str
-    acquired_on: datetime.date
-    source_ref: str
-    transaction_type: str | None
-    reference: str | None
-    source_occurrence: int
-
-
-class LotExclusion(NamedTuple):
-    """Why a CAS transaction did not become a lot, with a stable ``reason``."""
-
-    reason: str
-    detail: str
-    instrument_id: str | None
-    source_ref: str | None
+def _decode_cas_payload(raw_payload: str | None) -> dict | None:
+    """Decode one preserved CAS payload, accepting JSON objects only."""
+    if raw_payload is None:
+        return None
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError, TypeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 class CanonicalLotKey(NamedTuple):
@@ -200,40 +179,6 @@ class _RawTransactionCandidate(NamedTuple):
     source_order: int
 
 
-class LotKey(NamedTuple):
-    """Stable source identity of one persisted acquisition lot.
-
-    ``occurrence`` preserves multiplicity for the same source transaction
-    identity. This compatibility key omits portfolio/cost facts; new projection
-    code should use :class:`CanonicalLotKey`.
-    """
-
-    instrument_id: str
-    source_ref: str
-    acquired_on: datetime.date
-    reference: str | None
-    occurrence: int
-
-
-class LotConsumption(NamedTuple):
-    """Read-only remaining-lot model derived from preserved CAS facts.
-
-    ``remaining`` contains only acquisition lots touched by deterministic
-    disposal allocation, keyed by :class:`LotKey`. An absent key is untouched,
-    zero means full consumption, and a positive value is the exact remaining
-    quantity. The projection preserves the acquisition's explicit unit cost and
-    computes its reduced reporting cost basis as ``remaining * unit_cost`` at
-    money precision. Persisted :class:`InvestmentLot` rows are never changed.
-
-    ``unresolved_instruments`` contains instruments for which at least one
-    disposal cannot be allocated without guessing. Projection suppresses every
-    lot for such an instrument, regardless of values in ``remaining``.
-    """
-
-    unresolved_instruments: set[str]
-    remaining: dict[LotKey, Decimal]
-
-
 class CanonicalLotConsumption(NamedTuple):
     """Disposal state keyed to :class:`CanonicalLotKey` for projection.
 
@@ -246,473 +191,9 @@ class CanonicalLotConsumption(NamedTuple):
     remaining: dict[CanonicalLotKey, Decimal]
 
 
-class _AcquisitionFact(NamedTuple):
-    key: LotKey
-    quantity: Decimal
-
-
-class _DisposalFact(NamedTuple):
-    source_ref: str
-    quantity: Decimal | None
-    disposed_on: datetime.date | None
-    reference: str | None
-    order: int
-
-
-def _to_decimal(value) -> Decimal | None:
-    """Parse a CAS numeric field into a finite ``Decimal``, or ``None``.
-
-    Strings, ints, floats and existing Decimals are all accepted (the payload
-    arrives JSON-decoded); anything non-finite or unparseable is ``None`` so a
-    malformed row is excluded rather than crashing the whole ingest.
-    """
-    if value is None or value == "":
-        return None
-    try:
-        amount = Decimal(str(value))
-    except InvalidOperation, ValueError, TypeError:
-        return None
-    if not amount.is_finite():
-        return None
-    return amount
-
-
-def _classify_transaction(raw: dict) -> tuple[CompleteLot | None, LotExclusion | None]:
-    """Classify one CAS transaction dict into a complete lot or an exclusion.
-
-    Returns ``(lot, None)`` for a complete acquisition, ``(None, exclusion)``
-    otherwise. Pure: no DB, no side effects, so the same function backs both
-    ingest-time lot creation and query-time diagnostics.
-    """
-    scope = str(raw.get("scope") or "").lower()
-    source_ref = raw.get("source_ref")
-    source_ref_text = str(source_ref) if source_ref is not None else None
-    isin = raw.get("isin")
-    isin_text = (
-        str(isin).strip().upper() if isinstance(isin, str) and isin.strip() else None
-    )
-    ttype_raw = raw.get("transaction_type")
-    ttype = (
-        str(ttype_raw).strip().lower()
-        if isinstance(ttype_raw, str) and ttype_raw.strip()
-        else ""
-    )
-    reference = raw.get("reference")
-    reference_text = (
-        str(reference).strip()
-        if isinstance(reference, str) and reference.strip()
-        else None
-    )
-
-    # MF transactions carry units/nav/amount; demat rows carry only quantity.
-    if scope != "mf":
-        return None, LotExclusion(
-            reason="not_mutual_fund",
-            detail=f"scope {scope!r}: only MF purchase transactions carry cost in CAS",
-            instrument_id=isin_text,
-            source_ref=source_ref_text,
-        )
-
-    if ttype and any(marker in ttype for marker in _DISPOSAL_TYPES):
-        return None, LotExclusion(
-            reason="disposal_transaction",
-            detail=f"transaction_type {ttype!r} is a disposal, not an acquisition",
-            instrument_id=isin_text,
-            source_ref=source_ref_text,
-        )
-    if not ttype or not any(marker in ttype for marker in _ACQUISITION_TYPES):
-        return None, LotExclusion(
-            reason="ambiguous_transaction_type",
-            detail=(
-                f"transaction_type {ttype!r} does not identify an acquisition; "
-                f"refusing to treat the date as an acquisition date"
-            ),
-            instrument_id=isin_text,
-            source_ref=source_ref_text,
-        )
-
-    units = _to_decimal(raw.get("units"))
-    nav = _to_decimal(raw.get("nav"))
-    amount = _to_decimal(raw.get("amount"))
-    date_raw = raw.get("date")
-    acquired_on = parse_date(str(date_raw)) if date_raw is not None else None
-
-    # Every lot field must be explicit and positive; a missing/zero/negative
-    # value is reported, never filled in from another field or from value.
-    missing: list[str] = []
-    if units is None or units <= 0:
-        missing.append("units")
-    if nav is None or nav <= 0:
-        missing.append("nav")
-    if amount is None or amount <= 0:
-        missing.append("amount")
-    if acquired_on is None:
-        missing.append("date")
-    if isin_text is None:
-        missing.append("isin")
-    if missing:
-        return None, LotExclusion(
-            reason="missing_lot_facts",
-            detail="missing/invalid: " + ", ".join(missing),
-            instrument_id=isin_text,
-            source_ref=source_ref_text,
-        )
-
-    # Agreement + exact balance. CAS prints units/nav at limited precision, so
-    # the printed ``amount`` is a rounding of the true ``units * nav``; a
-    # sub-penny disagreement is unavoidable display noise, but a discrepancy of
-    # a full paisa or more means the printed numbers are mutually inconsistent
-    # beyond rounding and the lot is excluded with a stable reason. The bound is
-    # exclusive: a difference of exactly one paisa is rejected — it cannot arise
-    # from a single 2dp rounding — which removes the former 1-paisa grey zone.
-    assert (
-        units is not None and nav is not None and amount is not None
-    )  # narrowed above
-    product = units * nav  # full precision — what every backend recomputes
-    discrepancy = abs(product - amount)
-    if discrepancy >= _LOT_AGREEMENT_TOLERANCE:
-        return None, LotExclusion(
-            reason="cost_basis_inconsistent",
-            detail=(
-                f"amount {amount} differs from units*nav {product} by "
-                f"{discrepancy}; CAS values disagree beyond rounding"
-            ),
-            instrument_id=isin_text,
-            source_ref=source_ref_text,
-        )
-    # Store the quantized product — the parser's canonical lot value — NOT the
-    # separately-printed amount. The renderer values the asset leg as
-    # ``quantity * unit_cost`` and balance-checks at 2 dp, so a ``cost_basis``
-    # equal to ``(quantity * unit_cost).quantize(0.01)`` makes the lot exactly
-    # consistent (the renderer's guard passes with a zero diff, not up to a
-    # paisa) and the emitted entry balances at the renderer's money precision
-    # for every accepted lot. This is what closes the former 1-paisa grey zone.
-    cost_basis = product.quantize(_LOT_AGREEMENT_TOLERANCE)
-
-    description = raw.get("description")
-    instrument_name = (
-        str(description).strip()
-        if isinstance(description, str) and description.strip()
-        else isin_text
-    )
-    # The ``missing`` guard above guarantees these are non-None here; the asserts
-    # narrow them for the type checker (matches projection.py's convention).
-    assert isin_text is not None
-    assert acquired_on is not None
-    assert instrument_name  # isin_text is non-None here
-
-    lot = CompleteLot(
-        instrument_id=isin_text,
-        instrument_name=instrument_name,
-        quantity=units,
-        unit_cost=nav,
-        cost_basis=cost_basis,
-        currency=CAS_CURRENCY,
-        acquired_on=acquired_on,
-        source_ref=str(source_ref),
-        transaction_type=ttype or None,
-        reference=reference_text,
-        source_occurrence=0,
-    )
-    return lot, None
-
-
-def extract_lots_from_payload(
-    payload: dict,
-) -> tuple[list[CompleteLot], list[LotExclusion]]:
-    """Split a CAS payload's transactions into complete lots and exclusions.
-
-    Transactions are the only CAS section that can carry an acquisition date;
-    holdings/folios (value-only) are not scanned for lots — they remain
-    reconciliation data. Repeated complete rows are retained as source
-    multiplicity and assigned a zero-based ``source_occurrence`` within their
-    source transaction identity. Retry idempotency is enforced when persisting,
-    not by collapsing source rows here.
-    """
-    lots: list[CompleteLot] = []
-    exclusions: list[LotExclusion] = []
-    occurrences: dict[tuple[str, str, datetime.date, str | None], int] = defaultdict(
-        int
-    )
-    for raw in payload.get("transactions") or []:
-        if not isinstance(raw, dict):
-            continue
-        lot, exclusion = _classify_transaction(raw)
-        if lot is not None:
-            key = (
-                lot.source_ref,
-                lot.instrument_id,
-                lot.acquired_on,
-                lot.reference,
-            )
-            occurrence = occurrences[key]
-            occurrences[key] += 1
-            lots.append(lot._replace(source_occurrence=occurrence))
-        elif exclusion is not None:
-            exclusions.append(exclusion)
-    return lots, exclusions
-
-
-# ---------------------------------------------------------------------------
-# Disposal-history resolution (redemption safety)
-# ---------------------------------------------------------------------------
-
-
-def _txn_isin(raw: dict) -> str | None:
-    isin = raw.get("isin")
-    if isinstance(isin, str) and isin.strip():
-        return isin.strip().upper()
-    return None
-
-
-def _txn_is_disposal(raw: dict) -> bool:
-    """A CAS transaction that disposes units (redemption/switch_out/sell)."""
-    ttype_raw = raw.get("transaction_type")
-    ttype = (
-        str(ttype_raw).strip().lower()
-        if isinstance(ttype_raw, str) and ttype_raw.strip()
-        else ""
-    )
-    return bool(ttype) and any(marker in ttype for marker in _DISPOSAL_TYPES)
-
-
-def _txn_is_acquisition(raw: dict) -> bool:
-    """A CAS transaction that acquires units (purchase/switch_in/buy)."""
-    ttype_raw = raw.get("transaction_type")
-    ttype = (
-        str(ttype_raw).strip().lower()
-        if isinstance(ttype_raw, str) and ttype_raw.strip()
-        else ""
-    )
-    return bool(ttype) and any(marker in ttype for marker in _ACQUISITION_TYPES)
-
-
-def unresolved_disposal_instruments(payloads) -> set[str]:
-    """Instrument ids whose preserved CAS facts contain a disposal that cannot
-    be truthfully allocated to specific acquisition lots.
-
-    Thin wrapper over :func:`resolve_lot_consumption` returning just the
-    unresolved set. Kept for backward compatibility with existing call sites
-    and tests; new code should call :func:`resolve_lot_consumption` directly
-    to also inspect the consumption map.
-    """
-    return resolve_lot_consumption(payloads).unresolved_instruments
-
-
-def _normalized_ref(value) -> str:
-    return str(value).strip() if value is not None else ""
-
-
-def _normalized_reference(value) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    return value.strip()
-
-
-def _allocate_exact(
-    disposal: _DisposalFact,
-    acquisitions: list[_AcquisitionFact],
-    remaining: dict[LotKey, Decimal],
-) -> bool:
-    """Consume ``disposal`` only when its source facts identify one lot.
-
-    Candidates are already scoped by exact instrument and ``source_ref``. An
-    explicit transaction reference that matches exactly one active acquisition
-    identifies that lot. Otherwise the bucket must contain exactly one active
-    acquisition, which is the only deterministic identity left. Full and
-    partial consumption of that one lot are both supported.
-
-    Multiple possible acquisitions are unresolved. Acquisition date order is
-    deliberately *not* an allocation fact: CAS does not say that a redemption
-    consumed FIFO, so neither an exact aggregate quantity nor distinct dates
-    authorize spreading a disposal across lots.
-    """
-    active = [lot for lot in acquisitions if remaining[lot.key] > 0]
-    if not active or disposal.quantity is None or disposal.quantity <= 0:
-        return False
-
-    if disposal.reference:
-        exact = [lot for lot in active if lot.key.reference == disposal.reference]
-        if len(exact) > 1:
-            return False
-        if len(exact) == 1:
-            lot = exact[0]
-            if (
-                disposal.disposed_on is not None
-                and lot.key.acquired_on > disposal.disposed_on
-            ):
-                return False
-            if disposal.quantity > remaining[lot.key]:
-                return False
-            remaining[lot.key] -= disposal.quantity
-            return True
-
-    # A dated disposal cannot consume a future acquisition. A missing date does
-    # not fabricate one; identity still comes solely from the explicit bucket.
-    eligible = [
-        lot
-        for lot in active
-        if disposal.disposed_on is None or lot.key.acquired_on <= disposal.disposed_on
-    ]
-    if len(eligible) != 1:
-        return False
-    lot = eligible[0]
-    if disposal.quantity > remaining[lot.key]:
-        return False
-    remaining[lot.key] -= disposal.quantity
-    return True
-
-
-def resolve_lot_consumption(payloads) -> LotConsumption:
-    """Conservative lot consumption/netting from explicit CAS facts.
-
-    Allocation is scoped first by ``(instrument_id, source_ref)``; a shared ref
-    never crosses instruments. Within that explicit bucket, one transaction
-    reference identifying one acquisition wins. Otherwise exactly one active
-    acquisition is a deterministic identity. Multiple possible acquisitions
-    are never allocated by inferred FIFO, acquisition date, or aggregate cost.
-    A missing ref/units, an incomplete/conflicting acquisition in the same
-    bucket, an unmatched disposal, future-lot consumption, or over-disposal
-    marks the whole affected instrument unresolved and suppresses it
-    conservatively.
-
-    Full consumption records zero and partial consumption records the exact
-    source quantity left; untouched lots are absent so projection continues to
-    use their normalized persisted quantity. Projection retains the source
-    acquisition date/unit cost and recomputes the proportional cost basis.
-    Identical magnitudes are never used as a de-duplication key: separate source
-    rows retain multiplicity; overlap canonicalization belongs to
-    :func:`get_canonical_lot_consumption`, not this compatibility pure helper.
-
-    Pure over its argument (an iterable of CAS payload dicts) so the same
-    rule backs ingest-time diagnostics and projection-time consumption.
-    """
-    acquisitions: dict[str, dict[str, list[_AcquisitionFact]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    disposals: dict[str, list[_DisposalFact]] = defaultdict(list)
-    ambiguous_acquisitions: dict[str, dict[str, set[str | None]]] = defaultdict(
-        lambda: defaultdict(set)
-    )
-    occurrences: dict[tuple[str, str, datetime.date, str | None], int] = defaultdict(
-        int
-    )
-    order = 0
-    for payload in payloads or ():
-        if not isinstance(payload, dict):
-            continue
-        for raw in payload.get("transactions") or []:
-            if not isinstance(raw, dict):
-                continue
-            isin = _txn_isin(raw)
-            if isin is None:
-                continue
-            order += 1
-            if _txn_is_disposal(raw):
-                units = _to_decimal(raw.get("units"))
-                date_raw = raw.get("date")
-                disposals[isin].append(
-                    _DisposalFact(
-                        source_ref=_normalized_ref(raw.get("source_ref")),
-                        quantity=abs(units) if units is not None else None,
-                        disposed_on=(
-                            parse_date(str(date_raw)) if date_raw is not None else None
-                        ),
-                        reference=_normalized_reference(raw.get("reference")),
-                        order=order,
-                    )
-                )
-                continue
-            if not _txn_is_acquisition(raw):
-                continue
-            lot, _exclusion = _classify_transaction(raw)
-            if lot is None:
-                ref = _normalized_ref(raw.get("source_ref"))
-                if ref:
-                    # A disposal sharing this bucket could have consumed the
-                    # incomplete acquisition. Allocating it only among complete
-                    # persisted lots would invent certainty/cost basis.
-                    ambiguous_acquisitions[isin][ref].add(
-                        _normalized_reference(raw.get("reference"))
-                    )
-                continue
-            natural = (
-                lot.instrument_id,
-                _normalized_ref(lot.source_ref),
-                lot.acquired_on,
-                _normalized_reference(lot.reference),
-            )
-            occurrence = occurrences[natural]
-            occurrences[natural] += 1
-            key = LotKey(*natural, occurrence)
-            acquisitions[isin][key.source_ref].append(
-                _AcquisitionFact(key=key, quantity=lot.quantity)
-            )
-
-    unresolved: set[str] = set()
-    original: dict[LotKey, Decimal] = {
-        lot.key: lot.quantity
-        for by_ref in acquisitions.values()
-        for lots in by_ref.values()
-        for lot in lots
-    }
-    resolved_remaining = dict(original)
-
-    for isin, instrument_disposals in disposals.items():
-        by_ref = acquisitions.get(isin, {})
-        # Date then source order makes repeated exact-lot consumption stable
-        # while retaining multiplicity. This ordering never allocates one
-        # disposal across acquisition lots.
-        ordered = sorted(
-            instrument_disposals,
-            key=lambda disposal: (
-                disposal.disposed_on is None,
-                disposal.disposed_on or datetime.date.max,
-                disposal.order,
-            ),
-        )
-        for disposal in ordered:
-            if not disposal.source_ref or disposal.quantity is None:
-                unresolved.add(isin)
-                break
-            candidates = by_ref.get(disposal.source_ref, [])
-            ambiguous_references = ambiguous_acquisitions.get(isin, {}).get(
-                disposal.source_ref, set()
-            )
-            if ambiguous_references:
-                exact_complete = [
-                    lot
-                    for lot in candidates
-                    if resolved_remaining[lot.key] > 0
-                    and disposal.reference
-                    and lot.key.reference == disposal.reference
-                ]
-                if (
-                    disposal.reference is None
-                    or disposal.reference in ambiguous_references
-                    or len(exact_complete) != 1
-                ):
-                    unresolved.add(isin)
-                    break
-            if not _allocate_exact(disposal, candidates, resolved_remaining):
-                unresolved.add(isin)
-                break
-
-    remaining = {
-        key: quantity
-        for key, quantity in resolved_remaining.items()
-        if key.instrument_id not in unresolved and quantity != original[key]
-    }
-
-    return LotConsumption(
-        unresolved_instruments=unresolved,
-        remaining=remaining,
-    )
-
-
 async def create_investment_lots(
     session: AsyncSession, *, cas_upload_id: int, payload: dict
-) -> tuple[int, list[LotExclusion]]:
+) -> CreateInvestmentLotsResult:
     """Persist complete lots for one CAS upload; return ``(created, excluded)``.
 
     Idempotent within an upload: a retry compares every normalized source fact
@@ -758,7 +239,7 @@ async def create_investment_lots(
         created += 1
     if created:
         await session.flush()
-    return created, exclusions
+    return CreateInvestmentLotsResult(created=created, exclusions=exclusions)
 
 
 def _complete_lot_key(lot: CompleteLot) -> tuple:
@@ -811,9 +292,9 @@ async def backfill_investment_lots(session: AsyncSession) -> LotBackfillResult:
     malformed: list[int] = []
     for upload in uploads:
         try:
-            payload = json.loads(upload.raw_holdings_json)
-            if not isinstance(payload, dict):
-                raise TypeError("CAS payload must be a JSON object")
+            payload = _decode_cas_payload(upload.raw_holdings_json)
+            if payload is None:
+                raise ValueError("CAS payload must be a JSON object")
             upload_created, _ = await create_investment_lots(
                 session,
                 cas_upload_id=upload.id,
@@ -1024,9 +505,8 @@ async def get_incomplete_reasons(session: AsyncSession) -> list[LotExclusion]:
         .all()
     )
     for upload in uploads:
-        try:
-            payload = json.loads(upload.raw_holdings_json)
-        except json.JSONDecodeError, TypeError:
+        payload = _decode_cas_payload(upload.raw_holdings_json)
+        if payload is None:
             continue
         _, exclusions = extract_lots_from_payload(payload)
         out.extend(exclusions)
@@ -1047,10 +527,9 @@ async def get_lot_consumption(session: AsyncSession) -> LotConsumption:
         .all()
     )
     for upload in uploads:
-        try:
-            payloads.append(json.loads(upload.raw_holdings_json))
-        except json.JSONDecodeError, TypeError:
-            continue
+        payload = _decode_cas_payload(upload.raw_holdings_json)
+        if payload is not None:
+            payloads.append(payload)
     return resolve_lot_consumption(payloads)
 
 
@@ -1195,11 +674,8 @@ async def get_canonical_lot_consumption(
     )
     by_portfolio: dict[str, list[_PayloadSource]] = defaultdict(list)
     for upload in uploads:
-        try:
-            payload = json.loads(upload.raw_holdings_json)
-            if not isinstance(payload, dict):
-                raise TypeError("CAS payload must be a JSON object")
-        except json.JSONDecodeError, TypeError:
+        payload = _decode_cas_payload(upload.raw_holdings_json)
+        if payload is None:
             logger.warning(
                 "Skipping malformed CAS disposal history (cas_upload_id=%s)",
                 upload.id,
@@ -1363,11 +839,8 @@ async def get_current_valuations(session: AsyncSession) -> list[CurrentValuation
 
     valuations: list[CurrentValuation] = []
     for upload in latest.values():
-        try:
-            payload = json.loads(upload.raw_holdings_json)
-            if not isinstance(payload, dict):
-                raise TypeError("CAS payload must be a JSON object")
-        except json.JSONDecodeError, TypeError:
+        payload = _decode_cas_payload(upload.raw_holdings_json)
+        if payload is None:
             logger.warning(
                 "Skipping malformed current CAS valuation (cas_upload_id=%s)",
                 upload.id,
@@ -1401,10 +874,7 @@ async def get_latest_payload(session: AsyncSession) -> dict | None:
     )
     if upload is None:
         return None
-    try:
-        return json.loads(upload.raw_holdings_json)
-    except json.JSONDecodeError, TypeError:
-        return None
+    return _decode_cas_payload(upload.raw_holdings_json)
 
 
 async def get_positions(session: AsyncSession) -> list[LotPosition]:

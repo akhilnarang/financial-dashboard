@@ -52,25 +52,34 @@ from financial_dashboard.services.investments import (
     get_canonical_lots,
     get_current_valuations,
 )
-from financial_dashboard.services.cashflow.scope import (
-    CARD_ACCOUNT_TYPES,
-)
-from financial_dashboard.services.categorization.slugs import (
-    CREDIT_CARD_ACCOUNT_TYPE,
-    REPAYMENT_SLUG,
+from financial_dashboard.services.paisa.accounting import (
+    CREDIT_CARD_PAYMENT_SLUG,
+    INVESTMENT_CATEGORY_SLUGS,
+    KIND_CARD_PAYMENT,
+    KIND_CONTRA_EXPENSE,
+    KIND_EXPENSE,
+    KIND_INCOME,
+    KIND_INVESTMENT,
+    KIND_LOT,
+    KIND_OPENING,
+    KIND_REPAYMENT,
+    KIND_SELF_TRANSFER,
+    KIND_UNKNOWN,
+    ProjectionError,
+    SELF_TRANSFER_SLUG,
+    card_clearing_account,
+    category_kind,
+    contra_account,
+    normalize_policy_account,
+    resolve_account,
 )
 from financial_dashboard.services.paisa.config import PaisaProjectionConfig
 from financial_dashboard.services.paisa.renderers import (
-    normalize_default_account,
     render_document as render_document_for_backend,
-    validate_account_name,
 )
 from financial_dashboard.services.paisa.renderers.base import (
-    CARD_PAYMENT_CLEARING,
     INR,
     INVESTMENT_EQUITY_OPENING,
-    INVESTMENT_UNALLOCATED_ACCOUNT,
-    InvalidAccountName,
     InvestmentLotEntry,
     LedgerAccount,
     LedgerDocument,
@@ -78,7 +87,6 @@ from financial_dashboard.services.paisa.renderers.base import (
     OpeningBalance,
     PriceDirective,
     ProjectedEntry,
-    REPAYMENT_CLEARING_ACCOUNT,
     sanitize_commodity,
     sanitize_meta_value,
 )
@@ -111,28 +119,10 @@ from financial_dashboard.services.paisa.renderers.base import (
 # projection surfaces an ``imprecise`` diagnostic so an operator knows the
 # movement is not truthfully allocated.
 
-SELF_TRANSFER_SLUG = "self_transfer"
-CREDIT_CARD_PAYMENT_SLUG = "credit_card_payment"
-
-INCOME_CATEGORY_SLUGS = frozenset({"salary", "interest", "other_income"})
-CONTRA_EXPENSE_CATEGORY_SLUGS = frozenset({"refund", "cashback_rewards"})
-INVESTMENT_CATEGORY_SLUGS = frozenset({"investment", "investment_redemption"})
 #: Expense slugs whose contra is imprecise (no principal/cash account in the
 #: source row). They post to a conservative Expenses clearing and the report
 #: carries an ``imprecise`` diagnostic rather than fabricating an account.
 IMPRECISE_CATEGORY_SLUGS = frozenset({"emi_loan", "cash_withdrawal"})
-
-# Closed dashboard_kind taxonomy. Every emitted entry carries exactly one.
-KIND_EXPENSE = "expense"
-KIND_INCOME = "income"
-KIND_CONTRA_EXPENSE = "contra_expense"
-KIND_INVESTMENT = "investment"
-KIND_REPAYMENT = "repayment"
-KIND_SELF_TRANSFER = "self_transfer"
-KIND_CARD_PAYMENT = "card_payment"
-KIND_OPENING = "opening"
-KIND_LOT = "investment_lot"
-KIND_UNKNOWN = "unknown"
 
 DASHBOARD_KINDS = frozenset(
     {
@@ -148,10 +138,6 @@ DASHBOARD_KINDS = frozenset(
         KIND_UNKNOWN,
     }
 )
-
-
-class ProjectionError(Exception):
-    """Raised when projection cannot proceed (e.g. no cutover date configured)."""
 
 
 class SkippedRow(NamedTuple):
@@ -383,173 +369,6 @@ def _decide_fx(txn: Transaction, config: PaisaProjectionConfig) -> FxDecision:
     if fx is None:
         return FxDecision(currency, currency, None, "missing_fx_rate")
     return FxDecision(currency, currency, fx.rate, None)
-
-
-# ---------------------------------------------------------------------------
-# Account resolution
-# ---------------------------------------------------------------------------
-
-
-def _account_kind(account_type: str | None) -> str:
-    """Map a dashboard account type to a ledger account kind.
-
-    A credit-card account is a liability (it holds what you owe); everything
-    else the linker recognizes (bank_account, debit_card) is an asset. An
-    unknown type is treated as an asset — same as the cashflow scope's fallback
-    — and surfaced via the projection's account list so the operator notices.
-    """
-    if account_type == CREDIT_CARD_ACCOUNT_TYPE or account_type in CARD_ACCOUNT_TYPES:
-        return "liability"
-    return "asset"
-
-
-def _default_account_name(account: Account, kind: str) -> str:
-    """Deterministic default ledger name for an account.
-
-    Banks land under ``Assets:Bank:<bank>:<label>``; cards under
-    ``Liabilities:Card:<bank>:<label>``. Operator overrides (via
-    ``account_mappings``) take precedence and are applied by the caller.
-    """
-    bank = _title_segment(account.bank)
-    label = _title_segment(account.label)
-    if kind == "liability":
-        return f"Liabilities:Card:{bank}:{label}"
-    return f"Assets:Bank:{bank}:{label}"
-
-
-def _title_segment(value: str | None) -> str:
-    """Render a free-form string as a ledger-safe account path segment.
-
-    Title-cases words and drops every character ledger would misread as
-    structure (``:``) or whitespace noise. Underscores become spaces first so
-    ``savings_account`` reads as ``Savings Account``.
-    """
-    text = (value or "").replace("_", " ")
-    cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text)
-    return " ".join(part.capitalize() for part in cleaned.split())
-
-
-def _finalize_name(raw: str, *, is_default: bool, backend: str, label: str) -> str:
-    """Resolve a projection account name for the configured backend.
-
-    Defaults are normalized (so a beancount target gets PascalCase'd segments);
-    operator overrides are validated strictly and never silently rewritten — an
-    incompatible override surfaces as a :class:`ProjectionError` rather than a
-    malformed file.
-    """
-    name = normalize_default_account(raw, backend) if is_default else raw
-    try:
-        return validate_account_name(name, backend)
-    except InvalidAccountName as exc:
-        raise ProjectionError(
-            f"{label}: invalid ledger name for {backend!r}: {exc}"
-        ) from exc
-
-
-def _resolve_account(
-    account: Account, mappings: dict[str, str], backend: str
-) -> LedgerAccount:
-    kind = _account_kind(account.type)
-    override = mappings.get(str(account.id))
-    name = _finalize_name(
-        override if override is not None else _default_account_name(account, kind),
-        is_default=override is None,
-        backend=backend,
-        label=f"account {account.id}",
-    )
-    return LedgerAccount(account_id=account.id, name=name, kind=kind)
-
-
-# ---------------------------------------------------------------------------
-# Contra (category) resolution — dashboard taxonomy semantics
-# ---------------------------------------------------------------------------
-
-
-def _category_kind(slug: str) -> str:
-    """Classify a category slug into a closed ``dashboard_kind`` value.
-
-    The kind is the *accounting meaning* of the entry, independent of the
-    transaction's direction. It drives the contra-root choice and the
-    ``dashboard_kind`` metadata tag. Direction only affects the sign (a
-    credit on an expense slug is a reversal that nets, not a different kind).
-    """
-    if slug in INCOME_CATEGORY_SLUGS:
-        return KIND_INCOME
-    if slug in CONTRA_EXPENSE_CATEGORY_SLUGS:
-        return KIND_CONTRA_EXPENSE
-    if slug in INVESTMENT_CATEGORY_SLUGS:
-        return KIND_INVESTMENT
-    if slug == REPAYMENT_SLUG:
-        return KIND_REPAYMENT
-    if slug in ("", "unknown", "misc"):
-        return KIND_UNKNOWN
-    return KIND_EXPENSE
-
-
-def _contra_account(
-    category: str | None,
-    direction: str,
-    config: PaisaProjectionConfig,
-    backend: str,
-) -> str:
-    """Resolve the contra account a category posts against.
-
-    The contra is rooted by **category semantics**, not direction:
-
-    * income slugs → ``Income:<Title>`` (always)
-    * refund/cashback → ``Expenses:<Title>`` (contra-expense: negative expense
-      on credit so the refund nets against the original spend)
-    * investment/redemption → :data:`INVESTMENT_UNALLOCATED_ACCOUNT` (asset
-      movement, not P&L)
-    * repayment → :data:`REPAYMENT_CLEARING_ACCOUNT` (non-income equity clearing)
-    * every other slug → ``Expenses:<Title>`` — a credit on an expense slug is
-      a **reversal** that nets against the expense root, never relabelled as
-      income. This is the key difference from the direction-only rooting.
-
-    Operator ``category_mappings`` overrides win for *any* slug (including the
-    special ones) and are validated as backend account names. ``unknown``/blank
-    maps to ``Expenses:Unknown`` (a suspense contra) and is counted in the
-    report's ``unknown_count``.
-    """
-    slug = (category or "").strip().lower() or "unknown"
-    override = config.category_mappings.get(slug)
-    if override is not None:
-        return _finalize_name(
-            override, is_default=False, backend=backend, label=f"category {slug!r}"
-        )
-    kind = _category_kind(slug)
-    title = _title_segment(slug)
-    if kind == KIND_INVESTMENT:
-        raw = INVESTMENT_UNALLOCATED_ACCOUNT
-    elif kind == KIND_REPAYMENT:
-        raw = REPAYMENT_CLEARING_ACCOUNT
-    elif kind == KIND_INCOME:
-        raw = f"Income:{title}"
-    elif kind == KIND_CONTRA_EXPENSE:
-        raw = f"Expenses:{title}"
-    elif kind == KIND_UNKNOWN:
-        raw = "Expenses:Unknown"
-    else:
-        raw = f"Expenses:{title}"
-    return _finalize_name(
-        raw, is_default=True, backend=backend, label=f"category {slug!r}"
-    )
-
-
-def _card_clearing_account(config: PaisaProjectionConfig, backend: str) -> str:
-    """The liability a card payment posts against, resolved for the backend.
-
-    Defaults to :data:`CARD_PAYMENT_CLEARING` (normalized for beancount); an
-    operator override is validated strictly.
-    """
-    override = config.category_mappings.get(CREDIT_CARD_PAYMENT_SLUG)
-    raw = override if override is not None else CARD_PAYMENT_CLEARING
-    return _finalize_name(
-        raw,
-        is_default=override is None,
-        backend=backend,
-        label="credit_card_payment",
-    )
 
 
 def _account_sign(direction: str) -> int:
@@ -785,11 +604,11 @@ def _build_standard_entry(
     """
     sign = _account_sign(txn.direction)
     slug = (txn.category or "").strip().lower() or "unknown"
-    kind = kind_override or _category_kind(slug)
+    kind = kind_override or category_kind(slug)
     if contra_override is not None:
         contra = contra_override
     else:
-        contra = _contra_account(txn.category, txn.direction, config, backend)
+        contra = contra_account(txn.category, config, backend)
     date = txn.transaction_date
     assert date is not None  # caller filters transaction_date.is_not(None)
     card_ids = (txn.card_id,) if txn.card_id is not None else ()
@@ -856,7 +675,7 @@ def _build_card_payment_entry(
         card_ids = (resolved.card_id,)
         account_ids = (bank_account.account_id, resolved.account.account_id)
     else:
-        liability_name = _card_clearing_account(config, backend)
+        liability_name = card_clearing_account(config, backend)
         card_ids = ()
         account_ids = (bank_account.account_id,)
     extra = (("dashboard_card_resolution", resolution.status),)
@@ -1492,7 +1311,7 @@ async def project(
         for aid in missing_ids
     ]
     for acct in account_rows:
-        accounts_by_id[acct.id] = _resolve_account(
+        accounts_by_id[acct.id] = resolve_account(
             acct, config.account_mappings, backend
         )
 
@@ -1804,9 +1623,8 @@ async def project(
             if category in INVESTMENT_CATEGORY_SLUGS and lot_entries:
                 instr, _funding_amt = _check_investment_funding(txn, fmap)
                 if instr is not None:
-                    contra_override = _finalize_name(
+                    contra_override = normalize_policy_account(
                         INVESTMENT_EQUITY_OPENING,
-                        is_default=True,
                         backend=backend,
                         label="investment_funding_remap",
                     )

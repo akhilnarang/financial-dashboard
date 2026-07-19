@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     # Register builtin extensions before init_db() runs load_all_settings(), so
     # contributed SettingDef entries are present when the settings cache fills.
-    app.state.extension_manager = bootstrap_extensions()
+    app.state.extension_manager = bootstrap_extensions(session_factory=async_session)
 
     logger.info("Initializing database...")
     await init_db()

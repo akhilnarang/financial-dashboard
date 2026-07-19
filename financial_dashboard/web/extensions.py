@@ -184,9 +184,9 @@ def _form_to_input(form) -> PaisaConfigInput:
 
     min_interval_raw = (form.get("auto_sync_min_interval_minutes") or "").strip()
     try:
-        min_interval = int(min_interval_raw) if min_interval_raw else 30
+        min_interval = int(min_interval_raw) if min_interval_raw else 1
     except ValueError:
-        min_interval = 30
+        min_interval = 1
     ttl_raw = (form.get("report_cache_ttl_seconds") or "").strip()
     try:
         ttl = int(ttl_raw) if ttl_raw else 60

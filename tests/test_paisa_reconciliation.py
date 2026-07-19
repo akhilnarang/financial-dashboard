@@ -170,6 +170,25 @@ def _liabs(*groups) -> PaisaLiabilitiesReport:
 # --------------------------------------------------------------------------- #
 
 
+async def test_reconciliation_uses_injected_config_snapshot(session, monkeypatch):
+    config = _cfg(mode="disabled", selected_account_ids=())
+
+    def unexpected_global_load():
+        raise AssertionError("reconciliation reloaded global config")
+
+    monkeypatch.setattr(recon_mod, "load_config", unexpected_global_load)
+
+    response = await build_reconciliation(
+        session,
+        config=config,
+        asset_report=None,
+        liability_report=None,
+    )
+
+    assert response.ok is True
+    assert response.mode == "disabled"
+
+
 async def test_reconciliation_writes_no_core_rows(session, monkeypatch):
     await _seed_bank(session)
     await _seed_txn(session, 1)

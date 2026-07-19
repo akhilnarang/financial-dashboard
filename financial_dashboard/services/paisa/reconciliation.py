@@ -42,13 +42,9 @@ from financial_dashboard.schemas.extensions import (
     PaisaReconcileProjectionDiag,
     PaisaReconcileResponse,
 )
-from financial_dashboard.services.cashflow.scope import CARD_ACCOUNT_TYPES
-from financial_dashboard.services.categorization.slugs import (
-    CREDIT_CARD_ACCOUNT_TYPE,
-)
+from financial_dashboard.services.paisa.accounting import account_kind, resolve_account
 from financial_dashboard.services.paisa.config import PaisaProjectionConfig, load_config
 from financial_dashboard.services.paisa.orchestrator import preview
-from financial_dashboard.services.paisa.projection import _resolve_account
 from financial_dashboard.services.paisa.renderers.base import CARD_PAYMENT_CLEARING
 
 logger = logging.getLogger(__name__)
@@ -62,19 +58,6 @@ NATIVE_STALE_DAYS = 45
 OPENING_GAP_DAYS = 45
 
 _Q2 = Decimal("0.01")
-
-
-def _account_is_liability(account_type: str | None) -> bool:
-    """True for credit-card accounts, which project as credit-normal liabilities.
-
-    Mirrors the projection's account-kind rule so the reconciliation compares
-    like-for-like: liabilities are emitted (and summed) under the ledger
-    credit-normal convention (negative = owed), while native snapshots and
-    Paisa carry them as a positive amount owed.
-    """
-    if account_type == CREDIT_CARD_ACCOUNT_TYPE or account_type in CARD_ACCOUNT_TYPES:
-        return True
-    return False
 
 
 def _norm_account(name: str) -> str:
@@ -252,7 +235,7 @@ def _resolve_ledger_name(account: Account, config: PaisaProjectionConfig) -> str
     no opening visible. Operator mappings retain the same precedence and strict
     backend validation they have during an actual projection.
     """
-    return _resolve_account(account, config.account_mappings, config.ledger_cli).name
+    return resolve_account(account, config.account_mappings, config.ledger_cli).name
 
 
 def _paisa_balance_for(
@@ -301,12 +284,13 @@ def _suggested_mapping(account: Account, config: PaisaProjectionConfig) -> str:
     never written without an explicit accept through the normal config-save
     path.
     """
-    return _resolve_account(account, {}, config.ledger_cli).name
+    return resolve_account(account, {}, config.ledger_cli).name
 
 
 async def build_reconciliation(
     session: AsyncSession,
     *,
+    config: PaisaProjectionConfig | None = None,
     asset_report=None,
     liability_report=None,
     upstream_available: bool = False,
@@ -315,10 +299,12 @@ async def build_reconciliation(
 
     ``asset_report``/``liability_report`` are the already-cached, normalized
     curated reports (typed NamedTuples from integrations.paisa). The surface
-    fetches them (subject to the TTL cache + mode gating) and passes them in so
-    this function is pure over its arguments and trivially testable.
+    fetches them (subject to the TTL cache + mode gating) and passes them with
+    the same config snapshot, so upstream identity and local mappings cannot
+    drift during one request. Direct domain callers may omit ``config`` for
+    backwards compatibility.
     """
-    config = load_config()
+    config = config if config is not None else load_config()
     mode = config.mode
 
     # Projection diagnostics + projected balances (project mode only; a
@@ -394,7 +380,7 @@ async def build_reconciliation(
     for account in accounts:
         aid = account.id
         mapped_to = _resolve_ledger_name(account, config)
-        is_liability = _account_is_liability(account.type)
+        is_liability = account_kind(account.type) == "liability"
 
         # Native snapshot cell.
         native = native_by_account.get(aid)
