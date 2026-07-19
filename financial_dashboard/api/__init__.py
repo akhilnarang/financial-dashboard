@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 
+from .accounts import router as accounts_router
 from .cas import router as cas_router
 from .cashflow import router as cashflow_router
 from .emails import router as emails_router
@@ -13,6 +14,7 @@ from .system import router as system_router
 from .transactions import router as transactions_router
 
 router = APIRouter(prefix="/api")
+router.include_router(accounts_router)
 router.include_router(cas_router)
 router.include_router(cashflow_router)
 router.include_router(emails_router)
