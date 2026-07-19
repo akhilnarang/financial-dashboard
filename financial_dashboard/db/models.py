@@ -145,7 +145,7 @@ class StatementUpload(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("accounts.id"), nullable=False
+        Integer, ForeignKey("accounts.id"), nullable=False, index=True
     )
     email_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("emails.id"), nullable=True, index=True
@@ -187,7 +187,7 @@ class BankStatementUpload(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("accounts.id"), nullable=False
+        Integer, ForeignKey("accounts.id"), nullable=False, index=True
     )
     email_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("emails.id"), nullable=True, index=True
@@ -356,10 +356,10 @@ class Transaction(Base):
         Integer, ForeignKey("cards.id"), nullable=True
     )
     statement_upload_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("statement_uploads.id"), nullable=True
+        Integer, ForeignKey("statement_uploads.id"), nullable=True, index=True
     )
     bank_statement_upload_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("bank_statement_uploads.id"), nullable=True
+        Integer, ForeignKey("bank_statement_uploads.id"), nullable=True, index=True
     )
 
     account: Mapped["Account | None"] = relationship(lazy="joined")

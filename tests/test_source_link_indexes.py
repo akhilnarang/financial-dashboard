@@ -14,6 +14,10 @@ _INDEXES = {
     "ix_bank_statement_uploads_email_id": "bank_statement_uploads",
     "ix_sms_messages_transaction_id": "sms_messages",
     "ix_cas_uploads_email_id": "cas_uploads",
+    "ix_statement_uploads_account_id": "statement_uploads",
+    "ix_bank_statement_uploads_account_id": "bank_statement_uploads",
+    "ix_transactions_statement_upload_id": "transactions",
+    "ix_transactions_bank_statement_upload_id": "transactions",
 }
 
 
