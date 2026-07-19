@@ -22,6 +22,10 @@ from financial_dashboard.db import Transaction
 from financial_dashboard.services.categorization.self_transfer import (
     apply_reference_self_transfer_rule,
 )
+from financial_dashboard.services.email_attachments import (
+    TransactionSlotConflict,
+    claim_transaction_source_slot,
+)
 from financial_dashboard.services.parser_quirks import (
     AMBIGUOUS_12H_TIME_EMAIL_TYPES,
     CARD_PAYMENT_LINK_BY_MASK_EMAIL_TYPES,
@@ -254,7 +258,10 @@ def _card_payment_mask_match(existing: Transaction, txn_data: dict) -> bool:
 
 
 async def _gather_fuzzy_candidates(
-    session: AsyncSession, txn_data: dict
+    session: AsyncSession,
+    txn_data: dict,
+    *,
+    currency_filter: str | None = None,
 ) -> list[Transaction]:
     """Return the time-window candidate *list* for the fuzzy path, with the
     existing counterparty / date-only / card-mask gates applied as candidate
@@ -267,7 +274,11 @@ async def _gather_fuzzy_candidates(
     if txn_date is None:
         return []  # No date → can't fuzzy-match.
 
-    incoming_currency = txn_data.get("currency") or "INR"
+    incoming_currency = (
+        txn_data.get("currency") or "INR"
+        if currency_filter is None
+        else currency_filter
+    )
     incoming_time = txn_data.get("transaction_time")
 
     # Date window: if we have a time, narrow to ±10 min; otherwise whole day.
@@ -388,6 +399,93 @@ def _decide(
         # Clean balance-less 1+1 (e.g. HDFC CC) → merge as today.
         return MatchDecision("match", candidates[0], "standard")
     return MatchDecision("defer")
+
+
+def _normalized_currency(value: object) -> str:
+    return str(value or "INR").strip().upper()
+
+
+def _plausible_event_time(target: Transaction, txn_data: dict) -> bool:
+    """Apply the fuzzy matcher's date/time window to one explicit target."""
+    incoming_date = txn_data.get("transaction_date")
+    if incoming_date is None or target.transaction_date is None:
+        return False
+    incoming_time = txn_data.get("transaction_time")
+    if incoming_time is None:
+        return target.transaction_date == incoming_date
+    if target.transaction_time is None:
+        incoming_point = datetime.combine(incoming_date, incoming_time)
+        lower = incoming_point - timedelta(minutes=_FUZZY_MATCH_WINDOW_MINUTES)
+        upper = incoming_point + timedelta(minutes=_FUZZY_MATCH_WINDOW_MINUTES)
+        return lower.date() <= target.transaction_date <= upper.date()
+    target_point = datetime.combine(target.transaction_date, target.transaction_time)
+    incoming_point = datetime.combine(incoming_date, incoming_time)
+    return abs(target_point - incoming_point) <= timedelta(
+        minutes=_FUZZY_MATCH_WINDOW_MINUTES
+    )
+
+
+def _shortened_reference_match(first: str | None, second: str | None) -> bool:
+    """Recognize a provider's prefix- or suffix-truncated reference."""
+    first_norm = "".join(ch for ch in (first or "").upper() if ch.isalnum())
+    second_norm = "".join(ch for ch in (second or "").upper() if ch.isalnum())
+    if min(len(first_norm), len(second_norm)) < 4:
+        return False
+    return (
+        first_norm.startswith(second_norm)
+        or second_norm.startswith(first_norm)
+        or first_norm.endswith(second_norm)
+        or second_norm.endswith(first_norm)
+    )
+
+
+async def qualifies_as_explicit_match(
+    session: AsyncSession, target: Transaction, txn_data: dict
+) -> bool:
+    """Whether ``target`` is a plausible existing row for an explicit merge.
+
+    This deliberately keeps the automatic matcher's immutable identity gates and
+    event window. The target must be in the fuzzy candidate set that can cause a
+    defer. A prefix- or suffix-truncated reference is also accepted when the
+    same event window agrees, because alerts can shorten a reference that the
+    corresponding email carries in full.
+    """
+    if (
+        target.bank != txn_data.get("bank")
+        or target.direction != txn_data.get("direction")
+        or target.amount != txn_data.get("amount")
+        or _normalized_currency(target.currency)
+        != _normalized_currency(txn_data.get("currency"))
+        or not _plausible_event_time(target, txn_data)
+    ):
+        return False
+
+    incoming_balance = _quantize_balance(txn_data.get("balance"))
+    target_balance = _quantize_balance(target.balance)
+    if (
+        incoming_balance is not None
+        and target_balance is not None
+        and incoming_balance != target_balance
+    ):
+        # The automatic matcher treats differing known balances as proof of
+        # distinct events. An explicit target selection must not bypass that
+        # authoritative split and overwrite the contradictory balance.
+        return False
+
+    # The generic automatic matcher intentionally keeps its existing raw
+    # currency comparison. For an explicit target, the normalized identity gate
+    # above already proved equivalence, so gather with the target's stored form;
+    # otherwise formatting-only input differences could exclude that very row.
+    candidates = await _gather_fuzzy_candidates(
+        session,
+        txn_data,
+        currency_filter=target.currency if target.currency is not None else "INR",
+    )
+    if any(candidate.id == target.id for candidate in candidates):
+        return True
+    return _shortened_reference_match(
+        target.reference_number, txn_data.get("reference_number")
+    )
 
 
 async def find_match(
@@ -703,9 +801,45 @@ async def merge_transaction(
         return MergeTransactionResult("deferred", None, EnrichmentDiff())
 
     assert decision.transaction is not None  # action == "match"
-    match, match_kind = decision.transaction, decision.kind
+    match = decision.transaction
+    try:
+        diff = await apply_transaction_enrichment(
+            session,
+            match,
+            txn_data,
+            channel,
+            sms_message_id=sms_message_id,
+            email_id=email_id,
+            match_kind=decision.kind,
+        )
+    except TransactionSlotConflict:
+        # The matcher observed an open destination slot, but another source
+        # claimed it first. Automatic ingestion must defer rather than enrich
+        # an unowned row or turn this expected race into a 500.
+        return MergeTransactionResult("deferred", None, EnrichmentDiff())
+    return MergeTransactionResult("enriched", match, diff)
 
-    # Enrichment path.
+
+async def apply_transaction_enrichment(
+    session: AsyncSession,
+    match: Transaction,
+    txn_data: dict,
+    channel: Channel,
+    *,
+    sms_message_id: int | None = None,
+    email_id: int | None = None,
+    match_kind: MatchKind | None = "standard",
+) -> EnrichmentDiff:
+    """Apply the canonical second-source enrichment mutation to ``match``.
+
+    Matching/authorization is intentionally outside this helper. Both automatic
+    merging and explicit duplicate resolution call it after choosing a target,
+    so field precedence, provenance, timestamp behavior, and self-transfer
+    follow-ups cannot drift between those paths.
+    """
+    source_id = sms_message_id if channel == "sms" else email_id
+    await claim_transaction_source_slot(session, match, channel, source_id)
+
     diff = compute_enrichment_diff(match, txn_data, channel)
     for key, value in diff.filled.items():
         setattr(match, key, value)
@@ -727,10 +861,6 @@ async def merge_transaction(
 
     if match.source != channel and match.source is not None:
         match.source = "sms+email"
-    if sms_message_id is not None and match.sms_message_id is None:
-        match.sms_message_id = sms_message_id
-    if email_id is not None and match.email_id is None:
-        match.email_id = email_id
     # Gate the timestamp churn on a real change: a no-op duplicate (equal
     # balance, slot already filled) must not rewrite the row.
     if diff.changed_fields:
@@ -738,7 +868,7 @@ async def merge_transaction(
 
     await session.flush()
     await apply_reference_self_transfer_rule(session, match)
-    return MergeTransactionResult("enriched", match, diff)
+    return diff
 
 
 async def _existing_for_source(

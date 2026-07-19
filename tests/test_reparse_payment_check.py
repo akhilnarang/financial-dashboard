@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 import financial_dashboard.core.deps as core_deps
 import financial_dashboard.services.reminders as reminders_module
+import financial_dashboard.web.emails as emails_web
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.web import get_router as get_web_router
 from financial_dashboard.db import (
@@ -284,8 +285,15 @@ class TestReparseEmailForceNewDupDefer:
 
     async def test_force_new_creates_row(self, session_maker):
         email_id = await self._seed_deferred(session_maker)
-        r = await self._reparse(session_maker, email_id, force_new=True)
+        with patch.object(
+            emails_web,
+            "lock_email_for_attachment",
+            wraps=emails_web.lock_email_for_attachment,
+        ) as attachment_lock:
+            r = await self._reparse(session_maker, email_id, force_new=True)
         assert r.status_code == 200, r.text
+        attachment_lock.assert_awaited_once()
+        assert attachment_lock.await_args.args[1] == email_id
         assert r.json()["new_status"] == "parsed"
         async with session_maker() as s:
             rows = (await s.execute(select(Transaction))).scalars().all()

@@ -2,15 +2,17 @@
 
 from datetime import date, time
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from financial_dashboard.db import Base, Transaction
+import financial_dashboard.services.txn_merge as txn_merge_module
 from financial_dashboard.services.txn_merge import (
     EnrichmentDiff,
+    MatchDecision,
     compute_enrichment_diff,
     find_match,
     merge_transaction,
@@ -788,6 +790,82 @@ async def test_merge_transaction_enrich_fills_null(session: AsyncSession):
     assert row.enriched_at is not None
     assert "counterparty" in diff.filled
     assert "channel" in diff.filled
+
+
+@pytest.mark.anyio
+async def test_lost_destination_slot_race_defers_without_enrichment(
+    tmp_path, monkeypatch
+):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'lost-slot-race.sqlite'}"
+    )
+    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        async with maker() as automatic_session:
+            stale_target = Transaction(
+                bank="hdfc",
+                email_type="hdfc_dc_transaction_alert",
+                direction="debit",
+                amount=Decimal("500"),
+                currency="INR",
+                transaction_date=date(2026, 5, 2),
+                transaction_time=time(14, 23),
+                counterparty=None,
+                source="sms",
+            )
+            automatic_session.add(stale_target)
+            await automatic_session.commit()
+            target_id = stale_target.id
+            assert stale_target.email_id is None
+
+            # Simulate a different email winning after automatic matching loaded
+            # this target but before its canonical enrichment writer runs.
+            async with maker() as winner_session:
+                winner = await winner_session.get(Transaction, stale_target.id)
+                assert winner is not None
+                winner.email_id = 101
+                await winner_session.commit()
+
+            monkeypatch.setattr(
+                txn_merge_module,
+                "find_match",
+                AsyncMock(
+                    return_value=MatchDecision("match", stale_target, "standard")
+                ),
+            )
+            outcome, row, diff = await merge_transaction(
+                automatic_session,
+                "email",
+                {
+                    "bank": "hdfc",
+                    "email_type": "hdfc_dc_transaction_alert",
+                    "direction": "debit",
+                    "amount": Decimal("500"),
+                    "currency": "INR",
+                    "transaction_date": date(2026, 5, 2),
+                    "transaction_time": time(14, 23),
+                    "counterparty": "Losing email enrichment",
+                },
+                email_id=202,
+            )
+
+            assert outcome == "deferred"
+            assert row is None
+            assert diff.changed_fields == []
+            assert stale_target.counterparty is None
+            await automatic_session.rollback()
+
+        async with maker() as check_session:
+            stored = await check_session.get(Transaction, target_id)
+            assert stored is not None
+            assert stored.email_id == 101
+            assert stored.counterparty is None
+            assert stored.source == "sms"
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.anyio

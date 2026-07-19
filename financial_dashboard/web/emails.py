@@ -47,6 +47,9 @@ from financial_dashboard.services.cc_disambiguation import (
 from financial_dashboard.services.categorization.self_transfer import (
     apply_reference_self_transfer_rule,
 )
+from financial_dashboard.services.email_attachments import (
+    lock_email_for_attachment,
+)
 from financial_dashboard.services.emails import parse_email_by_kind
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.reminders import check_payment_received
@@ -394,9 +397,17 @@ async def _apply_reparsed_transaction(
             # and applies downgrade-safe field merges (so a richer SMS value
             # like an in-body time is not clobbered by the email's null). It
             # does NOT clear FKs, so an already-linked row keeps its account.
-            _, txn_row, _ = await merge_transaction(
+            merge_outcome, txn_row, _ = await merge_transaction(
                 session, "email", txn_data, email_id=em.id
             )
+            if merge_outcome == "deferred":
+                # The destination email slot may have been claimed after the
+                # initial match. Preserve the source for later review instead
+                # of reporting success or enriching a row this email does not
+                # own.
+                em.status = "skipped"
+                em.error = DUP_DEFER_NOTE
+                deferred_noop = True
         elif existing is not None:
             # In-place refresh to pick up parser fixes. Skip None values so a
             # field already enriched from another source (e.g. an SMS-only
@@ -508,6 +519,15 @@ async def reparse_email(
             status_code=400, detail="No fetch rule associated with this email"
         )
 
+    # Raw loading and parsing can perform provider I/O and must not hold the
+    # request session's implicit read transaction open. Preserve the state we
+    # observed so a later parse-error write can be revalidated after taking the
+    # same attachment lock used by successful reparse and explicit resolution.
+    original_status = email_row.status
+    original_error = email_row.error
+    session.expunge_all()
+    await session.rollback()
+
     raw_bytes, fetch_error = await load_or_fetch_raw_email(email_row)
     if raw_bytes is None:
         raise HTTPException(
@@ -524,27 +544,33 @@ async def reparse_email(
     )
 
     if not txn_data and not stmt_result:
-        # Parsing still fails — update error message so it's fresh, but keep
-        # status=failed. Re-save the raw bytes to the spool so the next retry
+        # Parsing still fails — update error message so it's fresh, but keep the
+        # current status. Re-save the raw bytes to the spool so the next retry
         # doesn't have to hit the provider again until the cleanup cron evicts them.
         _save_failed_email(email_row.provider, email_row.message_id, raw_bytes)
-        em = await session.get(Email, email_id)
-        if em:
-            em.error = error
-            await session.commit()
+        async with session.begin():
+            # This is the first DB operation in a fresh transaction. Revalidate
+            # the pre-I/O snapshot after locking: an explicit duplicate apply
+            # may have parsed the row and cleared its error while parsing ran.
+            em = await lock_email_for_attachment(session, email_id)
+            if (
+                em is not None
+                and em.status == original_status
+                and em.error == original_error
+            ):
+                em.error = error
         raise HTTPException(
             status_code=422,
             detail=error or "Parsing failed (no transaction or statement found)",
         )
 
-    # Success — update the email row and create transaction if needed
-
-    # Close the implicit read transaction opened earlier (from session.get at
-    # the top of this handler) so session.begin() below doesn't collide with it.
-    await session.rollback()
-
+    # Success — update the email row and create transaction if needed.
     async with session.begin():
-        em = await session.get(Email, email_id)
+        # Serialize every transaction attachment for this existing Email with
+        # explicit duplicate resolution. This is the first DB operation in the
+        # transaction so SQLite can safely acquire BEGIN IMMEDIATE; row-locking
+        # databases use SELECT ... FOR UPDATE in the shared helper.
+        em = await lock_email_for_attachment(session, email_id)
         if not em:
             raise HTTPException(status_code=500, detail="Email disappeared")
 
@@ -745,7 +771,9 @@ async def reparse_all_failed(
         pending_payment_check: tuple[int, int, Decimal] | None = None
         pending_disambiguation: dict | None = None
         async with session.begin():
-            em = await session.get(Email, email_row.id)
+            # Keep the bulk attachment writer on the same lock/check protocol
+            # as single reparse and explicit duplicate resolution.
+            em = await lock_email_for_attachment(session, email_row.id)
             if not em:
                 continue
             em.status = "parsed"
