@@ -1,4 +1,4 @@
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from pydantic import BaseModel
 
@@ -44,3 +44,44 @@ class SystemInfoResponse(BaseModel):
     runtime: RuntimeInfo
     schema_state: SchemaState
     parser_packages: list[ParserPackageInfo]
+
+
+HealthStatus = Literal["ok", "degraded", "unavailable"]
+DatabaseBackend = Literal["sqlite", "other"]
+SQLiteJournalMode = Literal[
+    "delete", "truncate", "persist", "memory", "wal", "off", "unknown"
+]
+SQLiteSynchronousMode = Literal["off", "normal", "full", "extra", "unknown"]
+SQLiteQuickCheck = Literal["ok", "failed", "unavailable"]
+SQLiteQuickCheckSource = Literal["live", "cache", "unavailable"]
+
+
+class DiagnosticScalarResult(NamedTuple):
+    value: object | None
+    succeeded: bool
+
+
+class QuickCheckDiagnosticResult(NamedTuple):
+    quick_check: SQLiteQuickCheck
+    source: SQLiteQuickCheckSource
+
+
+class SQLiteHealthDiagnostics(BaseModel):
+    journal_mode: SQLiteJournalMode | None = None
+    foreign_keys_enabled: bool | None = None
+    busy_timeout_ms: int | None = None
+    synchronous_mode: SQLiteSynchronousMode | None = None
+    quick_check: SQLiteQuickCheck
+    quick_check_source: SQLiteQuickCheckSource
+    diagnostics_complete: bool
+
+
+class DatabaseHealth(BaseModel):
+    backend: DatabaseBackend
+    connected: bool
+    sqlite: SQLiteHealthDiagnostics | None = None
+
+
+class SystemHealthResponse(BaseModel):
+    status: HealthStatus
+    database: DatabaseHealth
