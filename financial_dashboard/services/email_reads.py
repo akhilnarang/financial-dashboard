@@ -489,16 +489,17 @@ async def get_email_raw(
     await session.rollback()
 
     try:
-        raw_bytes, load_error = await load_or_fetch_raw_email(email)
+        raw_email_result = await load_or_fetch_raw_email(email)
     except Exception:
         logger.warning(
             "Raw email loader raised for email %d (loader-exception)", email_id
         )
         raise EmailRawReadError(424, "Raw email source is unavailable") from None
-    if raw_bytes is None:
-        reason = _raw_load_reason(load_error)
+    if raw_email_result.raw_bytes is None:
+        reason = _raw_load_reason(raw_email_result.error)
         logger.warning("Raw email unavailable for email %d (%s)", email_id, reason)
-        raise EmailRawReadError(424, "Raw email source is unavailable") from None
+        raise EmailRawReadError(424, "Raw email source is unavailable")
+    raw_bytes = raw_email_result.raw_bytes
     if len(raw_bytes) > _RAW_BYTES_LIMIT:
         raise EmailRawReadError(413, "Raw email source exceeds the read limit")
 

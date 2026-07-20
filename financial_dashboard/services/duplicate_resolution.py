@@ -317,15 +317,15 @@ async def resolve_email_duplicate(
     finally:
         await session.rollback()
 
-    loaded = await load_or_fetch_raw_email(email_row)
-    if loaded.raw_bytes is None:
+    raw_email_result = await load_or_fetch_raw_email(email_row)
+    if raw_email_result.raw_bytes is None:
         logger.warning(
             "Raw email load failed during duplicate resolution for email %d: %s",
             email_id,
-            loaded.error,
+            raw_email_result.error,
         )
         raise DuplicateResolutionError(404, "Raw email source is unavailable")
-    raw_bytes = loaded.raw_bytes
+    raw_bytes = raw_email_result.raw_bytes
 
     if not request.apply:
         async with session.begin():

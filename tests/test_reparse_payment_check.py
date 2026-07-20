@@ -37,6 +37,7 @@ from financial_dashboard.db import (
     Transaction,
 )
 from financial_dashboard.db.enums import PaymentStatus
+from financial_dashboard.integrations.email.body import RawEmailResult
 
 
 @pytest.fixture
@@ -168,7 +169,7 @@ class TestReparseEmailInvokesPaymentCheck:
         with (
             patch(
                 "financial_dashboard.web.emails.load_or_fetch_raw_email",
-                new=AsyncMock(return_value=(raw, None)),
+                new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
             ),
             patch(
                 "financial_dashboard.web.emails.should_notify_transactions",
@@ -199,7 +200,7 @@ class TestReparseEmailInvokesPaymentCheck:
         with (
             patch(
                 "financial_dashboard.web.emails.load_or_fetch_raw_email",
-                new=AsyncMock(return_value=(raw, None)),
+                new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
             ),
             patch(
                 "financial_dashboard.web.emails.should_notify_transactions",
@@ -258,7 +259,7 @@ class TestReparseEmailForceNewDupDefer:
         with (
             patch(
                 "financial_dashboard.web.emails.load_or_fetch_raw_email",
-                new=AsyncMock(return_value=(raw, None)),
+                new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
             ),
             patch(
                 "financial_dashboard.web.emails.should_notify_transactions",
@@ -362,7 +363,7 @@ class TestReparseAllFailedBulkRoute:
         with (
             patch(
                 "financial_dashboard.web.emails.load_or_fetch_raw_email",
-                new=AsyncMock(return_value=(raw, None)),
+                new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
             ),
             patch(
                 "financial_dashboard.web.emails.should_notify_transactions",

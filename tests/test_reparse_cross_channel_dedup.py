@@ -28,6 +28,7 @@ import financial_dashboard.core.deps as core_deps
 import financial_dashboard.services.reminders as reminders_module
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.db import Account, Base, Email, FetchRule, Transaction
+from financial_dashboard.integrations.email.body import RawEmailResult
 from financial_dashboard.services.emails import _process_email_full
 from financial_dashboard.web import get_router as get_web_router
 
@@ -143,7 +144,7 @@ async def test_reparse_email_enriches_existing_sms_row(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -218,7 +219,7 @@ async def test_reparse_email_no_match_still_creates_row(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -290,7 +291,7 @@ async def test_reparse_email_does_not_match_different_amount(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -400,7 +401,7 @@ async def test_reparse_same_ref_different_amount_defers_not_409(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -439,7 +440,7 @@ async def test_bulk_reparse_enriches_existing_sms_row(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -516,7 +517,7 @@ async def test_bulk_reparse_retains_sms_enrichment_on_none(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -589,7 +590,7 @@ async def test_single_reparse_retains_sms_enrichment_on_none(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -670,7 +671,7 @@ async def test_reparse_does_not_steal_row_claimed_by_another_email(session_maker
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",

@@ -528,11 +528,13 @@ async def reparse_email(
     session.expunge_all()
     await session.rollback()
 
-    raw_bytes, fetch_error = await load_or_fetch_raw_email(email_row)
-    if raw_bytes is None:
+    raw_email_result = await load_or_fetch_raw_email(email_row)
+    if raw_email_result.raw_bytes is None:
         raise HTTPException(
-            status_code=404, detail=fetch_error or "Unable to load raw email"
+            status_code=404,
+            detail=raw_email_result.error or "Unable to load raw email",
         )
+    raw_bytes = raw_email_result.raw_bytes
 
     error, txn_data, password_hint, stmt_result = await parse_email_by_kind(
         bank=rule.bank,
@@ -741,12 +743,12 @@ async def reparse_all_failed(
             still_failed += 1
             continue
 
-        raw_bytes, fetch_error = await load_or_fetch_raw_email(email_row)
-        if raw_bytes is None:
+        raw_email_result = await load_or_fetch_raw_email(email_row)
+        if raw_email_result.raw_bytes is None:
             logger.info(
                 "Skipping bulk reparse for email %d: %s",
                 email_row.id,
-                fetch_error,
+                raw_email_result.error,
             )
             still_failed += 1
             continue
@@ -754,7 +756,7 @@ async def reparse_all_failed(
         error, txn_data, _, stmt_result = await parse_email_by_kind(
             bank=rule.bank,
             email_kind=rule.email_kind,
-            raw_bytes=raw_bytes,
+            raw_bytes=raw_email_result.raw_bytes,
             subject=email_row.subject or "",
             source_id=email_row.source_id,
             log_ref=f"bulk-reparse:{email_row.id}",
@@ -763,7 +765,9 @@ async def reparse_all_failed(
         if not txn_data and not stmt_result:
             # Re-save to spool so the next retry doesn't re-fetch from the
             # provider (cleanup cron will evict after FAILED_SPOOL_MAX_AGE_DAYS).
-            _save_failed_email(email_row.provider, email_row.message_id, raw_bytes)
+            _save_failed_email(
+                email_row.provider, email_row.message_id, raw_email_result.raw_bytes
+            )
             still_failed += 1
             continue
 

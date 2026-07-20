@@ -688,9 +688,10 @@ async def statements_reprocess_failed(
 
     processed = 0
     for email_row, rule in failed_emails:
-        raw_bytes, _fetch_error = await load_or_fetch_raw_email(email_row)
-        if raw_bytes is None:
+        raw_email_result = await load_or_fetch_raw_email(email_row)
+        if raw_email_result.raw_bytes is None:
             continue
+        raw_bytes = raw_email_result.raw_bytes
 
         pdfs = extract_pdf_from_email(raw_bytes)
         if not pdfs:

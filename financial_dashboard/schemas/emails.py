@@ -156,3 +156,74 @@ class EmailBatchRequest(BaseModel):
 class EmailBatchResponse(BaseModel):
     items: Annotated[list[EmailRead], Field(max_length=100)]
     missing_ids: Annotated[list[int], Field(max_length=100)]
+
+
+class EmailParsedTransactionPreview(BaseModel):
+    """Bounded normalized transaction output with source masks redacted."""
+
+    bank: Annotated[str, Field(max_length=64)]
+    email_type: Annotated[str, Field(max_length=128)]
+    direction: Annotated[str, Field(max_length=16)]
+    amount: Decimal
+    currency: Annotated[str | None, Field(max_length=8)]
+    transaction_date: datetime.date | None
+    transaction_time: datetime.time | None
+    counterparty: Annotated[str | None, Field(max_length=1_000)]
+    card_mask: Annotated[str | None, Field(max_length=8)]
+    account_mask: Annotated[str | None, Field(max_length=8)]
+    reference_number: Annotated[str | None, Field(max_length=256)]
+    channel: Annotated[str | None, Field(max_length=64)]
+    balance: Decimal | None
+
+
+class EmailStatementSummaryPreview(BaseModel):
+    total_amount_due: Decimal | None
+    minimum_amount_due: Decimal | None
+    due_date: datetime.date | None
+    card_mask: Annotated[str | None, Field(max_length=8)]
+    statement_period_start: datetime.date | None
+    statement_period_end: datetime.date | None
+
+
+class EmailParserPreview(BaseModel):
+    disposition: Literal[
+        "transaction",
+        "statement_summary",
+        "non_transaction",
+        "routed_elsewhere",
+        "error",
+    ]
+    email_type: Annotated[str | None, Field(max_length=128)]
+    error: Annotated[str | None, Field(max_length=1_000)]
+    password_hint_present: bool
+    transaction: EmailParsedTransactionPreview | None
+    statement: EmailStatementSummaryPreview | None
+
+
+class EmailMergePreview(BaseModel):
+    """Projected merge plus whether linked account/card attribution is rerun."""
+
+    action: Literal[
+        "none",
+        "refresh_linked",
+        "match",
+        "insert",
+        "defer",
+        "conflict",
+        "multiple_linked",
+    ]
+    target_transaction_id: int | None
+    match_kind: Annotated[str | None, Field(max_length=32)]
+    changed_fields: Annotated[list[str], Field(max_length=32)]
+    identity_conflicts: Annotated[list[str], Field(max_length=4)]
+    linked_attribution_refresh: bool
+
+
+class EmailParsePreviewResponse(BaseModel):
+    email_id: int
+    current_status: Annotated[str | None, Field(max_length=32)]
+    current_transaction_ids: Annotated[list[int], Field(max_length=10)]
+    raw_provenance: Literal["spool", "provider"]
+    routing: Literal["transaction", "statement", "cas"]
+    parser: EmailParserPreview
+    merge: EmailMergePreview

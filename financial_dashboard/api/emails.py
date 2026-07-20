@@ -25,6 +25,10 @@ from financial_dashboard.services.email_reads import (
     get_emails_by_ids,
     list_emails,
 )
+from financial_dashboard.services.parse_previews import (
+    EmailParsePreviewError,
+    preview_email_parse,
+)
 
 router = APIRouter()
 
@@ -104,6 +108,23 @@ async def email_detail(
     response.headers["Cache-Control"] = "no-store"
     if email := await get_email_detail(session, email_id):
         return email
+
+    raise NotFoundException(detail="Email not found")
+
+
+@router.post("/emails/{email_id}/parse-preview")
+async def email_parse_preview(
+    email_id: Annotated[DatabaseId, Path()],
+    response: Response,
+    session: SessionDep,
+) -> email_schemas.EmailParsePreviewResponse:
+    """Refetch and parse one stored email without database or notification writes."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        if preview := await preview_email_parse(session, email_id):
+            return preview
+    except EmailParsePreviewError as exc:
+        raise ApiException(status_code=exc.status_code, detail=str(exc)) from exc
 
     raise NotFoundException(detail="Email not found")
 

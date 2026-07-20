@@ -33,6 +33,7 @@ from financial_dashboard.db import (
     Transaction,
 )
 from financial_dashboard.db.enums import PaymentStatus
+from financial_dashboard.integrations.email.body import RawEmailResult
 from financial_dashboard.web import get_router as get_web_router
 
 
@@ -173,7 +174,7 @@ async def test_maskless_indusind_cc_payment_resolves_via_amount(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -224,7 +225,7 @@ async def test_maskless_indusind_cc_payment_with_no_match_stays_unlinked(
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -281,7 +282,7 @@ async def test_bulk_reparse_disambiguates_maskless_cc_payment(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
     ):
         app = _build_test_app(session_maker)
@@ -335,7 +336,7 @@ async def test_reparse_upserts_existing_attached_transaction(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -448,7 +449,7 @@ async def test_cc_reversal_credit_does_not_mark_statement_paid(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",
@@ -528,7 +529,7 @@ async def test_reparse_does_not_re_credit_already_linked_txn(session_maker):
     with (
         patch(
             "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=(raw, None)),
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
         ),
         patch(
             "financial_dashboard.web.emails.should_notify_transactions",

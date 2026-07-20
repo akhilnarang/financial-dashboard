@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from financial_dashboard.db import Account, Base, Email, FetchRule, Transaction
-from financial_dashboard.integrations.email.body import RawEmailLoadResult
+from financial_dashboard.integrations.email.body import RawEmailResult
 from financial_dashboard.schemas.emails import DuplicateResolutionRequest
 from financial_dashboard.services.emails import ProcessedEmailParse
 from financial_dashboard.services.txn_merge import DUP_DEFER_NOTE, EnrichmentDiff
@@ -92,7 +92,7 @@ async def _seed_deferred(session, *, target_email_id=None) -> tuple[Email, Trans
 def _patch_current_parse(monkeypatch, txn_data: dict | None = None) -> AsyncMock:
     from financial_dashboard.services import duplicate_resolution as service
 
-    loader = AsyncMock(return_value=RawEmailLoadResult(RAW_EMAIL, None))
+    loader = AsyncMock(return_value=RawEmailResult(RAW_EMAIL, None, "provider"))
     monkeypatch.setattr(service, "load_or_fetch_raw_email", loader)
     result = ProcessedEmailParse(
         None if txn_data is not None else "synthetic parse failure",
@@ -683,7 +683,7 @@ async def test_missing_email_transaction_and_raw_source_return_404(
     monkeypatch.setattr(
         service,
         "load_or_fetch_raw_email",
-        AsyncMock(return_value=RawEmailLoadResult(None, "secret provider detail")),
+        AsyncMock(return_value=RawEmailResult(None, "secret provider detail", None)),
     )
     with caplog.at_level(logging.WARNING, logger=service.__name__):
         missing_raw = await client.post(
@@ -716,7 +716,7 @@ async def test_single_reparse_parse_failure_refreshes_error_without_race(
 
     from financial_dashboard.web import emails as emails_web
 
-    loader = AsyncMock(return_value=RawEmailLoadResult(RAW_EMAIL, None))
+    loader = AsyncMock(return_value=RawEmailResult(RAW_EMAIL, None, "provider"))
     parser = AsyncMock(return_value=("current parser detail", None, None, None))
     monkeypatch.setattr(emails_web, "load_or_fetch_raw_email", loader)
     monkeypatch.setattr(emails_web, "parse_email_by_kind", parser)
@@ -775,7 +775,7 @@ async def test_reparse_parse_failure_does_not_overwrite_concurrent_explicit_appl
         monkeypatch.setattr(
             emails_web,
             "load_or_fetch_raw_email",
-            AsyncMock(return_value=RawEmailLoadResult(RAW_EMAIL, None)),
+            AsyncMock(return_value=RawEmailResult(RAW_EMAIL, None, "provider")),
         )
         monkeypatch.setattr(emails_web, "parse_email_by_kind", failing_parse)
         monkeypatch.setattr(emails_web, "_save_failed_email", lambda *_args: None)

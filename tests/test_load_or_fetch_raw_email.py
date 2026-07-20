@@ -84,10 +84,11 @@ async def test_loads_from_spool_when_present(session_factory, spool_dir):
         patch.object(fetcher_module, "_fetch_fastmail_single_sync") as fastmail_fetch,
         patch.object(fetcher_module, "_fetch_gmail_single_sync") as gmail_fetch,
     ):
-        raw, err = await fetcher_module.load_or_fetch_raw_email(em)
+        result = await fetcher_module.load_or_fetch_raw_email(em)
 
-    assert raw == b"spooled content"
-    assert err is None
+    assert result.raw_bytes == b"spooled content"
+    assert result.error is None
+    assert result.provenance == "spool"
     fastmail_fetch.assert_not_called()
     gmail_fetch.assert_not_called()
 
@@ -113,10 +114,11 @@ async def test_refetches_from_fastmail_when_spool_missing(session_factory, spool
             return_value=b"re-fetched bytes",
         ) as fastmail_fetch,
     ):
-        raw, err = await fetcher_module.load_or_fetch_raw_email(em)
+        result = await fetcher_module.load_or_fetch_raw_email(em)
 
-    assert raw == b"re-fetched bytes"
-    assert err is None
+    assert result.raw_bytes == b"re-fetched bytes"
+    assert result.error is None
+    assert result.provenance == "provider"
     fastmail_fetch.assert_called_once_with("tok", "remote-xyz")
 
 
@@ -141,10 +143,11 @@ async def test_refetches_from_gmail_when_spool_missing(session_factory, spool_di
             fetcher_module, "_fetch_gmail_single_sync", return_value=b"gmail bytes"
         ) as gmail_fetch,
     ):
-        raw, err = await fetcher_module.load_or_fetch_raw_email(em)
+        result = await fetcher_module.load_or_fetch_raw_email(em)
 
-    assert raw == b"gmail bytes"
-    assert err is None
+    assert result.raw_bytes == b"gmail bytes"
+    assert result.error is None
+    assert result.provenance == "provider"
     gmail_fetch.assert_called_once_with("u@example.com", "pw", "gmsgid-999")
 
 
@@ -158,11 +161,12 @@ async def test_error_when_spool_missing_and_no_remote_id(session_factory, spool_
         source_id=None,
     )
 
-    raw, err = await fetcher_module.load_or_fetch_raw_email(em)
+    result = await fetcher_module.load_or_fetch_raw_email(em)
 
-    assert raw is None
-    assert err is not None
-    assert "no source" in err.lower() or "remote" in err.lower()
+    assert result.raw_bytes is None
+    assert result.error is not None
+    assert result.provenance is None
+    assert "no source" in result.error.lower() or "remote" in result.error.lower()
 
 
 @pytest.mark.anyio
@@ -182,11 +186,12 @@ async def test_error_when_provider_returns_nothing(session_factory, spool_dir):
         ),
         patch.object(fetcher_module, "_fetch_fastmail_single_sync", return_value=None),
     ):
-        raw, err = await fetcher_module.load_or_fetch_raw_email(em)
+        result = await fetcher_module.load_or_fetch_raw_email(em)
 
-    assert raw is None
-    assert err is not None
-    assert "deleted" in err.lower() or "no data" in err.lower()
+    assert result.raw_bytes is None
+    assert result.error is not None
+    assert result.provenance is None
+    assert "deleted" in result.error.lower() or "no data" in result.error.lower()
 
 
 @pytest.mark.anyio
@@ -201,8 +206,9 @@ async def test_error_when_source_row_deleted(session_factory, spool_dir):
         source_id=9999,  # doesn't exist
     )
 
-    raw, err = await fetcher_module.load_or_fetch_raw_email(em)
+    result = await fetcher_module.load_or_fetch_raw_email(em)
 
-    assert raw is None
-    assert err is not None
-    assert "source" in err.lower()
+    assert result.raw_bytes is None
+    assert result.error is not None
+    assert result.provenance is None
+    assert "source" in result.error.lower()

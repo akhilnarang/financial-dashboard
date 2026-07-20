@@ -15,6 +15,7 @@ from financial_dashboard.db import (
     StatementUpload,
     Transaction,
 )
+from financial_dashboard.integrations.email.body import RawEmailResult
 
 pytestmark = pytest.mark.anyio
 
@@ -316,7 +317,7 @@ async def test_email_raw_is_explicit_bounded_and_not_cached(
 
     async def load_after_connection_release(_email):
         assert not session.in_transaction()
-        return raw, None
+        return RawEmailResult(raw, None, "provider")
 
     loader = AsyncMock(side_effect=load_after_connection_release)
     monkeypatch.setattr(
@@ -340,7 +341,7 @@ async def test_email_raw_handles_unknown_mime_charset(client, session, monkeypat
     raw = b"Content-Type: text/plain; charset=x-does-not-exist\r\n\r\nbody"
     monkeypatch.setattr(
         "financial_dashboard.services.email_reads.load_or_fetch_raw_email",
-        AsyncMock(return_value=(raw, None)),
+        AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
     )
 
     response = await client.get(f"/api/emails/{email.id}/raw")
@@ -355,7 +356,11 @@ async def test_email_raw_sanitizes_provider_failures(
     email, *_ = await _seed_email(session)
     monkeypatch.setattr(
         "financial_dashboard.services.email_reads.load_or_fetch_raw_email",
-        AsyncMock(return_value=(None, "credential failure containing secret")),
+        AsyncMock(
+            return_value=RawEmailResult(
+                None, "credential failure containing secret", None
+            )
+        ),
     )
 
     response = await client.get(f"/api/emails/{email.id}/raw")
