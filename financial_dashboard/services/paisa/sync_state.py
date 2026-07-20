@@ -772,6 +772,37 @@ async def record_hash_noop(
     )
 
 
+async def record_guard_caught_up(
+    session: AsyncSession,
+    *,
+    target_revision: int,
+    token: str,
+    extension_id: str = EXTENSION_PAISA,
+    now: datetime.datetime | None = None,
+) -> AppliedUpdate:
+    """Consume the current revision when a preflight guard blocks the run.
+
+    A guard outcome (mode not ``project``, ``connect``-only, or not configured —
+    e.g. no accounts selected) means there is nothing to reconcile *until the
+    operator changes config*. That config change re-bumps ``desired_revision``,
+    so it is safe — and necessary — to advance ``applied`` to the captured
+    target here. Without it the row stays ``desired > applied`` (perpetually
+    dirty); because the lease and audit commits each fire the ``after_commit``
+    coordinator wake, the loop would re-tick immediately and rewrite a SKIPPED
+    audit row every cycle. No remote call was made, so remote/hash fields are
+    untouched — identical to a hash-noop completion but for the guard case.
+    Token-guarded.
+    """
+    return await _apply_caught_up(
+        session,
+        target_revision=target_revision,
+        token=token,
+        extension_id=extension_id,
+        now=now,
+        set_remote_hash=False,
+    )
+
+
 async def record_accepted_post(
     session: AsyncSession,
     *,

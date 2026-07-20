@@ -727,6 +727,185 @@ async def test_accepted_post_with_fatal_diagnosis_advances_applied_no_loop(facto
     assert remote.await_count == 0
 
 
+@pytest.mark.usefixtures("settings_paisa")
+async def test_readiness_guard_advances_applied_no_audit_storm(factory):
+    """A ``not_configured`` preflight guard (e.g. project mode + auto on but no
+    accounts selected) must consume the dirty revision, not leave it pending.
+
+    Otherwise the snapshot stays ``desired > applied`` (perpetually dirty), and
+    since the lease-claim / release / audit commits each fire the global
+    ``after_commit`` wake, the coordinator re-ticks immediately and writes a new
+    SKIPPED audit row every cycle — an unbounded audit-row + writer-lock storm.
+    The guard is terminal until the operator changes config (which re-bumps
+    ``desired``), so it must advance ``applied`` to caught-up.
+    """
+    clock = FakeClock(datetime.datetime(2026, 1, 1, 12, 0, tzinfo=_TZ))
+    await _dirty(factory, clock, n=1)
+    clock.advance(DEFAULT_QUIET_DEBOUNCE + datetime.timedelta(seconds=1))
+
+    async def _preflight_not_configured(cfg, *, client=None):
+        return PreflightReport(
+            ok=False,
+            outcome="not_configured",
+            capabilities=None,
+            reason="no accounts selected",
+        )
+
+    gen = AsyncMock(side_effect=AssertionError("must not generate on guard"))
+    c = _make_coordinator(
+        factory, clock, preflight_fn=_preflight_not_configured, generate_fn=gen
+    )
+    await c._tick()
+    gen.assert_not_called()
+
+    snap = await _snapshot(factory)
+    # The guard consumed the dirty revision: caught up, so not re-eligible.
+    assert snap.applied_revision >= snap.desired_revision
+    # Exactly one SKIPPED audit row was written for the guard outcome.
+    assert await _autowrite_count(factory) == 1
+
+    # A second immediate tick (as an after_commit wake would trigger) is a
+    # no-op: the row is caught up, so no new attempt and no new audit row.
+    await c._tick()
+    assert await _autowrite_count(factory) == 1
+
+
+@pytest.mark.usefixtures("settings_paisa")
+async def test_generate_stage_guard_advances_applied_no_storm(factory):
+    """A readiness/mode guard surfacing at the GENERATE stage (config changed
+    between preflight and generate) must also consume the revision, or it would
+    self-wake the same way the preflight guard did. Preflight passes; generate
+    returns a guard reason."""
+    clock = FakeClock(datetime.datetime(2026, 1, 1, 12, 0, tzinfo=_TZ))
+    await _dirty(factory, clock, n=1)
+    clock.advance(DEFAULT_QUIET_DEBOUNCE + datetime.timedelta(seconds=1))
+
+    async def _generate_not_configured(sess, cfg):
+        return _gen_result(ok=False, reason="generated_path not configured")
+
+    c = _make_coordinator(factory, clock, generate_fn=_generate_not_configured)
+    await c._tick()
+    snap = await _snapshot(factory)
+    assert snap.applied_revision >= snap.desired_revision  # caught up, no loop
+    # Second immediate tick is a no-op: no new audit row.
+    n = await _autowrite_count(factory)
+    await c._tick()
+    assert await _autowrite_count(factory) == n
+
+
+@pytest.mark.usefixtures("settings_paisa")
+async def test_config_fix_during_guard_window_is_not_swallowed(factory):
+    """If the operator fixes config while a guard tick is in preflight, the
+    resulting ``desired`` bump must survive: the guard consumes only the
+    revision captured at tick start, so the fix reconciles on a later tick.
+    """
+    clock = FakeClock(datetime.datetime(2026, 1, 1, 12, 0, tzinfo=_TZ))
+    await _dirty(factory, clock, n=1)
+    clock.advance(DEFAULT_QUIET_DEBOUNCE + datetime.timedelta(seconds=1))
+
+    # Preflight returns a readiness guard, but simulates a concurrent operator
+    # config-fix landing DURING the guard window by bumping desired_revision.
+    async def _preflight_guard_then_bump(cfg, *, client=None):
+        async with factory() as s:
+            await s.execute(
+                text(
+                    "UPDATE extension_sync_state "
+                    "SET desired_revision = desired_revision + 1, "
+                    "    last_dirty_at = :ts, "
+                    "    first_dirty_at = COALESCE(first_dirty_at, :ts) "
+                    "WHERE extension_id = 'paisa'"
+                ),
+                {"ts": clock().replace(tzinfo=None).isoformat(sep=" ")},
+            )
+            await s.commit()
+        return PreflightReport(
+            ok=False,
+            outcome="not_configured",
+            capabilities=None,
+            reason="no accounts selected",
+        )
+
+    c = _make_coordinator(factory, clock, preflight_fn=_preflight_guard_then_bump)
+    await c._tick()
+    snap = await _snapshot(factory)
+    # The guard consumed only the tick-start revision; the concurrent bump
+    # remains pending, so the row is still dirty (fix not swallowed).
+    assert snap.desired_revision > snap.applied_revision
+
+
+@pytest.mark.usefixtures("settings_paisa")
+async def test_tick_reads_snapshot_before_loading_config(factory, monkeypatch):
+    """The 3b ordering guarantee: ``_tick`` must read the sync-state snapshot
+    BEFORE ``load_config``. This is what bounds the guard's consumed revision to
+    the pre-config value, so a config-fix committing in that window (which bumps
+    ``desired_revision`` via the settings trigger) lands above the captured
+    ceiling and is not swallowed. Assert the ordering directly.
+    """
+    clock = FakeClock(datetime.datetime(2026, 1, 1, 12, 0, tzinfo=_TZ))
+    await _dirty(factory, clock, n=1)
+    clock.advance(DEFAULT_QUIET_DEBOUNCE + datetime.timedelta(seconds=1))
+
+    order: list[str] = []
+
+    base_cfg = coord_mod.load_config()
+
+    def _spy_load_config():
+        order.append("load_config")
+        return base_cfg
+
+    real_read = coord_mod.read_sync_state
+
+    async def _spy_read_sync_state(session, *args, **kwargs):
+        order.append("read_sync_state")
+        return await real_read(session, *args, **kwargs)
+
+    monkeypatch.setattr(coord_mod, "load_config", _spy_load_config)
+    monkeypatch.setattr(coord_mod, "read_sync_state", _spy_read_sync_state)
+
+    async def _preflight_not_configured(cfg, *, client=None):
+        return PreflightReport(
+            ok=False, outcome="not_configured", capabilities=None, reason="no accounts"
+        )
+
+    c = _make_coordinator(factory, clock, preflight_fn=_preflight_not_configured)
+    await c._tick()
+    # Snapshot read happened, and it happened before the config load.
+    assert "read_sync_state" in order
+    assert "load_config" in order
+    assert order.index("read_sync_state") < order.index("load_config")
+
+
+@pytest.mark.usefixtures("settings_paisa")
+async def test_real_preflight_failure_is_not_treated_as_guard(factory):
+    """A genuine transient preflight FAILURE must arm backoff and stay dirty —
+    even if its free-form reason text happens to contain a guard substring.
+
+    The revision-consuming guard path keys off the TYPED ``outcome`` against
+    GUARD_OUTCOMES, not a substring match on the human-readable reason. An
+    ``unreachable`` whose reason mentions e.g. "connection disabled by peer"
+    must NOT consume the dirty revision (which would silently drop a real
+    failure); it must retry.
+    """
+    clock = FakeClock(datetime.datetime(2026, 1, 1, 12, 0, tzinfo=_TZ))
+    await _dirty(factory, clock, n=1)
+    clock.advance(DEFAULT_QUIET_DEBOUNCE + datetime.timedelta(seconds=1))
+
+    async def _preflight_unreachable(cfg, *, client=None):
+        return PreflightReport(
+            ok=False,
+            outcome="unreachable",
+            capabilities=None,
+            reason="host disabled the connection",  # contains guard substring
+        )
+
+    c = _make_coordinator(factory, clock, preflight_fn=_preflight_unreachable)
+    await c._tick()
+    snap = await _snapshot(factory)
+    # Real failure: backoff armed, revision NOT consumed (still dirty).
+    assert snap.failure_count == 1
+    assert snap.desired_revision > snap.applied_revision
+
+
 # --------------------------------------------------------------------------- #
 # Periodic force reload calls remote even when clean
 # --------------------------------------------------------------------------- #

@@ -85,6 +85,7 @@ from financial_dashboard.services.paisa.sync_state import (
     read_sync_state,
     record_accepted_post,
     record_diagnosis,
+    record_guard_caught_up,
     record_hash_noop,
     record_pre_post_failure,
     record_published_hash,
@@ -394,14 +395,16 @@ class PaisaCoordinator:
 
     async def _tick(self) -> None:
         """Read eligibility, and if due+eligible, run one reconciled attempt."""
-        config = load_config()
-        # Eligibility: only project mode + auto enabled does any I/O.
-        if not config.can_project or not get_setting_bool(
-            "paisa.auto_sync_enabled", False
-        ):
-            return
-
         now = self._now()
+        # Read the sync-state snapshot BEFORE loading config so the revision the
+        # guard may later consume (``snapshot.desired_revision``) is never newer
+        # than the config preflight evaluates. Otherwise a config-fix committing
+        # between ``load_config`` and the snapshot read would bump
+        # ``desired_revision`` (via the settings trigger) while preflight still
+        # sees the stale, not-ready config — and the guard would consume the
+        # fix's bump. Reading snapshot-first makes ``config`` at-or-newer than
+        # the snapshot, so a not-ready preflight proves revision R had nothing
+        # to do, and any later fix lands above R and survives the clamp.
         async with self._session_factory() as session:
             snapshot = await read_sync_state(session)
             # ``init_db`` seeds this singleton on every boot.  Keep the hot tick
@@ -418,6 +421,15 @@ class PaisaCoordinator:
                 # own poll and turn a clean, caught-up row into a tight loop.
                 await session.rollback()
         if snapshot is None:
+            return
+
+        # Config is loaded AFTER the snapshot (see the note above): it is now
+        # at-or-newer than ``snapshot.desired_revision``. Eligibility: only
+        # project mode + auto enabled does any I/O.
+        config = load_config()
+        if not config.can_project or not get_setting_bool(
+            "paisa.auto_sync_enabled", False
+        ):
             return
 
         eligibility = reconcile_eligibility(snapshot, now=now)
@@ -490,7 +502,12 @@ class PaisaCoordinator:
                 await session.rollback()
 
             result = await asyncio.wait_for(
-                self._run_attempt_stages(config, token, force_remote=force_remote),
+                self._run_attempt_stages(
+                    config,
+                    token,
+                    force_remote=force_remote,
+                    guard_target_revision=snapshot.desired_revision,
+                ),
                 timeout=self._attempt_timeout,
             )
         except asyncio.TimeoutError:
@@ -630,6 +647,7 @@ class PaisaCoordinator:
         token: str,
         *,
         force_remote: bool,
+        guard_target_revision: int,
     ) -> AttemptResult:
         """preflight → generate once → publish checkpoint → (skip|POST+diagnosis).
 
@@ -650,7 +668,9 @@ class PaisaCoordinator:
             #    BEFORE any file write. Session-free.
             pre = await self._preflight(config, client=client)
             if not pre.ok:
-                return await self._record_preflight_outcome(token, pre, now=now)
+                return await self._record_preflight_outcome(
+                    token, pre, now=now, guard_target_revision=guard_target_revision
+                )
 
             # 2. Capture target revision R in a fresh state session.
             async with self._session_factory() as state_sess:
@@ -669,7 +689,12 @@ class PaisaCoordinator:
                 or generated.report is None
                 or generated.publish is None
             ):
-                return await self._record_generate_outcome(token, generated, now=now)
+                return await self._record_generate_outcome(
+                    token,
+                    generated,
+                    now=now,
+                    guard_target_revision=guard_target_revision,
+                )
 
             body_hash = generated.publish.body_hash
             emitted = generated.report.emitted_count
@@ -764,13 +789,43 @@ class PaisaCoordinator:
     # ------------------------------------------------------------------ #
 
     async def _record_preflight_outcome(
-        self, token: str, pre: PreflightReport, *, now: datetime.datetime
+        self,
+        token: str,
+        pre: PreflightReport,
+        *,
+        now: datetime.datetime,
+        guard_target_revision: int,
     ) -> AttemptResult:
         outcome = pre.outcome or "error"
         reason = pre.reason
-        guard = _guard_outcome_token(reason) or _guard_outcome_token(outcome)
-        if guard is not None:
+        # The revision-consuming decision keys off the TYPED outcome, not a
+        # substring match on the free-form reason: a real transient failure
+        # (unreachable/readonly/unsupported_backend) whose message happens to
+        # contain a guard word must still take the backoff path below, never
+        # silently consume the dirty revision.
+        if outcome in GUARD_OUTCOMES:
             # Mode/readiness guard: skipped, no remote attempt, no backoff.
+            # Consume the current revision so the row does not stay perpetually
+            # dirty — otherwise the after_commit wake would re-tick this same
+            # guard forever, one SKIPPED audit row per cycle. There is nothing
+            # to reconcile until the operator changes config, which re-bumps
+            # desired_revision. Token-guarded; a stale token propagates as
+            # LeaseStaleError and is abandoned by the caller.
+            #
+            # Consume only up to ``guard_target_revision`` — the revision read
+            # at the start of this tick, before preflight. A config-fix that
+            # bumps ``desired`` during preflight lands above this ceiling, so
+            # ``_apply_caught_up``'s clamp leaves the row dirty and the operator
+            # fix reconciles on the next tick rather than being swallowed here.
+            guard = outcome
+            async with self._session_factory() as session:
+                await record_guard_caught_up(
+                    session,
+                    target_revision=guard_target_revision,
+                    token=token,
+                    now=now,
+                )
+                await session.commit()
             return AttemptResult(
                 attempted=True,
                 status=STATUS_SKIPPED,
@@ -798,11 +853,29 @@ class PaisaCoordinator:
         )
 
     async def _record_generate_outcome(
-        self, token: str, generated: GenerateResult, *, now: datetime.datetime
+        self,
+        token: str,
+        generated: GenerateResult,
+        *,
+        now: datetime.datetime,
+        guard_target_revision: int,
     ) -> AttemptResult:
         reason = generated.reason
         guard = _guard_outcome_token(reason)
         if guard is not None:
+            # A readiness/mode guard can resurface at the generate stage if
+            # config changed between preflight and generate. Consume the revision
+            # (same as the preflight guard) so this SKIPPED outcome does not leave
+            # the row perpetually dirty and re-wake the loop. Token-guarded;
+            # bounded by the tick-start revision so a concurrent fix survives.
+            async with self._session_factory() as session:
+                await record_guard_caught_up(
+                    session,
+                    target_revision=guard_target_revision,
+                    token=token,
+                    now=now,
+                )
+                await session.commit()
             return AttemptResult(
                 attempted=True,
                 status=STATUS_SKIPPED,
