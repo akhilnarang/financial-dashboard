@@ -33,6 +33,7 @@ from financial_dashboard.services.telegram import (
     send_enrichment_notification,
     send_transaction_notification,
 )
+from financial_dashboard.web.sms import reparse_sms as reparse_sms_service
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,16 @@ async def sms_parse_preview(
         return preview
 
     raise NotFoundException(detail="SMS not found")
+
+
+@router.post("/sms/{sms_id}/reparse")
+async def sms_reparse(
+    sms_id: Annotated[DatabaseId, Path()],
+    session: SessionDep,
+    force_new: Annotated[bool, Query()] = False,
+) -> sms_schemas.ReparseSmsResponse:
+    """Run the canonical SMS reparse behavior through the JSON API."""
+    return await reparse_sms_service(sms_id, force_new, session)
 
 
 @router.post(

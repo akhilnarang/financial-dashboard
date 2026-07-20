@@ -29,6 +29,7 @@ from financial_dashboard.services.parse_previews import (
     EmailParsePreviewError,
     preview_email_parse,
 )
+from financial_dashboard.web.emails import reparse_email as reparse_email_service
 
 router = APIRouter()
 
@@ -127,6 +128,16 @@ async def email_parse_preview(
         raise ApiException(status_code=exc.status_code, detail=str(exc)) from exc
 
     raise NotFoundException(detail="Email not found")
+
+
+@router.post("/emails/{email_id}/reparse")
+async def email_reparse(
+    email_id: Annotated[DatabaseId, Path()],
+    session: SessionDep,
+    force_new: Annotated[bool, Query()] = False,
+) -> email_schemas.ReparseEmailResponse:
+    """Run the canonical email reparse behavior through the JSON API."""
+    return await reparse_email_service(email_id, force_new, session)
 
 
 @router.post("/emails/{email_id}/resolve-duplicate")

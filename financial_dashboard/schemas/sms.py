@@ -10,6 +10,13 @@ from financial_dashboard.schemas.common import DatabaseIdBatch
 from financial_dashboard.schemas.parse_previews import MatchEvidencePreview
 
 
+class ReparseSmsResponse(BaseModel):
+    message: str
+    new_status: Literal["parsed", "enriched", "error", "skipped"]
+    txn_id: int | None = None
+    diff: list[str] | None = None
+
+
 class SmsIngestRequest(BaseModel):
     bank: str
     sender: str

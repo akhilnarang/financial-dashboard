@@ -2,7 +2,7 @@
 
 import logging
 from datetime import date as _date, datetime as _datetime
-from typing import TYPE_CHECKING, Annotated, Literal, cast
+from typing import TYPE_CHECKING, Annotated, cast
 from urllib.parse import urlencode
 
 if TYPE_CHECKING:
@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
 from financial_dashboard.db import SmsMessage, Transaction, async_session
+from financial_dashboard.schemas.sms import ReparseSmsResponse
 from financial_dashboard.services.linker import build_link_context
 from financial_dashboard.services.settings import (
     get_telegram_chat_id,
@@ -35,13 +36,6 @@ router = APIRouter()
 templates = (
     get_templates()
 )  # matches the pattern in web/emails.py and web/bank_statements.py
-
-
-class ReparseSmsResponse(BaseModel):
-    message: str
-    new_status: Literal["parsed", "enriched", "error", "skipped"]
-    txn_id: int | None = None
-    diff: list[str] | None = None
 
 
 @router.post("/sms/{sms_id}/reparse", response_model=ReparseSmsResponse)
