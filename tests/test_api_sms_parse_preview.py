@@ -69,6 +69,7 @@ async def test_sms_parse_preview_projects_insert_without_writes(
     assert body["current_status"] == "parsed"
     assert body["parser"]["disposition"] == "transaction"
     assert body["parser"]["transaction"]["card_mask"] == "XXXX1234"
+    evidence = body["merge"].pop("match_evidence")
     assert body["merge"] == {
         "action": "insert",
         "target_transaction_id": None,
@@ -76,6 +77,8 @@ async def test_sms_parse_preview_projects_insert_without_writes(
         "changed_fields": [],
         "identity_conflicts": [],
     }
+    assert evidence["candidate_ids"] == []
+    assert evidence["reason"] == "alias_no_candidates"
     assert not any(
         statement.startswith(("insert", "update", "delete")) for statement in statements
     )
@@ -107,13 +110,48 @@ async def test_sms_parse_preview_reports_linked_identity_conflict(
     response = await client.post(f"/api/sms/{sms.id}/parse-preview")
 
     assert response.status_code == 200, response.text
-    assert response.json()["merge"] == {
+    merge = response.json()["merge"]
+    evidence = merge.pop("match_evidence")
+    assert merge == {
         "action": "insert",
         "target_transaction_id": None,
         "match_kind": None,
         "changed_fields": [],
         "identity_conflicts": ["direction"],
     }
+    assert evidence["candidate_ids"] == []
+
+
+async def test_sms_parse_preview_includes_matching_candidate_evidence(
+    client, session, monkeypatch
+):
+    sms = await _sms(session)
+    candidate = Transaction(
+        bank="synthetic-bank",
+        email_type="synthetic_transaction_alert",
+        direction="debit",
+        amount=Decimal("12.34"),
+        currency="INR",
+        transaction_date=datetime.date(2030, 1, 2),
+        transaction_time=datetime.time(10, 30),
+        counterparty="Synthetic Merchant",
+    )
+    session.add(candidate)
+    await session.commit()
+    monkeypatch.setattr(
+        "financial_dashboard.services.parse_previews.parse_sms",
+        lambda *_args, **_kwargs: _parsed_sms(),
+    )
+
+    response = await client.post(f"/api/sms/{sms.id}/parse-preview")
+
+    assert response.status_code == 200
+    merge = response.json()["merge"]
+    assert merge["action"] == "match"
+    assert merge["target_transaction_id"] == candidate.id
+    assert merge["match_evidence"]["path"] == "fuzzy"
+    assert merge["match_evidence"]["candidate_ids"] == [candidate.id]
+    assert merge["match_evidence"]["reason"] == "fuzzy_match"
 
 
 async def test_sms_parse_preview_reports_notify_only(client, session, monkeypatch):

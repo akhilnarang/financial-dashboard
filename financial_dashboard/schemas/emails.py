@@ -7,6 +7,7 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, Field, model_validator
 
 from financial_dashboard.schemas.common import DatabaseId, DatabaseIdBatch
+from financial_dashboard.schemas.parse_previews import MatchEvidencePreview
 
 
 class ReparseEmailResponse(BaseModel):
@@ -217,6 +218,7 @@ class EmailMergePreview(BaseModel):
     changed_fields: Annotated[list[str], Field(max_length=32)]
     identity_conflicts: Annotated[list[str], Field(max_length=4)]
     linked_attribution_refresh: bool
+    match_evidence: MatchEvidencePreview | None
 
 
 class EmailParsePreviewResponse(BaseModel):

@@ -13,6 +13,7 @@ from financial_dashboard.db import Email, EmailKind, FetchRule, SmsMessage, Tran
 from financial_dashboard.integrations.email.body import load_or_fetch_raw_email
 from financial_dashboard.schemas import emails as email_schemas
 from financial_dashboard.schemas import sms as sms_schemas
+from financial_dashboard.schemas.parse_previews import MatchEvidencePreview
 from financial_dashboard.services.emails import _process_email_full
 from financial_dashboard.services.sms_pipeline import (
     DECLINED_DIRECTION,
@@ -21,6 +22,7 @@ from financial_dashboard.services.sms_pipeline import (
 )
 from financial_dashboard.services.txn_merge import (
     DUP_DEFER_PREFIX,
+    MatchEvidence,
     compute_applied_enrichment_diff,
     find_match,
 )
@@ -84,6 +86,18 @@ def _identity_conflicts(
     return conflicts
 
 
+def _match_evidence_preview(evidence: MatchEvidence) -> MatchEvidencePreview:
+    """Map internal matcher diagnostics to their bounded API schema."""
+    return MatchEvidencePreview(
+        path=evidence.path,
+        candidate_ids=evidence.candidate_ids,
+        observed_candidate_count=evidence.observed_candidate_count,
+        candidate_ids_truncated=evidence.candidate_ids_truncated,
+        gates=evidence.gates,
+        reason=evidence.reason,
+    )
+
+
 def _empty_merge(
     action: MergePreviewAction = "none",
 ) -> sms_schemas.SmsMergePreview:
@@ -94,6 +108,7 @@ def _empty_merge(
         match_kind=None,
         changed_fields=[],
         identity_conflicts=[],
+        match_evidence=None,
     )
 
 
@@ -157,8 +172,9 @@ async def preview_sms_parse(
         merge = _empty_merge("declined")
     else:
         conflicts = _identity_conflicts(linked, txn_data) if linked is not None else []
+        evidence = MatchEvidence()
         with session.no_autoflush:
-            decision = await find_match(session, txn_data, "sms")
+            decision = await find_match(session, txn_data, "sms", evidence=evidence)
         diff = (
             compute_applied_enrichment_diff(
                 decision.transaction,
@@ -177,6 +193,7 @@ async def preview_sms_parse(
             match_kind=decision.kind,
             changed_fields=diff.changed_fields if diff is not None else [],
             identity_conflicts=conflicts,
+            match_evidence=_match_evidence_preview(evidence),
         )
 
     return sms_schemas.SmsParsePreviewResponse(
@@ -256,6 +273,7 @@ def _email_merge(
     changed_fields: list[str] | None = None,
     identity_conflicts: list[str] | None = None,
     linked_attribution_refresh: bool = False,
+    match_evidence: MatchEvidence | None = None,
 ) -> email_schemas.EmailMergePreview:
     """Build one bounded email reparse merge projection."""
     return email_schemas.EmailMergePreview(
@@ -265,6 +283,11 @@ def _email_merge(
         changed_fields=changed_fields or [],
         identity_conflicts=identity_conflicts or [],
         linked_attribution_refresh=linked_attribution_refresh,
+        match_evidence=(
+            _match_evidence_preview(match_evidence)
+            if match_evidence is not None
+            else None
+        ),
     )
 
 
@@ -398,8 +421,11 @@ async def preview_email_parse(
         ):
             merge = _email_merge("defer", match_kind="existing_dup_defer")
         else:
+            evidence = MatchEvidence()
             with session.no_autoflush:
-                decision = await find_match(session, txn_data, "email")
+                decision = await find_match(
+                    session, txn_data, "email", evidence=evidence
+                )
             if (
                 decision.action == "match"
                 and decision.transaction is not None
@@ -413,6 +439,7 @@ async def preview_email_parse(
                     target_id=decision.transaction.id,
                     match_kind=decision.kind,
                     changed_fields=diff.changed_fields,
+                    match_evidence=evidence,
                 )
             elif (
                 decision.action == "match"
@@ -426,11 +453,14 @@ async def preview_email_parse(
                     "conflict",
                     target_id=decision.transaction.id,
                     match_kind="claimed_reference",
+                    match_evidence=evidence,
                 )
             elif decision.action == "defer" and decision.kind == "ref_amount_mismatch":
-                merge = _email_merge("defer", match_kind=decision.kind)
+                merge = _email_merge(
+                    "defer", match_kind=decision.kind, match_evidence=evidence
+                )
             else:
-                merge = _email_merge("insert")
+                merge = _email_merge("insert", match_evidence=evidence)
 
     return email_schemas.EmailParsePreviewResponse(
         email_id=email_id,

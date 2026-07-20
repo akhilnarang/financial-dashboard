@@ -217,6 +217,7 @@ async def test_email_parse_preview_preserves_existing_duplicate_defer(
         "changed_fields": [],
         "identity_conflicts": [],
         "linked_attribution_refresh": False,
+        "match_evidence": None,
     }
 
 

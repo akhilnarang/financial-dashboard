@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from financial_dashboard.schemas.common import DatabaseIdBatch
+from financial_dashboard.schemas.parse_previews import MatchEvidencePreview
 
 
 class SmsIngestRequest(BaseModel):
@@ -116,6 +117,7 @@ class SmsMergePreview(BaseModel):
     match_kind: Annotated[str | None, Field(max_length=32)]
     changed_fields: Annotated[list[str], Field(max_length=32)]
     identity_conflicts: Annotated[list[str], Field(max_length=8)]
+    match_evidence: MatchEvidencePreview | None
 
 
 class SmsParsePreviewResponse(BaseModel):

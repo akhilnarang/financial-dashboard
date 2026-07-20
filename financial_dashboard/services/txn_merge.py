@@ -41,6 +41,39 @@ MatchKind = Literal["standard", "am_pm_alias", "ref_amount_mismatch"]
 #   defer  → ambiguous and not safely decidable from balance; skip the row
 #            for manual resolution rather than risk a wrong merge/split.
 MatchAction = Literal["match", "insert", "defer"]
+MatchPath = Literal["none", "reference", "fuzzy", "am_pm_alias"]
+_MATCH_EVIDENCE_LIMIT = 10
+
+
+@dataclass
+class MatchEvidence:
+    """Bounded, non-sensitive explanation populated by ``find_match``."""
+
+    path: MatchPath = "none"
+    candidate_ids: list[int] = field(default_factory=list)
+    observed_candidate_count: int = 0
+    candidate_ids_truncated: bool = False
+    gates: list[str] = field(default_factory=list)
+    reason: str = "not_evaluated"
+
+
+def _record_match_evidence(
+    evidence: MatchEvidence | None,
+    *,
+    path: MatchPath,
+    candidates: list[Transaction],
+    gates: tuple[str, ...],
+    reason: str,
+) -> None:
+    """Populate optional operational evidence without affecting matching."""
+    if evidence is None:
+        return
+    evidence.path = path
+    evidence.candidate_ids = [row.id for row in candidates[:_MATCH_EVIDENCE_LIMIT]]
+    evidence.observed_candidate_count = len(candidates)
+    evidence.candidate_ids_truncated = len(candidates) > _MATCH_EVIDENCE_LIMIT
+    evidence.gates = list(gates)
+    evidence.reason = reason
 
 
 class MatchDecision(NamedTuple):
@@ -507,7 +540,11 @@ async def qualifies_as_explicit_match(
 
 
 async def find_match(
-    session: AsyncSession, txn_data: dict, channel: Channel = "sms"
+    session: AsyncSession,
+    txn_data: dict,
+    channel: Channel = "sms",
+    *,
+    evidence: MatchEvidence | None = None,
 ) -> MatchDecision:
     """Decide whether an incoming ``txn_data`` matches an existing row,
     is a new transaction, or is too ambiguous to decide.
@@ -541,35 +578,17 @@ async def find_match(
             )
             .limit(2)
         )
-        rows = result.scalars().all()
+        rows = list(result.scalars().all())
         if len(rows) == 1:
             if rows[0].amount != txn_data["amount"]:
-                # The ref matched but the amount disagrees — not a confident
-                # same-event signal. This is the failure mode when a parser
-                # emits a non-unique reference_number (e.g. boilerplate
-                # scraped from the email body): two genuinely different
-                # transactions share a ref and would otherwise collapse into
-                # one row, silently destroying a transaction. Defer for manual
-                # resolution rather than merge across an amount mismatch. The
-                # ``ref_amount_mismatch`` kind lets the reparse handler tell
-                # this apart from a fuzzy duplicate defer (which it inserts).
+                _record_match_evidence(
+                    evidence,
+                    path="reference",
+                    candidates=rows,
+                    gates=("bank_direction_reference", "amount"),
+                    reason="reference_amount_mismatch",
+                )
                 return MatchDecision("defer", kind="ref_amount_mismatch")
-            # Apply the same balance guard the fuzzy path uses: when BOTH the
-            # incoming and the matched row carry a known available balance and
-            # they differ (after the shared 2dp quantization), they can never
-            # be the same event. A recycled or boilerplate-scraped ref can
-            # otherwise collapse two distinct same-amount charges into one row,
-            # silently destroying a transaction. When only one side knows its
-            # balance, keep matching — the guard only fires on a confirmed
-            # disagreement.
-            #
-            # Unlike the fuzzy authoritative-split (which inserts), DEFER here:
-            # we reached this branch because the ref is non-empty, and the
-            # `uq_transactions_ref` partial unique index on
-            # (bank, reference_number, direction) forbids a second row with
-            # the same ref — so a new insert can't physically land. These are
-            # genuinely distinct events we can neither merge (different
-            # balance) nor insert (unique ref); park for manual resolution.
             incoming_balance = _quantize_balance(txn_data.get("balance"))
             matched_balance = _quantize_balance(rows[0].balance)
             if (
@@ -577,20 +596,61 @@ async def find_match(
                 and matched_balance is not None
                 and incoming_balance != matched_balance
             ):
+                _record_match_evidence(
+                    evidence,
+                    path="reference",
+                    candidates=rows,
+                    gates=("bank_direction_reference", "amount", "balance"),
+                    reason="reference_balance_mismatch",
+                )
                 return MatchDecision("defer", kind="ref_amount_mismatch")
+            _record_match_evidence(
+                evidence,
+                path="reference",
+                candidates=rows,
+                gates=("bank_direction_reference", "amount", "balance"),
+                reason="reference_match",
+            )
             return MatchDecision("match", rows[0], "standard")
         if len(rows) > 1:
+            _record_match_evidence(
+                evidence,
+                path="reference",
+                candidates=rows,
+                gates=("bank_direction_reference", "unique_candidate"),
+                reason="multiple_reference_candidates",
+            )
             return MatchDecision("defer")
-        # 0 rows: fall through to fuzzy.
 
     candidates = await _gather_fuzzy_candidates(session, txn_data)
     if candidates:
-        return _decide(candidates, txn_data, channel)
+        decision = _decide(candidates, txn_data, channel)
+        _record_match_evidence(
+            evidence,
+            path="fuzzy",
+            candidates=candidates,
+            gates=(
+                "bank_direction_amount_currency",
+                "date_time_window",
+                "counterparty_or_card_mask",
+                "balance",
+                "source_slot",
+            ),
+            reason=f"fuzzy_{decision.action}",
+        )
+        return decision
 
     # No fuzzy candidates. Try the AM/PM alias retry.
     txn_date = txn_data.get("transaction_date")
     incoming_time = txn_data.get("transaction_time")
     if txn_date is None or incoming_time is None:
+        _record_match_evidence(
+            evidence,
+            path="none",
+            candidates=[],
+            gates=("transaction_date", "transaction_time"),
+            reason="insufficient_time_evidence",
+        )
         return MatchDecision("insert")
     aliased = await _find_am_pm_alias_match(
         session,
@@ -599,13 +659,13 @@ async def find_match(
         incoming_time=incoming_time,
         incoming_currency=txn_data.get("currency") or "INR",
         incoming_cp=txn_data.get("counterparty"),
+        evidence=evidence,
     )
     if aliased is None:
         return MatchDecision("insert")
     # Apply the balance filter to the alias candidate too: if both balances
     # are present and differ, it's a distinct event → insert. Otherwise
-    # MATCH — pre-AM/PM-fix rows may have balance=None and must still merge
-    # (treat candidate.balance is None as merge, NOT presence-mismatch defer).
+    # MATCH — pre-AM/PM-fix rows may have balance=None and must still merge.
     incoming_balance = _quantize_balance(txn_data.get("balance"))
     cand_balance = _quantize_balance(aliased.balance)
     if (
@@ -613,7 +673,11 @@ async def find_match(
         and cand_balance is not None
         and incoming_balance != cand_balance
     ):
+        if evidence is not None:
+            evidence.reason = "alias_balance_mismatch"
         return MatchDecision("insert")
+    if evidence is not None:
+        evidence.reason = "alias_match"
     return MatchDecision("match", aliased, "am_pm_alias")
 
 
@@ -625,6 +689,7 @@ async def _find_am_pm_alias_match(
     incoming_time,
     incoming_currency: str,
     incoming_cp: str | None,
+    evidence: MatchEvidence | None = None,
 ) -> Transaction | None:
     """Retry the fuzzy match with the incoming time shifted by ±12h,
     restricted to candidates of known-AM/PM-ambiguous email_types.
@@ -662,6 +727,13 @@ async def _find_am_pm_alias_match(
     mismatch refuse case).
     """
     if not incoming_cp:
+        _record_match_evidence(
+            evidence,
+            path="am_pm_alias",
+            candidates=[],
+            gates=("known_ambiguous_type", "counterparty"),
+            reason="missing_counterparty",
+        )
         return None
 
     # Decide which alias directions are worth searching. Hour ranges
@@ -743,6 +815,25 @@ async def _find_am_pm_alias_match(
     candidates = [
         c for c in candidates if _counterparty_match(c.counterparty, incoming_cp)
     ]
+    _record_match_evidence(
+        evidence,
+        path="am_pm_alias",
+        candidates=candidates,
+        gates=(
+            "bank_direction_amount_currency",
+            "known_ambiguous_type",
+            "twelve_hour_window",
+            "counterparty",
+            "balance",
+        ),
+        reason=(
+            "alias_candidate"
+            if len(candidates) == 1
+            else "alias_no_candidates"
+            if not candidates
+            else "alias_multiple_candidates"
+        ),
+    )
     if len(candidates) == 1:
         return candidates[0]
     return None
