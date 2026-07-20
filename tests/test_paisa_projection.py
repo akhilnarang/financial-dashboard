@@ -808,6 +808,62 @@ async def test_card_payment_on_bank_emitted_as_liability_transfer(session):
     assert "Expenses:" not in report.journal
 
 
+async def test_credit_direction_card_payment_reverses_flow(session):
+    """A credit-direction credit_card_payment on a bank is a payment REVERSAL:
+    money returns to the bank. It must post bank ``+amount`` / liability
+    ``-amount`` — the mirror of the debit case — not be posted as another
+    outflow. Direction, not category, decides the sign.
+    """
+    bank = await _bank(session)
+    await _txn(
+        session,
+        account_id=bank.id,
+        direction="credit",
+        amount="5000.00",
+        date=dt.date(2026, 2, 1),
+        category="credit_card_payment",
+        counterparty="Card Payment Reversal",
+        bank="hdfc",
+    )
+    report = await project(session, _config())
+    assert report.card_payments == 1
+    # Find the card-payment entry and check the signed postings.
+    entry = next(e for e in report.entries if e.kind == "card_payment")
+    bank_posting = next(p for p in entry.postings if p.account.startswith("Assets:"))
+    liab_posting = next(
+        p for p in entry.postings if not p.account.startswith("Assets:")
+    )
+    # Reversal: bank receives money back (positive), liability rises (negative).
+    assert bank_posting.amount == Decimal("5000.00")
+    assert liab_posting.amount == Decimal("-5000.00")
+    assert bank_posting.amount + liab_posting.amount == Decimal("0")
+
+
+async def test_debit_direction_card_payment_flows_out(session):
+    """The debit (normal) case is unchanged: bank ``-amount``, liability
+    ``+amount``. Pins the sign so the reversal fix cannot flip the common path.
+    """
+    bank = await _bank(session)
+    await _txn(
+        session,
+        account_id=bank.id,
+        direction="debit",
+        amount="5000.00",
+        date=dt.date(2026, 2, 1),
+        category="credit_card_payment",
+        counterparty="Card Bill",
+        bank="hdfc",
+    )
+    report = await project(session, _config())
+    entry = next(e for e in report.entries if e.kind == "card_payment")
+    bank_posting = next(p for p in entry.postings if p.account.startswith("Assets:"))
+    liab_posting = next(
+        p for p in entry.postings if not p.account.startswith("Assets:")
+    )
+    assert bank_posting.amount == Decimal("-5000.00")
+    assert liab_posting.amount == Decimal("5000.00")
+
+
 async def test_card_side_payment_not_misposted(session):
     # A credit_card_payment on the CARD account (liability) is the card being
     # paid down. The bank-side leg is the authoritative event; the card-side

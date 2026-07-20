@@ -662,7 +662,13 @@ def _build_card_payment_entry(
 
     Only invoked for an ASSET (bank) account: the caller skips card-side
     ``credit_card_payment`` legs so they are not misposted here.
+
+    The sign follows ``txn.direction``: a debit is the normal payment (bank ↓,
+    liability ↓ i.e. positive on the credit-normal liability), a credit is a
+    payment reversal that returns money to the bank (bank ↑, liability ↑). A
+    fixed outflow sign would mispost every reversal as a second payment.
     """
+    sign = _account_sign(txn.direction)
     amount = Decimal(txn.amount)
     date = txn.transaction_date
     assert date is not None  # caller filters transaction_date.is_not(None)
@@ -691,9 +697,11 @@ def _build_card_payment_entry(
         payee=txn.counterparty or "Card Payment",
         txn_ids=(txn.id,) if txn.id is not None else (),
         postings=(
-            LedgerPosting(account=liability_name, amount=amount, commodity=commodity),
             LedgerPosting(
-                account=bank_account.name, amount=-amount, commodity=commodity
+                account=liability_name, amount=amount * -sign, commodity=commodity
+            ),
+            LedgerPosting(
+                account=bank_account.name, amount=amount * sign, commodity=commodity
             ),
         ),
         note=txn.note,
