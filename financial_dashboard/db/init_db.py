@@ -664,6 +664,45 @@ async def init_db(engine) -> None:
             for _ddl in _build_extension_sync_state_trigger_ddl():
                 await conn.execute(text(_ddl))
 
+        # Read APIs resolve source and statement provenance through these
+        # foreign keys for pages of at most 100 rows. Existing databases do not
+        # receive model indexes from create_all(), so create the same indexes
+        # idempotently.
+        for index_name, table_name, column_name in (
+            ("ix_transactions_email_id", "transactions", "email_id"),
+            ("ix_transactions_sms_message_id", "transactions", "sms_message_id"),
+            ("ix_statement_uploads_email_id", "statement_uploads", "email_id"),
+            (
+                "ix_bank_statement_uploads_email_id",
+                "bank_statement_uploads",
+                "email_id",
+            ),
+            ("ix_sms_messages_transaction_id", "sms_messages", "transaction_id"),
+            ("ix_cas_uploads_email_id", "cas_uploads", "email_id"),
+            ("ix_statement_uploads_account_id", "statement_uploads", "account_id"),
+            (
+                "ix_bank_statement_uploads_account_id",
+                "bank_statement_uploads",
+                "account_id",
+            ),
+            (
+                "ix_transactions_statement_upload_id",
+                "transactions",
+                "statement_upload_id",
+            ),
+            (
+                "ix_transactions_bank_statement_upload_id",
+                "transactions",
+                "bank_statement_upload_id",
+            ),
+        ):
+            await conn.execute(
+                text(
+                    f"CREATE INDEX IF NOT EXISTS {index_name} "
+                    f"ON {table_name} ({column_name})"
+                )
+            )
+
     async with engine.begin() as conn:
         # Seed the generic built-in merchant rules (INSERT OR IGNORE, idempotent).
         # Personal/local overrides are loaded separately via the CLI from the

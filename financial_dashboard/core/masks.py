@@ -125,6 +125,12 @@ def mask_digits(s: str | None) -> str:
     return "".join(ch for ch in s if "0" <= ch <= "9")
 
 
+def display_mask(value: str | None) -> str | None:
+    """Return a redacted display value containing at most four trailing digits."""
+    last_digits = mask_last4(value, partial=True)
+    return f"XXXX{last_digits}" if last_digits else None
+
+
 def mask_last4(s: str | None, *, partial: bool = False) -> str | None:
     """Last 4 digits of mask *s*.
 
