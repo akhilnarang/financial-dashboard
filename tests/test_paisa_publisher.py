@@ -128,6 +128,47 @@ def test_header_hash_matches_body_sha256(tmp_path):
     assert result.body_hash == hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def test_publish_refuses_to_overwrite_foreign_file(tmp_path):
+    """A path that already holds a file we did not generate must be refused.
+
+    ``generated_path`` is operator-supplied and reaches the publisher straight
+    from an HTTP config save. Without this guard, pointing it at any writable
+    file (e.g. the SQLite database) and triggering a generate would clobber
+    that file. The generated-header sentinel is the provenance marker: only a
+    file whose first line is our sentinel — or an absent path — may be written.
+    """
+    target = tmp_path / "precious.db"
+    target.write_bytes(b"SQLite format 3\x00 ... real database bytes ...")
+    original = target.read_bytes()
+    with pytest.raises(PublishError) as exc:
+        publish_journal(str(target), "body\n")
+    assert "not a generated Paisa file" in str(exc.value)
+    # The foreign file is untouched and no tempfile was orphaned.
+    assert target.read_bytes() == original
+    assert not any(p.suffix == ".tmp" for p in tmp_path.iterdir() if p.is_file())
+
+
+def test_publish_overwrites_own_generated_file(tmp_path):
+    """A file we previously generated carries the sentinel, so a refresh with
+    different content is allowed — the common idempotent overwrite case."""
+    target = tmp_path / "out.journal"
+    publish_journal(str(target), "first body\n")
+    result = publish_journal(str(target), "second body\n")
+    assert result.published is True
+    assert "second body" in target.read_text()
+    assert "first body" not in target.read_text()
+
+
+def test_publish_refuses_empty_foreign_file(tmp_path):
+    """A zero-byte foreign file has no sentinel line and must still be refused;
+    an empty file is a plausible operator typo target, not our output."""
+    target = tmp_path / "empty.txt"
+    target.write_bytes(b"")
+    with pytest.raises(PublishError):
+        publish_journal(str(target), "body\n")
+    assert target.read_bytes() == b""
+
+
 def test_published_file_permissions_are_normal(tmp_path):
     target = tmp_path / "out.journal"
     publish_journal(str(target), "x\n")

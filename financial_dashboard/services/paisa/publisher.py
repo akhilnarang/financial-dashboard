@@ -117,6 +117,18 @@ def publish_journal(path: str, body: str) -> PublishResult:
             existing = target.read_bytes()
         except OSError as exc:
             raise PublishError(f"Could not read existing {target!r}: {exc}") from exc
+        # ``generated_path`` is operator-supplied and reaches here straight from
+        # an HTTP config save. Refuse to overwrite a file we did not generate:
+        # the first line must be our sentinel. This blocks a misconfigured (or
+        # malicious) path from clobbering an unrelated file such as the SQLite
+        # database. An absent path stays writable (a fresh journal).
+        sentinel = HEADER_LINES[0].encode("utf-8")
+        first_line = existing.split(b"\n", 1)[0]
+        if first_line != sentinel:
+            raise PublishError(
+                f"Refusing to overwrite {target!r}: not a generated Paisa file "
+                "(missing the generated-header sentinel)."
+            )
         if existing == data:
             return PublishResult(
                 published=False,
