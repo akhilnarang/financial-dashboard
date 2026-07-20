@@ -40,6 +40,8 @@ from financial_dashboard.services.statements.shared import (
 _ROW_LIMIT = 100
 _FILE_SIZE_LIMIT = 25_000_000
 _TEXT_LIMIT = 1_000
+_REFERENCE_LIMIT = 5_000
+_REFERENCE_CHUNK_SIZE = 500
 
 
 class StatementPreviewError(Exception):
@@ -108,7 +110,7 @@ async def _load_statement(
         kind=kind,
         statement_id=statement_id,
         account_id=upload.account_id,
-        bank=account.bank if account is not None else upload.bank,
+        bank=upload.bank,
         path=path,
         password=password,
     )
@@ -249,13 +251,15 @@ def _reconciliation_entry(
 
 def _statement_candidate_index(
     entries: list[dict],
-) -> tuple[set[tuple[str, Decimal, datetime.date]], set[str]]:
+) -> tuple[set[tuple[str, Decimal, datetime.date]], set[str], bool]:
     """Normalize statement identities once for conservative extra detection."""
     identities: set[tuple[str, Decimal, datetime.date]] = set()
     uncertain_directions: set[str] = set()
+    uncertain_all_directions = False
     for entry in entries:
         direction = entry.get("direction")
         if not isinstance(direction, str):
+            uncertain_all_directions = True
             continue
         try:
             amount = Decimal(str(entry.get("amount")).replace(",", ""))
@@ -267,17 +271,19 @@ def _statement_candidate_index(
             uncertain_directions.add(direction)
             continue
         identities.add((direction, amount, txn_date))
-    return identities, uncertain_directions
+    return identities, uncertain_directions, uncertain_all_directions
 
 
 def _could_be_statement_candidate(
     transaction: Transaction,
     identities: set[tuple[str, Decimal, datetime.date]],
     uncertain_directions: set[str],
+    uncertain_all_directions: bool,
 ) -> bool:
     """Conservatively keep possible statement counterparts out of ``extra``."""
     if (
-        transaction.transaction_date is None
+        uncertain_all_directions
+        or transaction.transaction_date is None
         or transaction.direction in uncertain_directions
     ):
         return True
@@ -310,6 +316,9 @@ async def preview_statement_reconciliation(
     lo, hi = date_range
     if lo > hi:
         raise StatementPreviewError(422, "Statement date range is invalid")
+    # Candidate closure equivalent to email ingest without loading all history:
+    # fuzzy matching can only reach the buffered date range, while bank rows can
+    # additionally match a misdated/NULL-dated DB row by exact reference.
     statement = select(Transaction).where(
         Transaction.account_id == loaded.account_id,
         Transaction.transaction_date.between(
@@ -317,12 +326,48 @@ async def preview_statement_reconciliation(
             hi + datetime.timedelta(days=STMT_RECONCILE_DATE_BUFFER_DAYS),
         ),
     )
+    references = (
+        sorted(
+            {
+                row.reference_number
+                for row in parsed.transactions or []
+                if row.reference_number
+            }
+        )
+        if kind == "bank"
+        else []
+    )
+    if len(references) > _REFERENCE_LIMIT:
+        raise StatementPreviewError(413, "Statement has too many references")
+
     with session.no_autoflush:
-        db_transactions = list(
-            (await session.execute(statement.execution_options(autoflush=False)))
+        candidate_by_id = {
+            row.id: row
+            for row in (
+                await session.execute(statement.execution_options(autoflush=False))
+            )
             .scalars()
             .all()
-        )
+        }
+        for start in range(0, len(references), _REFERENCE_CHUNK_SIZE):
+            reference_rows = (
+                (
+                    await session.execute(
+                        select(Transaction)
+                        .where(
+                            Transaction.account_id == loaded.account_id,
+                            Transaction.reference_number.in_(
+                                references[start : start + _REFERENCE_CHUNK_SIZE]
+                            ),
+                        )
+                        .execution_options(autoflush=False)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            candidate_by_id.update((row.id, row) for row in reference_rows)
+        db_transactions = list(candidate_by_id.values())
         try:
             if kind == "cc":
                 reconciliation = reconcile_statement(
@@ -348,9 +393,11 @@ async def preview_statement_reconciliation(
         if entry.get("db_txn_id") is not None
     }
     all_statement_entries = [*matched_all, *missing_all]
-    candidate_identities, uncertain_directions = _statement_candidate_index(
-        all_statement_entries
-    )
+    (
+        candidate_identities,
+        uncertain_directions,
+        uncertain_all_directions,
+    ) = _statement_candidate_index(all_statement_entries)
     extra_ids = sorted(
         transaction.id
         for transaction in db_transactions
@@ -358,13 +405,17 @@ async def preview_statement_reconciliation(
         and transaction.transaction_date is not None
         and lo <= transaction.transaction_date <= hi
         and not _could_be_statement_candidate(
-            transaction, candidate_identities, uncertain_directions
+            transaction,
+            candidate_identities,
+            uncertain_directions,
+            uncertain_all_directions,
         )
     )
     return statement_schemas.StatementReconciliationPreviewResponse(
         statement_id=statement_id,
         kind=kind,
         account_id=loaded.account_id,
+        candidate_scope="date_buffer_plus_statement_references",
         date_from=lo,
         date_to=hi,
         matched_count=len(matched_all),

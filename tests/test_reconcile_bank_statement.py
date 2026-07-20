@@ -34,6 +34,7 @@ class StubDbTxn:
     counterparty: str | None = None
     raw_description: str | None = None
     channel: str | None = None
+    balance: Decimal | None = None
 
 
 def _stmt(
@@ -61,6 +62,7 @@ def _txn(
     ref: str | None = None,
     narration: str = "",
     channel: str | None = None,
+    balance: str | None = None,
 ) -> BankTransaction:
     return BankTransaction(
         date=date,
@@ -69,7 +71,102 @@ def _txn(
         transaction_type=direction,
         reference_number=ref,
         channel=channel,
+        balance=balance,
     )
+
+
+def test_reference_match_refuses_contradictory_amount():
+    """A recycled exact reference cannot override contradictory amount evidence."""
+    db_txn = StubDbTxn(
+        id=5256,
+        transaction_date=datetime.date(2026, 4, 14),
+        amount=Decimal("1000.00"),
+        direction="debit",
+        reference_number="REF-COLLISION",
+    )
+    parsed = _stmt(
+        [
+            _txn(
+                date="14/04/2026",
+                amount="2,000.00",
+                direction="debit",
+                ref="REF-COLLISION",
+            )
+        ]
+    )
+
+    recon = reconcile_bank_statement(parsed, [db_txn], account_id=1)
+
+    assert recon["matched"] == []
+    assert len(recon["missing"]) == 1
+    assert recon["missing"][0]["ambiguous"] is True
+    assert recon["missing"][0]["candidate_transaction_ids"] == [db_txn.id]
+
+
+def test_incompatible_reference_row_does_not_demote_valid_winner():
+    """Contradictory reference evidence blocks import but cannot win contention."""
+    db_txn = StubDbTxn(
+        id=5254,
+        transaction_date=datetime.date(2026, 4, 14),
+        amount=Decimal("1000.00"),
+        direction="debit",
+        reference_number="REF-REUSED",
+    )
+    parsed = _stmt(
+        [
+            _txn(
+                date="14/04/2026",
+                amount="1,000.00",
+                direction="debit",
+                ref="REF-REUSED",
+                narration="VALID MERCHANT",
+            ),
+            _txn(
+                date="14/04/2026",
+                amount="2,000.00",
+                direction="debit",
+                ref="REF-REUSED",
+                narration="DIFFERENT MERCHANT",
+            ),
+        ]
+    )
+
+    recon = reconcile_bank_statement(parsed, [db_txn], account_id=1)
+
+    assert [entry["stmt_idx"] for entry in recon["matched"]] == [0]
+    assert recon["matched"][0]["db_txn_id"] == db_txn.id
+    assert [entry["stmt_idx"] for entry in recon["missing"]] == [1]
+    assert recon["missing"][0]["ambiguous"] is True
+    assert recon["missing"][0]["candidate_transaction_ids"] == [db_txn.id]
+
+
+def test_reference_match_refuses_contradictory_known_balance():
+    """Equal amount/reference cannot override conflicting post-event balances."""
+    db_txn = StubDbTxn(
+        id=5255,
+        transaction_date=datetime.date(2026, 4, 14),
+        amount=Decimal("2000.00"),
+        direction="debit",
+        reference_number="REF-BALANCE",
+        balance=Decimal("5000.00"),
+    )
+    parsed = _stmt(
+        [
+            _txn(
+                date="14/04/2026",
+                amount="2,000.00",
+                direction="debit",
+                ref="REF-BALANCE",
+                balance="4,000.00",
+            )
+        ]
+    )
+
+    recon = reconcile_bank_statement(parsed, [db_txn], account_id=1)
+
+    assert recon["matched"] == []
+    assert recon["missing"][0]["ambiguous"] is True
+    assert recon["missing"][0]["candidate_transaction_ids"] == [db_txn.id]
 
 
 def test_ref_match_takes_priority_over_date_fallback():

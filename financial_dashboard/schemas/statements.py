@@ -154,6 +154,7 @@ class StatementReconciliationPreviewResponse(BaseModel):
     statement_id: int
     kind: Literal["cc", "bank"]
     account_id: int
+    candidate_scope: Literal["date_buffer_plus_statement_references"]
     date_from: datetime.date
     date_to: datetime.date
     matched_count: Annotated[int, Field(ge=0)]

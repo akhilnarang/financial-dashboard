@@ -13,6 +13,10 @@ from financial_dashboard.db import (
     StatementUpload,
     Transaction,
 )
+from financial_dashboard.services.statement_previews import (
+    _could_be_statement_candidate,
+    _statement_candidate_index,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -192,7 +196,7 @@ async def test_bank_statement_parse_and_reconcile_preview(
     pdf.write_bytes(b"synthetic PDF bytes")
     upload = BankStatementUpload(
         account_id=account.id,
-        bank=account.bank,
+        bank="statement-parser-bank",
         filename="synthetic-bank.pdf",
         file_path=str(pdf),
         status="parsed",
@@ -206,6 +210,7 @@ async def test_bank_statement_parse_and_reconcile_preview(
         currency="INR",
         transaction_date=datetime.date(2030, 1, 2),
         reference_number="SYNTHETIC-REF",
+        enriched_at=datetime.datetime(2029, 12, 31, 12, 0),
     )
     extra_transaction = Transaction(
         account_id=account.id,
@@ -218,17 +223,33 @@ async def test_bank_statement_parse_and_reconcile_preview(
     )
     session.add_all([upload, transaction, extra_transaction])
     await session.commit()
+    parser_banks = []
+
+    def parse_bank(_path, bank, _password):
+        parser_banks.append(bank)
+        return _bank_parsed([_bank_row()])
+
     monkeypatch.setattr(
         "financial_dashboard.services.statement_previews.parse_bank_statement",
-        lambda *_args, **_kwargs: _bank_parsed([_bank_row()]),
+        parse_bank,
     )
 
     parse_response = await client.post(
         f"/api/statements/bank/{upload.id}/parse-preview"
     )
-    reconcile_response = await client.post(
-        f"/api/statements/bank/{upload.id}/reconcile-preview"
-    )
+    statements: list[str] = []
+    bind = session.get_bind()
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.strip().lower())
+
+    event.listen(bind, "before_cursor_execute", record_statement)
+    try:
+        reconcile_response = await client.post(
+            f"/api/statements/bank/{upload.id}/reconcile-preview"
+        )
+    finally:
+        event.remove(bind, "before_cursor_execute", record_statement)
 
     assert parse_response.status_code == 200, parse_response.text
     assert parse_response.json()["account_mask"] == "XXXX1234"
@@ -242,6 +263,49 @@ async def test_bank_statement_parse_and_reconcile_preview(
     assert body["missing_count"] == 0
     assert body["extra_count"] == 1
     assert body["extra_transaction_ids"] == [extra_transaction.id]
+    assert parser_banks == ["statement-parser-bank", "statement-parser-bank"]
+    assert body["candidate_scope"] == "date_buffer_plus_statement_references"
+    assert transaction.enriched_at == datetime.datetime(2029, 12, 31, 12, 0)
+    assert not any(
+        statement.startswith(("insert", "update", "delete")) for statement in statements
+    )
+
+
+async def test_bank_reconcile_preview_includes_null_dated_reference_match(
+    client, session, monkeypatch, tmp_path
+):
+    account = await _account(session, account_type="bank_account")
+    pdf = tmp_path / "synthetic-null-date.pdf"
+    pdf.write_bytes(b"synthetic PDF bytes")
+    upload = BankStatementUpload(
+        account_id=account.id,
+        bank=account.bank,
+        filename="synthetic-null-date.pdf",
+        file_path=str(pdf),
+        status="parsed",
+    )
+    transaction = Transaction(
+        account_id=account.id,
+        bank=account.bank,
+        email_type="synthetic_alert",
+        direction="debit",
+        amount=Decimal("12.34"),
+        currency="INR",
+        transaction_date=None,
+        reference_number="SYNTHETIC-REF",
+    )
+    session.add_all([upload, transaction])
+    await session.commit()
+    monkeypatch.setattr(
+        "financial_dashboard.services.statement_previews.parse_bank_statement",
+        lambda *_args, **_kwargs: _bank_parsed([_bank_row()]),
+    )
+
+    response = await client.post(f"/api/statements/bank/{upload.id}/reconcile-preview")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["matched"][0]["matched_transaction_id"] == transaction.id
+    assert response.json()["matched"][0]["decision_reason"] == "matched_reference"
 
 
 async def test_statement_preview_rejects_email_summary(client, session):
@@ -348,6 +412,22 @@ async def test_statement_reconciliation_failure_is_sanitized(
 
     assert response.status_code == 422
     assert response.json() == {"detail": "Statement reconciliation failed"}
+
+
+async def test_extra_classification_treats_missing_direction_as_global_uncertainty():
+    identities, uncertain_directions, uncertain_all = _statement_candidate_index(
+        [{"direction": None, "amount": "12.34", "date": "02/01/2030"}]
+    )
+    transaction = Transaction(
+        direction="debit",
+        amount=Decimal("99.99"),
+        transaction_date=datetime.date(2030, 1, 2),
+    )
+
+    assert uncertain_all is True
+    assert _could_be_statement_candidate(
+        transaction, identities, uncertain_directions, uncertain_all
+    )
 
 
 async def test_statement_preview_openapi_routes_are_typed(client):

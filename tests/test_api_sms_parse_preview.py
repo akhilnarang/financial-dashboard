@@ -65,6 +65,7 @@ async def test_sms_parse_preview_projects_insert_without_writes(
         event.remove(bind, "before_cursor_execute", record_statement)
 
     assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
     body = response.json()
     assert body["current_status"] == "parsed"
     assert body["parser"]["disposition"] == "transaction"
@@ -135,6 +136,7 @@ async def test_sms_parse_preview_includes_matching_candidate_evidence(
         transaction_date=datetime.date(2030, 1, 2),
         transaction_time=datetime.time(10, 30),
         counterparty="Synthetic Merchant",
+        enriched_at=datetime.datetime(2029, 12, 31, 12, 0),
     )
     session.add(candidate)
     await session.commit()
@@ -143,7 +145,17 @@ async def test_sms_parse_preview_includes_matching_candidate_evidence(
         lambda *_args, **_kwargs: _parsed_sms(),
     )
 
-    response = await client.post(f"/api/sms/{sms.id}/parse-preview")
+    statements: list[str] = []
+    bind = session.get_bind()
+
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.strip().lower())
+
+    event.listen(bind, "before_cursor_execute", record_statement)
+    try:
+        response = await client.post(f"/api/sms/{sms.id}/parse-preview")
+    finally:
+        event.remove(bind, "before_cursor_execute", record_statement)
 
     assert response.status_code == 200
     merge = response.json()["merge"]
@@ -152,6 +164,10 @@ async def test_sms_parse_preview_includes_matching_candidate_evidence(
     assert merge["match_evidence"]["path"] == "fuzzy"
     assert merge["match_evidence"]["candidate_ids"] == [candidate.id]
     assert merge["match_evidence"]["reason"] == "fuzzy_match"
+    assert candidate.enriched_at == datetime.datetime(2029, 12, 31, 12, 0)
+    assert not any(
+        statement.startswith(("insert", "update", "delete")) for statement in statements
+    )
 
 
 async def test_sms_parse_preview_reports_notify_only(client, session, monkeypatch):

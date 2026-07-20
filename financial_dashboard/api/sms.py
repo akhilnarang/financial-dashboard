@@ -96,9 +96,11 @@ async def sms_detail(
 @router.post("/sms/{sms_id}/parse-preview")
 async def sms_parse_preview(
     sms_id: Annotated[DatabaseId, Path()],
+    response: Response,
     session: SessionDep,
 ) -> sms_schemas.SmsParsePreviewResponse:
     """Parse one stored SMS and project merge behavior without side effects."""
+    response.headers["Cache-Control"] = "no-store"
     if preview := await preview_sms_parse(session, sms_id):
         return preview
 

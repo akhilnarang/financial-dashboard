@@ -206,6 +206,8 @@ class EmailMergePreview(BaseModel):
 
     action: Literal[
         "none",
+        "routed_statement_pipeline",
+        "routed_cas_pipeline",
         "refresh_linked",
         "match",
         "insert",
@@ -225,6 +227,7 @@ class EmailParsePreviewResponse(BaseModel):
     email_id: int
     current_status: Annotated[str | None, Field(max_length=32)]
     current_transaction_ids: Annotated[list[int], Field(max_length=10)]
+    current_transaction_ids_truncated: bool
     raw_provenance: Literal["spool", "provider"]
     routing: Literal["transaction", "statement", "cas"]
     parser: EmailParserPreview

@@ -122,6 +122,7 @@ async def test_email_parse_preview_projects_insert_without_writes(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["raw_provenance"] == "provider"
+    assert body["current_transaction_ids_truncated"] is False
     assert body["parser"]["disposition"] == "transaction"
     assert body["parser"]["transaction"]["card_mask"] == "XXXX1234"
     assert "raw_description" not in body["parser"]["transaction"]
@@ -221,6 +222,36 @@ async def test_email_parse_preview_preserves_existing_duplicate_defer(
     }
 
 
+async def test_email_parse_preview_flags_truncated_linked_transactions(
+    client, session, monkeypatch
+):
+    email = await _email(session)
+    transactions = [
+        Transaction(
+            email_id=email.id,
+            bank="synthetic-bank",
+            email_type="synthetic_transaction_alert",
+            direction="debit",
+            amount=Decimal(index + 1),
+            currency="INR",
+            transaction_date=datetime.date(2030, 1, 2),
+        )
+        for index in range(11)
+    ]
+    session.add_all(transactions)
+    await session.commit()
+    _patch_raw_and_parse(monkeypatch, _transaction_parse())
+
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 200
+    assert response.json()["current_transaction_ids"] == [
+        transaction.id for transaction in transactions[:10]
+    ]
+    assert response.json()["current_transaction_ids_truncated"] is True
+    assert response.json()["merge"]["action"] == "multiple_linked"
+
+
 async def test_email_parse_preview_suppresses_merge_for_statement_rule(
     client, session, monkeypatch
 ):
@@ -233,8 +264,45 @@ async def test_email_parse_preview_suppresses_merge_for_statement_rule(
     assert response.status_code == 200
     assert response.json()["routing"] == "statement"
     assert response.json()["parser"]["disposition"] == "transaction"
-    assert response.json()["merge"]["action"] == "none"
+    assert response.json()["merge"]["action"] == "routed_statement_pipeline"
     assert response.json()["merge"]["match_kind"] == "statement_rule"
+
+
+async def test_email_parse_preview_routes_pdf_statement_after_html_parse_error(
+    client, session, monkeypatch
+):
+    email = await _email(session, email_kind="bank_statement")
+    await session.commit()
+    _patch_raw_and_parse(
+        monkeypatch,
+        ProcessedEmailParse("Synthetic HTML parser failure", None, None, None),
+    )
+
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 200
+    assert response.json()["parser"]["disposition"] == "error"
+    assert response.json()["merge"]["action"] == "routed_statement_pipeline"
+    assert response.json()["merge"]["match_kind"] == "statement_rule"
+
+
+async def test_email_parse_preview_routes_transaction_parse_failure_to_statement_fallback(
+    client, session, monkeypatch
+):
+    email = await _email(session, email_kind="transaction")
+    await session.commit()
+    _patch_raw_and_parse(
+        monkeypatch,
+        ProcessedEmailParse("Synthetic HTML parser failure", None, None, None),
+    )
+
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 200
+    assert response.json()["routing"] == "statement"
+    assert response.json()["parser"]["disposition"] == "error"
+    assert response.json()["merge"]["action"] == "routed_statement_pipeline"
+    assert response.json()["merge"]["match_kind"] == "transaction_parse_fallback"
 
 
 async def test_email_parse_preview_reports_statement_summary(
@@ -264,7 +332,40 @@ async def test_email_parse_preview_reports_statement_summary(
     assert parser["password_hint_present"] is True
     assert parser["statement"]["card_mask"] == "XXXX1234"
     assert "must-not-be-returned" not in response.text
-    assert response.json()["merge"]["action"] == "none"
+    assert response.json()["merge"]["action"] == "routed_statement_pipeline"
+
+
+async def test_email_parse_preview_reports_cas_pipeline(client, session, monkeypatch):
+    email = await _email(session, email_kind="cas_statement")
+    await session.commit()
+    _patch_raw_and_parse(monkeypatch, _transaction_parse())
+
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 200
+    assert response.json()["routing"] == "cas"
+    assert response.json()["parser"]["disposition"] == "routed_elsewhere"
+    assert response.json()["merge"]["action"] == "routed_cas_pipeline"
+
+
+async def test_email_parse_preview_ruleless_email_matches_reparse_status(
+    client, session
+):
+    email = Email(
+        provider="synthetic",
+        message_id="ruleless@example.invalid",
+        sender="synthetic@example.invalid",
+        subject="Synthetic source",
+        status="failed",
+        rule_id=None,
+    )
+    session.add(email)
+    await session.commit()
+
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Email has no associated fetch rule"}
 
 
 async def test_email_parse_preview_returns_404_when_raw_unavailable(
@@ -285,6 +386,27 @@ async def test_email_parse_preview_returns_404_when_raw_unavailable(
     assert response.status_code == 404
     assert response.json() == {"detail": "Raw email is unavailable"}
     assert "Sensitive" not in response.text
+
+
+async def test_email_parse_preview_sanitizes_loader_exceptions(
+    client, session, monkeypatch, caplog
+):
+    email = await _email(session)
+    await session.commit()
+
+    async def unavailable(_email):
+        raise OSError("Sensitive provider path")
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.parse_previews.load_or_fetch_raw_email",
+        unavailable,
+    )
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Raw email is unavailable"}
+    assert "Sensitive" not in response.text
+    assert "Sensitive" not in caplog.text
 
 
 async def test_email_parse_preview_openapi_is_typed(client):

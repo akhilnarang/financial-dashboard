@@ -300,13 +300,10 @@ async def test_distinguishable_rivals_hold_back_winner_and_loser(
 
 
 @pytest.mark.anyio
-async def test_two_statement_rows_claiming_one_reference_contend(
+async def test_incompatible_reused_reference_does_not_contend_with_valid_match(
     session_factory, monkeypatch
 ):
-    """The reference pass is not exempt from the contention analysis: two
-    statement rows carry the same reference and only one DB row does, so the
-    pairing is still decided by order. A reference feels authoritative; that
-    is not the same as being unique."""
+    """A contradictory amount remains ambiguous but cannot demote a valid match."""
     await _seed_account(session_factory)
     a_id = await _seed_txn(
         session_factory, counterparty="MERCHANT A", reference_number="REF12345"
@@ -321,8 +318,8 @@ async def test_two_statement_rows_claiming_one_reference_contend(
                 counterparty="MERCHANT B",
                 ref="REF12345",
             ),
-            # Same reference, but a date and amount that reach no DB row —
-            # so this row can only ever have claimed the one above by ref.
+            # Same reference but a contradictory amount. Keep it as ambiguous
+            # evidence without treating it as a rival for the valid winner.
             _stmt_txn(
                 date="09/04/2026",
                 amount="3,100.00",
@@ -333,14 +330,16 @@ async def test_two_statement_rows_claiming_one_reference_contend(
         ]
     )
     recon = await _reconcile(session_factory, parsed)
-    assert recon["matched"] == []
-    assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
+    assert [entry["stmt_idx"] for entry in recon["matched"]] == [0]
+    assert [entry["stmt_idx"] for entry in recon["missing"]] == [1]
+    assert recon["missing"][0]["ambiguous"] is True
+    assert recon["missing"][0]["candidate_transaction_ids"] == [a_id]
 
     rows, upload = await _run_real_reparse(session_factory, monkeypatch, parsed)
 
     assert [row.id for row in rows] == [a_id]
     assert upload.imported_count == 0
-    assert upload.missing_count == 2
+    assert upload.missing_count == 1
 
 
 @pytest.mark.anyio

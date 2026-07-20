@@ -581,6 +581,13 @@ async def find_match(
         rows = list(result.scalars().all())
         if len(rows) == 1:
             if rows[0].amount != txn_data["amount"]:
+                # A reference hit with a different amount is not a safe event
+                # identity. Parsers can scrape boilerplate or non-unique refs
+                # (the historical Kotak collision shape), and merging here
+                # would silently destroy one of two genuine transactions.
+                # Defer so the operator sees the contradiction; the specific
+                # kind also lets reparse distinguish this hard refusal from a
+                # fuzzy duplicate defer.
                 _record_match_evidence(
                     evidence,
                     path="reference",
@@ -589,6 +596,11 @@ async def find_match(
                     reason="reference_amount_mismatch",
                 )
                 return MatchDecision("defer", kind="ref_amount_mismatch")
+            # Apply the same authoritative balance guard as the fuzzy path.
+            # When both sources know the post-transaction balance and disagree,
+            # they cannot describe the same event even if the reference was
+            # recycled or scraped incorrectly. Presence mismatch is not proof,
+            # so one missing balance still permits a match.
             incoming_balance = _quantize_balance(txn_data.get("balance"))
             matched_balance = _quantize_balance(rows[0].balance)
             if (
@@ -603,6 +615,10 @@ async def find_match(
                     gates=("bank_direction_reference", "amount", "balance"),
                     reason="reference_balance_mismatch",
                 )
+                # Defer rather than insert: the partial unique index on
+                # (bank, reference_number, direction) forbids the second row.
+                # We can neither merge contradictory balances nor physically
+                # insert the distinct event, so manual resolution is required.
                 return MatchDecision("defer", kind="ref_amount_mismatch")
             _record_match_evidence(
                 evidence,

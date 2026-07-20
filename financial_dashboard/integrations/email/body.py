@@ -47,7 +47,12 @@ def _spool_path_for(provider: str, message_id: str) -> Path:
 
 
 async def load_or_fetch_raw_email(email_row) -> RawEmailResult:
-    """Load raw email bytes and report only safe spool/provider provenance."""
+    """Load raw bytes and report only safe spool/provider provenance.
+
+    The failed spool is a short-lived debugging cache, not a permanent archive;
+    callers must therefore tolerate provider fallback whenever cleanup has
+    removed the local copy.
+    """
     spool_path = _spool_path_for(email_row.provider, email_row.message_id)
     if spool_path.exists():
         return RawEmailResult(spool_path.read_bytes(), None, "spool")

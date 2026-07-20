@@ -72,82 +72,9 @@ from financial_dashboard.services.telegram import (
 logger = logging.getLogger(__name__)
 
 STATEMENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "statements"
-
-
-class BankStatementProcessingError(Exception):
-    """Raised when a bank statement was identified for processing but
-    processing failed in a way the caller should surface to the user.
-
-    Returning ``None`` from ``process_bank_statement_email`` is reserved
-    for *skips* (not a bank statement, no PDF, no matching account, etc.)
-    where the email simply doesn't apply. Anything past that boundary —
-    PDF unparseable, encryption deadlock, post-parse import collapse —
-    raises this error so the caller can put a real message in front of
-    the user instead of "Statement processing returned no result".
-    """
-
-
 _SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def _safe_filename(filename: str | None) -> str:
-    base = Path(filename or "statement.pdf").name or "statement.pdf"
-    cleaned = _SAFE_FILENAME_RE.sub("_", base).strip("._") or "statement.pdf"
-    return cleaned[:120]
-
-
-# ---------------------------------------------------------------------------
-# Parsing helpers
-# ---------------------------------------------------------------------------
-
-
-def parse_bank_statement(pdf_path: Path, bank: str, password: str | None = None):
-    """Parse a bank account statement PDF. Returns a ParsedBankStatement."""
-    return parse_bank_statement_pdf(pdf_path, bank, password)
-
-
-def _parse_amount(amount_str: str) -> Decimal:
-    """Convert amount string '25,000.00' to Decimal."""
-    return Decimal(amount_str.replace(",", ""))
-
-
-def _parse_date(date_str: str) -> date_type:
-    """Convert 'DD/MM/YYYY' to date object."""
-    parsed = parse_date(date_str, dayfirst=True)
-    if parsed is None:
-        raise ValueError(f"Could not parse bank statement date: {date_str!r}")
-    return parsed
-
-
-def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
-    return (txn_date, amount, direction)
-
-
-def _take_sole_unconsumed(
-    candidates: list[int] | None, consumed: set[int]
-) -> int | None:
-    """Return the id in ``candidates`` not already consumed, iff there is
-    exactly one.
-
-    A reference bucket is keyed on ``(reference_number, direction)`` alone,
-    and that is not an identity — ``uq_transactions_ref`` keys on ``bank`` as
-    well, so two DB rows from different banks may legitimately share a
-    reference. A reference therefore decides only when it decides alone;
-    otherwise the row falls through to the date pass, and its non-empty
-    candidate set surfaces it as an ambiguous miss rather than a guess.
-    """
-    if not candidates:
-        return None
-    pool = [cid for cid in candidates if cid not in consumed]
-    if len(pool) == 1:
-        return pool[0]
-    return None
-
-
-# Tokens we never count as distinctive overlap evidence for fuzzy
-# matching: banking nouns/verbs, transfer purpose words, generic header
-# words. Compared upper-case after extracting alphabetic runs of length
-# ≥ 4 from both narrations.
+_TOKEN_RE = re.compile(r"[A-Za-z]{4,}")
+_MIN_REF_SUBSTRING_LEN = 6
 _OVERLAP_STOPWORDS: frozenset[str] = frozenset(
     {
         "PAYMENT",
@@ -216,13 +143,115 @@ _OVERLAP_STOPWORDS: frozenset[str] = frozenset(
         "PAYTM",
     }
 )
+_BANK_RECONCILIATION_GATES = (
+    "account_scope",
+    "reference_direction",
+    "reference_amount_compatibility",
+    "known_balance_compatibility",
+    "direction_amount",
+    "date_window_plus_minus_one_day",
+    "reference_or_narration_compatibility",
+    "unique_unconsumed_candidate",
+    "contention",
+)
+_GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment done"}
 
-_TOKEN_RE = re.compile(r"[A-Za-z]{4,}")
 
-# Minimum length for a reference number to count as substring evidence.
-# Below this we risk matching on an accidental embedded run (a 4-digit
-# number inside a longer txn id, a year fragment, etc.).
-_MIN_REF_SUBSTRING_LEN = 6
+class BankStatementProcessingError(Exception):
+    """Raised when a bank statement was identified for processing but
+    processing failed in a way the caller should surface to the user.
+
+    Returning ``None`` from ``process_bank_statement_email`` is reserved
+    for *skips* (not a bank statement, no PDF, no matching account, etc.)
+    where the email simply doesn't apply. Anything past that boundary —
+    PDF unparseable, encryption deadlock, post-parse import collapse —
+    raises this error so the caller can put a real message in front of
+    the user instead of "Statement processing returned no result".
+    """
+
+
+def _safe_filename(filename: str | None) -> str:
+    base = Path(filename or "statement.pdf").name or "statement.pdf"
+    cleaned = _SAFE_FILENAME_RE.sub("_", base).strip("._") or "statement.pdf"
+    return cleaned[:120]
+
+
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_bank_statement(pdf_path: Path, bank: str, password: str | None = None):
+    """Parse a bank account statement PDF. Returns a ParsedBankStatement."""
+    return parse_bank_statement_pdf(pdf_path, bank, password)
+
+
+def _parse_amount(amount_str: str) -> Decimal:
+    """Convert amount string '25,000.00' to Decimal."""
+    return Decimal(amount_str.replace(",", ""))
+
+
+def _parse_date(date_str: str) -> date_type:
+    """Convert 'DD/MM/YYYY' to date object."""
+    parsed = parse_date(date_str, dayfirst=True)
+    if parsed is None:
+        raise ValueError(f"Could not parse bank statement date: {date_str!r}")
+    return parsed
+
+
+def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
+    return (txn_date, amount, direction)
+
+
+def _known_balance_compatible(
+    candidate_balance: Decimal | None, statement_balance: str | None
+) -> bool:
+    """Reject a reference match only when both known balances contradict."""
+    if candidate_balance is None or statement_balance is None:
+        return True
+    try:
+        return Decimal(str(candidate_balance)) == _parse_amount(statement_balance)
+    except InvalidOperation, ValueError:
+        # An unparseable value is unknown evidence, not a contradiction.
+        return True
+
+
+def _reference_compatible_ids(
+    candidate_ids: list[int] | None,
+    db_by_id: dict[int, Transaction],
+    *,
+    amount: Decimal,
+    statement_balance: str | None,
+) -> list[int]:
+    """Filter exact-reference candidates by amount and known balance."""
+    return [
+        candidate_id
+        for candidate_id in candidate_ids or []
+        if (candidate := db_by_id.get(candidate_id)) is not None
+        and Decimal(str(candidate.amount)) == amount
+        and _known_balance_compatible(candidate.balance, statement_balance)
+    ]
+
+
+def _take_sole_unconsumed(
+    candidates: list[int] | None, consumed: set[int]
+) -> int | None:
+    """Return the id in ``candidates`` not already consumed, iff there is
+    exactly one.
+
+    A reference bucket is keyed on ``(reference_number, direction)`` alone,
+    and that is not an identity — ``uq_transactions_ref`` keys on ``bank`` as
+    well, so two DB rows from different banks may legitimately share a
+    reference. A reference therefore decides only when it decides alone;
+    otherwise the row falls through to the date pass, and its non-empty
+    candidate set surfaces it as an ambiguous miss rather than a guess.
+    """
+    if not candidates:
+        return None
+    pool = [cid for cid in candidates if cid not in consumed]
+    if len(pool) == 1:
+        return pool[0]
+    return None
 
 
 def _ref_appears_in(ref: str | None, text: str | None) -> bool:
@@ -269,19 +298,36 @@ def _holder_name_tokens(name: str | None) -> set[str]:
     return {tok.upper() for tok in _TOKEN_RE.findall(name)}
 
 
-def _is_compatible(
-    cand,
+def _is_statement_candidate_compatible(
+    candidate_transaction: Transaction,
     *,
-    stmt_ref: str | None,
-    stmt_narration: str | None,
-    stmt_channel: str | None,
-    holder_tokens: set[str],
-    is_fuzzy_date: bool,
+    statement_reference: str | None,
+    statement_narration: str | None,
+    statement_channel: str | None,
+    statement_balance: str | None,
+    account_holder_tokens: set[str],
+    has_date_offset: bool,
 ) -> bool:
-    """Decide whether a date+amount+direction-matching DB candidate could
-    be the same logical transaction as a statement row.
+    """Decide whether a DB candidate could be the statement transaction.
+
+    Args:
+        candidate_transaction: Existing transaction with the same amount and
+            direction whose date is within the permitted matching window.
+        statement_reference: Reference number parsed from the statement row.
+        statement_narration: Description parsed from the statement row.
+        statement_channel: Normalized payment channel parsed from the statement,
+            such as ``"upi"``.
+        statement_balance: Post-transaction balance printed on the statement.
+        account_holder_tokens: Name tokens excluded from narration overlap because
+            they are common to unrelated self-transfers.
+        has_date_offset: Whether the candidate and statement dates differ. A
+            one-day offset is tolerated only when stronger evidence does not
+            contradict the match.
 
     Compatibility rules:
+
+    - Contradictory known post-transaction balances always refuse a pairing;
+      one missing or unparseable balance remains unknown rather than negative.
 
     - Refs agree, or at least one side has no ref → compatible. This is
       the common case: email parsers often miss the ref, statement
@@ -314,29 +360,38 @@ def _is_compatible(
 
     - Otherwise → incompatible.
     """
-    cand_ref = getattr(cand, "reference_number", None)
-    cand_raw = getattr(cand, "raw_description", None) or getattr(
-        cand, "counterparty", None
+    candidate_reference = candidate_transaction.reference_number
+    candidate_narration = (
+        candidate_transaction.raw_description or candidate_transaction.counterparty
     )
-    cand_channel = getattr(cand, "channel", None)
+    candidate_channel = candidate_transaction.channel
 
-    if not (stmt_ref and cand_ref) or stmt_ref == cand_ref:
+    if not _known_balance_compatible(candidate_transaction.balance, statement_balance):
+        return False
+    if (
+        not (statement_reference and candidate_reference)
+        or statement_reference == candidate_reference
+    ):
         return True
 
-    if is_fuzzy_date:
+    if has_date_offset:
         return False
 
-    if _ref_appears_in(cand_ref, stmt_narration):
+    if _ref_appears_in(candidate_reference, statement_narration):
         return True
-    if _ref_appears_in(stmt_ref, cand_raw):
+    if _ref_appears_in(statement_reference, candidate_narration):
         return True
 
     if (
-        stmt_channel == "upi"
-        and cand_channel == "upi"
+        statement_channel == "upi"
+        and candidate_channel == "upi"
         and (
-            _significant_tokens(cand_raw, _OVERLAP_STOPWORDS | holder_tokens)
-            & _significant_tokens(stmt_narration, _OVERLAP_STOPWORDS | holder_tokens)
+            _significant_tokens(
+                candidate_narration, _OVERLAP_STOPWORDS | account_holder_tokens
+            )
+            & _significant_tokens(
+                statement_narration, _OVERLAP_STOPWORDS | account_holder_tokens
+            )
         )
     ):
         return True
@@ -345,60 +400,78 @@ def _is_compatible(
 
 
 class CompatibleCandidates(NamedTuple):
-    """Candidates from one date-bucket that could be the statement row.
+    """Candidate IDs from one date bucket that could match a statement row.
 
-    ``strong`` (ref-substring evidence) is a subset of ``compatible``.
+    ``strong_ids`` is the subset with reference-substring evidence;
+    ``compatible_ids`` contains every candidate that passed the gates.
     """
 
-    strong: list[int]
-    compatible: list[int]
+    strong_ids: list[int]
+    compatible_ids: list[int]
 
 
 def _compatible_candidates(
-    candidates: list[int] | None,
-    consumed: set[int],
-    db_by_id: dict[int, object],
+    candidate_ids: list[int] | None,
+    consumed_ids: set[int],
+    transactions_by_id: dict[int, Transaction],
     *,
-    stmt_ref: str | None,
-    stmt_narration: str | None,
-    stmt_channel: str | None,
-    holder_tokens: set[str],
-    is_fuzzy_date: bool,
+    statement_reference: str | None,
+    statement_narration: str | None,
+    statement_channel: str | None,
+    statement_balance: str | None,
+    account_holder_tokens: set[str],
+    has_date_offset: bool,
 ) -> CompatibleCandidates:
-    """Split one date-bucket's unconsumed candidates into compatible ones
-    and the subset backed by ref-substring evidence (DB ref ⊆ stmt
-    narration, or stmt ref ⊆ DB raw_description, both word-bounded)."""
-    strong: list[int] = []
-    compatible: list[int] = []
-    for cid in candidates or []:
-        if cid in consumed:
+    """Classify candidates from one date bucket for a statement row.
+
+    Args:
+        candidate_ids: Existing transaction IDs sharing the row's normalized
+            date, amount, and direction identity.
+        consumed_ids: IDs already claimed by earlier statement rows.
+        transactions_by_id: Existing transaction records keyed by ID.
+        statement_reference: Reference number parsed from the statement row.
+        statement_narration: Description parsed from the statement row.
+        statement_channel: Normalized payment channel from the statement row.
+        statement_balance: Post-transaction balance from the statement row.
+        account_holder_tokens: Holder-name tokens excluded from narration overlap.
+        has_date_offset: Whether this bucket is one day away from the statement
+            date rather than an exact-date bucket.
+    """
+    strong_ids: list[int] = []
+    compatible_ids: list[int] = []
+    for candidate_id in candidate_ids or []:
+        if candidate_id in consumed_ids:
             continue
-        cand = db_by_id.get(cid)
-        if cand is None:
+        candidate_transaction = transactions_by_id.get(candidate_id)
+        if candidate_transaction is None:
             continue
-        if not _is_compatible(
-            cand,
-            stmt_ref=stmt_ref,
-            stmt_narration=stmt_narration,
-            stmt_channel=stmt_channel,
-            holder_tokens=holder_tokens,
-            is_fuzzy_date=is_fuzzy_date,
+        if not _is_statement_candidate_compatible(
+            candidate_transaction,
+            statement_reference=statement_reference,
+            statement_narration=statement_narration,
+            statement_channel=statement_channel,
+            statement_balance=statement_balance,
+            account_holder_tokens=account_holder_tokens,
+            has_date_offset=has_date_offset,
         ):
             continue
-        compatible.append(cid)
-        cand_ref = getattr(cand, "reference_number", None)
-        cand_raw = getattr(cand, "raw_description", None) or getattr(
-            cand, "counterparty", None
+        compatible_ids.append(candidate_id)
+        candidate_reference = candidate_transaction.reference_number
+        candidate_narration = (
+            candidate_transaction.raw_description or candidate_transaction.counterparty
         )
-        if _ref_appears_in(cand_ref, stmt_narration) or _ref_appears_in(
-            stmt_ref, cand_raw
+        if _ref_appears_in(candidate_reference, statement_narration) or (
+            _ref_appears_in(statement_reference, candidate_narration)
         ):
-            strong.append(cid)
+            strong_ids.append(candidate_id)
 
-    return CompatibleCandidates(strong=strong, compatible=compatible)
+    return CompatibleCandidates(
+        strong_ids=strong_ids,
+        compatible_ids=compatible_ids,
+    )
 
 
-def _select_unique_compatible(found: CompatibleCandidates) -> int | None:
+def _select_unique_compatible(candidates: CompatibleCandidates) -> int | None:
     """Return the unique compatible candidate in one bucket, or ``None``.
 
     Uniqueness is enforced in two tiers so distinctive narration evidence
@@ -414,7 +487,7 @@ def _select_unique_compatible(found: CompatibleCandidates) -> int | None:
     caller compares the whole ±1-day window before trusting the pick
     enough to overwrite a narration with it.
     """
-    pool_to_use = found.strong or found.compatible
+    pool_to_use = candidates.strong_ids or candidates.compatible_ids
     if len(pool_to_use) == 1:
         return pool_to_use[0]
     return None
@@ -443,41 +516,41 @@ def _refresh_identity(txn: "BankTransaction") -> RefreshIdentity:
     return RefreshIdentity(counterparty or narration, txn.channel)
 
 
-_BANK_RECONCILIATION_GATES = (
-    "account_scope",
-    "reference_direction",
-    "direction_amount",
-    "date_window_plus_minus_one_day",
-    "reference_or_narration_compatibility",
-    "unique_unconsumed_candidate",
-    "contention",
-)
-
-
 def _missing_entry(
-    stmt_idx: int,
+    statement_row_index: int,
     direction: str,
-    txn,
+    statement_transaction: "BankTransaction",
     *,
     ambiguous: bool = False,
-    candidates: set[int] | None = None,
+    candidate_ids: set[int] | None = None,
     reason: str = "unparseable_statement_identity",
     gates: tuple[str, ...] = ("parse_amount", "parse_date"),
-) -> dict:
+) -> dict[str, object]:
+    """Build reconciliation evidence for one unmatched statement row.
+
+    Args:
+        statement_row_index: Zero-based position of the row in the statement.
+        direction: Normalized transaction direction used during reconciliation.
+        statement_transaction: Parsed statement row that remained unmatched.
+        ambiguous: Whether candidates existed but reconciliation refused to choose.
+        candidate_ids: Existing transaction IDs the row could potentially claim.
+        reason: Stable machine-readable explanation of the outcome.
+        gates: Matching checks applied before reaching the outcome.
+    """
     return {
-        "stmt_idx": stmt_idx,
+        "stmt_idx": statement_row_index,
         "ambiguous": ambiguous,
-        "date": txn.date,
-        "amount": txn.amount,
+        "date": statement_transaction.date,
+        "amount": statement_transaction.amount,
         "direction": direction,
-        "narration": txn.narration,
-        "counterparty": txn.counterparty,
-        "reference_number": txn.reference_number,
-        "channel": txn.channel,
-        "balance": txn.balance,
+        "narration": statement_transaction.narration,
+        "counterparty": statement_transaction.counterparty,
+        "reference_number": statement_transaction.reference_number,
+        "channel": statement_transaction.channel,
+        "balance": statement_transaction.balance,
         "imported": False,
         **candidate_evidence(
-            candidates or set(),
+            candidate_ids or set(),
             reason=reason,
             gates=gates,
         ),
@@ -485,30 +558,44 @@ def _missing_entry(
 
 
 def _matched_entry(
-    stmt_idx: int,
+    statement_row_index: int,
     direction: str,
-    txn,
-    found,
+    statement_transaction: "BankTransaction",
+    matched_transaction: Transaction,
     *,
-    candidates: set[int],
+    candidate_ids: set[int],
     reason: str,
-) -> dict:
+) -> dict[str, object]:
+    """Build reconciliation evidence for one matched statement row.
+
+    Args:
+        statement_row_index: Zero-based position of the row in the parsed statement.
+        direction: Normalized transaction direction used during reconciliation.
+        statement_transaction: Parsed statement row that produced the match.
+        matched_transaction: Existing database transaction selected for the row.
+        candidate_ids: Every database transaction ID that the row could have claimed.
+        reason: Stable machine-readable explanation of the matching decision.
+    """
     return {
-        "stmt_idx": stmt_idx,
-        "date": txn.date,
-        "amount": txn.amount,
+        "stmt_idx": statement_row_index,
+        "date": statement_transaction.date,
+        "amount": statement_transaction.amount,
         "direction": direction,
-        "narration": txn.narration,
-        "counterparty": txn.counterparty,
-        "reference_number": txn.reference_number,
-        "channel": txn.channel,
-        "balance": txn.balance,
-        "db_txn_id": found.id,
-        "db_counterparty": found.counterparty,
-        "db_reference": found.reference_number,
-        "db_date": str(found.transaction_date) if found.transaction_date else None,
+        "narration": statement_transaction.narration,
+        "counterparty": statement_transaction.counterparty,
+        "reference_number": statement_transaction.reference_number,
+        "channel": statement_transaction.channel,
+        "balance": statement_transaction.balance,
+        "db_txn_id": matched_transaction.id,
+        "db_counterparty": matched_transaction.counterparty,
+        "db_reference": matched_transaction.reference_number,
+        "db_date": (
+            str(matched_transaction.transaction_date)
+            if matched_transaction.transaction_date
+            else None
+        ),
         **candidate_evidence(
-            candidates,
+            candidate_ids,
             reason=reason,
             gates=_BANK_RECONCILIATION_GATES,
         ),
@@ -568,7 +655,7 @@ def reconcile_bank_statement(
     # ref_pool: (reference_number, direction) — UPI refunds may reuse the
     # same ref with the opposite direction, so direction stays in the key.
     # date_pool: (date, amount, direction) for fuzzy fallback.
-    db_by_id: dict[int, object] = {db_txn.id: db_txn for db_txn in db_transactions}
+    db_by_id: dict[int, Transaction] = {db_txn.id: db_txn for db_txn in db_transactions}
     ref_pool: dict[tuple[str, str], list[int]] = {}
     date_pool: dict[tuple, list[int]] = {}
     for db_txn in db_transactions:
@@ -585,30 +672,37 @@ def reconcile_bank_statement(
             date_pool.setdefault(key, []).append(db_txn.id)
 
     consumed: set[int] = set()
-    matched_db_ids: dict[int, object] = {}
+    matched_db_ids: dict[int, Transaction] = {}
     # Which DB row each matched statement row claimed. The claim has to be
     # re-examined once every row's reach is known, so the id is kept, not just
     # the object.
     claimed_ids: dict[int, int] = {}
     reference_matched_indices: set[int] = set()
 
-    # What each statement row carrying a reference could claim by reference.
-    # The ref pass gets the same candidate-set treatment as the fuzzy one:
-    # two statement rows can carry the same reference, in which case one of
-    # them is claiming a DB row the other has as good a title to.
-    ref_sets: dict[int, set[int]] = {}
-    for stmt_idx, direction, txn, _amount, _txn_date in parsed_rows:
-        if not txn.reference_number:
+    # Keep two reference sets per statement row. Every exact-reference row is
+    # retained as evidence so an amount/balance contradiction remains ambiguous
+    # rather than looking absent and being imported. Only compatible rows enter
+    # contention, however: contradictory evidence cannot demote a valid winner.
+    reference_evidence_sets: dict[int, set[int]] = {}
+    compatible_reference_ids: dict[int, list[int]] = {}
+    for stmt_idx, direction, txn, amount, _txn_date in parsed_rows:
+        if not txn.reference_number or amount is None:
             continue
-        if ref_ids := ref_pool.get((txn.reference_number, direction)):
-            ref_sets[stmt_idx] = set(ref_ids)
+        reference_ids = ref_pool.get((txn.reference_number, direction))
+        if not reference_ids:
+            continue
+        reference_evidence_sets[stmt_idx] = set(reference_ids)
+        compatible_reference_ids[stmt_idx] = _reference_compatible_ids(
+            reference_ids,
+            db_by_id,
+            amount=amount,
+            statement_balance=txn.balance,
+        )
 
     # Pass 1: reference-number matches across all stmt rows.
-    for stmt_idx, direction, txn, _amount, _txn_date in parsed_rows:
-        if not txn.reference_number:
-            continue
-        ref_key = (txn.reference_number, direction)
-        candidate_id = _take_sole_unconsumed(ref_pool.get(ref_key), consumed)
+    for stmt_idx, _direction, _txn, _amount, _txn_date in parsed_rows:
+        compatible_ids = compatible_reference_ids.get(stmt_idx, [])
+        candidate_id = _take_sole_unconsumed(compatible_ids, consumed)
         if candidate_id is None:
             continue
         consumed.add(candidate_id)
@@ -617,13 +711,15 @@ def reconcile_bank_statement(
         reference_matched_indices.add(stmt_idx)
 
     # Pass 2: date+amount+direction fallback for stmt rows still unmatched.
-    # Compatibility is ref-and-narration-aware (see ``_is_compatible``).
+    # Compatibility is ref-and-narration-aware (see
+    # ``_is_statement_candidate_compatible``).
     # The ±1 day window stays as the date-pool walk so timezone-slop
     # cases (DB row dated one off, stmt is exact, neither side has a
     # disagreeing ref) still match. Per-candidate exactness for the
-    # both-refs-disagree path lives inside ``_is_compatible`` via the
+    # both-refs-disagree path lives inside
+    # ``_is_statement_candidate_compatible`` via the
     # ``is_fuzzy_date`` flag.
-    holder_tokens = _holder_name_tokens(parsed.account_holder_name)
+    account_holder_tokens = _holder_name_tokens(parsed.account_holder_name)
 
     # What each statement row could claim by date: every DB candidate across
     # its window that passes the same compatibility rule the picker applies.
@@ -646,19 +742,26 @@ def reconcile_bank_statement(
                     date_pool.get(key),
                     unconsumed,
                     db_by_id,
-                    stmt_ref=txn.reference_number,
-                    stmt_narration=txn.narration,
-                    stmt_channel=txn.channel,
-                    holder_tokens=holder_tokens,
-                    is_fuzzy_date=offset != 0,
-                ).compatible
+                    statement_reference=txn.reference_number,
+                    statement_narration=txn.narration,
+                    statement_channel=txn.channel,
+                    statement_balance=txn.balance,
+                    account_holder_tokens=account_holder_tokens,
+                    has_date_offset=offset != 0,
+                ).compatible_ids
             )
         fuzzy_sets[stmt_idx] = reachable
 
     # One set per statement row, spanning both passes: what it could claim by
     # reference, plus what it could claim by date. Contention is read off these.
     candidate_sets: dict[int, set[int]] = {
-        stmt_idx: ref_sets.get(stmt_idx, set()) | fuzzy_sets.get(stmt_idx, set())
+        stmt_idx: reference_evidence_sets.get(stmt_idx, set())
+        | fuzzy_sets.get(stmt_idx, set())
+        for stmt_idx, *_ in parsed_rows
+    }
+    contention_sets: dict[int, set[int]] = {
+        stmt_idx: set(compatible_reference_ids.get(stmt_idx, []))
+        | fuzzy_sets.get(stmt_idx, set())
         for stmt_idx, *_ in parsed_rows
     }
 
@@ -686,7 +789,7 @@ def reconcile_bank_statement(
                 )
             )
             continue
-        stmt_ref = txn.reference_number
+        statement_reference = txn.reference_number
         # The pick: first bucket to yield a unique compatible candidate wins,
         # exact date first. Whether a row that got *no* pick may be imported is
         # a separate question, answered by the candidate sets above.
@@ -698,11 +801,12 @@ def reconcile_bank_statement(
                     date_pool.get(key),
                     consumed,
                     db_by_id,
-                    stmt_ref=stmt_ref,
-                    stmt_narration=txn.narration,
-                    stmt_channel=txn.channel,
-                    holder_tokens=holder_tokens,
-                    is_fuzzy_date=offset != 0,
+                    statement_reference=statement_reference,
+                    statement_narration=txn.narration,
+                    statement_channel=txn.channel,
+                    statement_balance=txn.balance,
+                    account_holder_tokens=account_holder_tokens,
+                    has_date_offset=offset != 0,
                 )
             )
             if chosen_id is not None:
@@ -727,7 +831,7 @@ def reconcile_bank_statement(
     for stmt_idx, db_id in claimed_ids.items():
         rivals = [
             other_idx
-            for other_idx, candidates in candidate_sets.items()
+            for other_idx, candidates in contention_sets.items()
             if other_idx != stmt_idx and db_id in candidates
         ]
         if not rivals:
@@ -739,16 +843,16 @@ def reconcile_bank_statement(
 
     # Build matched / missing entries in original statement order.
     for stmt_idx, direction, txn, _amount, _txn_date in parsed_rows:
-        cand = matched_db_ids.get(stmt_idx)
+        candidate_transaction = matched_db_ids.get(stmt_idx)
         candidates = candidate_sets.get(stmt_idx, set())
-        if cand is not None:
+        if candidate_transaction is not None:
             matched.append(
                 _matched_entry(
                     stmt_idx,
                     direction,
                     txn,
-                    cand,
-                    candidates=candidates,
+                    candidate_transaction,
+                    candidate_ids=candidates,
                     reason=(
                         "matched_reference"
                         if stmt_idx in reference_matched_indices
@@ -763,7 +867,7 @@ def reconcile_bank_statement(
                     direction,
                     txn,
                     ambiguous=contended_miss(candidates),
-                    candidates=candidates,
+                    candidate_ids=candidates,
                     reason=(
                         "contested_match_demoted"
                         if stmt_idx in contested
@@ -801,9 +905,6 @@ def reconcile_bank_statement(
         "opening_balance": parsed.opening_balance,
         "closing_balance": parsed.closing_balance,
     }
-
-
-_GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment done"}
 
 
 async def enrich_matched_transactions(recon: dict) -> int:

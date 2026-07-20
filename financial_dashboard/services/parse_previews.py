@@ -1,6 +1,7 @@
 """Side-effect-free parser previews for stored source records."""
 
 import datetime
+import logging
 from typing import Literal
 
 from bank_sms_parser import parse_sms
@@ -30,6 +31,8 @@ from financial_dashboard.services.txn_merge import (
 _IDENTITY_FIELDS = ("bank", "direction", "amount", "currency")
 _ERROR_LIMIT = 1_000
 _LINK_LIMIT = 10
+logger = logging.getLogger(__name__)
+
 MergePreviewAction = Literal[
     "none",
     "notify_only",
@@ -260,6 +263,8 @@ def _email_refresh_fields(existing: Transaction, txn_data: dict) -> list[str]:
 def _email_merge(
     action: Literal[
         "none",
+        "routed_statement_pipeline",
+        "routed_cas_pipeline",
         "refresh_linked",
         "match",
         "insert",
@@ -314,7 +319,7 @@ async def preview_email_parse(
             else None
         )
     if rule is None:
-        raise EmailParsePreviewError(409, "Email has no associated fetch rule")
+        raise EmailParsePreviewError(400, "Email has no associated fetch rule")
 
     bank = rule.bank
     email_kind = rule.email_kind
@@ -331,7 +336,17 @@ async def preview_email_parse(
     session.expunge_all()
     await session.rollback()
 
-    raw_email_result = await load_or_fetch_raw_email(email_row)
+    try:
+        raw_email_result = await load_or_fetch_raw_email(email_row)
+    except Exception:
+        logger.warning(
+            "Raw email loader raised during parse preview for email %d",
+            email_id,
+        )
+        raise EmailParsePreviewError(
+            status.HTTP_404_NOT_FOUND,
+            "Raw email is unavailable",
+        ) from None
     if raw_email_result.raw_bytes is None or raw_email_result.provenance is None:
         raise EmailParsePreviewError(404, "Raw email is unavailable")
     raw_bytes = raw_email_result.raw_bytes
@@ -340,6 +355,15 @@ async def preview_email_parse(
         error = txn_data = password_hint = parsed = None
     else:
         error, txn_data, password_hint, parsed = _process_email_full(bank, raw_bytes)
+    statement_fallback = (
+        email_kind in {None, EmailKind.TRANSACTION} and txn_data is None
+    )
+    if statement_fallback:
+        routing = "statement"
+    statement_match_kind = (
+        "transaction_parse_fallback" if statement_fallback else "statement_rule"
+    )
+
     with session.no_autoflush:
         linked = list(
             (
@@ -365,7 +389,7 @@ async def preview_email_parse(
             transaction=None,
             statement=None,
         )
-        merge = _email_merge("none", match_kind="cas_rule")
+        merge = _email_merge("routed_cas_pipeline", match_kind="cas_rule")
     elif parsed is None:
         parser = email_schemas.EmailParserPreview(
             disposition="error",
@@ -377,7 +401,14 @@ async def preview_email_parse(
             transaction=None,
             statement=None,
         )
-        merge = _email_merge("none")
+        merge = (
+            _email_merge(
+                "routed_statement_pipeline",
+                match_kind=statement_match_kind,
+            )
+            if routing == "statement"
+            else _email_merge("none")
+        )
     else:
         statement = (
             _statement_summary_preview(parsed) if parsed.statement is not None else None
@@ -398,10 +429,13 @@ async def preview_email_parse(
             ),
             statement=statement,
         )
-        if txn_data is None:
+        if routing == "statement":
+            merge = _email_merge(
+                "routed_statement_pipeline",
+                match_kind=statement_match_kind,
+            )
+        elif txn_data is None:
             merge = _email_merge("none")
-        elif routing != "transaction":
-            merge = _email_merge("none", match_kind="statement_rule")
         elif len(linked) > 1:
             merge = _email_merge("multiple_linked")
         elif linked:
@@ -466,6 +500,7 @@ async def preview_email_parse(
         email_id=email_id,
         current_status=current_status,
         current_transaction_ids=linked_ids,
+        current_transaction_ids_truncated=len(linked) > _LINK_LIMIT,
         raw_provenance=raw_email_result.provenance,
         routing=routing,
         parser=parser,
