@@ -21,7 +21,11 @@ from financial_dashboard.db import (
     SmsMessage,
     Transaction,
 )
-from financial_dashboard.services.cashflow.buckets import internal_slugs_for_scope
+from financial_dashboard.db.models import Category
+from financial_dashboard.services.cashflow.buckets import (
+    LABEL_OVERRIDES,
+    internal_slugs_for_scope,
+)
 from financial_dashboard.services.cashflow.report import (
     BLANK_CATEGORY,
     BLANK_COUNTERPARTY,
@@ -47,9 +51,34 @@ PAGE_SIZE = 50
 SORT_COLUMNS = {
     "amount": Transaction.amount,
     "bank": Transaction.bank,
+    "category": Transaction.category,
     "counterparty": Transaction.counterparty,
     "date": Transaction.transaction_date,
 }
+
+# Display labels for the categorization pipeline's category_method column, so a
+# transaction's provenance reads as a word rather than the internal state-machine
+# value. ``None`` is omitted on purpose: a row that was never run through the
+# pipeline has no method to label.
+CATEGORY_METHOD_LABELS: dict[str, str] = {
+    "manual": "Manual",
+    "rule": "Rule",
+    "llm": "AI",
+    "pending_llm": "Pending AI",
+}
+
+
+def _category_label(slug: str) -> str:
+    """User-facing label for a category slug, for the filter dropdown and badges.
+
+    Unlike ``label_for_slug`` (which prefixes unrecognized slugs with
+    ``unmapped:`` for the cashflow report), this title-cases any slug the bucket
+    map does not override — a manually added category is ordinary on this page,
+    not a reporting anomaly.
+    """
+    if slug in LABEL_OVERRIDES:
+        return LABEL_OVERRIDES[slug]
+    return slug.replace("_", " ").title()
 
 
 @router.get("/transactions", response_class=HTMLResponse)
@@ -241,6 +270,23 @@ async def transaction_list(
         .all()
     )
 
+    # Active category slugs, label-mapped for the filter dropdown and the per-row
+    # badge. Ordered by slug so the dropdown is stable and matches the vocabulary
+    # the categorizer offers; a transaction whose own category has since been
+    # deactivated still renders (the template falls back to a title-cased slug).
+    active_category_slugs = list(
+        (
+            await session.execute(
+                select(Category.slug)
+                .where(Category.active.is_(True))
+                .order_by(Category.slug)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    category_labels = {slug: _category_label(slug) for slug in active_category_slugs}
+
     # Build JSON for dependent dropdowns
     cards_by_account: dict[int, list] = {}
     for c in cards:
@@ -311,6 +357,8 @@ async def transaction_list(
             "accounts": accounts,
             "accounts_json": json.dumps(accounts_by_bank),
             "cards_json": json.dumps(cards_by_account),
+            "category_labels": category_labels,
+            "category_method_labels": CATEGORY_METHOD_LABELS,
             "filters": filters,
             "sort": sort,
             "order": order,
@@ -393,6 +441,7 @@ async def transaction_detail(
             "account": account,
             "sms": sms,
             "bank_accounts": bank_accounts,
+            "category_method_labels": CATEGORY_METHOD_LABELS,
         },
     )
 
@@ -420,5 +469,6 @@ async def transaction_page(
             "account": account,
             "sms": sms,
             "bank_accounts": bank_accounts,
+            "category_method_labels": CATEGORY_METHOD_LABELS,
         },
     )

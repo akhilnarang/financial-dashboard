@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import null, select
 
-from financial_dashboard.db.models import Transaction
+from financial_dashboard.db.models import Category, Transaction
 from tests.conftest import MISSING_ACCOUNT_ID, ensure_account
 
 pytestmark = pytest.mark.anyio
@@ -384,6 +384,306 @@ async def test_existing_filters_unchanged_without_drill_params(client, session):
     await _seed(session)
     r = await client.get("/transactions?direction=credit")
     assert _count_rows(r.text) == 1  # only the repayment credit
+
+
+# ---------------------------------------------------------------------------
+# Category column, filter dropdown and uncategorized toggle on /transactions.
+#
+# The category the enricher/seed wrote onto a row is now visible on the list as a
+# badge, selectable from a dropdown built off the active categories table, and
+# the uncategorized population — rows no bucket can place — is reachable through
+# an explicit checkbox wired to the existing ?uncategorized= drill param. The
+# dropdown and the toggle are fed by params every pagination/sort link already
+# carries (base_qs), so the filter survives paging and re-sorting.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_categories(session, *slugs):
+    for slug in slugs:
+        session.add(Category(slug=slug, active=True))
+    await session.flush()
+
+
+async def test_category_dropdown_populated_from_active_categories(client, session):
+    await _seed(session)
+    await _seed_categories(session, "groceries", "dining", "rent")
+    r = await client.get("/transactions")
+    assert r.status_code == 200
+    assert 'name="category"' in r.text
+    assert '<option value="groceries"' in r.text
+    assert '<option value="dining"' in r.text
+    assert '<option value="rent"' in r.text
+
+
+async def test_category_dropdown_excludes_inactive_categories(client, session):
+    await _seed(session)
+    await _seed_categories(session, "groceries")
+    session.add(Category(slug="dining", active=False))
+    await session.flush()
+    r = await client.get("/transactions")
+    assert '<option value="groceries"' in r.text
+    assert '<option value="dining"' not in r.text
+
+
+async def test_category_dropdown_marks_the_selected_slug(client, session):
+    await _seed(session)
+    await _seed_categories(session, "groceries", "dining")
+    r = await client.get("/transactions?category=groceries")
+    assert '<option value="groceries" selected' in r.text
+    # A different slug is present but not selected.
+    assert '<option value="dining" selected' not in r.text
+
+
+async def test_uncategorized_toggle_reflects_query_param(client, session):
+    await _seed(session)
+    r = await client.get("/transactions?uncategorized=1")
+    assert 'name="uncategorized"' in r.text
+    assert 'id="uncategorized-toggle" checked' in r.text
+
+
+async def test_uncategorized_toggle_unchecked_by_default(client, session):
+    await _seed(session)
+    r = await client.get("/transactions")
+    assert 'id="uncategorized-toggle" checked' not in r.text
+
+
+async def test_list_shows_category_badge_label(client, session):
+    # A categorized row carries the slug's display label as a badge; the label is
+    # title-cased off the slug when no override names it.
+    await _seed_categories(session, "groceries")
+    await _seed(session)
+    r = await client.get("/transactions?category=groceries")
+    assert "Groceries" in r.text
+
+
+async def test_list_uses_label_override_for_known_slug(client, session):
+    # 'credit_card_payment' has a report override ("Card bills"); the list badge
+    # uses the same override so the column and the cashflow tile agree.
+    await _seed_categories(session, "credit_card_payment")
+    session.add(
+        Transaction(
+            bank="hdfc",
+            email_type="x",
+            direction="debit",
+            amount=Decimal("100"),
+            category="credit_card_payment",
+            currency="INR",
+            transaction_date=DATED,
+        )
+    )
+    await session.flush()
+    r = await client.get("/transactions")
+    assert "Card bills" in r.text
+
+
+async def test_list_shows_uncategorized_badge_for_null_category(client, session):
+    await _seed_categories(session, "groceries")
+    await _seed(session)  # includes a NULL-category row (amount 9)
+    r = await client.get("/transactions?category_null=1")
+    assert _count_rows(r.text) == 1
+    assert "Uncategorized" in r.text
+
+
+async def test_list_shows_uncategorized_badge_for_unknown_sentinel(client, session):
+    await _seed_categories(session, "unknown")
+    await _seed(session)
+    r = await client.get("/transactions?category=unknown")
+    assert _count_rows(r.text) == 1
+    assert "Uncategorized" in r.text
+
+
+async def test_category_filter_preserved_through_pagination(client, session):
+    await _seed_categories(session, "groceries")
+    for i in range(55):
+        session.add(
+            Transaction(
+                bank="hdfc",
+                email_type="x",
+                direction="debit",
+                amount=Decimal(100 + i),
+                category="groceries",
+                currency="INR",
+                transaction_date=DATED,
+            )
+        )
+    # A decoy the pagination link must not widen into.
+    session.add(
+        Transaction(
+            bank="hdfc",
+            email_type="x",
+            direction="debit",
+            amount=Decimal("9999"),
+            category="dining",
+            currency="INR",
+            transaction_date=DATED,
+        )
+    )
+    await session.flush()
+
+    r = await client.get("/transactions?category=groceries")
+    assert _count_rows(r.text) == 50  # a full first page, so pagination renders
+    assert "9,999.00" not in r.text
+
+    hrefs = [html.unescape(h) for h in re.findall(r'href="([^"]+)"', r.text)]
+    page_two = [h for h in hrefs if "page=2" in h]
+    assert page_two, "pagination nav did not render a page-2 link"
+    assert all("category=groceries" in h for h in page_two)
+
+    r2 = await client.get(page_two[0])
+    assert _count_rows(r2.text) == 5  # 55 matching rows - a full page of 50
+    assert "9,999.00" not in r2.text
+
+
+async def test_uncategorized_filter_preserved_through_pagination(client, session):
+    for i in range(55):
+        session.add(
+            Transaction(
+                bank="hdfc",
+                email_type="x",
+                direction="debit",
+                amount=Decimal(100 + i),
+                category=None,
+                currency="INR",
+                transaction_date=DATED,
+            )
+        )
+    # A categorized decoy the uncategorized listing must never include.
+    session.add(
+        Transaction(
+            bank="hdfc",
+            email_type="x",
+            direction="debit",
+            amount=Decimal("9999"),
+            category="groceries",
+            currency="INR",
+            transaction_date=DATED,
+        )
+    )
+    await session.flush()
+
+    r = await client.get("/transactions?uncategorized=1")
+    assert _count_rows(r.text) == 50
+    assert "9,999.00" not in r.text
+
+    hrefs = [html.unescape(h) for h in re.findall(r'href="([^"]+)"', r.text)]
+    page_two = [h for h in hrefs if "page=2" in h]
+    assert page_two
+    assert all("uncategorized=1" in h for h in page_two)
+
+    r2 = await client.get(page_two[0])
+    assert _count_rows(r2.text) == 5
+    assert "9,999.00" not in r2.text
+
+
+async def test_category_filter_preserved_through_sort_links(client, session):
+    await _seed_categories(session, "groceries")
+    await _seed(session)
+    r = await client.get("/transactions?category=groceries")
+    sort_links = [
+        html.unescape(h)
+        for h in re.findall(r'href="([^"]+)"', r.text)
+        if "sort=amount" in h
+    ]
+    assert sort_links, "no sortable column header rendered a link"
+    assert all("category=groceries" in h for h in sort_links)
+
+
+async def test_category_column_is_sortable(client, session):
+    await _seed_categories(session, "groceries")
+    await _seed(session)
+    r = await client.get("/transactions")
+    sort_links = [
+        html.unescape(h)
+        for h in re.findall(r'href="([^"]+)"', r.text)
+        if "sort=category" in h
+    ]
+    assert sort_links, "the Category column header did not render a sort link"
+
+
+async def test_detail_shows_category_method_and_review_labels(client, session):
+    txn = Transaction(
+        bank="hdfc",
+        email_type="x",
+        direction="debit",
+        amount=Decimal("100"),
+        category="groceries",
+        category_method="llm",
+        category_confidence=0.85,
+        review_status="pending",
+        review_reason="low confidence",
+        currency="INR",
+        transaction_date=DATED,
+    )
+    session.add(txn)
+    await session.flush()
+
+    r = await client.get(f"/transactions/{txn.id}/detail")
+    assert r.status_code == 200
+    assert "AI" in r.text  # category_method 'llm' -> 'AI'
+    assert "Needs review" in r.text  # review_status 'pending'
+    assert "85%" in r.text  # confidence rendered as a percentage
+
+
+async def test_detail_shows_uncategorized_label_for_null_category(client, session):
+    txn = Transaction(
+        bank="hdfc",
+        email_type="x",
+        direction="debit",
+        amount=Decimal("100"),
+        category=None,
+        currency="INR",
+        transaction_date=DATED,
+    )
+    session.add(txn)
+    await session.flush()
+
+    r = await client.get(f"/transactions/{txn.id}/detail")
+    assert r.status_code == 200
+    assert "Uncategorized" in r.text
+
+
+async def test_detail_shows_resolved_review_and_manual_method(client, session):
+    txn = Transaction(
+        bank="hdfc",
+        email_type="x",
+        direction="debit",
+        amount=Decimal("100"),
+        category="groceries",
+        category_method="manual",
+        review_status="resolved",
+        currency="INR",
+        transaction_date=DATED,
+    )
+    session.add(txn)
+    await session.flush()
+
+    r = await client.get(f"/transactions/{txn.id}/detail")
+    assert "Manual" in r.text  # category_method 'manual'
+    assert "Reviewed" in r.text  # review_status 'resolved'
+
+
+async def test_detail_hides_method_badge_when_never_categorized(client, session):
+    # A row that the pipeline never touched has category_method=None and
+    # review_status=None; neither badge should render.
+    txn = Transaction(
+        bank="hdfc",
+        email_type="x",
+        direction="debit",
+        amount=Decimal("100"),
+        category=None,
+        category_method=None,
+        review_status=None,
+        currency="INR",
+        transaction_date=DATED,
+    )
+    session.add(txn)
+    await session.flush()
+
+    r = await client.get(f"/transactions/{txn.id}/detail")
+    assert "Needs review" not in r.text
+    assert "Reviewed" not in r.text
+    # Uncategorized IS shown (the category is NULL), but no method badge.
+    assert "Uncategorized" in r.text
 
 
 # ---------------------------------------------------------------------------

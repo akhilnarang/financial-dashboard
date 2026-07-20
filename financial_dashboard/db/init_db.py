@@ -1,8 +1,158 @@
 """Database initialization and inline migrations."""
 
-from sqlalchemy import text
+from sqlalchemy import Table, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import Base
+from financial_dashboard.db.models import Base, InvestmentLot
+
+_INVESTMENT_LOT_BACKFILL_MARKER = "migrations.investment_lots_backfill_v1"
+
+
+#: Core tables whose changes dirty an extension's reconciled projection.
+#: Every INSERT/UPDATE/DELETE on each bumps ``extension_sync_state.desired_revision``
+#: so a coordinator can detect drift without re-deriving the projection.
+_EXTENSION_SYNC_TRIGGER_TABLES = (
+    "transactions",
+    "accounts",
+    "cards",
+    "balance_snapshots",
+    "investment_lots",
+    "cas_uploads",
+)
+
+
+def _extension_sync_bump_body(*, reset_backoff: bool) -> str:
+    """SQL fragment that bumps desired_revision + manages dirty timestamps.
+
+    ``reset_backoff`` additionally clears the retry fields so a Paisa config
+    change is retried immediately rather than waiting out a stale backoff.
+    """
+    fragment = (
+        "UPDATE extension_sync_state "
+        "SET desired_revision = desired_revision + 1, "
+        "first_dirty_at = COALESCE(first_dirty_at, CURRENT_TIMESTAMP), "
+        "last_dirty_at = CURRENT_TIMESTAMP, "
+        "updated_at = CURRENT_TIMESTAMP"
+    )
+    if reset_backoff:
+        fragment += (
+            ", failure_count = 0, next_attempt_at = NULL, last_remote_attempt_at = NULL"
+        )
+    return fragment
+
+
+def _build_extension_sync_state_trigger_ddl() -> list[str]:
+    """Return the CREATE TRIGGER statements that keep extension_sync_state dirty.
+
+    Each statement is ``CREATE TRIGGER IF NOT EXISTS`` so re-running ``init_db``
+    is safe (re-boot is the common path). Every trigger is an AFTER row trigger,
+    so:
+
+    * the bump runs inside the triggering statement's transaction and rolls
+      back with it (and with any enclosing SAVEPOINT) — a rolled-back write
+      leaves ``desired_revision`` untouched;
+    * ``INSERT ... ON CONFLICT DO NOTHING`` / ``INSERT OR IGNORE`` that inserts
+      no row does not fire the AFTER trigger, so a conflict-no-op never bumps;
+    * the singleton row is updated in-place; if it is missing the UPDATE
+      matches zero rows (no failure, no recursion).
+
+    No trigger is installed on ``extension_sync_state`` or ``extension_runs``
+    themselves, so a coordinator's direct writes to this row never recurse.
+    The settings trigger additionally filters to ``paisa.%`` keys via a
+    NEW/OLD reference, so non-Paisa settings writes never dirty the state —
+    and a settings change also resets the retry backoff so a config fix is
+    retried immediately. SQLite only: on other dialects the table still
+    exists (built by ``create_all``) but no triggers are installed.
+    """
+    statements: list[str] = []
+    bump = _extension_sync_bump_body(reset_backoff=False)
+    for table in _EXTENSION_SYNC_TRIGGER_TABLES:
+        for verb in ("INSERT", "UPDATE", "DELETE"):
+            statements.append(
+                f"CREATE TRIGGER IF NOT EXISTS ext_sync_dirty_{table}_{verb.lower()} "
+                f"AFTER {verb} ON {table} BEGIN {bump} WHERE extension_id = 'paisa'; END"
+            )
+    bump_settings = _extension_sync_bump_body(reset_backoff=True)
+    for verb, ref in (("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")):
+        statements.append(
+            f"CREATE TRIGGER IF NOT EXISTS ext_sync_dirty_settings_{verb.lower()} "
+            f"AFTER {verb} ON settings BEGIN {bump_settings} "
+            f"WHERE extension_id = 'paisa' AND {ref}.key LIKE 'paisa.%'; END"
+        )
+    return statements
+
+
+async def _ensure_investment_lot_occurrence(conn) -> None:
+    """Upgrade the interim lot table to occurrence-preserving uniqueness.
+
+    SQLite cannot drop the old table-level UNIQUE constraint, so an existing
+    pre-occurrence table is rebuilt through SQLAlchemy's current table metadata.
+    No table references ``investment_lots``; its CAS foreign key and rows are
+    copied unchanged with occurrence zero.
+    """
+    try:
+        await conn.execute(
+            text("SELECT source_occurrence FROM investment_lots LIMIT 0")
+        )
+        return
+    except Exception:
+        pass
+
+    if conn.dialect.name != "sqlite":
+        await conn.execute(
+            text(
+                "ALTER TABLE investment_lots ADD COLUMN "
+                "source_occurrence INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+        return
+
+    await conn.execute(
+        text("ALTER TABLE investment_lots RENAME TO investment_lots_legacy_occurrence")
+    )
+    await conn.execute(text("DROP INDEX IF EXISTS ix_investment_lots_upload"))
+    await conn.execute(text("DROP INDEX IF EXISTS ix_investment_lots_instrument"))
+    lot_table = InvestmentLot.__table__
+    assert isinstance(lot_table, Table)
+    await conn.run_sync(lambda sync_conn: lot_table.create(sync_conn, checkfirst=False))
+    await conn.execute(
+        text(
+            "INSERT INTO investment_lots "
+            "(id, cas_upload_id, instrument_id, instrument_name, quantity, "
+            " unit_cost, cost_basis, currency, acquired_on, source_ref, "
+            " transaction_type, reference, source_occurrence, created_at) "
+            "SELECT id, cas_upload_id, instrument_id, instrument_name, quantity, "
+            "       unit_cost, cost_basis, currency, acquired_on, source_ref, "
+            "       transaction_type, reference, 0, created_at "
+            "FROM investment_lots_legacy_occurrence"
+        )
+    )
+    await conn.execute(text("DROP TABLE investment_lots_legacy_occurrence"))
+
+
+async def _backfill_legacy_investment_lots(conn) -> None:
+    """Run the one-time, idempotent CAS raw-payload lot backfill."""
+    async with AsyncSession(
+        bind=conn,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
+    ) as session:
+        marker = (
+            await session.execute(
+                text("SELECT 1 FROM settings WHERE key = :key"),
+                {"key": _INVESTMENT_LOT_BACKFILL_MARKER},
+            )
+        ).first()
+        if marker is not None:
+            return
+        from financial_dashboard.services.investments import backfill_investment_lots
+
+        await backfill_investment_lots(session)
+        await session.execute(
+            text("INSERT INTO settings (key, value) VALUES (:key, '1')"),
+            {"key": _INVESTMENT_LOT_BACKFILL_MARKER},
+        )
+        await session.commit()
 
 
 async def init_db(engine) -> None:
@@ -10,6 +160,18 @@ async def init_db(engine) -> None:
         await conn.run_sync(Base.metadata.create_all)
 
     async with engine.begin() as conn:
+        # ``settings`` predates its ORM bookkeeping column on deployed
+        # databases.  Upgrade it before any migration marker is read/written:
+        # the CAS-lot backfill below uses a marker in this table, and startup's
+        # later ``load_all_settings()`` selects the complete Setting model.
+        # Keeping this inline/column-probe style matches the rest of this file
+        # and makes repeated boots idempotent.
+        try:
+            await conn.execute(text("SELECT updated_at FROM settings LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE settings ADD COLUMN updated_at DATETIME")
+            )
         try:
             await conn.execute(text("SELECT note FROM transactions LIMIT 0"))
         except Exception:
@@ -428,9 +590,84 @@ async def init_db(engine) -> None:
             )
         )
 
+        # --- Investment-grade holding detail (Phase 4) ---
+        # SnapshotHolding gains optional instrument-level columns a CAS payload
+        # can state for a priced instrument. They stay NULL on the existing
+        # per-asset-class aggregated rows; the columns are added so a future
+        # instrument-level holding can record them. The new investment_lots
+        # table is created by ``create_all`` (it only creates missing tables),
+        # then upgraded/backfilled below before dirty triggers are installed.
+        # A prior boot may already have installed the lot triggers, so remove
+        # those three inside this same migration transaction. They are recreated
+        # LAST below; the upgrade's own row copies/inserts therefore do not look
+        # like user data changes, while rollback restores the prior trigger set.
+        if conn.dialect.name == "sqlite":
+            for _verb in ("insert", "update", "delete"):
+                await conn.execute(
+                    text(
+                        f"DROP TRIGGER IF EXISTS ext_sync_dirty_investment_lots_{_verb}"
+                    )
+                )
+        await _ensure_investment_lot_occurrence(conn)
+        for _col, _type in (
+            ("instrument_id", "VARCHAR"),
+            ("quantity", "NUMERIC(20,6)"),
+            ("unit_price", "NUMERIC(20,6)"),
+            ("currency", "VARCHAR(3)"),
+            ("cost_basis", "NUMERIC(18,4)"),
+            ("acquired_on", "DATE"),
+        ):
+            try:
+                await conn.execute(
+                    text(f"SELECT {_col} FROM snapshot_holdings LIMIT 0")
+                )
+            except Exception:
+                await conn.execute(
+                    text(f"ALTER TABLE snapshot_holdings ADD COLUMN {_col} {_type}")
+                )
+
+        # Existing installations already preserve source-complete CAS payloads
+        # but predate normalized lots. Parse each once through the exact normal
+        # no-fabrication service. The service skips existing fact/occurrence rows
+        # and isolates malformed uploads; the marker makes later boots O(1).
+        await _backfill_legacy_investment_lots(conn)
+
+        # --- Extension sync-state: Paisa singleton + dirty-revision triggers ---
+        # ``create_all`` builds extension_sync_state on fresh + legacy DBs (it
+        # only creates missing tables). Idempotently seed the Paisa singleton
+        # row dirty (desired_revision=1, applied_revision=0) and force_reload=1
+        # so the next enabled coordinator reconciles once, even with no
+        # observable drift yet. ON CONFLICT DO NOTHING leaves a coordinator-
+        # owned row authoritative — migration never overwrites a row a
+        # coordinator has already touched (so re-boot does not re-force a
+        # reconcile after the first one succeeded).
+        await conn.execute(
+            text(
+                "INSERT INTO extension_sync_state "
+                "(extension_id, desired_revision, applied_revision, "
+                " first_dirty_at, last_dirty_at, force_reload, failure_count, "
+                " created_at, updated_at) "
+                "VALUES ('paisa', 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, "
+                "        1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(extension_id) DO NOTHING"
+            )
+        )
+
+        # Install the SQLite triggers LAST in this block, after every column
+        # ALTER and data backfill above has run un-tracked. That keeps the
+        # migration's own UPDATEs (e.g. category_method backfill) from firing
+        # them, so a legacy DB does not accumulate spurious bumps during its
+        # first migration pass — only writes after this point dirty the state.
+        # Non-SQLite: the table exists, triggers are a SQLite implementation
+        # detail and are skipped (coordinators fall back to always-reconcile).
+        if conn.dialect.name == "sqlite":
+            for _ddl in _build_extension_sync_state_trigger_ddl():
+                await conn.execute(text(_ddl))
+
         # Read APIs resolve source and statement provenance through these
-        # foreign keys for pages of at most 100 rows. Existing databases do not receive model
-        # indexes from create_all(), so create the same indexes idempotently.
+        # foreign keys for pages of at most 100 rows. Existing databases do not
+        # receive model indexes from create_all(), so create the same indexes
+        # idempotently.
         for index_name, table_name, column_name in (
             ("ix_transactions_email_id", "transactions", "email_id"),
             ("ix_transactions_sms_message_id", "transactions", "sms_message_id"),

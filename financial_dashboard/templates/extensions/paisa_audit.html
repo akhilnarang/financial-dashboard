@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Paisa audit - Ledger{% endblock %}
+{% block content %}
+
+<style>
+    .audit-table { width: 100%; }
+    .audit-table th, .audit-table td { white-space: nowrap; }
+    .audit-table td.wrap { white-space: normal; }
+    .badge-ok { background: color-mix(in srgb, var(--clr-credit) 18%, transparent); color: var(--clr-credit); }
+    .badge-bad { background: color-mix(in srgb, var(--clr-debit) 18%, transparent); color: var(--clr-debit); }
+    .badge-pending { background: var(--surface-inset); color: var(--text-muted); }
+    .status-chip { font-size: 0.72rem; font-weight: 600; padding: 0.1rem 0.4rem; border-radius: 999px; text-transform: capitalize; }
+    pre.details-pre { white-space: pre-wrap; word-break: break-word; font-size: 0.76rem; margin: 0; }
+</style>
+
+<div class="section-header">
+    <div>
+        <h2>Paisa audit log</h2>
+        <p class="text-sm text-muted" style="margin: 0;">Recent extension operations — manual and automatic. No credentials or raw journal text are stored.</p>
+    </div>
+    <a href="/extensions/paisa" role="button" class="secondary">Back to Paisa</a>
+</div>
+
+{% if flash.error %}<div class="flash-msg bad" style="padding: 0.6rem 0.9rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.85rem; font-weight: 600;">{{ flash.error }}</div>{% endif %}
+
+<div style="display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 1.5rem;">
+    <article class="card">
+        <h3 style="margin: 0 0 0.3rem; font-size: 0.95rem;">Last success</h3>
+        {% if audit.last_success %}
+        <p class="text-sm" style="margin: 0;">
+            <span class="status-chip badge-ok">{{ audit.last_success.operation }}</span>
+            {{ audit.last_success.outcome or '' }}<br>
+            <small class="text-muted">{{ audit.last_success.started_at }} · {{ "%.1f"|format(audit.last_success.duration_seconds or 0) }}s</small>
+        </p>
+        {% else %}
+        <p class="text-sm text-muted" style="margin: 0;">No successful run yet.</p>
+        {% endif %}
+    </article>
+    <article class="card">
+        <h3 style="margin: 0 0 0.3rem; font-size: 0.95rem;">Last error</h3>
+        {% if audit.last_error %}
+        <p class="text-sm" style="margin: 0;">
+            <span class="status-chip badge-bad">{{ audit.last_error.operation }}</span>
+            {{ audit.last_error.outcome or '' }}<br>
+            <small class="text-muted">{{ audit.last_error.started_at }}</small>
+        </p>
+        {% else %}
+        <p class="text-sm text-muted" style="margin: 0;">No failed run. 🎉</p>
+        {% endif %}
+    </article>
+</div>
+
+<article class="card">
+    <h3 style="margin: 0 0 0.75rem; font-size: 1.05rem;">Recent runs</h3>
+    {% if audit.runs %}
+    <div class="table" style="overflow-x: auto;">
+        <table class="audit-table">
+            <thead>
+                <tr>
+                    <th>Started</th><th>Operation</th><th>Trigger</th><th>Status</th>
+                    <th>Outcome</th><th>Emitted</th><th>Skipped</th><th>Duration</th>
+                    <th>Output hash</th><th>Error</th><th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for r in audit.runs %}
+                <tr>
+                    <td><small>{{ r.started_at }}</small></td>
+                    <td>{{ r.operation }}</td>
+                    <td><small class="text-muted">{{ r.trigger or '—' }}</small></td>
+                    <td>
+                        {% if r.status == 'success' %}<span class="status-chip badge-ok">{{ r.status }}</span>
+                        {% elif r.status == 'failure' %}<span class="status-chip badge-bad">{{ r.status }}</span>
+                        {% else %}<span class="status-chip badge-pending">{{ r.status }}</span>{% endif %}
+                    </td>
+                    <td><small>{{ r.outcome or '—' }}</small></td>
+                    <td>{{ r.emitted_count if r.emitted_count is not none else '—' }}</td>
+                    <td>{{ r.skipped_count if r.skipped_count is not none else '—' }}</td>
+                    <td><small>{{ "%.1f"|format(r.duration_seconds) if r.duration_seconds is not none else '—' }}s</small></td>
+                    <td><small class="text-muted" title="{{ r.output_hash or '' }}">{{ r.output_hash[:10] if r.output_hash else '—' }}</small></td>
+                    <td class="wrap"><small class="text-muted">{{ r.error or '' }}</small></td>
+                    <td class="wrap">
+                        {% if r.details %}<details><summary class="text-sm" style="cursor: pointer;">JSON</summary><pre class="details-pre">{{ r.details | tojson(indent=2) }}</pre></details>{% else %}—{% endif %}
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p class="text-sm text-muted" style="margin: 0;">No operations recorded yet.</p>
+    {% endif %}
+</article>
+
+{% endblock %}

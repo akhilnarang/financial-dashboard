@@ -177,10 +177,7 @@ async def process_sms_row(
     # (hypothetical) non-credit shape of such a role falls through instead of
     # being swallowed. Reading the role off ``parsed`` keeps it out of the
     # ``txn_data`` dict, which is unpacked directly into a Transaction row.
-    if (
-        parsed.ledger_role in _NOTIFY_ONLY_ROLES
-        and txn_data["direction"] == "credit"
-    ):
+    if parsed.ledger_role in _NOTIFY_ONLY_ROLES and txn_data["direction"] == "credit":
         sms_row.status = "parsed"
         # Notify-only makes no NEW row, but must not orphan an old one. A
         # reparse of a message that produced a row under an earlier parser

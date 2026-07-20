@@ -1,0 +1,460 @@
+{% extends "base.html" %}
+{% block title %}Paisa - Ledger{% endblock %}
+{% block content %}
+
+<style>
+    .paisa-grid { display: grid; grid-template-columns: 1fr; gap: 1.5rem; }
+    @media (min-width: 1100px) { .paisa-grid { grid-template-columns: 1fr 1fr; } }
+    .field { display: flex; flex-direction: column; gap: 0.25rem; margin-block-end: 0; font-size: 0.82rem; font-weight: 600; }
+    .field input, .field select { margin-block-end: 0; }
+    .fields-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }
+    .account-pick { display: flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0; }
+    .mapping-row { display: grid; grid-template-columns: 1fr 1.6fr auto; gap: 0.5rem; align-items: center; margin-bottom: 0.4rem; }
+    .mapping-row input { margin-block-end: 0; }
+    .journal-pre { white-space: pre-wrap; word-break: break-word; font-family: var(--font-mono); font-size: 0.78rem; max-height: 320px; overflow: auto; }
+    .skip-list { max-height: 220px; overflow: auto; }
+    .skip-list table { white-space: normal; }
+    .status-dot { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%; vertical-align: middle; margin-right: 0.3rem; }
+    .status-dot.ok { background: var(--clr-credit); }
+    .status-dot.bad { background: var(--clr-debit); }
+    .status-dot.unknown { background: var(--border-light); }
+    .flash-msg { padding: 0.6rem 0.9rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.85rem; font-weight: 600; }
+    .flash-msg.good { background: color-mix(in srgb, var(--clr-credit) 12%, transparent); color: var(--clr-credit); }
+    .flash-msg.bad { background: color-mix(in srgb, var(--clr-debit) 12%, transparent); color: var(--clr-debit); }
+    code.include-line { font-family: var(--font-mono); font-size: 0.82rem; background: var(--surface-inset); padding: 0.15rem 0.35rem; border-radius: 4px; }
+</style>
+
+<div class="section-header">
+    <div>
+        <h2>Paisa</h2>
+        <p class="text-sm text-muted" style="margin: 0;">Project ledger data into a local <a href="https://github.com/ananthakumaran/paisa" target="_blank" rel="noopener">Paisa</a> instance.</p>
+    </div>
+    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+        <span id="paisa-status-badge" class="text-sm text-muted"><span class="status-dot unknown"></span>checking…</span>
+        {% if safe_link %}
+        <a href="{{ safe_link }}" target="_blank" rel="noopener" role="button" class="secondary">Open Paisa ↗</a>
+        {% endif %}
+        <a href="/extensions/paisa/reconciliation" role="button" class="secondary">Reconciliation</a>
+        <a href="/extensions/paisa/audit" role="button" class="secondary">Audit log</a>
+        <a href="/extensions" role="button" class="secondary">All extensions</a>
+    </div>
+</div>
+
+{% if flash.saved %}<div class="flash-msg good">Configuration saved.</div>{% endif %}
+{% if flash.generated %}<div class="flash-msg good">Generated include file written.</div>{% endif %}
+{% if flash.synced %}<div class="flash-msg good">Synced — journal published and Paisa reloaded.</div>{% endif %}
+{% if flash.outcome %}<div class="flash-msg bad">Sync did not complete: <strong>{{ flash.outcome }}</strong>{% if flash.error %} — {{ flash.error }}{% endif %}</div>{% endif %}
+{% if flash.error and not flash.outcome %}<div class="flash-msg bad">Action failed: {{ flash.error }}</div>{% endif %}
+
+{% if errors %}
+<article class="card" style="margin-bottom: 1.5rem; border-left: 3px solid var(--clr-debit);">
+    <strong>Validation errors — changes not saved:</strong>
+    <ul style="margin: 0.5rem 0 0; padding-left: 1.25rem;">
+    {% for err in errors %}<li>{{ err }}</li>{% endfor %}
+    </ul>
+</article>
+{% endif %}
+
+<div id="paisa-status-detail" class="text-sm text-muted" style="margin-bottom: 1rem;"></div>
+
+<div class="paisa-grid">
+    {# ----------------------------- Configuration form ----------------------------- #}
+    <section>
+        <form method="post" action="/extensions/paisa" id="paisa-config-form">
+            <article class="card">
+                <h3 style="margin: 0 0 0.75rem; font-size: 1.05rem;">Connection</h3>
+                <div class="fields-row">
+                    <label class="field">
+                        Mode
+                        <select name="mode" id="paisa-mode">
+                            <option value="disabled" {% if config.mode == "disabled" %}selected{% endif %}>disabled — inactive</option>
+                            <option value="connect" {% if config.mode == "connect" %}selected{% endif %}>connect — probe only</option>
+                            <option value="project" {% if config.mode == "project" %}selected{% endif %}>project — full projection</option>
+                        </select>
+                    </label>
+                    <label class="field">
+                        Base URL
+                        <input type="text" name="base_url" value="{{ config.base_url }}" placeholder="http://127.0.0.1:7500">
+                    </label>
+                    <label class="field">
+                        External URL
+                        <input type="text" name="external_url" value="{{ config.external_url }}" placeholder="https://paisa.example/">
+                    </label>
+                    <label class="field">
+                        Request Timeout (s)
+                        <input type="number" name="request_timeout_seconds" value="{{ config.request_timeout_seconds }}" min="1">
+                    </label>
+                </div>
+                <div class="fields-row" style="margin-top: 1rem;">
+                    <label class="field">
+                        Auth Username
+                        <input type="text" name="auth_username" value="{{ config.auth_username }}" placeholder="Optional X-Auth user">
+                    </label>
+                    <label class="field">
+                        Auth Password
+                        <input type="password" name="auth_password" value="" autocomplete="off" placeholder="{{ 'Configured — leave blank to keep' if config.auth_password_set else 'Not set' }}">
+                    </label>
+                    <label class="field" style="flex-direction: row; align-items: center; gap: 0.5rem; font-weight: 500;">
+                        <input type="checkbox" name="allow_remote" value="true" {% if config.allow_remote %}checked{% endif %}>
+                        Allow remote (requires HTTPS)
+                    </label>
+                </div>
+            </article>
+
+            <article class="card" style="margin-top: 1rem;">
+                <h3 style="margin: 0 0 0.75rem; font-size: 1.05rem;">Projection</h3>
+                <div class="fields-row">
+                    <label class="field">
+                        Project Since (ISO date cutover)
+                        <input type="date" name="project_since" value="{{ config.project_since }}">
+                    </label>
+                    <label class="field">
+                        Generated Include Path
+                        <input type="text" name="generated_path" id="paisa-generated-path" value="{{ config.generated_path }}" placeholder="/absolute/path/to/financial-dashboard.journal">
+                    </label>
+                </div>
+                <label class="field" style="flex-direction: row; align-items: center; gap: 0.5rem; font-weight: 500; margin-top: 0.75rem;">
+                    <input type="checkbox" name="project_investments" value="true" {% if config.project_investments %}checked{% endif %}>
+                    Project CAS investment lots (project mode only; acquisition cost stays on lots and latest explicit CAS NAV is emitted separately as market price)
+                </label>
+                <p class="text-sm text-muted" style="margin: 0.5rem 0 0;">
+                    Absolute path to the file this dashboard writes. The parent directory must already exist; it is never created for you.
+                </p>
+            </article>
+
+            <article class="card" style="margin-top: 1rem;">
+                <h3 style="margin: 0 0 0.75rem; font-size: 1.05rem;">Rendering &amp; FX</h3>
+                <div class="fields-row">
+                    <label class="field">
+                        Ledger CLI Backend
+                        <select name="ledger_cli" id="paisa-ledger-cli">
+                            {% for b in ["ledger", "hledger", "beancount"] %}
+                            <option value="{{ b }}" {% if config.ledger_cli == b %}selected{% endif %}>{{ b }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label class="field">
+                        Non-INR Policy
+                        <select name="non_inr_policy">
+                            {% for p in ["skip", "priced"] %}
+                            <option value="{{ p }}" {% if config.non_inr_policy == p %}selected{% endif %}>{{ p }}{% if p == "priced" %} (needs FX rates){% endif %}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                </div>
+                <p class="text-sm text-muted" style="margin: 0.75rem 0 0.4rem;">
+                    Historical INR-per-unit FX rates for the <code class="include-line">priced</code> policy. Positive decimals only; one row per currency/date. Exact JSON is stored.
+                </p>
+                <div id="fx-rates">
+                {% for row in config.fx_rates %}
+                    <div class="mapping-row" style="grid-template-columns: 0.8fr 0.9fr 1fr auto;">
+                        <input type="text" name="fx_currency" value="{{ row.currency }}" placeholder="USD">
+                        <input type="date" name="fx_date" value="{{ row.date }}">
+                        <input type="text" name="fx_rate" value="{{ row.rate }}" placeholder="83.0000">
+                        <button type="button" class="btn-link danger" onclick="this.closest('.mapping-row').remove()">remove</button>
+                    </div>
+                {% endfor %}
+                    <div class="mapping-row" style="grid-template-columns: 0.8fr 0.9fr 1fr auto;">
+                        <input type="text" name="fx_currency" value="" placeholder="USD">
+                        <input type="date" name="fx_date" value="">
+                        <input type="text" name="fx_rate" value="" placeholder="83.0000">
+                        <button type="button" class="btn-link danger" onclick="this.closest('.mapping-row').remove()">remove</button>
+                    </div>
+                </div>
+                <button type="button" class="btn-action btn-ghost" style="margin-top: 0.4rem;" onclick="addFxRow()">+ add FX rate</button>
+            </article>
+
+            <article class="card" style="margin-top: 1rem;">
+                <h3 style="margin: 0 0 0.75rem; font-size: 1.05rem;">Selected Accounts</h3>
+                {% if accounts %}
+                <div style="columns: 2; column-gap: 1.5rem;">
+                {% for a in accounts %}
+                    <div class="account-pick">
+                        <label style="margin: 0; font-weight: 500; font-size: 0.85rem;">
+                            <input type="checkbox" name="selected_account_ids" value="{{ a.id }}" {% if a.selected %}checked{% endif %}>
+                            {{ a.bank }} · {{ a.label }}
+                            <small class="text-muted">#{{ a.id }} · {{ a.type }}</small>
+                        </label>
+                    </div>
+                {% endfor %}
+                </div>
+                {% else %}
+                <p class="text-sm text-muted" style="margin: 0;">No native accounts exist yet. Add accounts first.</p>
+                {% endif %}
+            </article>
+
+            <article class="card" style="margin-top: 1rem;">
+                <h3 style="margin: 0 0 0.75rem; font-size: 1.05rem;">Account Mappings</h3>
+                <p class="text-sm text-muted" style="margin: 0 0 0.5rem;">Map a native account id (e.g. <code class="include-line">1</code>) to a ledger account name. Unmapped accounts use a generated default.</p>
+                <div id="account-mappings">
+                {% for k, v in config.account_mappings.items() %}
+                    <div class="mapping-row">
+                        <input type="text" name="account_mapping_key" value="{{ k }}" placeholder="account id">
+                        <input type="text" name="account_mapping_value" value="{{ v }}" placeholder="Assets:Bank:HDFC:Main">
+                        <button type="button" class="btn-link danger" onclick="this.closest('.mapping-row').remove()">remove</button>
+                    </div>
+                {% endfor %}
+                    <div class="mapping-row">
+                        <input type="text" name="account_mapping_key" value="" placeholder="account id">
+                        <input type="text" name="account_mapping_value" value="" placeholder="Assets:Bank:HDFC:Main">
+                        <button type="button" class="btn-link danger" onclick="this.closest('.mapping-row').remove()">remove</button>
+                    </div>
+                </div>
+                <button type="button" class="btn-action btn-ghost" style="margin-top: 0.4rem;" onclick="addMappingRow('account-mappings', 'account_mapping_key', 'account_mapping_value', 'account id', 'Assets:Bank:HDFC:Main')">+ add account mapping</button>
+            </article>
+
+            <article class="card" style="margin-top: 1rem;">
+                <h3 style="margin: 0 0 0.75rem; font-size: 1.05rem;">Category Mappings</h3>
+                <p class="text-sm text-muted" style="margin: 0 0 0.5rem;">Map a category slug (e.g. <code class="include-line">groceries</code>) to a ledger account name. Unmapped categories default to <code class="include-line">Expenses:Groceries</code> / <code class="include-line">Income:&hellip;</code>.</p>
+                <div id="category-mappings">
+                {% for k, v in config.category_mappings.items() %}
+                    <div class="mapping-row">
+                        <input type="text" name="category_mapping_key" value="{{ k }}" placeholder="category slug">
+                        <input type="text" name="category_mapping_value" value="{{ v }}" placeholder="Expenses:Groceries">
+                        <button type="button" class="btn-link danger" onclick="this.closest('.mapping-row').remove()">remove</button>
+                    </div>
+                {% endfor %}
+                    <div class="mapping-row">
+                        <input type="text" name="category_mapping_key" value="" placeholder="category slug">
+                        <input type="text" name="category_mapping_value" value="" placeholder="Expenses:Groceries">
+                        <button type="button" class="btn-link danger" onclick="this.closest('.mapping-row').remove()">remove</button>
+                    </div>
+                </div>
+                <button type="button" class="btn-action btn-ghost" style="margin-top: 0.4rem;" onclick="addMappingRow('category-mappings', 'category_mapping_key', 'category_mapping_value', 'category slug', 'Expenses:Groceries')">+ add category mapping</button>
+            </article>
+
+            <article class="card" style="margin-top: 1rem;">
+                <h3 style="margin: 0 0 0.75rem; font-size: 1.05rem;">Automation &amp; Caching</h3>
+                <div class="fields-row">
+                    <label class="field" style="flex-direction: row; align-items: center; gap: 0.5rem; font-weight: 500;">
+                        <input type="checkbox" name="auto_sync_enabled" value="true" {% if config.auto_sync_enabled %}checked{% endif %}>
+                        Auto sync (coalesced; requires project mode)
+                    </label>
+                    <label class="field">
+                        Min Reload Interval (minutes)
+                        <input type="number" name="auto_sync_min_interval_minutes" value="{{ config.auto_sync_min_interval_minutes }}" min="1">
+                    </label>
+                    <label class="field">
+                        Report Cache TTL (seconds, 0 disables)
+                        <input type="number" name="report_cache_ttl_seconds" value="{{ config.report_cache_ttl_seconds }}" min="0">
+                    </label>
+                </div>
+                <p class="text-sm text-muted" style="margin: 0.75rem 0 0;">
+                    When auto sync is on, a coordinator coalesces dirtying core changes (new/edited transactions, accounts, cards, snapshots, CAS lots, or <code class="include-line">paisa.*</code> settings) into one full-journal Paisa reload — there is no per-transaction/partial sync API, so a bulk statement import (one outer commit) is one bump and one coalesced reload. Fixed, non-tunable timings: 5s quiet debounce, 30s max dirty latency, 2s state polling, lease/single-flight, 1/2/5/10/15-min retry backoff, and a six-hour force reload. <code class="include-line">disabled</code>/<code class="include-line">connect</code> accumulate dirty state with no I/O; the min-reload interval is a hard floor between remote reloads and retries only (not the debounce).
+                </p>
+                <label class="field" style="flex-direction: row; align-items: center; gap: 0.5rem; font-weight: 500; margin-top: 0.75rem;">
+                    <input type="checkbox" name="notify_sync_failures" value="true" {% if config.notify_sync_failures %}checked{% endif %}>
+                    Notify on auto-sync failure via Telegram (requires Telegram configured). Repeated identical failures are deduped.
+                </label>
+            </article>
+
+            <div style="margin-top: 1rem;">
+                <button type="submit" id="paisa-save-btn">Save Configuration</button>
+            </div>
+        </form>
+    </section>
+
+    {# ----------------------------- Right column: setup, preview, actions ----------------------------- #}
+    <section>
+        <article class="card" style="margin-bottom: 1rem;">
+            <h3 style="margin: 0 0 0.5rem; font-size: 1.05rem;">Setup</h3>
+            <p class="text-sm" style="margin: 0 0 0.5rem;">
+                Add this single line to your main Paisa journal file once. The dashboard overwrites the generated file on every generate/sync; Paisa picks it up on reload.
+            </p>
+            <pre class="journal-pre" id="paisa-include-instruction" data-placeholder="/absolute/path/to/financial-dashboard.journal" style="background: var(--surface-inset); padding: 0.6rem; border-radius: 6px; margin: 0;">{{ setup_include_line }}</pre>
+        </article>
+
+        <article class="card" style="margin-bottom: 1rem;">
+            <h3 style="margin: 0 0 0.5rem; font-size: 1.05rem;">Actions</h3>
+            <p class="text-sm text-muted" style="margin: 0 0 0.75rem;">
+                Generate writes the include file; Sync also asks Paisa to reload and verifies. Both require <strong>project</strong> mode.
+            </p>
+            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                <form method="post" action="/extensions/paisa/generate" style="margin: 0;">
+                    <button type="submit" class="btn-action btn-primary" {% if not config.can_project %}disabled{% endif %}>Generate</button>
+                </form>
+                <form method="post" action="/extensions/paisa/sync" style="margin: 0;">
+                    <button type="submit" class="btn-action btn-primary" {% if not config.can_project %}disabled{% endif %}>Sync</button>
+                </form>
+            </div>
+        </article>
+
+        {% if preview.ok and preview.summary %}
+        {% set s = preview.summary %}
+        <article class="card" style="margin-bottom: 1rem; border-left: 4px solid {% if s.net_worth_scope_complete %}var(--success){% else %}var(--warning){% endif %};">
+            <h3 style="margin: 0 0 0.5rem; font-size: 1.05rem;">Net-worth projection scope</h3>
+            <p class="text-sm" style="margin: 0 0 0.5rem;">
+                <strong>{% if s.net_worth_scope_complete %}Complete for active non-account sources.{% else %}Incomplete — Paisa is not a full native net-worth view.{% endif %}</strong>
+                The account picker selects only Account rows; CAS and manual sources are listed explicitly below.
+            </p>
+            <dl class="text-sm text-muted" style="margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 0.75rem;">
+                <dt>CAS portfolios</dt>
+                <dd>{{ s.cas_portfolio_count }} · investment scope <strong>{{ s.cas_investment_scope }}</strong>{% if s.cas_portfolio_labels %} · {{ s.cas_portfolio_labels|join(', ') }}{% endif %}</dd>
+                <dt>Manual assets</dt>
+                <dd>{{ s.manual_asset_count }} outside projection{% if s.manual_asset_labels %} · {{ s.manual_asset_labels|join(', ') }}{% endif %}</dd>
+                <dt>Manual liabilities</dt>
+                <dd>{{ s.manual_liability_count }} outside projection{% if s.manual_liability_labels %} · {{ s.manual_liability_labels|join(', ') }}{% endif %}</dd>
+            </dl>
+        </article>
+        {% endif %}
+
+        <article class="card">
+            <h3 style="margin: 0 0 0.5rem; font-size: 1.05rem;">Preview Diagnostics</h3>
+            {% if preview.ok and preview.summary %}
+            <p class="text-sm" style="margin: 0 0 0.5rem;">
+                <span class="status-dot ok"></span>
+                {{ preview.summary.emitted_count }} entr{{ 'y' if preview.summary.emitted_count == 1 else 'ies' }} ·
+                {{ preview.summary.self_transfer_pairs }} self-transfer pair{{ '' if preview.summary.self_transfer_pairs == 1 else 's' }} ·
+                {{ preview.summary.card_payments }} card payment{{ '' if preview.summary.card_payments == 1 else 's' }}
+                {%- if preview.summary.card_payments %} ({{ preview.summary.card_payments_resolved }} resolved · {{ preview.summary.card_payments_unresolved }} unresolved{% if preview.summary.card_payments_ambiguous_mask %}, {{ preview.summary.card_payments_ambiguous_mask }} ambiguous exact mask{% endif %}){%- endif %}
+            </p>
+            {% set s = preview.summary %}
+            {% if s.imprecise_count or s.investment_lot_count or s.investment_funding_remapped or s.investment_funding_unresolved or s.investment_current_valuation_count or s.projected_foreign_count or s.missing_fx_rate_count or s.kind_counts %}
+            <details style="margin: 0 0 0.5rem;">
+                <summary class="text-sm" style="cursor: pointer;">Computed diagnostics</summary>
+                <dl class="text-sm text-muted" style="margin: 0.5rem 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 0.75rem;">
+                    {%- if s.imprecise_count %}
+                    <dt>Imprecise categories</dt><dd>{{ s.imprecise_count }} (emi_loan/cash_withdrawal posted to a conservative Expenses clearing)</dd>
+                    {%- endif %}
+                    {%- if s.card_payments %}
+                    <dt>Card payments</dt><dd>{{ s.card_payments_resolved }} resolved · {{ s.card_payments_unresolved }} unresolved (generic clearing){% if s.card_payments_ambiguous_mask %} · {{ s.card_payments_ambiguous_mask }} ambiguous exact mask{% endif %}</dd>
+                    {%- endif %}
+                    {%- if s.investment_lot_count or s.investment_funding_remapped or s.investment_funding_unresolved %}
+                    <dt>Investment lots</dt><dd>{{ s.investment_lot_count }} projected · {{ s.investment_funding_remapped }} bank leg(s) funding-remapped · {{ s.investment_funding_unresolved|length }} lot(s) suppressed as funding-unresolved</dd>
+                    {%- endif %}
+                    {%- if s.investment_current_valuation_count %}
+                    <dt>CAS valuation</dt><dd>{{ s.investment_current_valuation_count }} identity-preserved source position(s) · {{ s.investment_market_price_count }} current market price(s) emitted · {{ s.investment_value_only_count }} value-only/outside surviving lots · {{ s.investment_quantity_mismatch_count }} current-vs-lot quantity mismatch(es) · {{ s.investment_missing_market_price_count }} missing explicit unit price · {{ s.investment_market_price_conflicts|length }} conflicting commodity/date price(s) suppressed{% if s.investment_market_price_conflicts %} ({{ s.investment_market_price_conflicts|join(', ') }}){% endif %}</dd>
+                    {%- endif %}
+                    {%- if s.projected_foreign_count or s.missing_fx_rate_count %}
+                    <dt>Foreign currency</dt><dd>{{ s.projected_foreign_count }} projected entr{{ 'y' if s.projected_foreign_count == 1 else 'ies' }} ({{ s.source_currencies|join(', ') }}) · {{ s.missing_fx_rate_count }} skipped for missing rate</dd>
+                    {%- endif %}
+                    {%- if s.kind_counts %}
+                    <dt>Kind breakdown</dt><dd>{{ s.kind_counts|dictsort|map('join', ' ')|join(' · ') }}</dd>
+                    {%- endif %}
+                </dl>
+            </details>
+            {% endif %}
+            <details>
+                <summary class="text-sm" style="cursor: pointer;">Full journal</summary>
+                <pre class="journal-pre" style="margin: 0.5rem 0 0;">{{ preview.journal }}</pre>
+            </details>
+            {% if preview.summary.skipped %}
+            <details style="margin-top: 0.5rem;">
+                <summary class="text-sm" style="cursor: pointer;">Skipped ({{ preview.summary.skipped|length }})</summary>
+                <div class="skip-list table">
+                    <table>
+                        <thead><tr><th>Txn</th><th>Reason</th><th>Detail</th></tr></thead>
+                        <tbody>
+                        {% for row in preview.summary.skipped %}
+                            <tr><td>{{ row.txn_id if row.txn_id else '—' }}</td><td><code>{{ row.reason }}</code></td><td class="text-muted">{{ row.detail }}</td></tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </details>
+            {% endif %}
+            {% elif preview.reason %}
+            <p class="text-sm text-muted" style="margin: 0;"><span class="status-dot unknown"></span>Preview unavailable: <strong>{{ preview.reason }}</strong></p>
+            {% else %}
+            <p class="text-sm text-muted" style="margin: 0;">Nothing to preview yet.</p>
+            {% endif %}
+        </article>
+    </section>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function addMappingRow(containerId, keyName, valueName, keyPh, valPh) {
+    const container = document.getElementById(containerId);
+    const row = document.createElement('div');
+    row.className = 'mapping-row';
+    row.innerHTML =
+        '<input type="text" name="' + keyName + '" value="" placeholder="' + keyPh + '">' +
+        '<input type="text" name="' + valueName + '" value="" placeholder="' + valPh + '">' +
+        '<button type="button" class="btn-link danger" onclick="this.closest(\'.mapping-row\').remove()">remove</button>';
+    container.appendChild(row);
+}
+
+function addFxRow() {
+    const container = document.getElementById('fx-rates');
+    const row = document.createElement('div');
+    row.className = 'mapping-row';
+    row.style.gridTemplateColumns = '0.8fr 0.9fr 1fr auto';
+    row.innerHTML =
+        '<input type="text" name="fx_currency" value="" placeholder="USD">' +
+        '<input type="date" name="fx_date" value="">' +
+        '<input type="text" name="fx_rate" value="" placeholder="83.0000">' +
+        '<button type="button" class="btn-link danger" onclick="this.closest(\'.mapping-row\').remove()">remove</button>';
+    container.appendChild(row);
+}
+
+document.getElementById('paisa-config-form').addEventListener('submit', function() {
+    var btn = document.getElementById('paisa-save-btn');
+    btn.textContent = 'Saving…';
+    btn.disabled = true;
+});
+
+// Keep the setup instruction in sync with the selected renderer and path.
+// Assign through textContent only: a generated path is text, never markup.
+function quoteBeancountString(value) {
+    return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+}
+
+function updateSetupInclude() {
+    const ledgerCli = document.getElementById('paisa-ledger-cli');
+    const generatedPath = document.getElementById('paisa-generated-path');
+    const includeLine = document.getElementById('paisa-include-instruction');
+    const path = generatedPath.value.trim() || includeLine.dataset.placeholder;
+    const renderedPath = ledgerCli.value === 'beancount'
+        ? quoteBeancountString(path)
+        : path;
+    includeLine.textContent = 'include ' + renderedPath;
+}
+
+document.getElementById('paisa-ledger-cli').addEventListener('change', updateSetupInclude);
+document.getElementById('paisa-generated-path').addEventListener('input', updateSetupInclude);
+
+// Status is fetched client-side so a down/slow Paisa never blocks the render.
+// The badge is built with DOM APIs (createElement/classList/replaceChildren)
+// and a text node — never innerHTML — so a misconfigured or hostile upstream
+// string in mode/label/reason cannot inject markup into the page.
+function setStatusBadge(dotClass, text) {
+    const badge = document.getElementById('paisa-status-badge');
+    const dot = document.createElement('span');
+    dot.classList.add('status-dot', dotClass);
+    badge.replaceChildren(dot);
+    badge.appendChild(document.createTextNode(text));
+}
+
+async function loadStatus() {
+    const detail = document.getElementById('paisa-status-detail');
+    try {
+        const resp = await fetch('/api/extensions/paisa/status', {headers: {'Accept': 'application/json'}});
+        const data = await resp.json();
+        const mode = data.mode || 'disabled';
+        if (!data.can_connect) {
+            setStatusBadge('unknown', 'mode: ' + mode + ' (inactive)');
+            detail.replaceChildren();
+            return;
+        }
+        const dot = data.ok ? 'ok' : 'bad';
+        const label = data.ok ? 'reachable' : (data.reachable ? 'reachable (issues)' : 'unreachable');
+        setStatusBadge(dot, label + ' · mode: ' + mode);
+        let bits = [];
+        if (data.capabilities) {
+            if (data.capabilities.ledger_cli) bits.push('backend: ' + data.capabilities.ledger_cli);
+            if (data.capabilities.readonly) bits.push('readonly');
+            if (data.capabilities.default_currency) bits.push('currency: ' + data.capabilities.default_currency);
+        }
+        if (data.reason) bits.push(data.reason);
+        if (data.diagnosis && data.diagnosis.danger_count > 0) bits.push(data.diagnosis.danger_count + ' diagnosis danger(s)');
+        detail.textContent = bits.join(' · ');
+    } catch (e) {
+        setStatusBadge('unknown', 'status unavailable');
+    }
+}
+loadStatus();
+</script>
+{% endblock %}

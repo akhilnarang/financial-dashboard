@@ -1,0 +1,181 @@
+name: CI
+
+# Continuous integration for financial-dashboard.
+#
+# Jobs:
+#   * quality   — the standard quality gates (ruff check, ruff format --check,
+#                 ty check, pytest). Runs on every push and PR.
+#   * ledger    — the pinned Paisa 0.7.4 *ledger* contract: mounts the generated
+#                 synthetic corpus into ananthakumaran/paisa:v0.7.4 and runs the
+#                 real ``paisa update --journal`` parse path AND a direct
+#                 ``ledger`` parse of the PRODUCTION ``render_document`` corpus
+#                 with parsed identity assertions. Requires Docker.
+#   * hledger   — a pinned reproducible hledger image (dastapov/hledger:1.52.1)
+#                 runs ``hledger check`` over a lot-bearing production journal.
+#                 Requires Docker.
+#   * beancount — beancount is a declared dev dependency, so the mandatory
+#                 ``bean-check`` + loader identity test runs inside the plain
+#                 pytest job (no Docker, no skip).
+#
+# No backend is silently skipped in CI: ledger and hledger are real Docker-gated
+# parses (fail red when Docker is present), and beancount is an always-on dev
+# dependency. There is no "documented unsupported" step that hides a missing
+# parser — every backend the renderers target is really parsed somewhere.
+#
+# uv sources: the workflow runs against the committed git sources in
+# pyproject.toml / uv.lock (never path-based sources). It never edits them.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"
+
+jobs:
+  quality:
+    name: Lint, typecheck, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync
+
+      # Guard against an accidental path-source edit sneaking into a commit —
+      # CI must always run off the committed git sources (AGENTS.md).
+      - name: Refuse path-based uv sources
+        run: |
+          if grep -Eq 'path *= *"\.\.' pyproject.toml; then
+            echo "::error::pyproject.toml contains a path-based uv source; revert to git sources before pushing"
+            exit 1
+          fi
+
+      - name: Ruff check
+        run: uv run ruff check financial_dashboard tests scripts
+
+      - name: Ruff format
+        run: uv run ruff format --check financial_dashboard tests scripts
+
+      - name: Type check (ty)
+        run: uv run ty check financial_dashboard
+
+      # beancount is a dev dependency, so the mandatory bean-check + loader
+      # identity tests inside the suite always run here (never skipped).
+      - name: Pytest (default suite)
+        env:
+          # Keep the opt-in stress projection benchmark OUT of the default CI
+          # run (it loads 200k+ rows and is documented/tested separately).
+          SYNTH_BENCH: ""
+        run: uv run pytest -q
+
+  ledger:
+    name: Ledger 3.3.2 contract (Paisa v0.7.4)
+    runs-on: ubuntu-latest
+    # The contract is a Docker-only developer probe; it never runs in the
+    # dashboard runtime. It parses BOTH the hand-mirrored corpus (via
+    # ``paisa update --journal``) and the PRODUCTION ``render_document`` corpus
+    # (via a direct ``ledger`` parse with identity assertions).
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync
+
+      # Pinned to the exact upstream tag the corpus is verified against. The
+      # probe builds the golden corpus, mounts it, and runs the real
+      # ``paisa --config /data/paisa.yaml --now <d> update --journal`` parse
+      # (Ledger 3.3.2, fully offline) PLUS a direct ``ledger balance``/
+      # ``commodities``/``accounts`` parse of the production renderer output
+      # with commodity/account/quantity identity assertions.
+      - name: Paisa ledger contract (ananthakumaran/paisa:v0.7.4)
+        run: |
+          uv run python scripts/paisa_contract.py --backend ledger
+
+  hledger:
+    name: hledger 1.52.1 contract
+    runs-on: ubuntu-latest
+    # hledger is verified against a pinned, reproducible image tag (not
+    # ``latest``) so a re-run reproduces the same hledger binary CI saw. The
+    # check parses a lot-bearing production journal — the exact grammar the
+    # bare-alphanumeric-commodity defect would break (hledger rejects a bare
+    # ISIN in a ``commodity``/``P`` directive that ledger tolerates).
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync
+
+      # Render the production hledger journal (lots + priced FX + long names)
+      # and parse it with the pinned image's real hledger. ``hledger check`` is
+      # the parse + balance assertion; a lot-bearing check is mandatory — no
+      # silently skipped lot grammar. The temp dir is chmod-ed 755 so the
+      # container (root, or userns-mapped) can read it under any Docker setup.
+      - name: hledger check on production lot-bearing journal
+        run: |
+          set -euo pipefail
+          uv run python -c "
+          import datetime, tempfile, pathlib, os
+          from decimal import Decimal
+          from financial_dashboard.services.paisa.renderers import render_document
+          from financial_dashboard.services.paisa.renderers.base import (
+              LedgerDocument, InvestmentLotEntry, LedgerPosting, ProjectedEntry,
+              PriceDirective,
+          )
+          lot = InvestmentLotEntry(
+              instrument='INE000A01020', instrument_name='Example Fund',
+              quantity=Decimal('500'), unit_cost=Decimal('100.00'),
+              cost_basis=Decimal('50000.00'), currency='INR',
+              acquired_on=datetime.date(2026, 3, 17))
+          entry = ProjectedEntry(
+              date=datetime.date(2026, 2, 1), payee='Cafe', txn_ids=(42,),
+              postings=(LedgerPosting('Expenses:Food:Groceries', Decimal('10.00'), 'USD'),
+                        LedgerPosting('Assets:Bank:HDFC:Savings', Decimal('-10.00'), 'USD')),
+              currency='USD')
+          doc = LedgerDocument(
+              cutover_date=datetime.date(2026, 1, 1),
+              openings=(), entries=(entry,),
+              accounts_declared=('Expenses:Food:Groceries', 'Assets:Bank:HDFC:Savings'),
+              lot_postings=(lot,),
+              price_directives=(PriceDirective(datetime.date(2026,2,1),'USD',Decimal('83.2500')),
+                                PriceDirective(datetime.date(2026,3,17),'INE000A01020',Decimal('100.0000'))))
+          d = pathlib.Path(tempfile.mkdtemp())
+          (d / 'hledger.journal').write_text(render_document(doc, 'hledger'))
+          os.chmod(d, 0o755)
+          import sys; sys.stdout.write(str(d))
+          " > /tmp/hledger_dir
+          DIR=$(cat /tmp/hledger_dir)
+          docker run --rm -v "$DIR:/data" --entrypoint sh \
+            dastapov/hledger:1.52.1 \
+            -c "hledger -f /data/hledger.journal check && hledger -f /data/hledger.journal commodities"

@@ -42,7 +42,9 @@ from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
+
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 if TYPE_CHECKING:
     # Aliased: the statement parser's row model shares the name Transaction
@@ -76,6 +78,7 @@ from financial_dashboard.services.linker import build_link_context, link_transac
 from financial_dashboard.services.snapshots import emit_cc_snapshot
 from financial_dashboard.services.statements.contention import contended_miss
 from financial_dashboard.services.statements.hint import extract_password_hint
+from financial_dashboard.services.statements.skip_summary import import_skip_summary
 from financial_dashboard.services.settings import (
     get_setting_int,
     get_telegram_chat_id,
@@ -558,6 +561,13 @@ async def import_missing_cc_txns(
     scoped to ``upload.account_id``, and run through ``link_transaction`` so
     the card mask resolves to an addon card when possible.
 
+    Each row imports inside its own SAVEPOINT so a single duplicate /
+    constraint violation or unexpected error cannot abort the entire
+    statement import — symmetric with bank imports. Failures are tagged on
+    the missing entry (``duplicate`` / ``import_error``) so the UI and the
+    upload's ``error`` summary can surface them; the upload row stays
+    committed with whatever subset succeeded.
+
     Args:
         session: Open async SQLAlchemy session. The caller owns the
             transaction; this function calls ``flush`` but never ``commit``.
@@ -572,9 +582,10 @@ async def import_missing_cc_txns(
             account's linked ``cards``.
         recon: Reconciliation dict from ``reconcile_statement``. Mutated
             in place: each imported entry gets ``imported=True`` and
-            ``imported_txn_id=<new txn id>``. Entries already marked
-            ``imported`` are skipped, making this function idempotent.
-            Entries whose amount or date fail to parse are skipped silently.
+            ``imported_txn_id=<new txn id>``; failed entries get
+            ``duplicate``/``import_error``/``import_failed`` tags. Entries
+            already marked ``imported`` are skipped, making this function
+            idempotent.
 
     Returns:
         The newly-created ``Transaction`` objects, in order of processing.
@@ -596,6 +607,7 @@ async def import_missing_cc_txns(
             amount = parse_cc_amount(entry["amount"])
             txn_date = parse_cc_date(entry["date"])
         except ValueError, KeyError:
+            entry["import_error"] = "could not parse amount/date"
             continue
         txn = Transaction(
             statement_upload_id=upload.id,
@@ -613,10 +625,35 @@ async def import_missing_cc_txns(
             channel="cc_statement",
             raw_description=entry.get("narration"),
         )
-        session.add(txn)
-        await session.flush()
-        link_transaction(link_ctx, txn)
-        await session.flush()
+        try:
+            async with session.begin_nested():
+                session.add(txn)
+                await session.flush()
+                link_transaction(link_ctx, txn)
+                await session.flush()
+        except IntegrityError as e:
+            entry["duplicate"] = True
+            entry["import_error"] = "duplicate transaction"
+            logger.info(
+                "Skipping duplicate CC stmt txn (direction=%s date=%s amount=%s): %s",
+                entry["direction"],
+                entry["date"],
+                entry["amount"],
+                e.orig,
+            )
+            continue
+        except Exception as e:
+            entry["import_failed"] = True
+            entry["import_error"] = f"{type(e).__name__}: {e}"
+            logger.exception(
+                "Unexpected error importing CC stmt txn (direction=%s "
+                "date=%s amount=%s)",
+                entry["direction"],
+                entry["date"],
+                entry["amount"],
+            )
+            continue
+
         await apply_reference_self_transfer_rule(session, txn)
         entry["imported"] = True
         entry["imported_txn_id"] = txn.id
@@ -1435,6 +1472,9 @@ async def process_statement_email(
             upload.status = "imported"  # all matched or all imported
         elif imported_rows:
             upload.status = "partial_import"
+        _dupes, _errs, skip_error = import_skip_summary(recon)
+        if skip_error:
+            upload.error = skip_error
         await emit_cc_snapshot(session, upload)
         await session.commit()
 

@@ -141,7 +141,7 @@ async def test_same_account_uber_auth_reversal_is_not_self_transfer(
         currency="INR",
         counterparty="UBER",
         card_mask="XX1234",
-        account_mask="XX214",
+        account_mask="xxxxxxxxxx8214",
         reference_number="UBER-AUTH-6276-6280",
         channel="credit_card",
         category="expense",
@@ -173,6 +173,45 @@ async def test_same_account_uber_auth_reversal_is_not_self_transfer(
     assert charge.category_method == "rule"
     assert reversal.category != "self_transfer"
     assert reversal.category_method is None
+
+
+async def test_apply_reference_self_transfer_rule_idempotent_second_call(
+    session: AsyncSession,
+):
+    """Calling apply_reference_self_transfer_rule twice on the same pair is a
+    no-op the second time: both legs stay categorized and the second call
+    does not churn category timestamps or re-fire."""
+    debit = _transaction(
+        bank="hdfc",
+        direction="debit",
+        reference_number="619445758035",
+        account_mask="XX7702",
+    )
+    credit = _transaction(
+        bank="icici",
+        direction="credit",
+        reference_number="619445758035",
+        account_mask="XX214",
+    )
+    session.add_all([debit, credit])
+    await session.flush()
+
+    first = await apply_reference_self_transfer_rule(session, credit)
+    assert first is True
+    _assert_reference_rule(debit)
+    _assert_reference_rule(credit)
+    debit_categorized_at = debit.categorized_at
+    credit_categorized_at = credit.categorized_at
+
+    # Second call: opposite leg still exists → still returns True, but the
+    # already-current guard must leave the categorization untouched (no
+    # timestamp churn on either leg).
+    second = await apply_reference_self_transfer_rule(session, credit)
+    assert second is True
+    _assert_reference_rule(debit)
+    _assert_reference_rule(credit)
+    assert credit.categorized_at == credit_categorized_at
+    assert debit.categorized_at == debit_categorized_at
 
 
 async def test_short_account_masks_are_not_enough_to_prove_different_accounts(

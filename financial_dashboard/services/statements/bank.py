@@ -60,6 +60,7 @@ from financial_dashboard.services.settings import (
 from financial_dashboard.services.statements.cc import extract_pdf_from_email
 from financial_dashboard.services.statements.contention import contended_miss
 from financial_dashboard.services.statements.hint import extract_password_hint
+from financial_dashboard.services.statements.skip_summary import import_skip_summary
 from financial_dashboard.services.telegram import (
     build_account_label,
     send_bulk_summary,
@@ -862,6 +863,121 @@ async def _find_bank_account(bank: str, parsed) -> "Account | None":
 
 
 # ---------------------------------------------------------------------------
+# Missing-transaction import (shared by email, manual upload, and retry paths)
+# ---------------------------------------------------------------------------
+
+
+async def import_missing_bank_txns(
+    session,
+    upload: "BankStatementUpload",
+    parsed: "ParsedBankStatement",
+    account: "Account",
+    recon: dict,
+) -> list["Transaction"]:
+    """Import ``recon["missing"]`` entries as bank-statement ``Transaction`` rows.
+
+    Used by every code path that processes a bank statement — polling,
+    manual upload, and password-entry retry — so they stay in sync. Each row
+    imports inside its own SAVEPOINT so a single duplicate / constraint
+    violation or unexpected error cannot abort the entire statement import.
+    Failures are tagged on the missing entry (``duplicate`` /
+    ``import_error`` / ``import_failed``); the upload row stays committed
+    with whatever subset succeeded.
+
+    Args:
+        session: Open async SQLAlchemy session. The caller owns the
+            transaction; this function calls ``flush`` but never ``commit``.
+        upload: The ``BankStatementUpload`` row this statement belongs to.
+            Must already be flushed (``upload.id`` is read and set on each
+            new transaction).
+        parsed: The bank-statement-parser ``ParsedBankStatement`` — used for
+            ``parsed.bank`` and ``parsed.account_number`` on each row.
+        account: The matching bank_account ``Account``.
+        recon: Reconciliation dict from ``reconcile_bank_statement``. Mutated
+            in place: each imported entry gets ``imported=True`` and
+            ``imported_txn_id=<new txn id>``; failed entries get
+            ``duplicate``/``import_error``/``import_failed`` tags. Entries
+            already marked ``imported`` are skipped, making this function
+            idempotent.
+
+    Returns:
+        The newly-created ``Transaction`` objects, in order of processing.
+        Excludes rows already imported in a prior call. Callers that only
+        need the count can take ``len()`` of the result.
+    """
+    link_ctx = await build_link_context(session)
+    imported: list[Transaction] = []
+    for entry in recon["missing"]:
+        if entry.get("imported"):
+            continue
+        if entry.get("ambiguous"):
+            entry["import_error"] = (
+                "ambiguous match — the DB may already hold this transaction under a "
+                "row it could not be safely paired with; resolve manually"
+            )
+            continue
+        try:
+            amount = _parse_amount(entry["amount"])
+            txn_date = _parse_date(entry["date"])
+        except ValueError, KeyError, InvalidOperation:
+            entry["import_error"] = "could not parse amount/date"
+            continue
+
+        txn = Transaction(
+            bank_statement_upload_id=upload.id,
+            account_id=account.id,
+            bank=parsed.bank or account.bank,
+            email_type="bank_statement",
+            direction=entry["direction"],
+            amount=amount,
+            currency="INR",
+            transaction_date=txn_date,
+            counterparty=entry.get("counterparty") or entry.get("narration"),
+            account_mask=_last4(parsed.account_number),
+            reference_number=entry.get("reference_number"),
+            channel=entry.get("channel") or "bank_statement",
+            raw_description=entry.get("narration"),
+        )
+
+        try:
+            async with session.begin_nested():
+                session.add(txn)
+                await session.flush()
+                link_transaction(link_ctx, txn)
+                await session.flush()
+        except IntegrityError as e:
+            entry["duplicate"] = True
+            entry["import_error"] = "duplicate transaction"
+            logger.info(
+                "Skipping duplicate %s stmt txn (ref=%s direction=%s "
+                "date=%s amount=%s): %s",
+                parsed.bank or account.bank,
+                entry.get("reference_number"),
+                entry["direction"],
+                entry["date"],
+                entry["amount"],
+                e.orig,
+            )
+            continue
+        except Exception as e:
+            entry["import_failed"] = True
+            entry["import_error"] = f"{type(e).__name__}: {e}"
+            logger.exception(
+                "Unexpected error importing stmt txn (ref=%s)",
+                entry.get("reference_number"),
+            )
+            continue
+
+        await apply_reference_self_transfer_rule(session, txn)
+
+        entry["imported"] = True
+        entry["imported_txn_id"] = txn.id
+        imported.append(txn)
+
+    return imported
+
+
+# ---------------------------------------------------------------------------
 # End-to-end email processing
 # ---------------------------------------------------------------------------
 
@@ -1132,78 +1248,12 @@ async def process_bank_statement_email(
         # the entire statement import. The upload row stays committed with
         # whatever subset succeeded; failures are tagged on the missing
         # entries so the UI can show them.
-        link_ctx = await build_link_context(session)
+        imported_rows = await import_missing_bank_txns(
+            session, upload, parsed, account, recon
+        )
 
-        imported = 0
-        duplicate_count = 0
-        import_error_count = 0
         imported_txns: list[tuple[int, dict]] = []
-        for entry in recon["missing"]:
-            if entry.get("ambiguous"):
-                entry["import_error"] = (
-                    "ambiguous match — the DB may already hold this transaction "
-                    "under a row it could not be safely paired with; "
-                    "resolve manually"
-                )
-                continue
-            try:
-                amount = _parse_amount(entry["amount"])
-                txn_date = _parse_date(entry["date"])
-            except ValueError, KeyError, InvalidOperation:
-                entry["import_error"] = "could not parse amount/date"
-                continue
-
-            txn = Transaction(
-                bank_statement_upload_id=upload.id,
-                account_id=account.id,
-                bank=bank,
-                email_type="bank_statement",
-                direction=entry["direction"],
-                amount=amount,
-                currency="INR",
-                transaction_date=txn_date,
-                counterparty=entry.get("counterparty") or entry.get("narration"),
-                account_mask=_last4(parsed.account_number),
-                reference_number=entry.get("reference_number"),
-                channel=entry.get("channel") or "bank_statement",
-                raw_description=entry.get("narration"),
-            )
-
-            try:
-                async with session.begin_nested():
-                    session.add(txn)
-                    await session.flush()
-                    link_transaction(link_ctx, txn)
-                    await session.flush()
-            except IntegrityError as e:
-                duplicate_count += 1
-                entry["duplicate"] = True
-                entry["import_error"] = "duplicate transaction"
-                logger.info(
-                    "Skipping duplicate %s stmt txn (ref=%s direction=%s "
-                    "date=%s amount=%s): %s",
-                    bank,
-                    entry.get("reference_number"),
-                    entry["direction"],
-                    entry["date"],
-                    entry["amount"],
-                    e.orig,
-                )
-                continue
-            except Exception as e:
-                import_error_count += 1
-                entry["import_error"] = f"{type(e).__name__}: {e}"
-                logger.exception(
-                    "Unexpected error importing stmt txn (ref=%s)",
-                    entry.get("reference_number"),
-                )
-                continue
-
-            await apply_reference_self_transfer_rule(session, txn)
-
-            entry["imported"] = True
-            entry["imported_txn_id"] = txn.id
-            imported += 1
+        for txn in imported_rows:
             account_obj = (
                 await session.get(Account, txn.account_id) if txn.account_id else None
             )
@@ -1225,6 +1275,7 @@ async def process_bank_statement_email(
                 )
             )
 
+        imported = len(imported_rows)
         upload.imported_count = imported
         upload.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
         upload.reconciliation_data = reconciliation_to_json(recon)
@@ -1232,16 +1283,9 @@ async def process_bank_statement_email(
             upload.status = "imported"
         elif imported > 0:
             upload.status = "partial_import"
-        if import_error_count or duplicate_count:
-            details = []
-            if duplicate_count:
-                details.append(f"{duplicate_count} duplicate")
-            if import_error_count:
-                details.append(f"{import_error_count} unexpected error")
-            upload.error = (
-                f"Skipped {', '.join(details)} row(s) during auto-import; "
-                "see reconciliation details."
-            )
+        _dupes, _errs, skip_error = import_skip_summary(recon)
+        if skip_error:
+            upload.error = skip_error
         await emit_bank_snapshot(session, upload)
         await session.commit()
         upload_id = upload.id
@@ -1265,6 +1309,7 @@ async def process_bank_statement_email(
 
     enriched = await enrich_matched_transactions(recon)
 
+    duplicate_count, import_error_count, _skip_msg = import_skip_summary(recon)
     logger.info(
         "Processed bank statement email: bank=%s account=%s matched=%d missing=%d "
         "imported=%d duplicates=%d errors=%d enriched=%d",

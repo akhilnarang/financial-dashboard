@@ -9,6 +9,7 @@ from financial_dashboard.web import (
     cashflow,
     dashboard,
     emails,
+    extensions,
     polling,
     rules,
     settings,
@@ -31,6 +32,7 @@ router.include_router(sources.router)
 router.include_router(rules.router)
 router.include_router(settings.router)
 router.include_router(sms.router)
+router.include_router(extensions.router)
 router.include_router(bank_statements.router)
 router.include_router(statements.router)
 router.include_router(polling.router)

@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}Paisa reconciliation - Ledger{% endblock %}
+{% block content %}
+
+<style>
+    .recon-table { width: 100%; }
+    .recon-table th, .recon-table td { white-space: nowrap; }
+    .recon-table td.wrap { white-space: normal; }
+    .recon-table td.amt { font-family: var(--font-mono); text-align: right; }
+    .status-dot { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%; vertical-align: middle; margin-right: 0.3rem; }
+    .status-dot.ok { background: var(--clr-credit); }
+    .status-dot.bad { background: var(--clr-debit); }
+    .status-dot.unknown { background: var(--border-light); }
+    .tag { font-size: 0.7rem; padding: 0.05rem 0.35rem; border-radius: 4px; background: var(--surface-inset); color: var(--text-muted); }
+    .tag.warn { background: color-mix(in srgb, var(--clr-debit) 14%, transparent); color: var(--clr-debit); }
+</style>
+
+<div class="section-header">
+    <div>
+        <h2>Paisa reconciliation</h2>
+        <p class="text-sm text-muted" style="margin: 0;">Side-by-side: local projection, latest native snapshot, and curated Paisa balance. Native ↔ Paisa joins only by explicit account mappings — never fuzzy. Read-only; writes nothing.</p>
+    </div>
+    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+        {% if safe_link %}<a href="{{ safe_link }}" target="_blank" rel="noopener" role="button" class="secondary">Open Paisa ↗</a>{% endif %}
+        <a href="/extensions/paisa" role="button" class="secondary">Back to Paisa</a>
+    </div>
+</div>
+
+<p id="recon-status" class="text-sm text-muted" style="margin: 0 0 1rem;"><span class="status-dot unknown"></span>loading…</p>
+<div id="recon-body"></div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// DOM-built throughout (textContent/createElement) — never innerHTML — so a
+// hostile/misconfigured upstream value cannot inject markup.
+function setStatus(cls, text) {
+    const p = document.getElementById('recon-status');
+    const dot = document.createElement('span');
+    dot.classList.add('status-dot', cls);
+    p.replaceChildren(dot);
+    p.appendChild(document.createTextNode(text));
+}
+function muted(text) { const p = document.createElement('p'); p.className = 'text-sm text-muted'; p.style.margin = '0 0 0.75rem'; p.textContent = text; return p; }
+function card() { const c = document.createElement('article'); c.className = 'card'; c.style.marginBottom = '1rem'; return c; }
+function h3(text) { const h = document.createElement('h3'); h.style.cssText = 'margin: 0 0 0.75rem; font-size: 1.05rem;'; h.textContent = text; return h; }
+function tag(text, warn) { const s = document.createElement('span'); s.className = 'tag' + (warn ? ' warn' : ''); s.textContent = text; return s; }
+
+function table(headers, rows) {
+    const wrap = document.createElement('div'); wrap.className = 'table'; wrap.style.overflowX = 'auto';
+    const table = document.createElement('table'); table.className = 'recon-table';
+    const thead = document.createElement('thead'); const htr = document.createElement('tr');
+    headers.forEach(ht => { const th = document.createElement('th'); th.textContent = ht; htr.appendChild(th); });
+    thead.appendChild(htr); table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    rows.forEach(r => {
+        const tr = document.createElement('tr');
+        r.forEach(cell => {
+            const td = document.createElement('td');
+            if (cell && typeof cell === 'object' && cell.__amt) { td.classList.add('amt'); td.textContent = cell.__amt; }
+            else if (cell && typeof cell === 'object' && cell.__html === false) { td.appendChild(cell.node); }
+            else { td.textContent = (cell === null || cell === undefined || cell === '') ? '—' : String(cell); }
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody); wrap.appendChild(table); return wrap;
+}
+function amt(v) { return v === null || v === undefined ? '—' : {__amt: String(v)}; }
+function amtStr(v, suffix) {
+    if (v === null || v === undefined) return '—';
+    return {__amt: String(v) + (suffix || '')};
+}
+
+function render(data) {
+    const body = document.getElementById('recon-body');
+    body.replaceChildren();
+
+    if (data.projection) {
+        const c = card(); c.appendChild(h3('Projection diagnostics'));
+        const d = data.projection;
+        c.appendChild(table(
+            ['Emitted', 'Unknown', 'Unmatched', 'Non-INR', 'Missing FX', 'Card-side'],
+            [[d.emitted_count, d.unknown_count, d.unmatched_count, d.non_inr_count, d.missing_fx_rate_count, d.card_side_payments]]
+        ));
+        // Computed diagnostics mirrored from the projection summary. Each block
+        // only renders when it carries a nonzero/meaningful value so an empty
+        // projection shows nothing.
+        const diag = [];
+        diag.push(['Net-worth scope', (d.net_worth_scope_complete ? 'complete' : 'INCOMPLETE') + ' · CAS ' + d.cas_portfolio_count + ' (' + d.cas_investment_scope + ')' + ' · manual assets ' + d.manual_asset_count + ' · manual liabilities ' + d.manual_liability_count]);
+        if ((d.cas_portfolio_labels || []).length) {
+            diag.push(['CAS portfolio labels', d.cas_portfolio_labels.join(', ')]);
+        }
+        if ((d.manual_asset_labels || []).length || (d.manual_liability_labels || []).length) {
+            diag.push(['Manual sources outside projection', (d.manual_asset_labels || []).concat(d.manual_liability_labels || []).join(', ')]);
+        }
+        if (d.card_payments) {
+            diag.push(['Card payments', d.card_payments_resolved + ' resolved · ' + d.card_payments_unresolved + ' unresolved (generic clearing) · ' + d.card_payments_ambiguous_mask + ' ambiguous exact mask']);
+        }
+        if (d.imprecise_count) {
+            diag.push(['Imprecise categories', d.imprecise_count + ' (emi_loan/cash_withdrawal → conservative Expenses clearing)']);
+        }
+        if (d.investment_lot_count || d.investment_funding_remapped || (d.investment_funding_unresolved || []).length) {
+            diag.push(['Investment lots', d.investment_lot_count + ' projected · ' + d.investment_funding_remapped + ' funding-remapped · ' + (d.investment_funding_unresolved || []).length + ' suppressed']);
+        }
+        if (d.investment_current_valuation_count) {
+            diag.push(['CAS valuation', d.investment_current_valuation_count + ' source positions · ' + d.investment_market_price_count + ' market prices · ' + d.investment_value_only_count + ' value-only/outside lots · ' + d.investment_quantity_mismatch_count + ' quantity mismatch · ' + d.investment_missing_market_price_count + ' missing price · ' + (d.investment_market_price_conflicts || []).length + ' conflicts suppressed']);
+        }
+        if (d.projected_foreign_count || d.missing_fx_rate_count) {
+            diag.push(['Foreign currency', d.projected_foreign_count + ' projected (' + (d.source_currencies || []).join(', ') + ') · ' + d.missing_fx_rate_count + ' missing rate']);
+        }
+        const kindKeys = Object.keys(d.kind_counts || {});
+        if (kindKeys.length) {
+            diag.push(['Kind breakdown', kindKeys.map(k => k + ' ' + d.kind_counts[k]).join(' · ')]);
+        }
+        if (diag.length) {
+            c.appendChild(table(['Diagnostic', 'Value'], diag));
+        }
+        const keys = Object.keys(d.skipped_reason_counts || {});
+        if (keys.length) {
+            c.appendChild(muted('Skipped-row reasons:'));
+            c.appendChild(table(['Reason', 'Count'], keys.map(k => [k, d.skipped_reason_counts[k]])));
+        }
+        body.appendChild(c);
+    }
+
+    const c2 = card(); c2.appendChild(h3('Account balances'));
+    if (!data.accounts || !data.accounts.length) {
+        c2.appendChild(muted('No selected accounts. Select accounts on the Paisa config page to reconcile them.'));
+    } else {
+        const rows = data.accounts.map(a => {
+            const deltaCell = document.createElement('span');
+            if (a.delta === null || a.delta === undefined) {
+                deltaCell.appendChild(tag('—'));
+            } else {
+                const zero = parseFloat(a.delta) === 0;
+                deltaCell.appendChild(tag(a.delta, !zero));
+            }
+            return [
+                a.bank + ' · ' + a.label + ' (#' + a.account_id + ')',
+                a.mapped_to || '—',
+                amtStr(a.native_balance, a.native_stale ? ' ⚠' : ''),
+                a.projected_available ? amt(a.projected_balance) : tag('unavailable', true),
+                a.paisa_available ? amt(a.paisa_balance) : tag('no mapping', true),
+                {__html: false, node: deltaCell}
+            ];
+        });
+        c2.appendChild(table(
+            ['Account', 'Maps to', 'Native', 'Projected', 'Paisa', 'Δ(proj−paisa)'],
+            rows
+        ));
+        c2.appendChild(muted('Native balances are the latest dashboard BalanceSnapshot rows; "⚠" marks a stale snapshot. Paisa balances are joined only by explicit account mappings.'));
+    }
+    body.appendChild(c2);
+
+    if (data.suggestions && data.suggestions.length) {
+        const c3 = card(); c3.appendChild(h3('Mapping suggestions (preview only)'));
+        c3.appendChild(muted('Deterministic defaults for unmapped selected accounts. These are never written — accept them by adding the mapping under Account Mappings on the config page.'));
+        c3.appendChild(table(
+            ['Account', 'Suggested mapping'],
+            data.suggestions.map(s => [s.bank + ' · ' + s.label + ' (#' + s.account_id + ')', s.suggested_mapping || '—'])
+        ));
+        body.appendChild(c3);
+    }
+
+    if (!data.upstream_available) {
+        body.appendChild(muted('Paisa balances unavailable — the instance is ' + (data.can_connect ? 'unreachable' : 'disabled') + '. Native and projected columns are still shown.'));
+    }
+}
+
+async function load() {
+    try {
+        const resp = await fetch('/api/extensions/paisa/reconciliation', {headers: {'Accept': 'application/json'}});
+        const data = await resp.json();
+        if (data.ok) {
+            setStatus(data.upstream_available ? 'ok' : 'unknown',
+                'mode: ' + data.mode + (data.upstream_available ? ' · upstream reachable' : ' · upstream unavailable'));
+            render(data);
+        } else {
+            setStatus('bad', 'unavailable: ' + (data.reason || 'unknown'));
+        }
+    } catch (e) {
+        setStatus('bad', 'failed to load reconciliation');
+    }
+}
+load();
+</script>
+{% endblock %}

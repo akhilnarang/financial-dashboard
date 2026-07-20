@@ -730,13 +730,24 @@ async def _find_am_pm_alias_match(
     return None
 
 
-def _is_duplicate_transaction_error(exc: IntegrityError) -> bool:
-    """Check whether an IntegrityError came from uq_transactions_ref."""
+def is_duplicate_transaction_error(exc: IntegrityError) -> bool:
+    """True when an ``IntegrityError`` came from the transactions ref unique index.
+
+    The single canonical classifier for the whole ingestion/merge layer —
+    imported by ``services/emails.py`` so the live-poll and merge paths can't
+    drift apart. Accepts every message shape SQLite emits for the
+    ``uq_transactions_ref`` partial unique index on
+    ``(bank, reference_number, direction)``: the named-index form, the legacy
+    ``uq_transaction_dedup`` name (kept for back-compat with older DBs), and
+    the generic ``UNIQUE constraint failed: transactions.…`` text. There is no
+    other unique constraint on the transactions table, so the generic clause
+    can only ever be the ref index in practice.
+    """
     message = str(exc.orig)
-    return "uq_transactions_ref" in message or (
-        "UNIQUE constraint failed:" in message
-        and "transactions." in message
-        and "reference_number" in message
+    return (
+        "uq_transactions_ref" in message
+        or "uq_transaction_dedup" in message
+        or ("UNIQUE constraint failed:" in message and "transactions." in message)
     )
 
 
@@ -786,7 +797,7 @@ async def merge_transaction(
                 session.add(row)
                 await session.flush()
         except IntegrityError as exc:
-            if not _is_duplicate_transaction_error(exc):
+            if not is_duplicate_transaction_error(exc):
                 raise
             decision = await find_match(session, txn_data, channel)
             # A ref-duplicate that re-resolves to insert or defer is still a

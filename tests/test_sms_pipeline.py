@@ -1174,3 +1174,127 @@ async def test_process_sms_row_deferred_marks_skipped_no_row(session):
     # No new transaction row was created (only the pre-existing one).
     rows = (await session.execute(select(Transaction))).scalars().all()
     assert len(rows) == 1
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_enriched_relinks_when_mask_filled(session, monkeypatch):
+    """An enriched row whose account/card was unknown on first arrival gets
+    re-linked when the second source (here the SMS) fills card_mask and the
+    linker can now resolve it. The relink only fires when the enrichment
+    filled a mask field AND the row is still unlinked."""
+    from financial_dashboard.db import Account, Card, Transaction
+    from bank_sms_parser.models import Money, SmsTransactionAlert
+
+    # An HDFC debit card account + card the SMS mask will resolve to.
+    acct = Account(
+        bank="hdfc",
+        type="bank_account",
+        label="HDFC Savings",
+        account_number="000000001111",
+    )
+    session.add(acct)
+    await session.flush()
+    card = Card(account_id=acct.id, card_mask="1111", label="HDFC Debit")
+    session.add(card)
+    await session.flush()
+
+    # Pre-existing row from an email: same ref, but card_mask was NULL so the
+    # linker couldn't attribute it on first arrival.
+    existing = Transaction(
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=datetime.date(2026, 5, 2),
+        transaction_time=datetime.time(14, 23, 0),
+        reference_number="IMPS:RELINK1",
+        source="email",
+        card_mask=None,
+        account_id=None,
+    )
+    session.add(existing)
+    await session.flush()
+
+    parsed = ParsedSms(
+        email_type="hdfc_dc_transaction_alert",
+        bank="hdfc",
+        transaction=SmsTransactionAlert(
+            direction="debit",
+            amount=Money(amount=Decimal("500"), currency="INR"),
+            transaction_date=datetime.date(2026, 5, 2),
+            transaction_time=datetime.time(14, 23, 0),
+            reference_number="IMPS:RELINK1",
+            card_mask="1111",  # the mask the email lacked
+        ),
+    )
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms",
+        lambda *a, **k: parsed,
+    )
+
+    sms = SmsMessage(
+        bank="hdfc",
+        sender="VK-HDFCBK",
+        body="<relink body>",
+        received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
+    )
+    session.add(sms)
+    await session.flush()
+
+    from financial_dashboard.services.linker import build_link_context
+
+    link_ctx = await build_link_context(session)
+
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.status == "enriched"
+    assert outcome.transaction_id == existing.id
+    # The now-filled card_mask let the linker attribute the row.
+    await session.refresh(existing)
+    assert existing.account_id == acct.id
+    assert existing.card_id == card.id
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_non_transaction_sms_is_skipped(session, monkeypatch):
+    """A parser that recognizes the SMS but yields no transaction (e.g. a
+    statement-ready / non-transactional alert) is dispositioned `skipped`,
+    not `error` — it shouldn't fill the failed-rows review queue."""
+    from bank_sms_parser.models import ParsedSms
+
+    parsed = ParsedSms(
+        email_type="onecard_cc_statement_ready",
+        bank="onecard",
+        transaction=None,
+    )
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms",
+        lambda *a, **k: parsed,
+    )
+
+    sms = SmsMessage(
+        bank="onecard",
+        sender="AD-ONECRD",
+        body="Your OneCard statement is ready.",
+        received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
+    )
+    session.add(sms)
+    await session.flush()
+
+    from financial_dashboard.db import Transaction
+    from financial_dashboard.services.linker import build_link_context
+
+    link_ctx = await build_link_context(session)
+
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+
+    assert outcome.status == "skipped"
+    assert outcome.transaction_id is None
+    assert sms.status == "skipped"
+    # No row created, and a stale parse_error (if any) was cleared.
+    assert sms.parse_error == "non-transaction SMS shape"
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 0

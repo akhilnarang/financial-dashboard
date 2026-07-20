@@ -64,18 +64,6 @@ def _serialize_datetime(value: datetime.datetime | None) -> str | None:
     return value.isoformat()
 
 
-def _is_duplicate_transaction_error(exc: IntegrityError) -> bool:
-    message = str(exc.orig)
-    # Accept both the stale name (uq_transaction_dedup, still in the message
-    # check for backwards compat) and the real one (uq_transactions_ref per
-    # db/models.py:259).
-    return (
-        "uq_transactions_ref" in message
-        or "uq_transaction_dedup" in message
-        or ("UNIQUE constraint failed:" in message and "transactions." in message)
-    )
-
-
 _IST = ZoneInfo("Asia/Kolkata")
 
 # Email types known to emit transaction time in 12-hour format with no
@@ -587,7 +575,10 @@ async def handle_polled_email(
                     txn_data["_declined"] = True
                     pending_notifications.append((0, txn_data))
             elif txn_data:
-                from financial_dashboard.services.txn_merge import merge_transaction
+                from financial_dashboard.services.txn_merge import (
+                    is_duplicate_transaction_error,
+                    merge_transaction,
+                )
 
                 try:
                     outcome, txn_row, diff = await merge_transaction(
@@ -597,8 +588,10 @@ async def handle_polled_email(
                     # Defense-in-depth: merge_transaction already catches
                     # uq_transactions_ref races, so this branch should be
                     # unreachable. Keep it to preserve the existing behavior
-                    # for any other unique constraint.
-                    if not _is_duplicate_transaction_error(exc):
+                    # for any other unique constraint. The classifier is
+                    # shared with txn_merge so both paths agree on what
+                    # counts as a transactions duplicate.
+                    if not is_duplicate_transaction_error(exc):
                         raise
                     email_row.status = "skipped"
                     email_row.error = "Duplicate transaction skipped because an identical transaction row already exists"

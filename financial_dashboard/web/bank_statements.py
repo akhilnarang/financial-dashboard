@@ -27,16 +27,10 @@ from financial_dashboard.db import (
 from financial_dashboard.services.accounts import (
     retry_password_required_statements as accounts_retry_password_required_statements,
 )
-from financial_dashboard.services.categorization.self_transfer import (
-    apply_reference_self_transfer_rule,
-)
-from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.snapshots import emit_bank_snapshot
 from financial_dashboard.services.statements.bank import (
-    _last4,
-    _parse_amount,
-    _parse_date,
     enrich_matched_transactions,
+    import_missing_bank_txns,
     parse_bank_statement,
     reconcile_bank_statement,
     reconciliation_from_json,
@@ -46,6 +40,7 @@ from financial_dashboard.services.statements.shared import (
     retry_bank_statement_upload,
     retry_cc_statement_upload,
 )
+from financial_dashboard.services.statements.skip_summary import import_skip_summary
 from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
 from financial_dashboard.web.forms import _unlink_statement_file
 
@@ -139,44 +134,13 @@ async def bank_statement_upload(
     session.add(upload)
     await session.flush()
 
-    link_ctx = await build_link_context(session)
-
-    imported = 0
-    for entry in recon["missing"]:
-        if entry.get("ambiguous"):
-            entry["import_error"] = (
-                "ambiguous match — the DB may already hold this transaction under a "
-                "row it could not be safely paired with; resolve manually"
-            )
-            continue
-        try:
-            amount = _parse_amount(entry["amount"])
-            txn_date = _parse_date(entry["date"])
-        except ValueError, KeyError:
-            continue
-        txn = Transaction(
-            bank_statement_upload_id=upload.id,
-            account_id=account_id,
-            bank=parsed.bank or account.bank,
-            email_type="bank_statement",
-            direction=entry["direction"],
-            amount=amount,
-            currency="INR",
-            transaction_date=txn_date,
-            counterparty=entry.get("counterparty") or entry.get("narration"),
-            account_mask=_last4(parsed.account_number),
-            reference_number=entry.get("reference_number"),
-            channel=entry.get("channel") or "bank_statement",
-            raw_description=entry.get("narration"),
-        )
-        session.add(txn)
-        await session.flush()
-        link_transaction(link_ctx, txn)
-        await session.flush()
-        await apply_reference_self_transfer_rule(session, txn)
-        entry["imported"] = True
-        entry["imported_txn_id"] = txn.id
-        imported += 1
+    # Auto-import missing transactions with the same per-row SAVEPOINT /
+    # duplicate-tolerant semantics as the email path — one bad row must not
+    # abort the entire manual upload.
+    imported_rows = await import_missing_bank_txns(
+        session, upload, parsed, account, recon
+    )
+    imported = len(imported_rows)
 
     upload.imported_count = imported
     upload.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
@@ -185,6 +149,9 @@ async def bank_statement_upload(
         upload.status = "imported"
     elif imported > 0:
         upload.status = "partial_import"
+    _dupes, _errs, skip_error = import_skip_summary(recon)
+    if skip_error:
+        upload.error = skip_error
     await emit_bank_snapshot(session, upload)
     await session.commit()
     upload_id = upload.id

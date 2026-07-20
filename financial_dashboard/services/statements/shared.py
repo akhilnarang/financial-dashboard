@@ -7,7 +7,6 @@ from pathlib import Path
 
 from sqlalchemy import select
 
-from financial_dashboard.core.dates import parse_date
 from financial_dashboard.db import (
     Account,
     BankStatementUpload,
@@ -15,19 +14,14 @@ from financial_dashboard.db import (
     Transaction,
     async_session,
 )
-from financial_dashboard.services.linker import build_link_context, link_transaction
-from financial_dashboard.services.categorization.self_transfer import (
-    apply_reference_self_transfer_rule,
-)
 from financial_dashboard.services.snapshots import emit_bank_snapshot, emit_cc_snapshot
 from financial_dashboard.services.statements.dates import (
     bank_stmt_date_range,
     cc_stmt_date_range,
 )
 from financial_dashboard.services.statements.bank import (
-    _last4 as bank_last4,
-    _parse_amount as parse_bank_amount,
     enrich_matched_transactions as enrich_bank_matched_transactions,
+    import_missing_bank_txns,
     parse_bank_statement,
     reconcile_bank_statement,
 )
@@ -39,6 +33,7 @@ from financial_dashboard.services.statements.cc import (
     reconcile_statement,
     reconciliation_to_json,
 )
+from financial_dashboard.services.statements.skip_summary import import_skip_summary
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +129,8 @@ async def retry_cc_statement_upload(
             upload.status = "imported"
         elif imported > 0:
             upload.status = "partial_import"
+        _dupes, _errs, skip_error = import_skip_summary(recon)
+        upload.error = skip_error  # None clears a prior error when nothing skipped
         await emit_cc_snapshot(session, upload)
         await session.commit()
 
@@ -204,48 +201,14 @@ async def retry_bank_statement_upload(
         upload.reconciliation_data = reconciliation_to_json(recon)
         upload.error = None
 
-        link_ctx = await build_link_context(session)
-        imported = 0
-        for entry in recon["missing"]:
-            if entry.get("imported"):
-                continue
-            if entry.get("ambiguous"):
-                entry["import_error"] = (
-                    "ambiguous match — the DB may already hold this transaction "
-                    "under a row it could not be safely paired with; "
-                    "resolve manually"
-                )
-                continue
-            try:
-                amount = parse_bank_amount(entry["amount"])
-                txn_date = parse_date(entry["date"], dayfirst=True)
-            except KeyError, TypeError, ValueError:
-                txn_date = None
-            if txn_date is None:
-                continue
-            txn = Transaction(
-                bank_statement_upload_id=upload_id,
-                account_id=account_id,
-                bank=parsed.bank,
-                email_type="bank_statement",
-                direction=entry["direction"],
-                amount=amount,
-                currency="INR",
-                transaction_date=txn_date,
-                counterparty=entry.get("counterparty") or entry.get("narration"),
-                account_mask=bank_last4(parsed.account_number),
-                reference_number=entry.get("reference_number"),
-                channel=entry.get("channel") or "bank_statement",
-                raw_description=entry.get("narration"),
-            )
-            session.add(txn)
-            await session.flush()
-            link_transaction(link_ctx, txn)
-            await session.flush()
-            await apply_reference_self_transfer_rule(session, txn)
-            entry["imported"] = True
-            entry["imported_txn_id"] = txn.id
-            imported += 1
+        account = await session.get(Account, account_id)
+        if account is None:
+            # The account was deleted between the first txn and this one.
+            return False
+        imported_rows = await import_missing_bank_txns(
+            session, upload, parsed, account, recon
+        )
+        imported = len(imported_rows)
 
         upload.imported_count = imported
         upload.missing_count = sum(
@@ -256,6 +219,9 @@ async def retry_bank_statement_upload(
             upload.status = "imported"
         elif imported > 0:
             upload.status = "partial_import"
+        _dupes, _errs, skip_error = import_skip_summary(recon)
+        if skip_error:
+            upload.error = skip_error
         await emit_bank_snapshot(session, upload)
         await session.commit()
 

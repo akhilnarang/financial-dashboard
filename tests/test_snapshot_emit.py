@@ -144,3 +144,78 @@ async def test_emit_replaces_same_source_date(session):
     snapshots = (await session.execute(select(BalanceSnapshot))).scalars().all()
     assert len(snapshots) == 1
     assert snapshots[0].value == Decimal("200.00")
+
+
+async def test_emit_cc_snapshot_null_created_at_falls_back_to_today(session):
+    """A CC upload with no created_at (None) dates the snapshot from the emit
+    time instead of crashing — the statement-generation-date fallback."""
+    account = await _account(session, "credit_card")
+    upload = StatementUpload(
+        account_id=account.id,
+        bank=account.bank,
+        filename="cc.pdf",
+        file_path="/tmp/cc.pdf",
+        status="parsed",
+        total_amount_due="10,000.00",
+        payment_paid_amount=None,
+        created_at=None,  # NULL — fallback path
+    )
+    session.add(upload)
+
+    before = dt.datetime.now(dt.UTC).date()
+    assert await emit_cc_snapshot(session, upload) is True
+    after = dt.datetime.now(dt.UTC).date()
+
+    snapshot = (await session.execute(select(BalanceSnapshot))).scalar_one()
+    # Dated by the fallback (statement generation date), not any txn date, and
+    # lands on today's UTC date.
+    assert snapshot.as_of_date == snapshot.as_of_date  # present
+    assert before <= snapshot.as_of_date <= after
+    assert snapshot.value == Decimal("10000.00")
+
+
+async def test_emit_cc_snapshot_same_day_replaces(session):
+    """Two CC uploads generated the same day upsert to one snapshot (the unique
+    key is account+category+as_of_date, and CC as_of is created_at.date()); the
+    later emit wins."""
+    account = await _account(session, "credit_card")
+    same_day = dt.datetime(2026, 5, 10, 9, 0, tzinfo=dt.UTC)
+    first = StatementUpload(
+        account_id=account.id,
+        bank=account.bank,
+        filename="cc1.pdf",
+        file_path="/tmp/cc1.pdf",
+        status="parsed",
+        total_amount_due="10,000.00",
+        payment_paid_amount=Decimal("0.00"),
+        created_at=same_day,
+    )
+    second = StatementUpload(
+        account_id=account.id,
+        bank=account.bank,
+        filename="cc2.pdf",
+        file_path="/tmp/cc2.pdf",
+        status="parsed",
+        total_amount_due="7,000.00",
+        payment_paid_amount=Decimal("0.00"),
+        created_at=same_day,
+    )
+    session.add_all([first, second])
+
+    await emit_cc_snapshot(session, first)
+    await emit_cc_snapshot(session, second)
+
+    snapshots = (
+        (
+            await session.execute(
+                select(BalanceSnapshot).where(
+                    BalanceSnapshot.category == SnapshotCategory.cc_outstanding.value
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(snapshots) == 1
+    assert snapshots[0].as_of_date == dt.date(2026, 5, 10)
+    assert snapshots[0].value == Decimal("7000.00")
