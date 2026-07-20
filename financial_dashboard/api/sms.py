@@ -17,6 +17,7 @@ from financial_dashboard.schemas import sms as sms_schemas
 from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.schemas.sms import SmsIngestRequest
 from financial_dashboard.services.linker import build_link_context
+from financial_dashboard.services.parse_previews import preview_sms_parse
 from financial_dashboard.services.settings import (
     get_telegram_chat_id,
     should_notify_transactions,
@@ -87,6 +88,18 @@ async def sms_detail(
     response.headers["Cache-Control"] = "no-store"
     if sms := await get_sms_detail(session, sms_id):
         return sms
+
+    raise NotFoundException(detail="SMS not found")
+
+
+@router.post("/sms/{sms_id}/parse-preview")
+async def sms_parse_preview(
+    sms_id: Annotated[DatabaseId, Path()],
+    session: SessionDep,
+) -> sms_schemas.SmsParsePreviewResponse:
+    """Parse one stored SMS and project merge behavior without side effects."""
+    if preview := await preview_sms_parse(session, sms_id):
+        return preview
 
     raise NotFoundException(detail="SMS not found")
 

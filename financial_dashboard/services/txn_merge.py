@@ -214,6 +214,24 @@ def compute_enrichment_diff(
     return EnrichmentDiff(filled=filled, overwritten=overwritten)
 
 
+def compute_applied_enrichment_diff(
+    existing,
+    incoming: dict,
+    channel: Channel,
+    match_kind: MatchKind | None = "standard",
+) -> EnrichmentDiff:
+    """Project the exact enrichment diff, including AM/PM alias correction."""
+    diff = compute_enrichment_diff(existing, incoming, channel)
+    if match_kind == "am_pm_alias":
+        new_time = incoming.get("transaction_time")
+        if new_time is not None and existing.transaction_time != new_time:
+            diff.overwritten["transaction_time"] = (
+                existing.transaction_time,
+                new_time,
+            )
+    return diff
+
+
 def _incoming_time_is_earlier(existing, incoming: dict, new_time, old_time) -> bool:
     """True iff the incoming (date, transaction_time) point is strictly
     earlier than the existing one. When both sides have transaction_date,
@@ -840,24 +858,11 @@ async def apply_transaction_enrichment(
     source_id = sms_message_id if channel == "sms" else email_id
     await claim_transaction_source_slot(session, match, channel, source_id)
 
-    diff = compute_enrichment_diff(match, txn_data, channel)
+    diff = compute_applied_enrichment_diff(match, txn_data, channel, match_kind)
     for key, value in diff.filled.items():
         setattr(match, key, value)
     for key, (_old, new) in diff.overwritten.items():
         setattr(match, key, new)
-
-    # AM/PM alias match: by construction the candidate's stored
-    # transaction_time is known-wrong by 12h (that's why the alias pass
-    # had to fire), and the incoming row's time is the corrected source
-    # of truth. Force-overwrite it, bypassing the usual channel rule
-    # that says "SMS does NOT overwrite email" — the email's time here
-    # is a pre-fix artifact, not real evidence.
-    if match_kind == "am_pm_alias":
-        new_time = txn_data.get("transaction_time")
-        if new_time is not None and match.transaction_time != new_time:
-            old_time = match.transaction_time
-            match.transaction_time = new_time
-            diff.overwritten["transaction_time"] = (old_time, new_time)
 
     if match.source != channel and match.source is not None:
         match.source = "sms+email"

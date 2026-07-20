@@ -1,8 +1,8 @@
 """Schema for SMS ingest endpoint."""
 
 import datetime
-
-from typing import Annotated
+from decimal import Decimal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -77,3 +77,50 @@ class SmsBatchRequest(BaseModel):
 class SmsBatchResponse(BaseModel):
     items: Annotated[list[SmsRead], Field(max_length=100)]
     missing_ids: Annotated[list[int], Field(max_length=100)]
+
+
+class SmsParsedTransactionPreview(BaseModel):
+    bank: Annotated[str, Field(max_length=64)]
+    email_type: Annotated[str, Field(max_length=128)]
+    direction: Annotated[str, Field(max_length=16)]
+    amount: Decimal
+    currency: Annotated[str | None, Field(max_length=8)]
+    transaction_date: datetime.date | None
+    transaction_time: datetime.time | None
+    counterparty: Annotated[str | None, Field(max_length=1_000)]
+    card_mask: Annotated[str | None, Field(max_length=8)]
+    account_mask: Annotated[str | None, Field(max_length=8)]
+    reference_number: Annotated[str | None, Field(max_length=256)]
+    channel: Annotated[str | None, Field(max_length=64)]
+    balance: Decimal | None
+
+
+class SmsParserPreview(BaseModel):
+    disposition: Literal["transaction", "non_transaction", "skipped", "error"]
+    email_type: Annotated[str | None, Field(max_length=128)]
+    ledger_role: Annotated[str | None, Field(max_length=32)]
+    error: Annotated[str | None, Field(max_length=1_000)]
+    transaction: SmsParsedTransactionPreview | None
+
+
+class SmsMergePreview(BaseModel):
+    action: Literal[
+        "none",
+        "notify_only",
+        "declined",
+        "match",
+        "insert",
+        "defer",
+    ]
+    target_transaction_id: int | None
+    match_kind: Annotated[str | None, Field(max_length=32)]
+    changed_fields: Annotated[list[str], Field(max_length=32)]
+    identity_conflicts: Annotated[list[str], Field(max_length=8)]
+
+
+class SmsParsePreviewResponse(BaseModel):
+    sms_id: int
+    current_status: Annotated[str, Field(max_length=32)]
+    current_transaction_id: int | None
+    parser: SmsParserPreview
+    merge: SmsMergePreview

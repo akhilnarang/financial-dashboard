@@ -94,12 +94,12 @@ def parsed_sms_to_txn_data(parsed: ParsedSms, sms_row: SmsMessage) -> dict | Non
     }
 
 
-_DECLINED_DIRECTION = "declined"
+DECLINED_DIRECTION = "declined"
 
 # The parser roles that do not open a ledger row: a pre-announcement whose
 # settlement is a later message, or a redundant echo of an earlier one. Both
 # are notify-only here. See bank_sms_parser ParsedSms.ledger_role.
-_NOTIFY_ONLY_ROLES = ("provisional", "restatement")
+NOTIFY_ONLY_ROLES = ("provisional", "restatement")
 
 
 async def process_sms_row(
@@ -177,10 +177,7 @@ async def process_sms_row(
     # (hypothetical) non-credit shape of such a role falls through instead of
     # being swallowed. Reading the role off ``parsed`` keeps it out of the
     # ``txn_data`` dict, which is unpacked directly into a Transaction row.
-    if (
-        parsed.ledger_role in _NOTIFY_ONLY_ROLES
-        and txn_data["direction"] == "credit"
-    ):
+    if parsed.ledger_role in NOTIFY_ONLY_ROLES and txn_data["direction"] == "credit":
         sms_row.status = "parsed"
         # Notify-only makes no NEW row, but must not orphan an old one. A
         # reparse of a message that produced a row under an earlier parser
@@ -199,7 +196,7 @@ async def process_sms_row(
     #    they take the existing declined-notification path. The match
     #    key includes `direction`, so a correctly-parsed declined event
     #    wouldn't pair with a debit anyway; this is defense-in-depth.
-    if txn_data["direction"] == _DECLINED_DIRECTION:
+    if txn_data["direction"] == DECLINED_DIRECTION:
         sms_row.status = "parsed"
         primary = {**txn_data, "_declined": True}
         return ProcessSmsOutcome(
