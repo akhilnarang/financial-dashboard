@@ -74,7 +74,10 @@ from financial_dashboard.services.categorization.self_transfer import (
 )
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.snapshots import emit_cc_snapshot
-from financial_dashboard.services.statements.contention import contended_miss
+from financial_dashboard.services.statements.contention import (
+    candidate_evidence,
+    contended_miss,
+)
 from financial_dashboard.services.statements.hint import extract_password_hint
 from financial_dashboard.services.settings import (
     get_setting_int,
@@ -193,6 +196,16 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
     return (txn_date, amount, direction)
 
 
+_CC_RECONCILIATION_GATES = (
+    "account_scope",
+    "direction_amount",
+    "date_window_plus_minus_one_day",
+    "registered_card_compatibility",
+    "unique_unconsumed_candidate",
+    "contention",
+)
+
+
 def reconcile_statement(
     parsed,
     db_transactions: list,
@@ -284,6 +297,11 @@ def reconcile_statement(
                     "person": txn.person,
                     "imported": False,
                     "imported_txn_id": None,
+                    **candidate_evidence(
+                        set(),
+                        reason="unparseable_statement_identity",
+                        gates=("parse_amount", "parse_date"),
+                    ),
                 }
             )
             continue
@@ -324,6 +342,15 @@ def reconcile_statement(
                         "db_counterparty": db_txn.counterparty,
                         "db_reference": db_txn.reference_number,
                         "db_date": str(db_txn.transaction_date),
+                        **candidate_evidence(
+                            candidate_sets.get(stmt_idx, set()),
+                            reason=(
+                                "matched_exact_date"
+                                if date_offset == 0
+                                else "matched_date_offset"
+                            ),
+                            gates=_CC_RECONCILIATION_GATES,
+                        ),
                     }
                 )
                 found = True
@@ -345,6 +372,15 @@ def reconcile_statement(
                     "person": txn.person,
                     "imported": False,
                     "imported_txn_id": None,
+                    **candidate_evidence(
+                        candidate_sets.get(stmt_idx, set()),
+                        reason=(
+                            "candidate_refused_or_consumed"
+                            if candidate_sets.get(stmt_idx)
+                            else "no_candidate"
+                        ),
+                        gates=_CC_RECONCILIATION_GATES,
+                    ),
                 }
             )
 
@@ -388,6 +424,11 @@ def reconcile_statement(
                 "person": entry["person"],
                 "imported": False,
                 "imported_txn_id": None,
+                **candidate_evidence(
+                    candidate_sets.get(entry["stmt_idx"], set()),
+                    reason="contested_match_demoted",
+                    gates=_CC_RECONCILIATION_GATES,
+                ),
             }
         )
     # Demoted rows are appended after the rows that missed outright; restore

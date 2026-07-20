@@ -22,6 +22,25 @@ apart contend if they both reach the DB row between them, and same-day rows
 do not contend if nothing nearby could be either of them.
 """
 
+CANDIDATE_EVIDENCE_LIMIT = 20
+
+
+def candidate_evidence(
+    candidates: set[int],
+    *,
+    reason: str,
+    gates: tuple[str, ...],
+) -> dict:
+    """Return bounded, deterministic candidate evidence for operators."""
+    ordered = sorted(candidates)
+    return {
+        "candidate_transaction_ids": ordered[:CANDIDATE_EVIDENCE_LIMIT],
+        "candidate_count": len(ordered),
+        "candidate_ids_truncated": len(ordered) > CANDIDATE_EVIDENCE_LIMIT,
+        "decision_reason": reason,
+        "gates": list(gates),
+    }
+
 
 def contended_miss(candidates: set[int]) -> bool:
     """Whether an unmatched statement row is unresolved rather than new.

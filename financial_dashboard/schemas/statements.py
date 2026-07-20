@@ -102,3 +102,69 @@ class CcStatementBatchResponse(BaseModel):
 class BankStatementBatchResponse(BaseModel):
     items: Annotated[list[BankStatementRead], Field(max_length=100)]
     missing_ids: Annotated[list[int], Field(max_length=100)]
+
+
+class StatementParsedRow(BaseModel):
+    index: Annotated[int, Field(ge=0)]
+    section: Literal["transactions", "payments_refunds"]
+    date: Annotated[str, Field(max_length=32)]
+    amount: Annotated[str, Field(max_length=64)]
+    direction: Annotated[str, Field(max_length=16)]
+    narration: Annotated[str | None, Field(max_length=1_000)]
+    card_mask: Annotated[str | None, Field(max_length=8)]
+    person: Annotated[str | None, Field(max_length=256)]
+    reference_number: Annotated[str | None, Field(max_length=256)]
+    channel: Annotated[str | None, Field(max_length=64)]
+    balance: Annotated[str | None, Field(max_length=64)]
+
+
+class StatementParsePreviewResponse(BaseModel):
+    statement_id: int
+    kind: Literal["cc", "bank"]
+    account_id: int
+    parser_bank: Annotated[str, Field(max_length=64)]
+    card_mask: Annotated[str | None, Field(max_length=8)]
+    account_mask: Annotated[str | None, Field(max_length=8)]
+    statement_period_start: Annotated[str | None, Field(max_length=32)]
+    statement_period_end: Annotated[str | None, Field(max_length=32)]
+    opening_balance: Annotated[str | None, Field(max_length=64)]
+    closing_balance: Annotated[str | None, Field(max_length=64)]
+    parsed_row_count: Annotated[int, Field(ge=0)]
+    rows: Annotated[list[StatementParsedRow], Field(max_length=100)]
+    rows_truncated: bool
+
+
+class StatementReconciliationEntry(BaseModel):
+    statement_row_index: int | None
+    date: Annotated[str | None, Field(max_length=32)]
+    amount: Annotated[str | None, Field(max_length=64)]
+    direction: Annotated[str | None, Field(max_length=16)]
+    narration: Annotated[str | None, Field(max_length=1_000)]
+    reference_number: Annotated[str | None, Field(max_length=256)]
+    matched_transaction_id: int | None
+    ambiguous: bool
+    candidate_transaction_ids: Annotated[list[int], Field(max_length=20)]
+    candidate_count: Annotated[int, Field(ge=0)]
+    candidate_ids_truncated: bool
+    decision_reason: Annotated[str, Field(max_length=64)]
+    gates: Annotated[list[str], Field(max_length=10)]
+
+
+class StatementReconciliationPreviewResponse(BaseModel):
+    statement_id: int
+    kind: Literal["cc", "bank"]
+    account_id: int
+    date_from: datetime.date
+    date_to: datetime.date
+    matched_count: Annotated[int, Field(ge=0)]
+    missing_count: Annotated[int, Field(ge=0)]
+    ambiguous_count: Annotated[int, Field(ge=0)]
+    extra_count: Annotated[int, Field(ge=0)]
+    matched: Annotated[list[StatementReconciliationEntry], Field(max_length=100)]
+    matched_truncated: bool
+    missing: Annotated[list[StatementReconciliationEntry], Field(max_length=100)]
+    missing_truncated: bool
+    ambiguous: Annotated[list[StatementReconciliationEntry], Field(max_length=100)]
+    ambiguous_truncated: bool
+    extra_transaction_ids: Annotated[list[int], Field(max_length=100)]
+    extra_transaction_ids_truncated: bool

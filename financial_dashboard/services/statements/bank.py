@@ -58,7 +58,10 @@ from financial_dashboard.services.settings import (
     should_notify_transactions,
 )
 from financial_dashboard.services.statements.cc import extract_pdf_from_email
-from financial_dashboard.services.statements.contention import contended_miss
+from financial_dashboard.services.statements.contention import (
+    candidate_evidence,
+    contended_miss,
+)
 from financial_dashboard.services.statements.hint import extract_password_hint
 from financial_dashboard.services.telegram import (
     build_account_label,
@@ -440,8 +443,26 @@ def _refresh_identity(txn: "BankTransaction") -> RefreshIdentity:
     return RefreshIdentity(counterparty or narration, txn.channel)
 
 
+_BANK_RECONCILIATION_GATES = (
+    "account_scope",
+    "reference_direction",
+    "direction_amount",
+    "date_window_plus_minus_one_day",
+    "reference_or_narration_compatibility",
+    "unique_unconsumed_candidate",
+    "contention",
+)
+
+
 def _missing_entry(
-    stmt_idx: int, direction: str, txn, *, ambiguous: bool = False
+    stmt_idx: int,
+    direction: str,
+    txn,
+    *,
+    ambiguous: bool = False,
+    candidates: set[int] | None = None,
+    reason: str = "unparseable_statement_identity",
+    gates: tuple[str, ...] = ("parse_amount", "parse_date"),
 ) -> dict:
     return {
         "stmt_idx": stmt_idx,
@@ -455,10 +476,23 @@ def _missing_entry(
         "channel": txn.channel,
         "balance": txn.balance,
         "imported": False,
+        **candidate_evidence(
+            candidates or set(),
+            reason=reason,
+            gates=gates,
+        ),
     }
 
 
-def _matched_entry(stmt_idx: int, direction: str, txn, found) -> dict:
+def _matched_entry(
+    stmt_idx: int,
+    direction: str,
+    txn,
+    found,
+    *,
+    candidates: set[int],
+    reason: str,
+) -> dict:
     return {
         "stmt_idx": stmt_idx,
         "date": txn.date,
@@ -473,6 +507,11 @@ def _matched_entry(stmt_idx: int, direction: str, txn, found) -> dict:
         "db_counterparty": found.counterparty,
         "db_reference": found.reference_number,
         "db_date": str(found.transaction_date) if found.transaction_date else None,
+        **candidate_evidence(
+            candidates,
+            reason=reason,
+            gates=_BANK_RECONCILIATION_GATES,
+        ),
     }
 
 
@@ -551,6 +590,7 @@ def reconcile_bank_statement(
     # re-examined once every row's reach is known, so the id is kept, not just
     # the object.
     claimed_ids: dict[int, int] = {}
+    reference_matched_indices: set[int] = set()
 
     # What each statement row carrying a reference could claim by reference.
     # The ref pass gets the same candidate-set treatment as the fuzzy one:
@@ -574,6 +614,7 @@ def reconcile_bank_statement(
         consumed.add(candidate_id)
         matched_db_ids[stmt_idx] = db_by_id[candidate_id]
         claimed_ids[stmt_idx] = candidate_id
+        reference_matched_indices.add(stmt_idx)
 
     # Pass 2: date+amount+direction fallback for stmt rows still unmatched.
     # Compatibility is ref-and-narration-aware (see ``_is_compatible``).
@@ -636,7 +677,14 @@ def reconcile_bank_statement(
                 "missing.",
                 stmt_idx,
             )
-            missing.append(_missing_entry(stmt_idx, direction, txn))
+            missing.append(
+                _missing_entry(
+                    stmt_idx,
+                    direction,
+                    txn,
+                    reason="invalid_normalized_identity",
+                )
+            )
             continue
         stmt_ref = txn.reference_number
         # The pick: first bucket to yield a unique compatible candidate wins,
@@ -692,15 +740,38 @@ def reconcile_bank_statement(
     # Build matched / missing entries in original statement order.
     for stmt_idx, direction, txn, _amount, _txn_date in parsed_rows:
         cand = matched_db_ids.get(stmt_idx)
+        candidates = candidate_sets.get(stmt_idx, set())
         if cand is not None:
-            matched.append(_matched_entry(stmt_idx, direction, txn, cand))
+            matched.append(
+                _matched_entry(
+                    stmt_idx,
+                    direction,
+                    txn,
+                    cand,
+                    candidates=candidates,
+                    reason=(
+                        "matched_reference"
+                        if stmt_idx in reference_matched_indices
+                        else "matched_date_amount"
+                    ),
+                )
+            )
         else:
             missing.append(
                 _missing_entry(
                     stmt_idx,
                     direction,
                     txn,
-                    ambiguous=contended_miss(candidate_sets.get(stmt_idx, set())),
+                    ambiguous=contended_miss(candidates),
+                    candidates=candidates,
+                    reason=(
+                        "contested_match_demoted"
+                        if stmt_idx in contested
+                        else "candidate_refused_or_consumed"
+                        if candidates
+                        else "no_candidate"
+                    ),
+                    gates=_BANK_RECONCILIATION_GATES,
                 )
             )
 

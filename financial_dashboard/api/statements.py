@@ -7,9 +7,14 @@ from fastapi import APIRouter, Path, Query, Response
 
 from financial_dashboard.api.query import inclusive_datetime_bounds
 from financial_dashboard.core.deps import SessionDep
-from financial_dashboard.exceptions import NotFoundException
+from financial_dashboard.exceptions import ApiException, NotFoundException
 from financial_dashboard.schemas import statements as statement_schemas
 from financial_dashboard.schemas.common import DatabaseId
+from financial_dashboard.services.statement_previews import (
+    StatementPreviewError,
+    preview_statement_parse,
+    preview_statement_reconciliation,
+)
 from financial_dashboard.services.statement_reads import (
     get_bank_statement_detail,
     get_bank_statements_by_ids,
@@ -79,6 +84,42 @@ async def cc_statement_detail(
     raise NotFoundException(detail="CC statement not found")
 
 
+@router.post("/statements/cc/{statement_id}/parse-preview")
+async def cc_statement_parse_preview(
+    statement_id: Annotated[DatabaseId, Path()],
+    response: Response,
+    session: SessionDep,
+) -> statement_schemas.StatementParsePreviewResponse:
+    """Reparse a stored CC statement PDF without imports or database writes."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        if preview := await preview_statement_parse(session, "cc", statement_id):
+            return preview
+    except StatementPreviewError as exc:
+        raise ApiException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    raise NotFoundException(detail="CC statement not found")
+
+
+@router.post("/statements/cc/{statement_id}/reconcile-preview")
+async def cc_statement_reconcile_preview(
+    statement_id: Annotated[DatabaseId, Path()],
+    response: Response,
+    session: SessionDep,
+) -> statement_schemas.StatementReconciliationPreviewResponse:
+    """Project CC statement matches and misses without enrichment or imports."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        if preview := await preview_statement_reconciliation(
+            session, "cc", statement_id
+        ):
+            return preview
+    except StatementPreviewError as exc:
+        raise ApiException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    raise NotFoundException(detail="CC statement not found")
+
+
 @router.get("/statements/bank")
 async def bank_statement_list(
     response: Response,
@@ -120,6 +161,42 @@ async def bank_statement_batch(
     """Return bank statement summaries for an ordered, explicit set of IDs."""
     response.headers["Cache-Control"] = "no-store"
     return await get_bank_statements_by_ids(session, payload.ids)
+
+
+@router.post("/statements/bank/{statement_id}/parse-preview")
+async def bank_statement_parse_preview(
+    statement_id: Annotated[DatabaseId, Path()],
+    response: Response,
+    session: SessionDep,
+) -> statement_schemas.StatementParsePreviewResponse:
+    """Reparse a stored bank statement PDF without imports or database writes."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        if preview := await preview_statement_parse(session, "bank", statement_id):
+            return preview
+    except StatementPreviewError as exc:
+        raise ApiException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    raise NotFoundException(detail="Bank statement not found")
+
+
+@router.post("/statements/bank/{statement_id}/reconcile-preview")
+async def bank_statement_reconcile_preview(
+    statement_id: Annotated[DatabaseId, Path()],
+    response: Response,
+    session: SessionDep,
+) -> statement_schemas.StatementReconciliationPreviewResponse:
+    """Project bank statement matches and misses without enrichment or imports."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        if preview := await preview_statement_reconciliation(
+            session, "bank", statement_id
+        ):
+            return preview
+    except StatementPreviewError as exc:
+        raise ApiException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    raise NotFoundException(detail="Bank statement not found")
 
 
 @router.get("/statements/bank/{statement_id}")
