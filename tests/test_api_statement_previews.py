@@ -415,7 +415,7 @@ async def test_statement_reconciliation_failure_is_sanitized(
 
 
 async def test_extra_classification_treats_missing_direction_as_global_uncertainty():
-    identities, uncertain_directions, uncertain_all = _statement_candidate_index(
+    candidate_index = _statement_candidate_index(
         [{"direction": None, "amount": "12.34", "date": "02/01/2030"}]
     )
     transaction = Transaction(
@@ -424,9 +424,12 @@ async def test_extra_classification_treats_missing_direction_as_global_uncertain
         transaction_date=datetime.date(2030, 1, 2),
     )
 
-    assert uncertain_all is True
+    assert candidate_index.uncertain_all_directions is True
     assert _could_be_statement_candidate(
-        transaction, identities, uncertain_directions, uncertain_all
+        transaction,
+        candidate_index.identities,
+        candidate_index.uncertain_directions,
+        candidate_index.uncertain_all_directions,
     )
 
 

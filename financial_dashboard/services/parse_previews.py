@@ -2,15 +2,18 @@
 
 import datetime
 import logging
-from typing import Literal
+from typing import Any, Literal
 
+from bank_email_parser.models import StatementSummary
 from bank_sms_parser import parse_sms
 from bank_sms_parser.exceptions import ParseError, UnsupportedSmsTypeError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import status
 
 from financial_dashboard.core.masks import display_mask
 from financial_dashboard.db import Email, EmailKind, FetchRule, SmsMessage, Transaction
+from financial_dashboard.exceptions import EmailParsePreviewError
 from financial_dashboard.integrations.email.body import load_or_fetch_raw_email
 from financial_dashboard.schemas import emails as email_schemas
 from financial_dashboard.schemas import sms as sms_schemas
@@ -44,17 +47,45 @@ MergePreviewAction = Literal[
 
 
 def _error_text(error: Exception) -> str:
-    """Bound parser diagnostics before returning them through the API."""
+    """Bound parser diagnostics before returning them through the API.
+
+    Args:
+        error: Parser exception whose message is safe for the preview response.
+
+    Returns:
+        The exception message truncated to the configured error-text limit.
+    """
     return str(error)[:_ERROR_LIMIT]
 
 
 def _bounded(value: object | None, limit: int) -> str | None:
-    """Convert an optional parser value to bounded response text."""
+    """Convert an optional parser value to bounded response text.
+
+    Args:
+        value: Parser value to stringify, or ``None`` when the field is absent.
+        limit: Maximum number of characters returned.
+
+    Returns:
+        The stringified value truncated to ``limit``, or ``None`` for an absent
+        value.
+    """
     return str(value)[:limit] if value is not None else None
 
 
-def _transaction_preview(txn_data: dict) -> sms_schemas.SmsParsedTransactionPreview:
-    """Map normalized parser data to a bounded, redacted response schema."""
+def _transaction_preview(
+    txn_data: dict[str, Any],
+) -> sms_schemas.SmsParsedTransactionPreview:
+    """Map normalized SMS transaction data to a safe preview schema.
+
+    Args:
+        txn_data: Normalized transaction fields produced by the SMS pipeline.
+            Required identity fields are read directly; optional provenance and
+            enrichment fields may be absent.
+
+    Returns:
+        A bounded transaction preview with account and card values reduced to
+        display masks and without raw source text.
+    """
     return sms_schemas.SmsParsedTransactionPreview(
         bank=_bounded(txn_data["bank"], 64) or "",
         email_type=_bounded(txn_data["email_type"], 128) or "",
@@ -74,9 +105,18 @@ def _transaction_preview(txn_data: dict) -> sms_schemas.SmsParsedTransactionPrev
 
 def _identity_conflicts(
     transaction: Transaction,
-    txn_data: dict,
+    txn_data: dict[str, Any],
 ) -> list[str]:
-    """Return immutable identity fields changed by the current parser."""
+    """Find immutable transaction identity fields changed by parsing.
+
+    Args:
+        transaction: Existing database transaction used as the comparison base.
+        txn_data: Newly normalized parser fields proposed for the transaction.
+
+    Returns:
+        Identity-field names whose normalized parsed values differ from storage.
+        Missing currencies are compared as INR for legacy-row compatibility.
+    """
     conflicts = []
     for field in _IDENTITY_FIELDS:
         stored = getattr(transaction, field)
@@ -90,7 +130,16 @@ def _identity_conflicts(
 
 
 def _match_evidence_preview(evidence: MatchEvidence) -> MatchEvidencePreview:
-    """Map internal matcher diagnostics to their bounded API schema."""
+    """Map internal matcher diagnostics to the public preview schema.
+
+    Args:
+        evidence: Candidate IDs, gates, and decision reason collected by the
+            transaction matcher.
+
+    Returns:
+        Serializable matcher evidence with the matcher's existing bounds and
+        truncation indicators preserved.
+    """
     return MatchEvidencePreview(
         path=evidence.path,
         candidate_ids=evidence.candidate_ids,
@@ -104,7 +153,15 @@ def _match_evidence_preview(evidence: MatchEvidence) -> MatchEvidencePreview:
 def _empty_merge(
     action: MergePreviewAction = "none",
 ) -> sms_schemas.SmsMergePreview:
-    """Build a merge projection with no target or field changes."""
+    """Build an SMS merge projection without a transaction target.
+
+    Args:
+        action: Parser disposition represented by the empty projection.
+
+    Returns:
+        A merge preview with no target, match kind, changed fields, conflicts,
+        or matcher evidence.
+    """
     return sms_schemas.SmsMergePreview(
         action=action,
         target_transaction_id=None,
@@ -119,7 +176,17 @@ async def preview_sms_parse(
     session: AsyncSession,
     sms_id: int,
 ) -> sms_schemas.SmsParsePreviewResponse | None:
-    """Parse one stored SMS and project merge behavior without writes or flushes."""
+    """Parse one stored SMS and project its merge behavior without writes.
+
+    Args:
+        session: Request-scoped asynchronous database session. The function uses
+            ``no_autoflush`` so preview reads cannot emit pending writes.
+        sms_id: Database ID of the stored SMS to preview.
+
+    Returns:
+        Parser disposition and projected merge evidence, or ``None`` when the SMS
+        does not exist. No transaction, notification, or source state is changed.
+    """
     with session.no_autoflush:
         sms = await session.get(SmsMessage, sms_id)
         if sms is None:
@@ -209,9 +276,17 @@ async def preview_sms_parse(
 
 
 def _email_transaction_preview(
-    txn_data: dict,
+    txn_data: dict[str, Any],
 ) -> email_schemas.EmailParsedTransactionPreview:
-    """Map email parser output to bounded values without raw descriptions."""
+    """Map normalized email transaction data to a safe preview schema.
+
+    Args:
+        txn_data: Normalized transaction fields produced by the email parser.
+
+    Returns:
+        A bounded transaction preview with display-safe masks and without raw
+        email bodies or parser descriptions.
+    """
     return email_schemas.EmailParsedTransactionPreview(
         bank=_bounded(txn_data["bank"], 64) or "",
         email_type=_bounded(txn_data["email_type"], 128) or "",
@@ -229,9 +304,18 @@ def _email_transaction_preview(
     )
 
 
-def _statement_summary_preview(parsed) -> email_schemas.EmailStatementSummaryPreview:
-    """Map a body statement summary without returning parser debug text."""
-    statement = parsed.statement
+def _statement_summary_preview(
+    statement: StatementSummary,
+) -> email_schemas.EmailStatementSummaryPreview:
+    """Map a parsed email statement summary to bounded response fields.
+
+    Args:
+        statement: Statement summary extracted from the email body.
+
+    Returns:
+        Amounts, dates, statement period, and display-safe card mask required by
+        the preview API. Parser debug text and raw email content are excluded.
+    """
     return email_schemas.EmailStatementSummaryPreview(
         total_amount_due=(
             statement.total_amount_due.amount
@@ -250,8 +334,17 @@ def _statement_summary_preview(parsed) -> email_schemas.EmailStatementSummaryPre
     )
 
 
-def _email_refresh_fields(existing: Transaction, txn_data: dict) -> list[str]:
-    """Project direct parser-field changes; attribution reruns separately."""
+def _email_refresh_fields(existing: Transaction, txn_data: dict[str, Any]) -> list[str]:
+    """Project direct parser-field changes for a linked email transaction.
+
+    Args:
+        existing: Transaction currently linked to the email.
+        txn_data: Non-null fields produced by the current parser.
+
+    Returns:
+        Field names whose proposed non-null values differ from storage. Derived
+        attribution changes are excluded because attribution reruns separately.
+    """
     changed = [
         field
         for field, value in txn_data.items()
@@ -280,7 +373,21 @@ def _email_merge(
     linked_attribution_refresh: bool = False,
     match_evidence: MatchEvidence | None = None,
 ) -> email_schemas.EmailMergePreview:
-    """Build one bounded email reparse merge projection."""
+    """Build a bounded projection of the email reparse decision.
+
+    Args:
+        action: Operation the real reparse path would attempt.
+        target_id: Existing transaction selected by linking or matching.
+        match_kind: Matcher path or routing rule that produced the action.
+        changed_fields: Stored fields that the projected operation would change.
+        identity_conflicts: Immutable identity fields that disagree with parsing.
+        linked_attribution_refresh: Whether linked-source attribution would rerun.
+        match_evidence: Internal candidate and gate diagnostics, when matching ran.
+
+    Returns:
+        Serializable merge projection with empty collections substituted for
+        omitted field-change and conflict lists.
+    """
     return email_schemas.EmailMergePreview(
         action=action,
         target_transaction_id=target_id,
@@ -296,19 +403,27 @@ def _email_merge(
     )
 
 
-class EmailParsePreviewError(Exception):
-    """A sanitized email-preview failure and its intended HTTP status."""
-
-    def __init__(self, status_code: int, message: str) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-
-
 async def preview_email_parse(
     session: AsyncSession,
     email_id: int,
 ) -> email_schemas.EmailParsePreviewResponse | None:
-    """Refetch and parse one email, projecting the UI reparse path without writes."""
+    """Refetch and parse one email while projecting the reparse workflow.
+
+    Args:
+        session: Request-scoped asynchronous database session. Preview queries run
+            with autoflush disabled and the initial read transaction is released
+            before provider I/O.
+        email_id: Database ID of the stored email to preview.
+
+    Returns:
+        Parser output, safe raw-source provenance, routing classification, linked
+        transaction IDs, and projected merge behavior; or ``None`` when the email
+        does not exist. The function performs no writes or notifications.
+
+    Raises:
+        EmailParsePreviewError: If the email lacks a fetch rule or its raw source
+            cannot be loaded safely.
+    """
     with session.no_autoflush:
         email_row = await session.get(Email, email_id)
         if email_row is None:
@@ -319,7 +434,10 @@ async def preview_email_parse(
             else None
         )
     if rule is None:
-        raise EmailParsePreviewError(400, "Email has no associated fetch rule")
+        raise EmailParsePreviewError(
+            status.HTTP_400_BAD_REQUEST,
+            "Email has no associated fetch rule",
+        )
 
     bank = rule.bank
     email_kind = rule.email_kind
@@ -348,7 +466,10 @@ async def preview_email_parse(
             "Raw email is unavailable",
         ) from None
     if raw_email_result.raw_bytes is None or raw_email_result.provenance is None:
-        raise EmailParsePreviewError(404, "Raw email is unavailable")
+        raise EmailParsePreviewError(
+            status.HTTP_404_NOT_FOUND,
+            "Raw email is unavailable",
+        )
     raw_bytes = raw_email_result.raw_bytes
 
     if routing == "cas":
@@ -394,9 +515,7 @@ async def preview_email_parse(
         parser = email_schemas.EmailParserPreview(
             disposition="error",
             email_type=None,
-            error=_bounded(
-                error or raw_email_result.error or "Parser failed", _ERROR_LIMIT
-            ),
+            error=_bounded(error or "Parser failed", _ERROR_LIMIT),
             password_hint_present=False,
             transaction=None,
             statement=None,
@@ -411,7 +530,9 @@ async def preview_email_parse(
         )
     else:
         statement = (
-            _statement_summary_preview(parsed) if parsed.statement is not None else None
+            _statement_summary_preview(parsed.statement)
+            if parsed.statement is not None
+            else None
         )
         parser = email_schemas.EmailParserPreview(
             disposition=(

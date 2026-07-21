@@ -7,11 +7,14 @@ from fastapi import APIRouter, Path, Query, Response
 
 from financial_dashboard.api.query import inclusive_datetime_bounds
 from financial_dashboard.core.deps import AsyncSessionDep
-from financial_dashboard.exceptions import ApiException, NotFoundException
+from financial_dashboard.exceptions import (
+    ApiException,
+    NotFoundException,
+    StatementPreviewError,
+)
 from financial_dashboard.schemas import statements as statement_schemas
 from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.services.statement_previews import (
-    StatementPreviewError,
     preview_statement_parse,
     preview_statement_reconciliation,
 )

@@ -7,7 +7,11 @@ from fastapi import APIRouter, Path, Query, Response
 
 from financial_dashboard.api.query import inclusive_datetime_bounds
 from financial_dashboard.core.deps import AsyncSessionDep
-from financial_dashboard.exceptions import ApiException, NotFoundException
+from financial_dashboard.exceptions import (
+    ApiException,
+    EmailParsePreviewError,
+    NotFoundException,
+)
 from financial_dashboard.schemas import emails as email_schemas
 from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.schemas.emails import (
@@ -25,10 +29,7 @@ from financial_dashboard.services.email_reads import (
     get_emails_by_ids,
     list_emails,
 )
-from financial_dashboard.services.parse_previews import (
-    EmailParsePreviewError,
-    preview_email_parse,
-)
+from financial_dashboard.services.parse_previews import preview_email_parse
 from financial_dashboard.web.emails import reparse_email as reparse_email_service
 
 router = APIRouter()

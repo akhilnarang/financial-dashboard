@@ -2,13 +2,15 @@
 
 import asyncio
 import datetime
+import logging
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import status
 
 from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
@@ -19,6 +21,7 @@ from financial_dashboard.db import (
     StatementUpload,
     Transaction,
 )
+from financial_dashboard.exceptions import StatementPreviewError
 from financial_dashboard.schemas import statements as statement_schemas
 from financial_dashboard.services.statements.bank import (
     parse_bank_statement,
@@ -37,6 +40,8 @@ from financial_dashboard.services.statements.shared import (
     STMT_RECONCILE_DATE_BUFFER_DAYS,
 )
 
+logger = logging.getLogger(__name__)
+
 _ROW_LIMIT = 100
 _FILE_SIZE_LIMIT = 25_000_000
 _TEXT_LIMIT = 1_000
@@ -44,16 +49,19 @@ _REFERENCE_LIMIT = 5_000
 _REFERENCE_CHUNK_SIZE = 500
 
 
-class StatementPreviewError(Exception):
-    """A sanitized statement-preview failure and its intended HTTP status."""
-
-    def __init__(self, status_code: int, message: str) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _LoadedStatement:
+    """Detached inputs required to parse one stored statement.
+
+    Attributes:
+        kind: Statement pipeline selected by the API route.
+        statement_id: Database ID of the statement upload.
+        account_id: Account whose transactions may be reconciled.
+        bank: Parser bank identifier stored on the upload.
+        path: Verified local PDF path; never exposed in preview responses.
+        password: Decrypted statement password when available.
+    """
+
     kind: Literal["cc", "bank"]
     statement_id: int
     account_id: int
@@ -62,8 +70,30 @@ class _LoadedStatement:
     password: str | None
 
 
+class _StatementCandidateIndex(NamedTuple):
+    """Normalized identities and uncertainty found in statement rows.
+
+    Attributes:
+        identities: Parsed direction, amount, and date identities.
+        uncertain_directions: Directions containing an unparseable identity.
+        uncertain_all_directions: Whether a row lacked even a usable direction.
+    """
+
+    identities: set[tuple[str, Decimal, datetime.date]]
+    uncertain_directions: set[str]
+    uncertain_all_directions: bool
+
+
 def _bounded(value: object | None, limit: int = _TEXT_LIMIT) -> str | None:
-    """Convert optional parser text to a bounded response value."""
+    """Convert an optional parser value to bounded response text.
+
+    Args:
+        value: Parser or reconciler value to stringify, or ``None``.
+        limit: Maximum number of characters returned.
+
+    Returns:
+        The stringified value truncated to ``limit``, or ``None`` when absent.
+    """
     return str(value)[:limit] if value is not None else None
 
 
@@ -72,14 +102,30 @@ async def _load_statement(
     kind: Literal["cc", "bank"],
     statement_id: int,
 ) -> _LoadedStatement | None:
-    """Capture parser inputs without exposing paths or retaining a DB transaction."""
+    """Load and detach the inputs required for statement parsing.
+
+    Args:
+        session: Request-scoped asynchronous database session.
+        kind: Credit-card or bank-statement pipeline to load.
+        statement_id: Database ID of the corresponding statement upload.
+
+    Returns:
+        Verified, detached parser inputs, or ``None`` when the upload does not
+        exist. Local paths and decrypted passwords remain internal.
+
+    Raises:
+        StatementPreviewError: If the upload has no PDF, the file is unavailable
+            or too large, or the statement is an email-only summary.
+    """
     with session.no_autoflush:
         if kind == "cc":
             upload = await session.get(StatementUpload, statement_id)
             if upload is None:
                 return None
             if upload.source_kind == "email_summary":
-                raise StatementPreviewError(409, "Email-summary statement has no PDF")
+                raise StatementPreviewError(
+                    status.HTTP_409_CONFLICT, "Email-summary statement has no PDF"
+                )
         else:
             upload = await session.get(BankStatementUpload, statement_id)
             if upload is None:
@@ -87,16 +133,24 @@ async def _load_statement(
         account = await session.get(Account, upload.account_id)
 
     if not upload.file_path:
-        raise StatementPreviewError(404, "Statement PDF is unavailable")
+        raise StatementPreviewError(
+            status.HTTP_404_NOT_FOUND, "Statement PDF is unavailable"
+        )
     path = Path(upload.file_path)
     if not path.is_file():
-        raise StatementPreviewError(404, "Statement PDF is unavailable")
+        raise StatementPreviewError(
+            status.HTTP_404_NOT_FOUND, "Statement PDF is unavailable"
+        )
     try:
         size = path.stat().st_size
     except OSError as exc:
-        raise StatementPreviewError(404, "Statement PDF is unavailable") from exc
+        raise StatementPreviewError(
+            status.HTTP_404_NOT_FOUND, "Statement PDF is unavailable"
+        ) from exc
     if size > _FILE_SIZE_LIMIT:
-        raise StatementPreviewError(413, "Statement PDF exceeds preview limit")
+        raise StatementPreviewError(
+            status.HTTP_413_CONTENT_TOO_LARGE, "Statement PDF exceeds preview limit"
+        )
 
     password = None
     if account is not None and account.statement_password:
@@ -105,6 +159,11 @@ async def _load_statement(
                 get_fernet().decrypt(account.statement_password.encode()).decode()
             )
         except Exception:
+            logger.warning(
+                "Could not decrypt password for %s statement %d",
+                kind,
+                statement_id,
+            )
             password = None
     loaded = _LoadedStatement(
         kind=kind,
@@ -119,8 +178,19 @@ async def _load_statement(
     return loaded
 
 
-async def _parse(loaded: _LoadedStatement):
-    """Run the appropriate synchronous PDF parser in a worker thread."""
+async def _parse(loaded: _LoadedStatement) -> Any:
+    """Run the selected synchronous statement parser outside the event loop.
+
+    Args:
+        loaded: Detached and verified parser inputs.
+
+    Returns:
+        The parsed credit-card or bank-statement model produced by the selected
+        parser package.
+
+    Raises:
+        StatementPreviewError: If the parser rejects or cannot read the PDF.
+    """
     try:
         if loaded.kind == "cc":
             return await asyncio.to_thread(
@@ -136,16 +206,29 @@ async def _parse(loaded: _LoadedStatement):
             loaded.password,
         )
     except Exception as exc:
-        raise StatementPreviewError(422, "Statement parse failed") from exc
+        raise StatementPreviewError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "Statement parse failed"
+        ) from exc
 
 
 def _row(
     kind: Literal["cc", "bank"],
     index: int,
     section: Literal["transactions", "payments_refunds"],
-    transaction,
+    transaction: Any,
 ) -> statement_schemas.StatementParsedRow:
-    """Map one parser row to bounded operational output."""
+    """Map one parser transaction row to bounded operational output.
+
+    Args:
+        kind: Parser model family represented by ``transaction``.
+        index: Zero-based row position in the flattened preview.
+        section: Source collection containing the row.
+        transaction: Credit-card or bank parser transaction model.
+
+    Returns:
+        Bounded, display-safe row data with only fields supported by the selected
+        parser family populated.
+    """
     if kind == "cc":
         card_mask = display_mask(transaction.card_number)
         person = _bounded(transaction.person, 256)
@@ -173,9 +256,18 @@ def _row(
 
 def _parse_response(
     loaded: _LoadedStatement,
-    parsed,
+    parsed: Any,
 ) -> statement_schemas.StatementParsePreviewResponse:
-    """Build a capped parser preview shared by CC and bank statements."""
+    """Build a capped parse response for either statement pipeline.
+
+    Args:
+        loaded: Detached upload metadata associated with the parsed document.
+        parsed: Credit-card or bank-statement parser result.
+
+    Returns:
+        Statement metadata and at most ``_ROW_LIMIT`` bounded parser rows,
+        including the total row count and truncation indicator.
+    """
     parser_rows: list[tuple[Literal["transactions", "payments_refunds"], object]] = []
     if loaded.kind == "cc":
         for transaction in parsed.transactions or []:
@@ -221,7 +313,19 @@ async def preview_statement_parse(
     kind: Literal["cc", "bank"],
     statement_id: int,
 ) -> statement_schemas.StatementParsePreviewResponse | None:
-    """Parse one stored PDF without mutating its upload or transactions."""
+    """Parse one stored statement PDF without database mutations.
+
+    Args:
+        session: Request-scoped asynchronous database session.
+        kind: Credit-card or bank-statement pipeline to preview.
+        statement_id: Database ID of the statement upload.
+
+    Returns:
+        Bounded parser output, or ``None`` when the upload does not exist.
+
+    Raises:
+        StatementPreviewError: If the PDF cannot be safely loaded or parsed.
+    """
     loaded = await _load_statement(session, kind, statement_id)
     if loaded is None:
         return None
@@ -229,9 +333,17 @@ async def preview_statement_parse(
 
 
 def _reconciliation_entry(
-    entry: dict,
+    entry: dict[str, Any],
 ) -> statement_schemas.StatementReconciliationEntry:
-    """Map one reconciler classification without leaking unbounded narration."""
+    """Map one reconciler classification to bounded API evidence.
+
+    Args:
+        entry: Internal matched, missing, or ambiguous reconciliation record.
+
+    Returns:
+        Public reconciliation evidence with narration, references, reasons, and
+        gate names bounded to their response limits.
+    """
     return statement_schemas.StatementReconciliationEntry(
         statement_row_index=entry.get("stmt_idx"),
         date=_bounded(entry.get("date"), 32),
@@ -250,9 +362,17 @@ def _reconciliation_entry(
 
 
 def _statement_candidate_index(
-    entries: list[dict],
-) -> tuple[set[tuple[str, Decimal, datetime.date]], set[str], bool]:
-    """Normalize statement identities once for conservative extra detection."""
+    entries: list[dict[str, Any]],
+) -> _StatementCandidateIndex:
+    """Index normalized statement identities for conservative extra detection.
+
+    Args:
+        entries: Every matched and unmatched statement reconciliation record.
+
+    Returns:
+        A ``_StatementCandidateIndex`` containing parsed identities and the
+        directions for which incomplete evidence requires conservative handling.
+    """
     identities: set[tuple[str, Decimal, datetime.date]] = set()
     uncertain_directions: set[str] = set()
     uncertain_all_directions = False
@@ -271,7 +391,11 @@ def _statement_candidate_index(
             uncertain_directions.add(direction)
             continue
         identities.add((direction, amount, txn_date))
-    return identities, uncertain_directions, uncertain_all_directions
+    return _StatementCandidateIndex(
+        identities=identities,
+        uncertain_directions=uncertain_directions,
+        uncertain_all_directions=uncertain_all_directions,
+    )
 
 
 def _could_be_statement_candidate(
@@ -280,7 +404,20 @@ def _could_be_statement_candidate(
     uncertain_directions: set[str],
     uncertain_all_directions: bool,
 ) -> bool:
-    """Conservatively keep possible statement counterparts out of ``extra``."""
+    """Decide whether a database row could correspond to a statement row.
+
+    Args:
+        transaction: Existing account transaction not selected as a match.
+        identities: Parsed statement direction, amount, and date identities.
+        uncertain_directions: Directions with at least one unparseable identity.
+        uncertain_all_directions: Whether any statement row lacked a usable
+            direction.
+
+    Returns:
+        ``True`` when missing or fuzzy evidence means the transaction must not be
+        labeled extra; otherwise, whether its ±1-day identity appears in the
+        statement index.
+    """
     if (
         uncertain_all_directions
         or transaction.transaction_date is None
@@ -303,7 +440,24 @@ async def preview_statement_reconciliation(
     kind: Literal["cc", "bank"],
     statement_id: int,
 ) -> statement_schemas.StatementReconciliationPreviewResponse | None:
-    """Parse and reconcile a stored PDF without imports, enrichment, or writes."""
+    """Preview reconciliation of one stored statement without side effects.
+
+    Args:
+        session: Request-scoped asynchronous database session. Candidate queries
+            run with autoflush disabled.
+        kind: Credit-card or bank-statement reconciliation pipeline.
+        statement_id: Database ID of the statement upload.
+
+    Returns:
+        Bounded matched, missing, ambiguous, and extra classifications with
+        candidate counts, decision reasons, gates, and truncation indicators; or
+        ``None`` when the upload does not exist.
+
+    Raises:
+        StatementPreviewError: If the PDF cannot be loaded or parsed, its date
+            range is unusable, reference closure exceeds the limit, or the
+            reconciler fails.
+    """
     loaded = await _load_statement(session, kind, statement_id)
     if loaded is None:
         return None
@@ -312,10 +466,15 @@ async def preview_statement_reconciliation(
         cc_stmt_date_range(parsed) if kind == "cc" else bank_stmt_date_range(parsed)
     )
     if date_range is None:
-        raise StatementPreviewError(422, "Statement has no parseable date range")
+        raise StatementPreviewError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "Statement has no parseable date range",
+        )
     lo, hi = date_range
     if lo > hi:
-        raise StatementPreviewError(422, "Statement date range is invalid")
+        raise StatementPreviewError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "Statement date range is invalid"
+        )
     # Candidate closure equivalent to email ingest without loading all history:
     # fuzzy matching can only reach the buffered date range, while bank rows can
     # additionally match a misdated/NULL-dated DB row by exact reference.
@@ -338,7 +497,9 @@ async def preview_statement_reconciliation(
         else []
     )
     if len(references) > _REFERENCE_LIMIT:
-        raise StatementPreviewError(413, "Statement has too many references")
+        raise StatementPreviewError(
+            status.HTTP_413_CONTENT_TOO_LARGE, "Statement has too many references"
+        )
 
     with session.no_autoflush:
         candidate_by_id = {
@@ -381,7 +542,9 @@ async def preview_statement_reconciliation(
                     parsed, db_transactions, loaded.account_id
                 )
         except Exception as exc:
-            raise StatementPreviewError(422, "Statement reconciliation failed") from exc
+            raise StatementPreviewError(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, "Statement reconciliation failed"
+            ) from exc
 
     matched_all = reconciliation.get("matched", [])
     missing_all = reconciliation.get("missing", [])
@@ -393,11 +556,7 @@ async def preview_statement_reconciliation(
         if entry.get("db_txn_id") is not None
     }
     all_statement_entries = [*matched_all, *missing_all]
-    (
-        candidate_identities,
-        uncertain_directions,
-        uncertain_all_directions,
-    ) = _statement_candidate_index(all_statement_entries)
+    candidate_index = _statement_candidate_index(all_statement_entries)
     extra_ids = sorted(
         transaction.id
         for transaction in db_transactions
@@ -406,9 +565,9 @@ async def preview_statement_reconciliation(
         and lo <= transaction.transaction_date <= hi
         and not _could_be_statement_candidate(
             transaction,
-            candidate_identities,
-            uncertain_directions,
-            uncertain_all_directions,
+            candidate_index.identities,
+            candidate_index.uncertain_directions,
+            candidate_index.uncertain_all_directions,
         )
     )
     return statement_schemas.StatementReconciliationPreviewResponse(

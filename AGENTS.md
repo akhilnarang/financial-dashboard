@@ -97,7 +97,7 @@ uv run pytest -q
   for things that cross an API boundary (already the convention in
   `schemas/`). Examples in the repo: `CasEmailProcessResult`,
   `FetchSourceResult`, `MergeTransactionResult`, `ProcessedEmailParse`,
-  `PdfAttachment`, `SmsIngestResult`, `RawEmailLoadResult`.
+  `PdfAttachment`, `SmsIngestResult`, `RawEmailResult`.
 - **No defensive `getattr(obj, "attr", default)`** for ORM columns or
   any attribute that is always present on the typed object. Use direct
   attribute access; let attribute errors surface. The only legitimate

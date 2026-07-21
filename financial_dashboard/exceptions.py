@@ -3,7 +3,51 @@
 from typing import Any
 
 from fastapi import HTTPException
-from starlette import status
+from fastapi import status
+
+
+class EmailParsePreviewError(Exception):
+    """A sanitized email-preview failure and its intended HTTP status.
+
+    Attributes:
+        status_code: HTTP status the API wrapper should return.
+    """
+
+    def __init__(self, status_code: int, message: str) -> None:
+        """Initialize a sanitized preview error.
+
+        Args:
+            status_code: HTTP status appropriate for the failure.
+            message: Operator-safe error text; sensitive loader details must not
+                be included.
+
+        Returns:
+            None.
+        """
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class StatementPreviewError(Exception):
+    """A sanitized statement-preview failure and its intended HTTP status.
+
+    Attributes:
+        status_code: HTTP status the API wrapper should return.
+    """
+
+    def __init__(self, status_code: int, message: str) -> None:
+        """Initialize a sanitized statement-preview error.
+
+        Args:
+            status_code: HTTP status appropriate for the failure.
+            message: Operator-safe error text that does not expose file paths,
+                passwords, or parser internals.
+
+        Returns:
+            None.
+        """
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class ApiException(HTTPException):
