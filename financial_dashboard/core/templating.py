@@ -8,9 +8,13 @@ from fastapi.templating import Jinja2Templates
 
 
 def currency_symbol(code: str | None) -> str:
-    if code and code.upper() == "USD":
+    """Return a safe amount prefix without mislabelling foreign currencies."""
+    normalized = (code or "").strip().upper() or "INR"
+    if normalized == "INR":
+        return "₹"
+    if normalized == "USD":
         return "$"
-    return "₹"
+    return f"{normalized} "
 
 
 def format_inr_compact(value) -> str:

@@ -83,6 +83,13 @@ def _count_rows(html: str) -> int:
     return html.count("/detail")
 
 
+def _transaction_rows_html(page: str) -> str:
+    """Limit amount assertions to rows, excluding the new totals cards."""
+    match = re.search(r"<tbody>(.*?)</tbody>", page, flags=re.DOTALL)
+    assert match is not None
+    return match.group(1)
+
+
 async def test_unfiltered_list_shows_every_row(client, session):
     await _seed(session)
     r = await client.get("/transactions")
@@ -223,7 +230,7 @@ async def test_non_inr_zero_lists_inr_and_null_currency_rows(client, session):
     assert r.status_code == 200
     # The 5 INR seed rows plus the NULL-currency one; the USD row is excluded.
     assert _count_rows(r.text) == 6
-    assert "3.00" not in r.text  # the USD dining row
+    assert "3.00" not in _transaction_rows_html(r.text)  # the USD dining row
 
 
 async def test_non_inr_zero_and_one_are_complements(client, session):
@@ -453,10 +460,11 @@ async def test_scope_bank_is_bank_accounts_and_debit_cards(client, session):
     r = await client.get("/transactions?scope=bank")
     assert r.status_code == 200
     assert _count_rows(r.text) == 2
-    assert "1,000.00" in r.text
-    assert "2,000.00" in r.text  # a debit card is immediate bank cash movement
+    rows = _transaction_rows_html(r.text)
+    assert "1,000.00" in rows
+    assert "2,000.00" in rows  # a debit card is immediate bank cash movement
     for decoy in ("3,000.00", "4,000.00", "5,000.00", "6,000.00"):
-        assert decoy not in r.text
+        assert decoy not in rows
 
 
 async def test_scope_card_is_credit_cards_alone(client, session):

@@ -2,6 +2,108 @@
 {% block title %}Transactions - Ledger{% endblock %}
 {% block content %}
 
+<style>
+    .transactions-filter {
+        display: grid;
+        grid-template-columns:
+            minmax(7.5rem, 0.75fr)
+            minmax(13rem, 1.35fr)
+            minmax(15rem, 1.55fr)
+            minmax(7rem, 0.65fr)
+            minmax(9.5rem, 0.8fr)
+            minmax(9.5rem, 0.8fr)
+            minmax(0, 1fr)
+            2.6rem;
+        align-items: end;
+        gap: 0.75rem;
+        border-radius: 12px;
+        padding: 1rem 1.1rem;
+        margin-bottom: 0;
+    }
+    .transactions-filter label[data-field] {
+        min-width: 0;
+    }
+    .transactions-filter select,
+    .transactions-filter input[type="text"] {
+        width: 100%;
+        min-height: 2.6rem;
+        border-radius: 8px;
+    }
+    .filter-caption {
+        display: flex;
+        align-items: baseline;
+        gap: 0.35rem;
+        white-space: nowrap;
+    }
+    .filter-clear {
+        grid-column: -2 / -1;
+        align-self: end;
+        justify-self: end;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.6rem;
+        min-width: 2.6rem;
+        height: 2.6rem;
+        margin: 0;
+        padding: 0;
+        border: 1px solid color-mix(in srgb, #dc2626 70%, transparent);
+        border-radius: 9px;
+        color: #ef4444;
+        background: color-mix(in srgb, #dc2626 8%, transparent);
+        text-decoration: none;
+        font-size: 1.1rem;
+        line-height: 1;
+    }
+    .filter-clear:hover {
+        color: #fff;
+        background: #dc2626;
+        border-color: #dc2626;
+    }
+    .date-presets {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+        margin: 0.7rem 0 1rem;
+        align-items: center;
+    }
+    .date-preset {
+        display: inline-flex;
+        align-items: center;
+        min-height: 1.85rem;
+        padding: 0.2rem 0.65rem;
+        border: 1px solid var(--border-light);
+        border-radius: 999px;
+        color: inherit;
+        background: var(--surface-muted);
+        text-decoration: none;
+        font-size: 0.78rem;
+        font-weight: 600;
+    }
+    .date-preset:hover,
+    .date-preset.active {
+        border-color: var(--clr-credit);
+        color: var(--clr-credit);
+    }
+    @media (max-width: 1200px) {
+        .transactions-filter {
+            grid-template-columns: repeat(3, minmax(10rem, 1fr));
+        }
+        .filter-clear {
+            grid-column: -2 / -1;
+        }
+    }
+    @media (max-width: 700px) {
+        .transactions-filter {
+            grid-template-columns: 1fr;
+        }
+        .filter-clear {
+            grid-column: 1;
+            justify-self: end;
+        }
+    }
+</style>
+
 {% macro sort_link(col_key, col_label) %}
 {% set new_order = 'asc' if (sort == col_key and order == 'desc') else 'desc' %}
 <a href="/transactions?{{ base_qs }}{% if base_qs %}&{% endif %}sort={{ col_key }}&order={{ new_order }}" style="text-decoration: none; color: inherit; white-space: nowrap;">
@@ -14,7 +116,7 @@
     <span class="result-count">{{ "{:,}".format(total_count) }} result{{ "s" if total_count != 1 }}</span>
 </div>
 
-<form method="get" class="filter-bar" id="transactions-filter-form">
+<form method="get" class="filter-bar transactions-filter" id="transactions-filter-form">
     <input type="hidden" name="sort" value="{{ sort }}">
     <input type="hidden" name="order" value="{{ order }}">
     <label data-field>
@@ -47,22 +149,47 @@
         </select>
     </label>
     <label data-field>
-        Date From
-        <input type="date" name="date_from" value="{{ filters.date_from or '' }}">
+        <span class="filter-caption">Date From <small class="text-muted">DD-MM-YYYY</small></span>
+        <input type="hidden" name="date_from" id="date-from-iso" value="{{ filters.date_from or '' }}">
+        <input type="text" id="date-from-display" value="{{ date_from_display }}" placeholder="DD-MM-YYYY" autocomplete="off">
     </label>
     <label data-field>
-        Date To
-        <input type="date" name="date_to" value="{{ filters.date_to or '' }}">
+        <span class="filter-caption">Date To <small class="text-muted">DD-MM-YYYY</small></span>
+        <input type="hidden" name="date_to" id="date-to-iso" value="{{ filters.date_to or '' }}">
+        <input type="text" id="date-to-display" value="{{ date_to_display }}" placeholder="DD-MM-YYYY" autocomplete="off">
     </label>
     {% if filters.bank or filters.direction or filters.date_from or filters.date_to or filters.account_id or filters.card_id %}
     <a
         href="/transactions"
         aria-label="Clear filters"
         title="Clear filters"
-        style="display: inline-flex; align-items: center; justify-content: center; width: 2rem; min-width: 2rem; height: 2rem; padding: 0; border-radius: 999px; border: 1px solid #dc2626; color: #dc2626; text-decoration: none; font-size: 1rem; line-height: 1; align-self: flex-end;"
+        class="filter-clear"
     >&times;</a>
     {% endif %}
 </form>
+
+<nav aria-label="Quick date filters" class="date-presets">
+    <span class="text-sm text-muted">Quick dates:</span>
+    {% for preset in date_presets %}
+    <a href="{{ preset.href }}" class="date-preset{% if preset.active %} active{% endif %}">{{ preset.label }}</a>
+    {% endfor %}
+</nav>
+
+<section aria-label="Filtered transaction totals" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: 0.75rem; margin-bottom: 1rem;">
+    {% for summary in transaction_totals %}
+    <article class="card" data-currency="{{ summary.currency }}" style="margin: 0; padding: 0.85rem 1rem;">
+        <div class="text-sm text-muted" style="margin-bottom: 0.45rem;">Filtered totals &middot; {{ summary.currency }}</div>
+        <dl style="display: grid; grid-template-columns: auto 1fr; gap: 0.3rem 0.75rem; margin: 0;">
+            <dt>Credits</dt>
+            <dd class="amt amt-credit" data-total="credits" style="margin: 0; text-align: right;">+{{ summary.currency|currency_symbol }}{{ "{:,.2f}".format(summary.credits) }}</dd>
+            <dt>Debits</dt>
+            <dd class="amt amt-debit" data-total="debits" style="margin: 0; text-align: right;">&minus;{{ summary.currency|currency_symbol }}{{ "{:,.2f}".format(summary.debits) }}</dd>
+            <dt>Net</dt>
+            <dd class="amt {% if summary.net < 0 %}amt-debit{% else %}amt-credit{% endif %}" data-total="net" style="margin: 0; text-align: right;">{% if summary.net < 0 %}&minus;{% else %}+{% endif %}{{ summary.currency|currency_symbol }}{{ "{:,.2f}".format(summary.net|abs) }}</dd>
+        </dl>
+    </article>
+    {% endfor %}
+</section>
 
 <section>
 {% if transactions %}
@@ -219,15 +346,66 @@
     });
 
     const transactionsFilterForm = document.getElementById("transactions-filter-form");
+    const dateFields = [
+        [document.getElementById("date-from-display"), document.getElementById("date-from-iso")],
+        [document.getElementById("date-to-display"), document.getElementById("date-to-iso")],
+    ];
+
+    function displayDateToIso(value) {
+        const match = value.trim().match(/^(\d{2})-(\d{2})-(\d{4})$/);
+        if (!match) return null;
+        const [, day, month, year] = match;
+        const candidate = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+        if (
+            candidate.getUTCFullYear() !== Number(year)
+            || candidate.getUTCMonth() !== Number(month) - 1
+            || candidate.getUTCDate() !== Number(day)
+        ) return null;
+        return `${year}-${month}-${day}`;
+    }
+
+    function syncDisplayDates() {
+        let valid = true;
+        for (const [display, hidden] of dateFields) {
+            const value = display.value.trim();
+            if (!value) {
+                display.setCustomValidity("");
+                hidden.value = "";
+                continue;
+            }
+            const iso = displayDateToIso(value);
+            display.setCustomValidity(iso ? "" : "Use DD-MM-YYYY, for example 30-04-2026");
+            if (iso) hidden.value = iso;
+            else valid = false;
+        }
+        return valid;
+    }
+
     if (transactionsFilterForm) {
-        transactionsFilterForm
-            .querySelectorAll('select, input[type="date"]')
-            .forEach((field) => {
-                field.addEventListener("change", () => {
-                    if (skipAutoSubmit) return;
-                    transactionsFilterForm.requestSubmit();
-                });
-            });
+        function requestFilterSubmit() {
+            if (skipAutoSubmit) return;
+            if (syncDisplayDates()) {
+                transactionsFilterForm.requestSubmit();
+                return;
+            }
+            const invalid = dateFields.find(([display]) => !display.checkValidity());
+            if (invalid) invalid[0].reportValidity();
+        }
+
+        transactionsFilterForm.querySelectorAll("select").forEach((field) => {
+            field.addEventListener("change", requestFilterSubmit);
+        });
+        for (const [display] of dateFields) {
+            display.addEventListener("input", () => display.setCustomValidity(""));
+            display.addEventListener("change", requestFilterSubmit);
+        }
+        transactionsFilterForm.addEventListener("submit", (event) => {
+            if (!syncDisplayDates()) {
+                event.preventDefault();
+                const invalid = dateFields.find(([display]) => !display.checkValidity());
+                if (invalid) invalid[0].reportValidity();
+            }
+        });
     }
 </script>
 {% endblock %}

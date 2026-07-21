@@ -1,13 +1,16 @@
 """Transaction HTML routes."""
 
+import calendar
 import json
 import logging
-from datetime import date
-from typing import Annotated
+import re
+from datetime import date, timedelta
+from decimal import Decimal
+from typing import Annotated, NamedTuple, TypedDict
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, Query, Request as FastAPIRequest
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request as FastAPIRequest
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -44,12 +47,171 @@ templates = get_templates()
 router = APIRouter()
 
 PAGE_SIZE = 50
+
+
+class NormalizedQueryDate(NamedTuple):
+    """Parsed date filter and its canonical query representation.
+
+    Attributes:
+        parsed_date: Validated calendar date, or ``None`` for an omitted filter.
+        query_value: Canonical ``YYYY-MM-DD`` string, or the preserved omitted
+            representation (``None`` or the empty string).
+    """
+
+    parsed_date: date | None
+    query_value: str | None
+
+
+class LoadedTransaction(NamedTuple):
+    """Transaction and optional records linked to its provenance.
+
+    Attributes:
+        transaction: Requested transaction row.
+        email: Email attached to the transaction, when present.
+        account: Account assigned to the transaction, when present.
+        sms: SMS attached to the transaction, when present.
+    """
+
+    transaction: Transaction
+    email: Email | None
+    account: Account | None
+    sms: SmsMessage | None
+
+
+class TransactionTotal(TypedDict):
+    """Aggregated amounts for one normalized currency.
+
+    Attributes:
+        currency: Uppercase ISO-style currency code.
+        credits: Sum of filtered credit transactions.
+        debits: Sum of filtered debit transactions.
+        net: Credits minus debits.
+    """
+
+    currency: str
+    credits: Decimal
+    debits: Decimal
+    net: Decimal
+
+
 SORT_COLUMNS = {
     "amount": Transaction.amount,
     "bank": Transaction.bank,
     "counterparty": Transaction.counterparty,
     "date": Transaction.transaction_date,
 }
+
+
+def _normalize_query_date(value: str | None, field: str) -> NormalizedQueryDate:
+    """Validate and normalize one ISO date query parameter.
+
+    Args:
+        value: Query value in strict ``YYYY-MM-DD`` form. ``None`` and the empty
+            string represent an omitted filter.
+        field: Parameter name included in validation errors, such as
+            ``"date_from"`` or ``"date_to"``.
+
+    Returns:
+        A ``NormalizedQueryDate`` containing the parsed date and canonical query
+        value. Omitted filters have no parsed date and preserve their ``None`` or
+        empty-string query representation. A day beyond the end of an otherwise
+        valid month is clamped to that month's final day.
+
+    Raises:
+        UnprocessableEntityException: If the value is not strict ISO syntax or
+            its year, month, or day cannot be safely normalized.
+    """
+    if value is None or value == "":
+        return NormalizedQueryDate(parsed_date=None, query_value=value)
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", value)
+    if match is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} must use YYYY-MM-DD and be a valid calendar date",
+        )
+    year, month, day = (int(part) for part in match.groups())
+    try:
+        maximum_day = calendar.monthrange(year, month)[1]
+    except (calendar.IllegalMonthError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} must use YYYY-MM-DD and be a valid calendar date",
+        ) from exc
+    if day < 1:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} must use YYYY-MM-DD and be a valid calendar date",
+        )
+    try:
+        normalized = date(year, month, min(day, maximum_day))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} must use YYYY-MM-DD and be a valid calendar date",
+        ) from exc
+    return NormalizedQueryDate(
+        parsed_date=normalized,
+        query_value=normalized.isoformat(),
+    )
+
+
+def _date_display(value: str | None) -> str:
+    """Render an ISO query date in the page's Indian display format.
+
+    Args:
+        value: ISO ``YYYY-MM-DD`` date string, or an omitted value.
+
+    Returns:
+        The date formatted as ``DD-MM-YYYY``. Omitted or invalid values return
+        an empty string so an invalid query value is never displayed as valid.
+    """
+    if not value:
+        return ""
+    try:
+        return date.fromisoformat(value).strftime("%d-%m-%Y")
+    except ValueError:
+        return ""
+
+
+def _date_presets(today: date) -> list[dict[str, str]]:
+    """Build common calendar and Indian financial-year filter ranges.
+
+    Args:
+        today: Date used as the boundary for relative ranges.
+
+    Returns:
+        Presets containing a display label and inclusive ISO ``date_from`` and
+        ``date_to`` values. Indian financial years run from April through March.
+    """
+    current_month_start = today.replace(day=1)
+    previous_month_end = current_month_start - timedelta(days=1)
+    previous_month_start = previous_month_end.replace(day=1)
+    next_month_start = (
+        current_month_start.replace(year=current_month_start.year + 1, month=1)
+        if current_month_start.month == 12
+        else current_month_start.replace(month=current_month_start.month + 1)
+    )
+    fy_start_year = today.year if today.month >= 4 else today.year - 1
+    ranges = (
+        ("Current month", current_month_start, next_month_start - timedelta(days=1)),
+        ("Previous month", previous_month_start, previous_month_end),
+        ("Last 30 days", today - timedelta(days=29), today),
+        (
+            "Current financial year",
+            date(fy_start_year, 4, 1),
+            date(fy_start_year + 1, 3, 31),
+        ),
+        (
+            "Previous financial year",
+            date(fy_start_year - 1, 4, 1),
+            date(fy_start_year, 3, 31),
+        ),
+        ("Current calendar year", date(today.year, 1, 1), date(today.year, 12, 31)),
+    )
+    return [
+        {"label": label, "date_from": start.isoformat(), "date_to": end.isoformat()}
+        for label, start, end in ranges
+    ]
 
 
 @router.get("/transactions", response_class=HTMLResponse)
@@ -106,7 +268,60 @@ async def transaction_list(
     order: Annotated[str, Query(description="Sort order: asc or desc")] = "desc",
     page: Annotated[int, Query(ge=1, description="Page number (1-indexed)")] = 1,
     session: AsyncSession = Depends(get_session),
-):
+) -> Response:
+    """Render the filtered, sorted, and paginated transaction listing.
+
+    Args:
+        request: Current request used to render the template and preserve queries.
+        bank: Optional exact bank-name filter.
+        account_id: Optional account ID filter supplied as a query string.
+        card_id: Optional card ID filter supplied as a query string.
+        direction: Optional transaction direction, normally ``debit`` or ``credit``.
+        date_from: Optional inclusive lower date bound in ISO ``YYYY-MM-DD`` form.
+        date_to: Optional inclusive upper date bound in ISO ``YYYY-MM-DD`` form.
+        category: Optional exact category-slug filter.
+        counterparty: Optional exact counterparty; a blank value selects rows with
+            no counterparty.
+        uncategorized: ``"1"`` selects rows outside the known category buckets.
+        category_null: ``"1"`` selects rows whose category is null or blank.
+        internal: ``"1"`` selects internal movement categories for the scope.
+        non_inr: ``"1"`` selects foreign currencies and ``"0"`` selects INR or
+            legacy rows without a currency.
+        undated: ``"1"`` selects rows without a transaction date.
+        scope: Optional account perimeter used by cash-flow drill-down links.
+        sort: Requested sort key; invalid values fall back to transaction date.
+        order: Sort direction; invalid values fall back to descending.
+        page: One-indexed result page.
+        session: Request-scoped asynchronous database session.
+
+    Returns:
+        A canonicalizing redirect when an overflowing date is corrected;
+        otherwise, the rendered transactions page with full-filter totals and
+        at most ``PAGE_SIZE`` transaction rows.
+    """
+    normalized_date_from = _normalize_query_date(date_from, "date_from")
+    normalized_date_to = _normalize_query_date(date_to, "date_to")
+    corrections: dict[str, str] = {}
+    for key, original, normalized in (
+        ("date_from", date_from, normalized_date_from.query_value),
+        ("date_to", date_to, normalized_date_to.query_value),
+    ):
+        if (
+            original not in (None, "")
+            and normalized is not None
+            and normalized != original
+        ):
+            corrections[key] = normalized
+    if corrections:
+        query = dict(request.query_params)
+        query.update(corrections)
+        return RedirectResponse(
+            url=f"/transactions?{urlencode(query)}",
+            status_code=307,
+        )
+    date_from = normalized_date_from.query_value
+    date_to = normalized_date_to.query_value
+
     stmt = select(Transaction)
 
     if bank:
@@ -123,20 +338,14 @@ async def transaction_list(
             pass
     if direction:
         stmt = stmt.where(Transaction.direction == direction)
-    if date_from:
-        try:
-            stmt = stmt.where(
-                Transaction.transaction_date >= date.fromisoformat(date_from)
-            )
-        except ValueError:
-            pass
-    if date_to:
-        try:
-            stmt = stmt.where(
-                Transaction.transaction_date <= date.fromisoformat(date_to)
-            )
-        except ValueError:
-            pass
+    if normalized_date_from.parsed_date is not None:
+        stmt = stmt.where(
+            Transaction.transaction_date >= normalized_date_from.parsed_date
+        )
+    if normalized_date_to.parsed_date is not None:
+        stmt = stmt.where(
+            Transaction.transaction_date <= normalized_date_to.parsed_date
+        )
     if category:
         stmt = stmt.where(Transaction.category == category)
     if counterparty is not None:
@@ -195,10 +404,55 @@ async def transaction_list(
         # thing to drift, which is the bug class the currency clause already hit.
         stmt = stmt.where(account_scope)
 
-    count_stmt = select(func.count()).select_from(stmt.subquery())
+    filtered = stmt.subquery()
+    count_stmt = select(func.count()).select_from(filtered)
     total_count = (await session.execute(count_stmt)).scalar() or 0
 
-    sort_col = SORT_COLUMNS.get(sort, Transaction.transaction_date)
+    currency_col = func.coalesce(
+        func.nullif(func.upper(func.trim(filtered.c.currency)), ""),
+        "INR",
+    )
+    totals_result = await session.execute(
+        select(
+            currency_col.label("currency"),
+            filtered.c.direction,
+            func.sum(filtered.c.amount).label("amount"),
+        )
+        .where(filtered.c.direction.in_(("credit", "debit")))
+        .group_by(currency_col, filtered.c.direction)
+    )
+    totals_by_currency: dict[str, TransactionTotal] = {}
+    for row in totals_result:
+        currency = row.currency or "INR"
+        summary = totals_by_currency.setdefault(
+            currency,
+            {
+                "currency": currency,
+                "credits": Decimal("0"),
+                "debits": Decimal("0"),
+                "net": Decimal("0"),
+            },
+        )
+        summary["credits" if row.direction == "credit" else "debits"] = Decimal(
+            str(row.amount or 0)
+        )
+    if not totals_by_currency:
+        totals_by_currency["INR"] = {
+            "currency": "INR",
+            "credits": Decimal("0"),
+            "debits": Decimal("0"),
+            "net": Decimal("0"),
+        }
+    for summary in totals_by_currency.values():
+        summary["net"] = summary["credits"] - summary["debits"]
+    transaction_totals = sorted(
+        totals_by_currency.values(),
+        key=lambda item: (item["currency"] != "INR", str(item["currency"])),
+    )
+
+    if sort not in SORT_COLUMNS:
+        sort = "date"
+    sort_col = SORT_COLUMNS[sort]
     if order not in ("asc", "desc"):
         order = "desc"
     if order == "asc":
@@ -287,13 +541,40 @@ async def transaction_list(
     # Drill params are kept whenever they are present, empty string included: a
     # blank counterparty narrows the result set, so dropping it on truthiness
     # would silently widen page 2 to every row.
+    retained_filters = {
+        k: v for k, v in form_filters.items() if v and k not in {"date_from", "date_to"}
+    } | {k: v for k, v in drill_filters.items() if v is not None}
     base_qs = urlencode(
         {k: v for k, v in form_filters.items() if v}
         | {k: v for k, v in drill_filters.items() if v is not None}
     )
+    date_presets = []
+    for preset in _date_presets(date.today()):
+        preset_query = {
+            **retained_filters,
+            "date_from": preset["date_from"],
+            "date_to": preset["date_to"],
+            "sort": sort,
+            "order": order,
+        }
+        date_presets.append(
+            {
+                **preset,
+                "href": f"/transactions?{urlencode(preset_query)}",
+                "active": (
+                    date_from == preset["date_from"] and date_to == preset["date_to"]
+                ),
+            }
+        )
 
     # Page window: show pages around current
-    def page_window():
+    def page_window() -> list[int]:
+        """Build the compact page-number window used by the paginator.
+
+        Returns:
+            Sorted unique page numbers containing the first and last pages plus
+            up to two pages on either side of the current page.
+        """
         pages = set()
         pages.add(1)
         pages.add(total_pages)
@@ -318,6 +599,10 @@ async def transaction_list(
             "total_count": total_count,
             "total_pages": total_pages,
             "page_size": PAGE_SIZE,
+            "transaction_totals": transaction_totals,
+            "date_from_display": _date_display(date_from),
+            "date_to_display": _date_display(date_to),
+            "date_presets": date_presets,
             "page_window": page_window(),
             "base_qs": base_qs,
         },
@@ -326,8 +611,17 @@ async def transaction_list(
 
 async def _load_transaction(
     session: AsyncSession, txn_id: int
-) -> tuple[Transaction, Email | None, Account | None, SmsMessage | None] | None:
-    """Load a Transaction with its linked Email, Account, and SMS, or None."""
+) -> LoadedTransaction | None:
+    """Load a transaction and the records linked to its provenance.
+
+    Args:
+        session: Request-scoped asynchronous database session.
+        txn_id: Database ID of the transaction to load.
+
+    Returns:
+        A ``LoadedTransaction`` containing the transaction and its optional
+        provenance records, or ``None`` when the transaction does not exist.
+    """
     result = await session.execute(
         select(Transaction, Email, Account, SmsMessage)
         .outerjoin(Email, Transaction.email_id == Email.id)
@@ -338,16 +632,25 @@ async def _load_transaction(
     row = result.first()
     if not row:
         return None
-    return tuple(row)  # type: ignore[return-value]
+    return LoadedTransaction(
+        transaction=row[0],
+        email=row[1],
+        account=row[2],
+        sms=row[3],
+    )
 
 
 async def _bank_account_picker(session: AsyncSession, bank: str) -> list[dict]:
-    """Compact JSON-friendly account list for the manual relink picker.
+    """Build the bounded account choices for the manual relink picker.
 
-    Returns active accounts of ``bank`` ordered by label, each with its
-    active cards (id, label, card_mask only — no ORM internals leak
-    into the template). Empty list when the bank has no active
-    accounts, which the template renders as a recovery hint.
+    Args:
+        session: Request-scoped asynchronous database session.
+        bank: Bank whose active accounts and cards should be offered.
+
+    Returns:
+        JSON-friendly active accounts ordered by label. Each item contains only
+        the account identity fields and active card identity fields required by
+        the template. Returns an empty list when the bank has no active accounts.
     """
     result = await session.execute(
         select(Account)
@@ -376,11 +679,22 @@ async def transaction_detail(
     txn_id: int,
     request: FastAPIRequest,
     session: AsyncSession = Depends(get_session),
-):
+) -> Response:
+    """Render the transaction detail fragment used by the listing dialog.
+
+    Args:
+        txn_id: Database ID of the transaction to display.
+        request: Current request used to render the template fragment.
+        session: Request-scoped asynchronous database session.
+
+    Returns:
+        The rendered detail fragment, or a small 404 HTML response when the
+        transaction does not exist.
+    """
     loaded = await _load_transaction(session, txn_id)
     if loaded is None:
         return HTMLResponse("<p>Transaction not found.</p>", 404)
-    txn, email, account, sms = loaded
+    txn = loaded.transaction
     bank_accounts = (
         await _bank_account_picker(session, txn.bank) if txn.account_id is None else []
     )
@@ -389,9 +703,9 @@ async def transaction_detail(
         "partials/transaction_detail.html",
         {
             "txn": txn,
-            "email": email,
-            "account": account,
-            "sms": sms,
+            "email": loaded.email,
+            "account": loaded.account,
+            "sms": loaded.sms,
             "bank_accounts": bank_accounts,
         },
     )
@@ -402,11 +716,22 @@ async def transaction_page(
     txn_id: int,
     request: FastAPIRequest,
     session: AsyncSession = Depends(get_session),
-):
+) -> Response:
+    """Render the standalone page for one transaction.
+
+    Args:
+        txn_id: Database ID of the transaction to display.
+        request: Current request used to render the page template.
+        session: Request-scoped asynchronous database session.
+
+    Returns:
+        The rendered transaction page, or a small 404 HTML response when the
+        transaction does not exist.
+    """
     loaded = await _load_transaction(session, txn_id)
     if loaded is None:
         return HTMLResponse("<p>Transaction not found.</p>", 404)
-    txn, email, account, sms = loaded
+    txn = loaded.transaction
     bank_accounts = (
         await _bank_account_picker(session, txn.bank) if txn.account_id is None else []
     )
@@ -416,9 +741,9 @@ async def transaction_page(
         {
             "active_page": "transactions",
             "txn": txn,
-            "email": email,
-            "account": account,
-            "sms": sms,
+            "email": loaded.email,
+            "account": loaded.account,
+            "sms": loaded.sms,
             "bank_accounts": bank_accounts,
         },
     )
