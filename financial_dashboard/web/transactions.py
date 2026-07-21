@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Annotated, NamedTuple, TypedDict
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request as FastAPIRequest
+from fastapi import APIRouter, Depends, Query, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,7 @@ from financial_dashboard.db import (
     SmsMessage,
     Transaction,
 )
+from financial_dashboard.exceptions import UnprocessableEntityException
 from financial_dashboard.services.cashflow.buckets import internal_slugs_for_scope
 from financial_dashboard.services.cashflow.report import (
     BLANK_CATEGORY,
@@ -125,28 +126,24 @@ def _normalize_query_date(value: str | None, field: str) -> NormalizedQueryDate:
         return NormalizedQueryDate(parsed_date=None, query_value=value)
     match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", value)
     if match is None:
-        raise HTTPException(
-            status_code=422,
+        raise UnprocessableEntityException(
             detail=f"{field} must use YYYY-MM-DD and be a valid calendar date",
         )
     year, month, day = (int(part) for part in match.groups())
     try:
         maximum_day = calendar.monthrange(year, month)[1]
     except (calendar.IllegalMonthError, ValueError) as exc:
-        raise HTTPException(
-            status_code=422,
+        raise UnprocessableEntityException(
             detail=f"{field} must use YYYY-MM-DD and be a valid calendar date",
         ) from exc
     if day < 1:
-        raise HTTPException(
-            status_code=422,
+        raise UnprocessableEntityException(
             detail=f"{field} must use YYYY-MM-DD and be a valid calendar date",
         )
     try:
         normalized = date(year, month, min(day, maximum_day))
     except ValueError as exc:
-        raise HTTPException(
-            status_code=422,
+        raise UnprocessableEntityException(
             detail=f"{field} must use YYYY-MM-DD and be a valid calendar date",
         ) from exc
     return NormalizedQueryDate(

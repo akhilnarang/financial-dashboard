@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Annotated, NamedTuple
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request as FastAPIRequest
+from fastapi import APIRouter, Depends, Query, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound
@@ -25,6 +25,13 @@ from financial_dashboard.db import (
     FetchRule,
     StatementUpload,
     Transaction,
+)
+from financial_dashboard.exceptions import (
+    BadRequestException,
+    ConflictException,
+    InternalServerException,
+    NotFoundException,
+    UnprocessableEntityException,
 )
 from financial_dashboard.integrations.email.body import (
     _extract_html_body,
@@ -508,16 +515,14 @@ async def reparse_email(
     """
     email_row = await session.get(Email, email_id)
     if not email_row:
-        raise HTTPException(status_code=404, detail="Email not found")
+        raise NotFoundException(detail="Email not found")
 
     rule = (
         await session.get(FetchRule, email_row.rule_id) if email_row.rule_id else None
     )
 
     if not rule:
-        raise HTTPException(
-            status_code=400, detail="No fetch rule associated with this email"
-        )
+        raise BadRequestException(detail="No fetch rule associated with this email")
 
     # Raw loading and parsing can perform provider I/O and must not hold the
     # request session's implicit read transaction open. Preserve the state we
@@ -530,9 +535,8 @@ async def reparse_email(
 
     raw_email_result = await load_or_fetch_raw_email(email_row)
     if raw_email_result.raw_bytes is None:
-        raise HTTPException(
-            status_code=404,
-            detail=raw_email_result.error or "Unable to load raw email",
+        raise NotFoundException(
+            detail=raw_email_result.error or "Unable to load raw email"
         )
     raw_bytes = raw_email_result.raw_bytes
 
@@ -561,8 +565,7 @@ async def reparse_email(
                 and em.error == original_error
             ):
                 em.error = error
-        raise HTTPException(
-            status_code=422,
+        raise UnprocessableEntityException(
             detail=error or "Parsing failed (no transaction or statement found)",
         )
 
@@ -574,7 +577,7 @@ async def reparse_email(
         # databases use SELECT ... FOR UPDATE in the shared helper.
         em = await lock_email_for_attachment(session, email_id)
         if not em:
-            raise HTTPException(status_code=500, detail="Email disappeared")
+            raise InternalServerException(detail="Email disappeared")
 
         # Was this email withheld by the duplicate matcher (DEFER)? If so, a
         # plain reparse must NOT re-insert the row the matcher deliberately
@@ -640,8 +643,7 @@ async def reparse_email(
                 # txns for one email, surface that loudly instead of
                 # silently picking one — the operator needs to merge or
                 # delete the duplicates first.
-                raise HTTPException(
-                    status_code=409,
+                raise ConflictException(
                     detail=(
                         f"Email {email_id} has more than one attached "
                         f"transaction; resolve the duplicates manually "
@@ -650,7 +652,7 @@ async def reparse_email(
                 )
 
     if duplicate_error:
-        raise HTTPException(status_code=409, detail=duplicate_error)
+        raise ConflictException(detail=duplicate_error)
 
     # Send Telegram notification for the new transaction
     if txn_id and txn_data and should_notify_transactions():

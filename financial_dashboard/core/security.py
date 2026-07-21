@@ -5,11 +5,11 @@ import secrets
 from functools import lru_cache
 from typing import Optional
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from starlette.status import HTTP_401_UNAUTHORIZED
 
 from financial_dashboard.config import settings
+from financial_dashboard.exceptions import UnauthorizedException
 
 http_basic = HTTPBasic(auto_error=False)
 
@@ -51,8 +51,7 @@ def check_credentials(
         return
 
     if credentials is None:
-        raise HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED,
+        raise UnauthorizedException(
             detail="Authentication required",
             headers={"WWW-Authenticate": "Basic"},
         )
@@ -66,8 +65,7 @@ def check_credentials(
         settings.auth_password.get_secret_value().encode("utf-8"),
     )
     if not (username_ok and password_ok):
-        raise HTTPException(
-            status_code=HTTP_401_UNAUTHORIZED,
+        raise UnauthorizedException(
             detail="Invalid credentials",
             headers={"WWW-Authenticate": "Basic"},
         )

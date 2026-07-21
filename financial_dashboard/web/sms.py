@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 if TYPE_CHECKING:
     from financial_dashboard.services.txn_merge import EnrichmentDiff
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi import Request as FastAPIRequest
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -18,6 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
 from financial_dashboard.db import SmsMessage, Transaction, async_session
+from financial_dashboard.exceptions import (
+    InternalServerException,
+    NotFoundException,
+    UnprocessableEntityException,
+)
 from financial_dashboard.schemas.sms import ReparseSmsResponse
 from financial_dashboard.services.linker import build_link_context
 from financial_dashboard.services.settings import (
@@ -49,7 +54,7 @@ async def reparse_sms(
     duplicate matcher and forces a new row (idempotent if already linked)."""
     sms = await session.get(SmsMessage, sms_id)
     if sms is None:
-        raise HTTPException(404, "SMS not found")
+        raise NotFoundException(detail="SMS not found")
 
     # Mirror the email-side dance at web/emails.py:314-318: close the
     # implicit read txn opened by session.get() above so the explicit
@@ -59,7 +64,7 @@ async def reparse_sms(
     async with session.begin():
         sms = await session.get(SmsMessage, sms_id)
         if sms is None:
-            raise HTTPException(500, "SMS disappeared")
+            raise InternalServerException(detail="SMS disappeared")
         link_ctx = await build_link_context(session)
         outcome = await process_sms_row(session, sms, link_ctx, force_new=force_new)
 
@@ -111,7 +116,7 @@ async def reparse_sms(
             logger.warning("Reparse disambiguation prompt failed: %s", exc)
 
     if outcome.status == "error":
-        raise HTTPException(status_code=422, detail=sms.parse_error or "Parse error")
+        raise UnprocessableEntityException(detail=sms.parse_error or "Parse error")
 
     diff_list = None
     if outcome.enrichment_notification is not None:

@@ -31,6 +31,12 @@ class BadRequestException(ApiException):
     status_code = status.HTTP_400_BAD_REQUEST
 
 
+class UnauthorizedException(ApiException):
+    """HTTP 401: authentication is required or the credentials are invalid."""
+
+    status_code = status.HTTP_401_UNAUTHORIZED
+
+
 class NotFoundException(ApiException):
     """HTTP 404: the requested resource does not exist."""
 
