@@ -6,7 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Path, Query, Response
 
 from financial_dashboard.api.query import inclusive_datetime_bounds
-from financial_dashboard.core.deps import SessionDep
+from financial_dashboard.core.deps import AsyncSessionDep
 from financial_dashboard.exceptions import ApiException, NotFoundException
 from financial_dashboard.schemas import statements as statement_schemas
 from financial_dashboard.schemas.common import DatabaseId
@@ -30,7 +30,7 @@ router = APIRouter()
 @router.get("/statements/cc")
 async def cc_statement_list(
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     statement_id: Annotated[DatabaseId | None, Query()] = None,
@@ -63,7 +63,7 @@ async def cc_statement_list(
 async def cc_statement_batch(
     payload: statement_schemas.StatementBatchRequest,
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> statement_schemas.CcStatementBatchResponse:
     """Return CC statement summaries for an ordered, explicit set of IDs."""
     response.headers["Cache-Control"] = "no-store"
@@ -74,7 +74,7 @@ async def cc_statement_batch(
 async def cc_statement_detail(
     statement_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> statement_schemas.CcStatementDetailResponse:
     """Return one CC statement with bounded reconciliation evidence."""
     response.headers["Cache-Control"] = "no-store"
@@ -88,7 +88,7 @@ async def cc_statement_detail(
 async def cc_statement_parse_preview(
     statement_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> statement_schemas.StatementParsePreviewResponse:
     """Reparse a stored CC statement PDF without imports or database writes."""
     response.headers["Cache-Control"] = "no-store"
@@ -105,7 +105,7 @@ async def cc_statement_parse_preview(
 async def cc_statement_reconcile_preview(
     statement_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> statement_schemas.StatementReconciliationPreviewResponse:
     """Project CC statement matches and misses without enrichment or imports."""
     response.headers["Cache-Control"] = "no-store"
@@ -123,7 +123,7 @@ async def cc_statement_reconcile_preview(
 @router.get("/statements/bank")
 async def bank_statement_list(
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     statement_id: Annotated[DatabaseId | None, Query()] = None,
@@ -156,7 +156,7 @@ async def bank_statement_list(
 async def bank_statement_batch(
     payload: statement_schemas.StatementBatchRequest,
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> statement_schemas.BankStatementBatchResponse:
     """Return bank statement summaries for an ordered, explicit set of IDs."""
     response.headers["Cache-Control"] = "no-store"
@@ -167,7 +167,7 @@ async def bank_statement_batch(
 async def bank_statement_parse_preview(
     statement_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> statement_schemas.StatementParsePreviewResponse:
     """Reparse a stored bank statement PDF without imports or database writes."""
     response.headers["Cache-Control"] = "no-store"
@@ -184,7 +184,7 @@ async def bank_statement_parse_preview(
 async def bank_statement_reconcile_preview(
     statement_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> statement_schemas.StatementReconciliationPreviewResponse:
     """Project bank statement matches and misses without enrichment or imports."""
     response.headers["Cache-Control"] = "no-store"
@@ -203,7 +203,7 @@ async def bank_statement_reconcile_preview(
 async def bank_statement_detail(
     statement_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> statement_schemas.BankStatementDetailResponse:
     """Return one bank statement with bounded reconciliation evidence."""
     response.headers["Cache-Control"] = "no-store"

@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Path, Query
 
-from financial_dashboard.core.deps import SessionDep
+from financial_dashboard.core.deps import AsyncSessionDep
 from financial_dashboard.exceptions import NotFoundException
 from financial_dashboard.schemas import accounts as account_schemas
 from financial_dashboard.schemas.common import DatabaseId
@@ -18,7 +18,7 @@ router = APIRouter()
 
 @router.get("/accounts")
 async def accounts_list(
-    session: SessionDep,
+    session: AsyncSessionDep,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     bank: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
@@ -39,7 +39,7 @@ async def accounts_list(
 @router.get("/accounts/{account_id}")
 async def account_detail(
     account_id: Annotated[DatabaseId, Path()],
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> account_schemas.AccountDetailResponse:
     """Return one account with balances, cards, and related-row counts."""
     if account := await get_account_detail(session, account_id):

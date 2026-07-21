@@ -4,7 +4,7 @@ import datetime
 
 from fastapi import APIRouter, File, Form, UploadFile
 
-from financial_dashboard.core.deps import SessionDep
+from financial_dashboard.core.deps import AsyncSessionDep
 from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
 from financial_dashboard.exceptions import (
     BadRequestException,
@@ -19,7 +19,7 @@ router = APIRouter()
 
 @router.post("/cas/upload")
 async def upload_cas(
-    session: SessionDep,
+    session: AsyncSessionDep,
     password: str = Form(""),
     force_replace: bool = Form(False),
     file: UploadFile = File(...),

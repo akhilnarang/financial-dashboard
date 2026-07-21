@@ -7,7 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Path, Query
 
 from financial_dashboard.api.query import validate_date_range
-from financial_dashboard.core.deps import SessionDep
+from financial_dashboard.core.deps import AsyncSessionDep
 from financial_dashboard.exceptions import BadRequestException, NotFoundException
 from financial_dashboard.schemas import transactions as transaction_schemas
 from financial_dashboard.schemas.common import DatabaseId
@@ -36,7 +36,7 @@ router = APIRouter()
 
 @router.get("/transactions")
 async def transactions_list(
-    session: SessionDep,
+    session: AsyncSessionDep,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     transaction_id: Annotated[DatabaseId | None, Query()] = None,
@@ -87,7 +87,7 @@ async def transactions_list(
 @router.post("/transactions/batch")
 async def transactions_batch(
     payload: transaction_schemas.TransactionBatchRequest,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> transaction_schemas.TransactionBatchResponse:
     """Return transaction summaries for an ordered, explicit set of IDs."""
     return await get_transactions_by_ids(session, payload.ids)
@@ -96,7 +96,7 @@ async def transactions_batch(
 @router.get("/transactions/{txn_id}")
 async def transaction_detail(
     txn_id: Annotated[DatabaseId, Path()],
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> transaction_schemas.TransactionDetailResponse:
     """Return one transaction with attribution and source provenance."""
     if transaction := await get_transaction_detail(session, txn_id):
@@ -109,7 +109,7 @@ async def transaction_detail(
 async def update_note(
     txn_id: Annotated[DatabaseId, Path()],
     payload: TransactionNoteUpdate,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> TransactionNoteResponse:
     """Replace the operator note on one transaction."""
     ok, note = await update_transaction_note(session, txn_id, payload.note)
@@ -123,7 +123,7 @@ async def update_note(
 async def update_category(
     txn_id: Annotated[DatabaseId, Path()],
     payload: TransactionCategoryUpdate,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> TransactionCategoryResponse:
     """Set or clear the manual category on one transaction."""
     try:
@@ -143,7 +143,7 @@ async def update_category(
 async def relink(
     txn_id: Annotated[DatabaseId, Path()],
     payload: TransactionRelinkUpdate,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> TransactionRelinkResponse:
     """Manually set or clear a transaction's account and card attribution.
 

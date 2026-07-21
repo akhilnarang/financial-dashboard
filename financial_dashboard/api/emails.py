@@ -6,7 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Path, Query, Response
 
 from financial_dashboard.api.query import inclusive_datetime_bounds
-from financial_dashboard.core.deps import SessionDep
+from financial_dashboard.core.deps import AsyncSessionDep
 from financial_dashboard.exceptions import ApiException, NotFoundException
 from financial_dashboard.schemas import emails as email_schemas
 from financial_dashboard.schemas.common import DatabaseId
@@ -36,7 +36,7 @@ router = APIRouter()
 
 @router.get("/emails")
 async def emails_list(
-    session: SessionDep,
+    session: AsyncSessionDep,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     email_id: Annotated[DatabaseId | None, Query()] = None,
@@ -79,7 +79,7 @@ async def emails_list(
 @router.post("/emails/batch")
 async def emails_batch(
     payload: email_schemas.EmailBatchRequest,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> email_schemas.EmailBatchResponse:
     """Return email summaries for an ordered, explicit set of IDs."""
     return await get_emails_by_ids(session, payload.ids)
@@ -89,7 +89,7 @@ async def emails_batch(
 async def email_raw(
     email_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> email_schemas.EmailRawResponse:
     """Load one bounded raw email body without allowing response caching."""
     response.headers["Cache-Control"] = "no-store"
@@ -103,7 +103,7 @@ async def email_raw(
 async def email_detail(
     email_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> email_schemas.EmailDetailResponse:
     """Return one email's bounded metadata and linked provenance."""
     response.headers["Cache-Control"] = "no-store"
@@ -117,7 +117,7 @@ async def email_detail(
 async def email_parse_preview(
     email_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> email_schemas.EmailParsePreviewResponse:
     """Refetch and parse one stored email without database or notification writes."""
     response.headers["Cache-Control"] = "no-store"
@@ -133,7 +133,7 @@ async def email_parse_preview(
 @router.post("/emails/{email_id}/reparse")
 async def email_reparse(
     email_id: Annotated[DatabaseId, Path()],
-    session: SessionDep,
+    session: AsyncSessionDep,
     force_new: Annotated[bool, Query()] = False,
 ) -> email_schemas.ReparseEmailResponse:
     """Run the canonical email reparse behavior through the JSON API."""
@@ -144,7 +144,7 @@ async def email_reparse(
 async def resolve_duplicate(
     email_id: Annotated[DatabaseId, Path()],
     payload: DuplicateResolutionRequest,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> DuplicateResolutionResponse:
     """Preview or apply explicit enrichment of a deferred duplicate email."""
     try:

@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import APIRouter, Path, Query, Response
 
 from financial_dashboard.api.query import inclusive_datetime_bounds
-from financial_dashboard.core.deps import SessionDep
+from financial_dashboard.core.deps import AsyncSessionDep
 from financial_dashboard.exceptions import NotFoundException
 from financial_dashboard.schemas import sms as sms_schemas
 from financial_dashboard.schemas.common import DatabaseId
@@ -42,7 +42,7 @@ router = APIRouter()
 
 @router.get("/sms")
 async def sms_list(
-    session: SessionDep,
+    session: AsyncSessionDep,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
     sms_id: Annotated[DatabaseId | None, Query()] = None,
@@ -73,7 +73,7 @@ async def sms_list(
 @router.post("/sms/batch")
 async def sms_batch(
     payload: sms_schemas.SmsBatchRequest,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> sms_schemas.SmsBatchResponse:
     """Return SMS summaries for an ordered, explicit set of IDs."""
     return await get_sms_by_ids(session, payload.ids)
@@ -83,7 +83,7 @@ async def sms_batch(
 async def sms_detail(
     sms_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> sms_schemas.SmsDetailResponse:
     """Return one SMS with a bounded raw body and linked transactions."""
     response.headers["Cache-Control"] = "no-store"
@@ -97,7 +97,7 @@ async def sms_detail(
 async def sms_parse_preview(
     sms_id: Annotated[DatabaseId, Path()],
     response: Response,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> sms_schemas.SmsParsePreviewResponse:
     """Parse one stored SMS and project merge behavior without side effects."""
     response.headers["Cache-Control"] = "no-store"
@@ -110,7 +110,7 @@ async def sms_parse_preview(
 @router.post("/sms/{sms_id}/reparse")
 async def sms_reparse(
     sms_id: Annotated[DatabaseId, Path()],
-    session: SessionDep,
+    session: AsyncSessionDep,
     force_new: Annotated[bool, Query()] = False,
 ) -> sms_schemas.ReparseSmsResponse:
     """Run the canonical SMS reparse behavior through the JSON API."""
@@ -128,7 +128,7 @@ async def sms_reparse(
 )
 async def post_sms(
     payload: SmsIngestRequest,
-    session: SessionDep,
+    session: AsyncSessionDep,
 ) -> Response:
     """Store, parse, and reconcile one forwarded SMS before notifying."""
     primary: dict | None = None
