@@ -14,7 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from financial_dashboard.db import Account, Base, Email, FetchRule, Transaction
 from financial_dashboard.integrations.email.body import RawEmailResult
 from financial_dashboard.schemas.emails import DuplicateResolutionRequest
-from financial_dashboard.services.emails import ProcessedEmailParse
+from financial_dashboard.services.emails import (
+    EmailDispatchResult,
+    ProcessedEmailParse,
+)
 from financial_dashboard.services.txn_merge import DUP_DEFER_NOTE, EnrichmentDiff
 
 
@@ -717,7 +720,11 @@ async def test_single_reparse_parse_failure_refreshes_error_without_race(
     from financial_dashboard.web import emails as emails_web
 
     loader = AsyncMock(return_value=RawEmailResult(RAW_EMAIL, None, "provider"))
-    parser = AsyncMock(return_value=("current parser detail", None, None, None))
+    parser = AsyncMock(
+        return_value=EmailDispatchResult(
+            "current parser detail", None, None, None, False
+        )
+    )
     monkeypatch.setattr(emails_web, "load_or_fetch_raw_email", loader)
     monkeypatch.setattr(emails_web, "parse_email_by_kind", parser)
     monkeypatch.setattr(emails_web, "_save_failed_email", lambda *_args: None)
@@ -770,7 +777,7 @@ async def test_reparse_parse_failure_does_not_overwrite_concurrent_explicit_appl
         async def failing_parse(**_kwargs):
             parse_started.set()
             await release_parse.wait()
-            return "stale parser detail", None, None, None
+            return EmailDispatchResult("stale parser detail", None, None, None, False)
 
         monkeypatch.setattr(
             emails_web,

@@ -511,12 +511,7 @@ async def test_parse_email_by_kind_threads_password_hint_for_statement_emails(
     monkeypatch.setattr(emails_service, "process_statement_email", _no_stmt)
     monkeypatch.setattr(emails_service, "process_bank_statement_email", _no_stmt)
 
-    (
-        error,
-        txn_data,
-        password_hint,
-        stmt_result,
-    ) = await emails_service.parse_email_by_kind(
+    result = await emails_service.parse_email_by_kind(
         bank="hdfc",
         email_kind="cc_statement",
         raw_bytes=b"",
@@ -525,9 +520,9 @@ async def test_parse_email_by_kind_threads_password_hint_for_statement_emails(
         log_ref="test",
     )
 
-    assert txn_data is None
-    assert stmt_result is None
-    assert password_hint == "DOB in DDMMYYYY"
+    assert result.txn_data is None
+    assert result.stmt_result is None
+    assert result.password_hint == "DOB in DDMMYYYY"
     # ``error`` is allowed to be set (statement path returned nothing), what
     # matters is that password_hint survived.
 
@@ -575,12 +570,7 @@ async def test_parse_email_by_kind_transaction_does_not_route_to_summary(monkeyp
         emails_service, "process_cc_statement_email_summary", _track_summary
     )
 
-    (
-        error,
-        txn_data,
-        password_hint,
-        stmt_result,
-    ) = await emails_service.parse_email_by_kind(
+    result = await emails_service.parse_email_by_kind(
         bank="hdfc",
         email_kind="transaction",
         raw_bytes=b"",
@@ -592,8 +582,8 @@ async def test_parse_email_by_kind_transaction_does_not_route_to_summary(monkeyp
     # Summary handler must never be invoked for a TRANSACTION rule.
     assert summary_calls == []
     # Transaction data should pass through.
-    assert txn_data is not None
-    assert stmt_result is None
+    assert result.txn_data is not None
+    assert result.stmt_result is None
 
 
 @pytest.mark.anyio
@@ -633,12 +623,7 @@ async def test_parse_email_by_kind_surfaces_error_when_summary_handler_refuses(
     monkeypatch.setattr(emails_service, "process_cc_statement_email_summary", _refuse)
 
     # email_kind=None is the case that previously silently skipped.
-    (
-        error,
-        txn_data,
-        password_hint,
-        stmt_result,
-    ) = await emails_service.parse_email_by_kind(
+    result = await emails_service.parse_email_by_kind(
         bank="onecard",
         email_kind=None,
         raw_bytes=b"",
@@ -647,9 +632,9 @@ async def test_parse_email_by_kind_surfaces_error_when_summary_handler_refuses(
         log_ref="test",
     )
 
-    assert stmt_result is None
-    assert error is not None
-    assert "summary" in error.lower()
+    assert result.stmt_result is None
+    assert result.error is not None
+    assert "summary" in result.error.lower()
 
 
 @pytest.mark.anyio
@@ -681,12 +666,7 @@ async def test_parse_email_by_kind_distinguishes_handler_exception_from_refusal(
 
     monkeypatch.setattr(emails_service, "process_cc_statement_email_summary", _raise)
 
-    (
-        error,
-        _txn,
-        _hint,
-        stmt_result,
-    ) = await emails_service.parse_email_by_kind(
+    result = await emails_service.parse_email_by_kind(
         bank="onecard",
         email_kind=None,
         raw_bytes=b"",
@@ -695,12 +675,12 @@ async def test_parse_email_by_kind_distinguishes_handler_exception_from_refusal(
         log_ref="test",
     )
 
-    assert stmt_result is None
-    assert error is not None
-    assert "db exploded" in error
+    assert result.stmt_result is None
+    assert result.error is not None
+    assert "db exploded" in result.error
     # Must NOT mis-report as an account/ambiguity refusal.
-    assert "matching CC account" not in error
-    assert "ambiguous" not in error
+    assert "matching CC account" not in result.error
+    assert "ambiguous" not in result.error
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, NamedTuple
+from typing import Annotated, Literal, NamedTuple
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Query, Request as FastAPIRequest
@@ -20,6 +20,7 @@ from financial_dashboard.db import (
     Account,
     BankStatementUpload,
     Card,
+    CasUpload,
     Email,
     EmailSource,
     FetchRule,
@@ -317,6 +318,60 @@ class _ReparseTxnResult(NamedTuple):
     pending_disambiguation: dict | None
 
 
+async def _mark_recognized_non_transaction_skipped(
+    session: AsyncSession,
+    email_id: int,
+    *,
+    expected_status: str | None,
+    expected_error: str | None,
+) -> Literal["updated", "ineligible", "missing", "stale"]:
+    """Persist a recognized no-ledger parse result without clobbering races.
+
+    Args:
+        session: Request session whose prior read transaction has been closed.
+        email_id: Stored email to mark as skipped.
+        expected_status: Status observed before provider I/O and parsing.
+        expected_error: Error observed before provider I/O and parsing.
+
+    Returns:
+        ``updated`` when the row was changed, ``ineligible`` when it is not a
+        failed and unlinked email, ``missing`` when it disappeared, or ``stale``
+        when its state changed during loading and parsing.
+    """
+    async with session.begin():
+        email_row = await lock_email_for_attachment(session, email_id)
+        if email_row is None:
+            return "missing"
+        if email_row.status != expected_status or email_row.error != expected_error:
+            return "stale"
+        if email_row.status != "failed":
+            return "ineligible"
+
+        has_ledger_link = await session.scalar(
+            select(
+                or_(
+                    select(Transaction.id)
+                    .where(Transaction.email_id == email_id)
+                    .exists(),
+                    select(StatementUpload.id)
+                    .where(StatementUpload.email_id == email_id)
+                    .exists(),
+                    select(BankStatementUpload.id)
+                    .where(BankStatementUpload.email_id == email_id)
+                    .exists(),
+                    select(CasUpload.id).where(CasUpload.email_id == email_id).exists(),
+                )
+            )
+        )
+        if has_ledger_link:
+            return "ineligible"
+
+        email_row.status = "skipped"
+        email_row.error = None
+
+    return "updated"
+
+
 async def _apply_reparsed_transaction(
     session: AsyncSession,
     em: Email,
@@ -540,7 +595,7 @@ async def reparse_email(
         )
     raw_bytes = raw_email_result.raw_bytes
 
-    error, txn_data, password_hint, stmt_result = await parse_email_by_kind(
+    dispatch_result = await parse_email_by_kind(
         bank=rule.bank,
         email_kind=rule.email_kind,
         raw_bytes=raw_bytes,
@@ -548,6 +603,35 @@ async def reparse_email(
         source_id=email_row.source_id,
         log_ref=f"reparse:{email_id}",
     )
+    error = dispatch_result.error
+    txn_data = dispatch_result.txn_data
+    stmt_result = dispatch_result.stmt_result
+
+    if not txn_data and not stmt_result and dispatch_result.recognized_non_transaction:
+        skip_outcome = await _mark_recognized_non_transaction_skipped(
+            session,
+            email_id,
+            expected_status=original_status,
+            expected_error=original_error,
+        )
+        if skip_outcome == "missing":
+            raise InternalServerException(detail="Email disappeared")
+        if skip_outcome == "stale":
+            raise ConflictException(
+                detail="Email changed while it was being reparsed; retry the request"
+            )
+        if skip_outcome == "ineligible":
+            raise ConflictException(
+                detail=(
+                    "Only failed emails without existing ledger links can be marked "
+                    "as non-transaction notices"
+                )
+            )
+        return ReparseEmailResponse(
+            message="Email contained no ledger event and was skipped",
+            new_status="skipped",
+            txn_id=None,
+        )
 
     if not txn_data and not stmt_result:
         # Parsing still fails — update error message so it's fresh, but keep the
@@ -565,9 +649,7 @@ async def reparse_email(
                 and em.error == original_error
             ):
                 em.error = error
-        raise UnprocessableEntityException(
-            detail=error or "Parsing failed (no transaction or statement found)",
-        )
+        raise UnprocessableEntityException(detail=error)
 
     # Success — update the email row and create transaction if needed.
     async with session.begin():
@@ -755,7 +837,7 @@ async def reparse_all_failed(
             still_failed += 1
             continue
 
-        error, txn_data, _, stmt_result = await parse_email_by_kind(
+        dispatch_result = await parse_email_by_kind(
             bank=rule.bank,
             email_kind=rule.email_kind,
             raw_bytes=raw_email_result.raw_bytes,
@@ -763,6 +845,30 @@ async def reparse_all_failed(
             source_id=email_row.source_id,
             log_ref=f"bulk-reparse:{email_row.id}",
         )
+        txn_data = dispatch_result.txn_data
+        stmt_result = dispatch_result.stmt_result
+
+        if (
+            not txn_data
+            and not stmt_result
+            and dispatch_result.recognized_non_transaction
+        ):
+            skip_outcome = await _mark_recognized_non_transaction_skipped(
+                session,
+                email_row.id,
+                expected_status=email_row.status,
+                expected_error=email_row.error,
+            )
+            if skip_outcome == "updated":
+                skipped += 1
+            else:
+                logger.warning(
+                    "Could not mark non-transaction email %d skipped: %s",
+                    email_row.id,
+                    skip_outcome,
+                )
+                still_failed += 1
+            continue
 
         if not txn_data and not stmt_result:
             # Re-save to spool so the next retry doesn't re-fetch from the

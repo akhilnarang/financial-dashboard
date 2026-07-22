@@ -57,6 +57,8 @@ from financial_dashboard.services.telegram import (
 
 logger = logging.getLogger(__name__)
 
+NON_TRANSACTION_EMAIL_TYPES = frozenset({"icici_cc_usage_control_notice"})
+
 
 def _serialize_datetime(value: datetime.datetime | None) -> str | None:
     if value is None:
@@ -242,16 +244,13 @@ _STATEMENT_KINDS = {
 
 
 class EmailDispatchResult(NamedTuple):
-    """Outcome of dispatching one raw email to the parse+route pipeline.
-
-    Tuple-compatible: existing callers that unpack positionally
-    (``error, txn_data, password_hint, stmt_result = ...``) continue to work.
-    """
+    """Outcome of dispatching one raw email to the parse+route pipeline."""
 
     error: str | None
     txn_data: dict | None
     password_hint: str | None
     stmt_result: dict | None
+    recognized_non_transaction: bool
 
 
 async def _dispatch_email_summary(
@@ -310,7 +309,7 @@ async def _dispatch_email_summary(
             "Statement summary could not be persisted "
             "(no matching CC account or ambiguous match — see logs)"
         )
-    return EmailDispatchResult(error, None, password_hint, stmt_result)
+    return EmailDispatchResult(error, None, password_hint, stmt_result, False)
 
 
 async def parse_email_by_kind(
@@ -322,9 +321,11 @@ async def parse_email_by_kind(
     source_id: int | None,
     log_ref: str,
 ) -> EmailDispatchResult:
-    """Run txn and/or statement pipelines based on the rule's email_kind.
+    """Run transaction and statement pipelines based on the rule's email kind.
 
-    Exactly one of ``txn_data`` or ``stmt_result`` is populated on success.
+    Transaction and statement successes populate their respective result field.
+    Recognized no-ledger notices instead set ``recognized_non_transaction``;
+    all other result-less outcomes retain an error so they remain retryable.
     """
     # CAS emails short-circuit: the bank/CC HTML parser doesn't apply, and we
     # don't want statement-fallback routing to run on them.
@@ -352,7 +353,9 @@ async def parse_email_by_kind(
                 else:
                     # Caught error inside process_cas_email — same rollback story.
                     await cas_session.rollback()
-        return EmailDispatchResult(cas_error, None, None, cas_result)
+        if cas_result is None and cas_error is None:
+            cas_error = "CAS processing returned no result"
+        return EmailDispatchResult(cas_error, None, None, cas_result, False)
 
     # Always run the HTML parser — statement-kind emails still carry a
     # ``password_hint`` and may carry a full ``StatementSummary`` in the body
@@ -361,6 +364,12 @@ async def parse_email_by_kind(
     # statement email) and only keep hint + summary.
     raw_error, txn_data, password_hint, parsed_email = _process_email_full(
         bank, raw_bytes
+    )
+    recognized_non_transaction = bool(
+        parsed_email is not None
+        and parsed_email.email_type in NON_TRANSACTION_EMAIL_TYPES
+        and parsed_email.transaction is None
+        and parsed_email.statement is None
     )
 
     # Compute routing booleans once.
@@ -457,10 +466,18 @@ async def parse_email_by_kind(
                 "Statement processing returned None for %s (no PDF or subject mismatch)",
                 log_ref,
             )
-            if is_statement_rule:
+            if not recognized_non_transaction and (
+                is_statement_rule or (parsed_email is not None and txn_data is None)
+            ):
                 error = bank_stmt_error or "Statement processing returned no result"
 
-    return EmailDispatchResult(error, txn_data, password_hint, stmt_result)
+    return EmailDispatchResult(
+        error,
+        txn_data,
+        password_hint,
+        stmt_result,
+        recognized_non_transaction,
+    )
 
 
 async def handle_polled_email(
@@ -480,7 +497,7 @@ async def handle_polled_email(
 
     email_kind = rule.email_kind
     subject = metadata.get("subject", "")
-    error, txn_data, password_hint, stmt_result = await parse_email_by_kind(
+    dispatch_result = await parse_email_by_kind(
         bank=rule.bank,
         email_kind=email_kind,
         raw_bytes=raw_bytes,
@@ -488,6 +505,9 @@ async def handle_polled_email(
         source_id=source_id,
         log_ref=msg_id,
     )
+    error = dispatch_result.error
+    txn_data = dispatch_result.txn_data
+    stmt_result = dispatch_result.stmt_result
 
     if stmt_result:
         error = None
@@ -527,10 +547,12 @@ async def handle_polled_email(
         async with session.begin():
             if stmt_result:
                 initial_status = "parsed"
+            elif txn_data:
+                initial_status = "pending"
+            elif dispatch_result.recognized_non_transaction:
+                initial_status = "skipped"
             else:
-                initial_status = (
-                    "pending" if txn_data else ("failed" if error else "skipped")
-                )
+                initial_status = "failed"
             email_row = Email(
                 provider=provider,
                 message_id=msg_id,
