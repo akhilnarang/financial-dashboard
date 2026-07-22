@@ -2,9 +2,11 @@ import datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from financial_dashboard.schemas.common import DatabaseIdBatch
+
+STATEMENT_PASSWORD_MAX_LENGTH = 12
 
 
 class StatementAccountLink(BaseModel):
@@ -92,6 +94,15 @@ class BankStatementDetailResponse(BankStatementRead):
 
 class StatementBatchRequest(BaseModel):
     ids: DatabaseIdBatch
+
+
+class StatementReparseRequest(BaseModel):
+    """Credentials used for one statement reparse without persisting them."""
+
+    password: Annotated[
+        SecretStr,
+        Field(max_length=STATEMENT_PASSWORD_MAX_LENGTH),
+    ] = SecretStr("")
 
 
 class CcStatementBatchResponse(BaseModel):
