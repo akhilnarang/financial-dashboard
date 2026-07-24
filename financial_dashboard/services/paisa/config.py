@@ -103,11 +103,13 @@ class PaisaProjectionConfig(NamedTuple):
     request_timeout_seconds: int
     ledger_cli: str = SUPPORTED_LEDGER_CLI
     fx_rates: dict[str, tuple[FxRate, ...]] = {}
-    #: When true, the projection additionally emits complete investment lots
-    #: (from :class:`InvestmentLot`) as conservative cost-basis opening posts.
-    #: Default off; the ``paisa.project_investments`` setting registration is
-    #: owned by the extension manifest, so this is read here with a false
-    #: fallback for a DB that has not registered it yet.
+    #: When true, the projection additionally emits each CAS portfolio's
+    #: authoritative aggregate valuation (from its INR ``BalanceSnapshot``
+    #: history). ``InvestmentLot`` rows are NOT consumed and no commodity lot or
+    #: CAS market price is emitted, so no cost basis, capital gain or XIRR is
+    #: claimed for CAS. Default off; the ``paisa.project_investments`` setting
+    #: registration is owned by the extension manifest, so this is read here
+    #: with a false fallback for a DB that has not registered it yet.
     project_investments: bool = False
 
     @property

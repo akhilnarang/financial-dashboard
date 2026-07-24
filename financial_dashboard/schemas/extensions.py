@@ -12,6 +12,8 @@ only ``auth_password_set`` so an operator can see whether a secret is held
 without the secret itself ever leaving the server.
 """
 
+from decimal import Decimal
+
 from pydantic import BaseModel
 
 
@@ -223,7 +225,16 @@ class PaisaProjectionSummary(BaseModel):
     manual_asset_labels: list[str] = []
     manual_liability_count: int = 0
     manual_liability_labels: list[str] = []
+    cas_investment_coverage: str = "none"
+    investment_cost_basis_portfolios: list[str] = []
+    investment_valuation_portfolios: list[str] = []
+    investment_valuation_entry_count: int = 0
+    investment_valuation_total: Decimal = Decimal("0.00")
+    investment_valuation_unrepresented: list[str] = []
+    investment_unresolved_purchases: int = 0
+    investment_unresolved_redemptions: int = 0
     net_worth_scope_complete: bool = True
+    net_worth_sources_complete: bool = True
     kind_counts: dict[str, int] = {}
     projected_foreign_count: int = 0
     missing_fx_rate_count: int = 0
@@ -440,10 +451,12 @@ class PaisaReportSummary(BaseModel):
 class PaisaReconcileProjectionDiag(BaseModel):
     """Counts lifted from the local projection report (unknown/unmatched/FX).
 
-    The ``investment_*`` fields surface investment-lot projection diagnostics so
-    an operator can see, in the reconciliation view, when lots were suppressed
-    for an unresolvable disposal (``disposal_history_unresolved``) — never
-    overstating holdings. The ``card_payments_*``/``imprecise_count``/
+    The lot/funding ``investment_*`` fields are LEGACY and always zero/empty:
+    Paisa projects CAS as an authoritative aggregate valuation and never
+    consumes ``InvestmentLot`` rows. The live investment diagnostics are
+    ``investment_unresolved_purchases``/``investment_unresolved_redemptions``
+    (bank legs Paisa deliberately does not attribute to a portfolio) and
+    ``cas_investment_coverage``. The ``card_payments_*``/``imprecise_count``/
     ``kind_counts``/``projected_foreign_count``/``source_currencies`` fields
     mirror the projection summary so an operator reads the same diagnostics in
     the reconciliation view as on the projection surface. All the added fields
@@ -481,7 +494,16 @@ class PaisaReconcileProjectionDiag(BaseModel):
     manual_asset_labels: list[str] = []
     manual_liability_count: int = 0
     manual_liability_labels: list[str] = []
+    cas_investment_coverage: str = "none"
+    investment_cost_basis_portfolios: list[str] = []
+    investment_valuation_portfolios: list[str] = []
+    investment_valuation_entry_count: int = 0
+    investment_valuation_total: Decimal = Decimal("0.00")
+    investment_valuation_unrepresented: list[str] = []
+    investment_unresolved_purchases: int = 0
+    investment_unresolved_redemptions: int = 0
     net_worth_scope_complete: bool = True
+    net_worth_sources_complete: bool = True
     kind_counts: dict[str, int] = {}
     projected_foreign_count: int = 0
     source_currencies: list[str] = []

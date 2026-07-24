@@ -284,12 +284,19 @@
         <article class="card" style="margin-bottom: 1rem; border-left: 4px solid {% if s.net_worth_scope_complete %}var(--success){% else %}var(--warning){% endif %};">
             <h3 style="margin: 0 0 0.5rem; font-size: 1.05rem;">Net-worth projection scope</h3>
             <p class="text-sm" style="margin: 0 0 0.5rem;">
-                <strong>{% if s.net_worth_scope_complete %}Complete for active non-account sources.{% else %}Incomplete — Paisa is not a full native net-worth view.{% endif %}</strong>
+                <strong>{% if s.net_worth_scope_complete %}Complete for active non-account sources.{% elif s.net_worth_sources_complete %}All sources present, but unresolved investment legs mean the total may not match native net worth.{% else %}Incomplete — Paisa is not a full native net-worth view.{% endif %}</strong>
                 The account picker selects only Account rows; CAS and manual sources are listed explicitly below.
             </p>
             <dl class="text-sm text-muted" style="margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 0.75rem;">
                 <dt>CAS portfolios</dt>
-                <dd>{{ s.cas_portfolio_count }} · investment scope <strong>{{ s.cas_investment_scope }}</strong>{% if s.cas_portfolio_labels %} · {{ s.cas_portfolio_labels|join(', ') }}{% endif %}</dd>
+                <dd>{{ s.cas_portfolio_count }} · investment scope <strong>{{ s.cas_investment_scope }}</strong> · accounting <strong>{{ s.cas_investment_coverage }}</strong>{% if s.cas_portfolio_labels %} · {{ s.cas_portfolio_labels|join(', ') }}{% endif %}</dd>
+                {% if s.investment_valuation_portfolios %}
+                <dt>CAS valuation</dt>
+                <dd>
+                    {{ s.investment_valuation_portfolios|length }} portfolio(s) projected at authoritative statement value ({{ '%.2f'|format(s.investment_valuation_total) }} INR).
+                    CAS commodity lots are never projected, so <strong>cost basis, capital gains and XIRR are not available</strong>.
+                </dd>
+                {% endif %}
                 <dt>Manual assets</dt>
                 <dd>{{ s.manual_asset_count }} outside projection{% if s.manual_asset_labels %} · {{ s.manual_asset_labels|join(', ') }}{% endif %}</dd>
                 <dt>Manual liabilities</dt>
@@ -309,7 +316,7 @@
                 {%- if preview.summary.card_payments %} ({{ preview.summary.card_payments_resolved }} resolved · {{ preview.summary.card_payments_unresolved }} unresolved{% if preview.summary.card_payments_ambiguous_mask %}, {{ preview.summary.card_payments_ambiguous_mask }} ambiguous exact mask{% endif %}){%- endif %}
             </p>
             {% set s = preview.summary %}
-            {% if s.imprecise_count or s.investment_lot_count or s.investment_funding_remapped or s.investment_funding_unresolved or s.investment_current_valuation_count or s.projected_foreign_count or s.missing_fx_rate_count or s.kind_counts %}
+            {% if s.imprecise_count or s.investment_valuation_portfolios or s.investment_unresolved_purchases or s.investment_unresolved_redemptions or s.investment_current_valuation_count or s.projected_foreign_count or s.missing_fx_rate_count or s.kind_counts %}
             <details style="margin: 0 0 0.5rem;">
                 <summary class="text-sm" style="cursor: pointer;">Computed diagnostics</summary>
                 <dl class="text-sm text-muted" style="margin: 0.5rem 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 0.75rem;">
@@ -319,11 +326,11 @@
                     {%- if s.card_payments %}
                     <dt>Card payments</dt><dd>{{ s.card_payments_resolved }} resolved · {{ s.card_payments_unresolved }} unresolved (generic clearing){% if s.card_payments_ambiguous_mask %} · {{ s.card_payments_ambiguous_mask }} ambiguous exact mask{% endif %}</dd>
                     {%- endif %}
-                    {%- if s.investment_lot_count or s.investment_funding_remapped or s.investment_funding_unresolved %}
-                    <dt>Investment lots</dt><dd>{{ s.investment_lot_count }} projected · {{ s.investment_funding_remapped }} bank leg(s) funding-remapped · {{ s.investment_funding_unresolved|length }} lot(s) suppressed as funding-unresolved</dd>
+                    {%- if s.investment_unresolved_purchases or s.investment_unresolved_redemptions %}
+                    <dt>Unresolved investment legs</dt><dd>{{ s.investment_unresolved_purchases }} purchase(s) keep an unallocated investment asset (a CAS aggregate may also contain them — possible double count) · {{ s.investment_unresolved_redemptions }} redemption(s) post to non-income clearing so no asset goes negative · Paisa never attributes a bank leg to a portfolio</dd>
                     {%- endif %}
-                    {%- if s.investment_current_valuation_count %}
-                    <dt>CAS valuation</dt><dd>{{ s.investment_current_valuation_count }} identity-preserved source position(s) · {{ s.investment_market_price_count }} current market price(s) emitted · {{ s.investment_value_only_count }} value-only/outside surviving lots · {{ s.investment_quantity_mismatch_count }} current-vs-lot quantity mismatch(es) · {{ s.investment_missing_market_price_count }} missing explicit unit price · {{ s.investment_market_price_conflicts|length }} conflicting commodity/date price(s) suppressed{% if s.investment_market_price_conflicts %} ({{ s.investment_market_price_conflicts|join(', ') }}){% endif %}</dd>
+                    {%- if s.investment_valuation_portfolios %}
+                    <dt>CAS valuation</dt><dd>{{ s.investment_valuation_portfolios|length }} portfolio(s) projected at authoritative statement value ({{ '%.2f'|format(s.investment_valuation_total) }} INR) · {{ s.investment_valuation_entry_count }} statement-effective entr{{ 'y' if s.investment_valuation_entry_count == 1 else 'ies' }} · no cost basis, gains or XIRR{% if s.investment_valuation_unrepresented %} · {{ s.investment_valuation_unrepresented|length }} portfolio(s) with no authoritative value{% endif %}</dd>
                     {%- endif %}
                     {%- if s.projected_foreign_count or s.missing_fx_rate_count %}
                     <dt>Foreign currency</dt><dd>{{ s.projected_foreign_count }} projected entr{{ 'y' if s.projected_foreign_count == 1 else 'ies' }} ({{ s.source_currencies|join(', ') }}) · {{ s.missing_fx_rate_count }} skipped for missing rate</dd>

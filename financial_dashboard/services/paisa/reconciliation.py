@@ -159,6 +159,17 @@ def _projection_diag(report) -> PaisaReconcileProjectionDiag | None:
         manual_liability_count=report.manual_liability_count,
         manual_liability_labels=list(report.manual_liability_labels),
         net_worth_scope_complete=report.net_worth_scope_complete,
+        cas_investment_coverage=report.cas_investment_coverage,
+        investment_cost_basis_portfolios=list(report.investment_cost_basis_portfolios),
+        investment_valuation_portfolios=list(report.investment_valuation_portfolios),
+        investment_valuation_entry_count=report.investment_valuation_entry_count,
+        investment_valuation_total=report.investment_valuation_total,
+        investment_valuation_unrepresented=list(
+            report.investment_valuation_unrepresented
+        ),
+        investment_unresolved_purchases=report.investment_unresolved_purchases,
+        investment_unresolved_redemptions=report.investment_unresolved_redemptions,
+        net_worth_sources_complete=report.net_worth_sources_complete,
         kind_counts=dict(report.kind_counts),
         projected_foreign_count=report.projected_foreign_count,
         source_currencies=list(report.source_currencies),

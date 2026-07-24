@@ -46,10 +46,9 @@ from financial_dashboard.db.models import (
     ManualItem,
     Transaction,
 )
+from financial_dashboard.db.enums import SnapshotCategory
 from financial_dashboard.services.investments import (
     CurrentValuation,
-    get_canonical_lot_consumption,
-    get_canonical_lots,
     get_current_valuations,
 )
 from financial_dashboard.services.paisa.accounting import (
@@ -65,7 +64,9 @@ from financial_dashboard.services.paisa.accounting import (
     KIND_REPAYMENT,
     KIND_SELF_TRANSFER,
     KIND_UNKNOWN,
+    KIND_VALUATION,
     ProjectionError,
+    REPAYMENT_CLEARING_ACCOUNT,
     SELF_TRANSFER_SLUG,
     card_clearing_account,
     category_kind,
@@ -74,20 +75,25 @@ from financial_dashboard.services.paisa.accounting import (
     resolve_account,
 )
 from financial_dashboard.services.paisa.config import PaisaProjectionConfig
+from financial_dashboard.services.settings import get_setting
 from financial_dashboard.services.paisa.renderers import (
     render_document as render_document_for_backend,
 )
+from financial_dashboard.services.paisa.portfolio_identity import (
+    PORTFOLIO_TOKEN_SECRET_KEY,
+    normalize_portfolio_key,
+    portfolio_token,
+)
 from financial_dashboard.services.paisa.renderers.base import (
+    EQUITY_REVALUATION,
     INR,
-    INVESTMENT_EQUITY_OPENING,
-    InvestmentLotEntry,
     LedgerAccount,
     LedgerDocument,
     LedgerPosting,
     OpeningBalance,
     PriceDirective,
     ProjectedEntry,
-    sanitize_commodity,
+    investment_valuation_account,
     sanitize_meta_value,
 )
 
@@ -177,20 +183,18 @@ class ProjectionReport(NamedTuple):
     projected_foreign_count: int = 0
     missing_fx_rate_count: int = 0
     source_currencies: tuple[str, ...] = ()
-    #: Investment-lot projection diagnostics. ``investment_lot_count`` is the
-    #: number of complete lots emitted (zero when ``project_investments`` is
-    #: off); ``investment_excluded`` is the deduplicated set of stable reason
-    #: labels for CAS facts that could not become a lot. Lots are read-only
-    #: here — projection never writes a core row.
+    #: LEGACY compatibility fields, always 0/empty. Paisa projects CAS as an
+    #: authoritative aggregate valuation and never consumes ``InvestmentLot``
+    #: rows, so no lot is emitted and no lot is suppressed. They are retained
+    #: only so clients built against the earlier cost-basis projection keep
+    #: deserializing; the core investment service still owns lot normalization
+    #: and its own diagnostics.
     investment_lot_count: int = 0
-    investment_excluded: tuple[str, ...] = ()
-    #: Instrument ids whose complete acquisition lots were *suppressed* because
-    #: the preserved CAS facts contain a disposal/redemption that cannot be
-    #: truthfully allocated to lots (so projecting the gross acquisitions would
-    #: overstate holdings). The matching ``disposal_history_unresolved`` label
-    #: is also added to ``investment_excluded``. Conservative by design: the
-    #: default lot projection never overstates holdings.
     investment_disposal_unresolved: tuple[str, ...] = ()
+    #: Projection policy diagnostics only (``valuation_only_no_cost_basis``,
+    #: ``portfolio_value_unavailable``). Lot-normalization reasons belong to the
+    #: core investment service, not here.
+    investment_excluded: tuple[str, ...] = ()
     #: Diagnostics for the dashboard taxonomy semantics.
     #: ``imprecise_count`` is the number of emitted entries whose category is
     #: inherently imprecise (emi_loan/cash_withdrawal) — posted to a
@@ -207,28 +211,34 @@ class ProjectionReport(NamedTuple):
     #: this separate count prevents that safety decision looking like a simple
     #: missing mapping.
     card_payments_ambiguous_mask: int = 0
-    #: Investment-funding double-count prevention: bank investment legs whose
-    #: contra was remapped to :data:`INVESTMENT_EQUITY_OPENING` because a
-    #: complete lot provably captured the holding. ``investment_funding_unresolved``
-    #: lists instruments whose lot was suppressed because the funding link was
-    #: potential but not provably deterministic.
+    #: LEGACY, always 0/empty. Kept only so clients built against the earlier
+    #: cost-basis projection keep deserializing. Paisa no longer matches bank
+    #: legs to lots at all — see ``investment_unresolved_purchases`` /
+    #: ``investment_unresolved_redemptions`` for the live diagnostics.
     investment_funding_remapped: int = 0
     investment_funding_unresolved: tuple[str, ...] = ()
     #: ``kind_counts`` is the cardinality of each ``dashboard_kind`` among
     #: emitted entries (excluding openings/lots which are structurally
     #: separate). Used by closed-population tests and operator diagnostics.
     kind_counts: dict[str, int] = {}
-    #: Current CAS valuation is independent of acquisition cost. These fields
-    #: count identity-preserving latest holding facts, emitted market-price
-    #: directives, conflicts suppressed at the same commodity/date, and active
-    #: positions for which no surviving acquisition lot exists.
+    #: LIVE holding-fact diagnostics, read from the latest CAS statement per
+    #: portfolio. They describe the source positions behind the projected
+    #: aggregate — identity-preserving, so the same ISIN in two folios or demat
+    #: accounts stays two facts. ``investment_value_only_count`` is the number
+    #: of active positions carrying no acquisition cost, which is why CAS is
+    #: projected as a valuation rather than as lots.
     investment_current_valuation_count: int = 0
+    investment_value_only_count: int = 0
+    investment_valuation_sources: tuple[str, ...] = ()
+    #: LEGACY compatibility fields, always 0/empty. Paisa emits no CAS
+    #: market-price directives and performs no lot/quantity reconciliation, so
+    #: nothing can be conflicted, mismatched or missing a price. Retained only
+    #: so clients built against the earlier cost-basis projection keep
+    #: deserializing.
     investment_market_price_count: int = 0
     investment_market_price_conflicts: tuple[str, ...] = ()
-    investment_value_only_count: int = 0
     investment_quantity_mismatch_count: int = 0
     investment_missing_market_price_count: int = 0
-    investment_valuation_sources: tuple[str, ...] = ()
     #: Closed-population net-worth scope diagnostics. Account selection cannot
     #: select CAS portfolios or manual items, so every preview/generate/sync
     #: explicitly says whether CAS is included/excluded/partial and names all
@@ -242,7 +252,33 @@ class ProjectionReport(NamedTuple):
     manual_asset_labels: tuple[str, ...] = ()
     manual_liability_count: int = 0
     manual_liability_labels: tuple[str, ...] = ()
+    #: How the represented CAS value is accounted. Always ``valuation_only``
+    #: when any CAS value is projected: this projection reads authoritative
+    #: portfolio aggregates and never consumes InvestmentLot rows, so cost
+    #: basis, capital gains and XIRR are unavailable for CAS by construction.
+    cas_investment_coverage: str = "none"
+    #: Always empty — retained for backward compatibility with clients built
+    #: against the earlier mixed cost-basis/valuation projection.
+    investment_cost_basis_portfolios: tuple[str, ...] = ()
+    #: Portfolios projected from their authoritative BalanceSnapshot history.
+    investment_valuation_portfolios: tuple[str, ...] = ()
+    investment_valuation_entry_count: int = 0
+    investment_valuation_total: Decimal = Decimal("0.00")
+    #: CAS portfolios with no authoritative INR snapshot to project.
+    investment_valuation_unrepresented: tuple[str, ...] = ()
+    #: Bank investment legs left unresolved by policy. Purchases keep their
+    #: ``Assets:Investments:Unallocated`` asset (which a CAS aggregate may also
+    #: contain — a possible overlap); redemptions post to the non-income
+    #: clearing so an asset account is never driven negative. Neither is netted
+    #: against CAS: the source data cannot say which portfolio a bank row
+    #: funded. Any non-zero count makes ``net_worth_scope_complete`` false.
+    investment_unresolved_purchases: int = 0
+    investment_unresolved_redemptions: int = 0
     net_worth_scope_complete: bool = True
+    #: Whether every native net-worth *source* is represented, independent of
+    #: whether the total is exact. ``net_worth_scope_complete`` additionally
+    #: requires no unresolved investment legs.
+    net_worth_sources_complete: bool = True
 
 
 class FxDecision(NamedTuple):
@@ -284,21 +320,6 @@ class _CardPaymentResolution(NamedTuple):
 
     card: _ResolvedCard | None
     status: str
-
-
-class _InvestmentProjectionLoad(NamedTuple):
-    """Canonical lots, independent current values, and sanitized diagnostics."""
-
-    entries: tuple[InvestmentLotEntry, ...]
-    entry_portfolio_instruments: frozenset[tuple[str, str]]
-    active_valuation_portfolio_instruments: frozenset[tuple[str, str]]
-    market_prices: tuple[PriceDirective, ...]
-    disposal_suppressed: frozenset[str]
-    market_price_conflicts: tuple[str, ...]
-    value_only_count: int
-    quantity_mismatch_count: int
-    missing_market_price_count: int
-    valuation_sources: tuple[str, ...]
 
 
 class _NetWorthScopeSources(NamedTuple):
@@ -784,211 +805,187 @@ def _price_directive_for(
 
 
 # ---------------------------------------------------------------------------
-# Investment lots
+# CAS portfolio valuation (aggregate only)
 # ---------------------------------------------------------------------------
-
-#: ``paisa.project_investments`` gates the entire investment-lot projection.
-#: Default off; the setting registration lives in the extension manifest (owned
-#: elsewhere), so the config reads it with a ``False`` fallback for a DB that
-#: has not registered it yet.
-
-# Investment-lot projection is deliberately separate from the bank/cash flow:
-# a lot posts ONLY to ``Assets:Investments:<instrument>`` against a dedicated
-# ``Equity:Opening Balances:Investment`` contra, and NO bank/cash leg is
-# inferred. This keeps lots from double-counting a bank balance.
 #
-# Caveat an operator should know: the bank account *purchase* that funded an
-# MF acquisition is still a dashboard Transaction. Unless its category is
-# mapped (via ``paisa.category_mappings``) to the investment/equity account,
-# the bank projection emits it as an ordinary expense while the lot projection
-# also records the holding — the same rupee appears twice. Investment
-# projection is OFF by default precisely so this is opt-in, and the report's
-# diagnostics let an operator see what was projected before relying on it.
+# Every CAS portfolio is projected from its authoritative INR ``BalanceSnapshot``
+# history and nothing else. There is no accounting-mode selection, no cost-basis
+# path, and no lot consumption — the journal carries plain INR balances with no
+# cost annotation, no acquisition date and no commodity, so no consumer can
+# derive a capital gain or XIRR from them.
+#
+# Statement-effective semantics. The value source is the one
+# :func:`financial_dashboard.services.networth.current_networth` selects, so the
+# ledger's CAS component equals the dashboard's by construction. The latest
+# snapshot on or before the cutover becomes an opening balance; each later
+# statement posts only the *delta* since the previous value; a portfolio falling
+# to zero posts the negative of its prior value and clears; an unchanged value
+# posts nothing. Because every posting is dated at its own statement date, a
+# future statement can only ever affect balances from that date forward — it can
+# never rewrite an earlier one.
 
 
-async def _load_investment_lot_entries(
-    session: AsyncSession,
-    valuations: list[CurrentValuation],
-) -> _InvestmentProjectionLoad:
-    """Project canonical acquisitions and independent latest CAS valuation.
+class _PortfolioValuation(NamedTuple):
+    """One CAS portfolio's authoritative INR value history."""
 
-    Overlapping CAS statements preserve every normalized source row, but
-    :func:`get_canonical_lots` collapses repeated history as a multiset before
-    it reaches the journal. Genuine repeated acquisitions remain repeated.
-    Canonical disposal consumption is then applied without FIFO/average-cost
-    inference. Full consumption emits no holding; partial consumption retains
-    acquisition date/unit cost and reduces cost basis proportionally.
+    portfolio_key: str
+    #: ``(as_of_date, value)`` ascending, one entry per source snapshot date.
+    points: tuple[tuple[datetime.date, Decimal], ...]
 
-    Acquisition ``unit_cost`` lives only in the lot's cost annotation. Latest
-    explicit CAS NAV/unit-price facts are emitted separately as dated market
-    prices, so a current valuation never changes cost basis. A market price is
-    emitted only for a commodity with a surviving lot. Equal same-day facts are
-    deduplicated; conflicting same-day prices are all suppressed and diagnosed
-    rather than selecting an arbitrary folio/demat source.
 
-    **Disposal safety.** Instruments whose preserved CAS facts contain a
-    disposal/redemption that cannot be truthfully allocated to lots are
-    *suppressed* (returned in the ``suppressed`` set): their gross acquisition
-    lots are not projected, so the default projection never overstates holdings.
-    CAS does not tie a redemption to the acquisition lots it settled, so any
-    instrument with a free-standing redemption is suppressed conservatively.
+async def _load_portfolio_valuations(
+    session: AsyncSession, *, as_of: datetime.date | None = None
+) -> dict[str, _PortfolioValuation]:
+    """Authoritative INR CAS portfolio values, keyed by normalized portfolio.
 
-    Read-only: all helpers SELECT normalized rows/preserved payloads and build
-    value objects; projection never mutates an InvestmentLot or CAS row.
+    Mirrors :func:`financial_dashboard.services.networth.current_networth`'s
+    source selection: investment-category INR balance snapshots, latest per
+    ``(portfolio_key, date)``. ``CasUpload.grand_total`` and the snapshot value
+    are written together by CAS ingestion, so reading the snapshot keeps exact
+    parity with native net worth without assuming instrument rows sum to the
+    portfolio total.
+
+    Snapshots dated after *as_of* are excluded so a future statement never
+    affects an earlier balance.
     """
-    canonical_lots = await get_canonical_lots(session)
-    consumption = await get_canonical_lot_consumption(session)
-    unresolved_pairs = set(consumption.unresolved)
-    invalid_pairs: set[tuple[str, str]] = set()
-    records: list[tuple[InvestmentLotEntry, tuple[str, str]]] = []
-    for lot in canonical_lots:
-        key = lot.key
-        pair = (key.portfolio_key, key.instrument_id)
-        if pair in unresolved_pairs:
-            continue
-        quantity = consumption.remaining.get(key, key.quantity)
-        if quantity == 0:
-            # Exactly consumed: no holding. Market prices are filtered against
-            # surviving commodities below, so this cannot leave an orphan.
-            continue
-        if quantity < 0 or quantity > key.quantity:
-            # The canonical resolver derives this from the same source facts.
-            # Any mismatch means the whole portfolio/instrument is unsafe.
-            invalid_pairs.add(pair)
-            continue
-        cost_basis = (quantity * key.unit_cost).quantize(Decimal("0.01"))
-        provenance_ids = tuple(item.cas_upload_id for item in lot.provenance)
-        provenance_sources = tuple(
-            dict.fromkeys(item.depository_source for item in lot.provenance)
+    rows = (
+        (
+            await session.execute(
+                select(BalanceSnapshot)
+                .outerjoin(CasUpload, BalanceSnapshot.cas_upload_id == CasUpload.id)
+                .where(
+                    BalanceSnapshot.category == SnapshotCategory.investment.value,
+                    BalanceSnapshot.currency == INR,
+                    BalanceSnapshot.cas_upload_id.is_not(None),
+                )
+                .order_by(BalanceSnapshot.as_of_date, BalanceSnapshot.id)
+            )
         )
-        # Preserve portfolio/source occurrence and every overlapping upload in
-        # reduced source-less metadata. No duplicate commodity holding is made
-        # to represent provenance.
-        lot_meta: list[tuple[str, str]] = [
-            ("dashboard_kind", KIND_LOT),
-            (
-                "dashboard_instrument",
-                sanitize_meta_value(key.instrument_id) or "unknown",
-            ),
-            ("dashboard_acquired_on", str(key.acquired_on)),
-            (
-                "dashboard_portfolio_key",
-                sanitize_meta_value(key.portfolio_key) or "unknown",
-            ),
-            ("dashboard_source_occurrence", str(key.occurrence)),
-            ("dashboard_cas_upload_ids", _pipe(provenance_ids) or "none"),
-            (
-                "dashboard_depository_sources",
-                "|".join(
-                    sanitize_meta_value(source) or "unknown"
-                    for source in provenance_sources
+        .unique()
+        .scalars()
+        .all()
+    )
+    # Grouped by the RAW portfolio key, exactly as
+    # :func:`networth._source_key` does — never by a normalized form. Native net
+    # worth treats two raw keys differing only in case or whitespace as separate
+    # sources and SUMS them; normalizing here would merge their series and (for
+    # same-date rows) silently drop one, so the ledger would under-report.
+    # Legacy/imported rows can carry such variants, so this must mirror native
+    # identity even though ingestion uppercases going forward. The private
+    # ledger token is still derived from the normalized key, so two raw
+    # identities may post to one account — their amounts still sum and match
+    # native net worth without exposing the raw key.
+    #
+    # Last write wins per (raw portfolio, date) exactly as _latest_per_source
+    # does: rows arrive ascending by (as_of_date, id), so a later id on the same
+    # date supersedes an earlier one.
+    per_portfolio: dict[str, dict[datetime.date, Decimal]] = {}
+    for row in rows:
+        if as_of is not None and row.as_of_date > as_of:
+            continue
+        key = row.portfolio_key or (
+            row.cas_upload.portfolio_key if row.cas_upload is not None else None
+        )
+        if key is None or not key.strip():
+            continue
+        per_portfolio.setdefault(key, {})[row.as_of_date] = Decimal(row.value)
+    return {
+        portfolio: _PortfolioValuation(
+            portfolio_key=portfolio,
+            points=tuple(sorted(points.items())),
+        )
+        for portfolio, points in per_portfolio.items()
+    }
+
+
+def _valuation_entries(
+    valuation: _PortfolioValuation,
+    *,
+    cutover: datetime.date,
+    account: str,
+    equity_account: str,
+    reason: str,
+) -> list[ProjectedEntry]:
+    """Opening + delta postings representing one portfolio's value over time.
+
+    The latest snapshot on or before the cutover is the opening balance (dated
+    at the cutover, like every other opening). Each later snapshot posts only
+    the change since the previous value, so the account's balance at any date
+    equals the CAS statement value in force on that date — including zero, when
+    a portfolio is emptied. Zero deltas emit nothing, keeping the journal
+    byte-stable when a statement repeats a value.
+    """
+    opening = Decimal("0.00")
+    later: list[tuple[datetime.date, Decimal]] = []
+    #: The statement date the opening value was actually observed on. The entry
+    #: itself is dated at the cutover (that is when the balance is struck), but
+    #: the metadata must retain the real source date or a stale valuation looks
+    #: like it was observed at cutover and audit provenance is lost.
+    opening_as_of: datetime.date | None = None
+    for as_of_date, value in valuation.points:
+        if as_of_date <= cutover:
+            opening = value
+            opening_as_of = as_of_date
+        else:
+            later.append((as_of_date, value))
+
+    entries: list[ProjectedEntry] = []
+    running = Decimal("0.00")
+
+    def _meta(as_of_date: datetime.date, kind: str) -> tuple[tuple[str, str], ...]:
+        return (
+            ("dashboard_kind", KIND_VALUATION),
+            ("dashboard_valuation_kind", kind),
+            ("dashboard_portfolio_token", sanitize_meta_value(account.split(":")[-1])),
+            ("dashboard_as_of", as_of_date.isoformat()),
+            ("dashboard_valuation_reason", sanitize_meta_value(reason) or "unknown"),
+            # Stated so no consumer reads the balance as an acquisition cost.
+            ("dashboard_cost_basis_available", "false"),
+        )
+
+    if opening:
+        running = opening
+        entries.append(
+            ProjectedEntry(
+                date=cutover,
+                payee="CAS Portfolio Valuation",
+                txn_ids=(),
+                postings=(
+                    LedgerPosting(account=account, amount=opening, commodity=INR),
+                    LedgerPosting(
+                        account=equity_account, amount=-opening, commodity=INR
+                    ),
                 ),
-            ),
-        ]
-        if lot.canonical_cas_upload_id is not None:
-            lot_meta.append(
-                ("dashboard_cas_upload_id", str(lot.canonical_cas_upload_id))
+                note=None,
+                currency=INR,
+                kind=KIND_VALUATION,
+                # Entry is dated at the cutover; the metadata keeps the real
+                # statement date the value was observed on.
+                meta=_meta(opening_as_of or cutover, "opening"),
             )
-        if key.source_ref:
-            lot_meta.append(
-                ("dashboard_source_ref", sanitize_meta_value(key.source_ref))
-            )
-        if key.reference:
-            lot_meta.append(("dashboard_reference", sanitize_meta_value(key.reference)))
-        records.append(
-            (
-                InvestmentLotEntry(
-                    instrument=sanitize_commodity(key.instrument_id),
-                    instrument_name=lot.instrument_name,
-                    quantity=quantity,
-                    unit_cost=key.unit_cost,
-                    cost_basis=cost_basis,
-                    currency=key.currency,
-                    acquired_on=key.acquired_on,
-                    cas_upload_id=lot.canonical_cas_upload_id,
-                    source_ref=key.source_ref,
-                    reference=key.reference,
-                    meta=tuple(lot_meta),
+        )
+
+    for as_of_date, value in later:
+        delta = value - running
+        running = value
+        if delta == 0:
+            continue
+        entries.append(
+            ProjectedEntry(
+                date=as_of_date,
+                payee="CAS Portfolio Revaluation",
+                txn_ids=(),
+                postings=(
+                    LedgerPosting(account=account, amount=delta, commodity=INR),
+                    LedgerPosting(account=equity_account, amount=-delta, commodity=INR),
                 ),
-                pair,
+                note=None,
+                currency=INR,
+                kind=KIND_VALUATION,
+                meta=_meta(as_of_date, "revaluation"),
             )
         )
-    suppressed_pairs = unresolved_pairs | invalid_pairs
-    records = [record for record in records if record[1] not in suppressed_pairs]
-    entries = tuple(record[0] for record in records)
-    entry_pairs = frozenset(record[1] for record in records)
-    emitted_instruments = {entry.instrument for entry in entries}
-
-    valuation_sources = tuple(_valuation_source_label(value) for value in valuations)
-    active_valuations = [value for value in valuations if _valuation_is_active(value)]
-    value_only_count = sum(
-        value.quantity is None
-        or (value.portfolio_key, value.instrument_id) not in entry_pairs
-        for value in active_valuations
-    )
-    projected_quantities: dict[tuple[str, str], Decimal] = {}
-    for entry, pair in records:
-        projected_quantities[pair] = projected_quantities.get(
-            pair, Decimal("0")
-        ) + Decimal(entry.quantity)
-    current_quantities: dict[tuple[str, str], Decimal] = {}
-    for value in active_valuations:
-        if value.quantity is None:
-            continue
-        pair = (value.portfolio_key, value.instrument_id)
-        current_quantities[pair] = (
-            current_quantities.get(pair, Decimal("0")) + value.quantity
-        )
-    quantity_mismatch_count = sum(
-        projected_quantities.get(pair, Decimal("0")) != quantity
-        for pair, quantity in current_quantities.items()
-    )
-
-    price_facts: dict[tuple[datetime.date, str, str], set[Decimal]] = {}
-    missing_market_price_count = 0
-    for value in valuations:
-        commodity = sanitize_commodity(value.instrument_id)
-        if commodity not in emitted_instruments:
-            continue
-        if value.unit_price is None or value.unit_price <= 0:
-            if _valuation_is_active(value):
-                missing_market_price_count += 1
-            continue
-        key = (value.statement_date, commodity, value.currency)
-        price_facts.setdefault(key, set()).add(value.unit_price)
-
-    prices: list[PriceDirective] = []
-    conflicts: list[str] = []
-    for (date, commodity, unit), rates in sorted(price_facts.items()):
-        if len(rates) != 1:
-            conflicts.append(f"{commodity}@{date.isoformat()}")
-            continue
-        prices.append(
-            PriceDirective(
-                date=date,
-                currency=commodity,
-                rate=next(iter(rates)),
-                unit=unit,
-            )
-        )
-
-    suppressed_instruments = frozenset(
-        instrument for _portfolio, instrument in suppressed_pairs
-    )
-    return _InvestmentProjectionLoad(
-        entries=entries,
-        entry_portfolio_instruments=entry_pairs,
-        active_valuation_portfolio_instruments=frozenset(
-            (value.portfolio_key, value.instrument_id) for value in active_valuations
-        ),
-        market_prices=tuple(prices),
-        disposal_suppressed=suppressed_instruments,
-        market_price_conflicts=tuple(conflicts),
-        value_only_count=value_only_count,
-        quantity_mismatch_count=quantity_mismatch_count,
-        missing_market_price_count=missing_market_price_count,
-        valuation_sources=valuation_sources,
-    )
+    return entries
 
 
 def _valuation_is_active(value: CurrentValuation) -> bool:
@@ -1059,22 +1056,6 @@ async def _load_net_worth_scope_sources(
         manual_asset_labels=asset_labels,
         manual_liability_labels=liability_labels,
     )
-
-
-async def _investment_excluded_reasons(session: AsyncSession) -> tuple[str, ...]:
-    """Deduplicated stable reason labels for CAS facts excluded from lots.
-
-    Delegates to the investment service, which recomputes exclusions from the
-    preserved raw payloads — so the diagnostic reflects the current lot
-    classification without a separate persisted store.
-    """
-    from financial_dashboard.services.investments import get_incomplete_reasons
-
-    exclusions = await get_incomplete_reasons(session)
-    seen: dict[str, None] = {}
-    for excl in exclusions:
-        seen.setdefault(excl.reason, None)
-    return tuple(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -1163,125 +1144,6 @@ def _resolve_card_for_payment(
 
 
 # ---------------------------------------------------------------------------
-# Investment funding double-count prevention (conservative, no fuzzy matching)
-# ---------------------------------------------------------------------------
-
-
-class _InvestmentFundingMap(NamedTuple):
-    """Lookup structures for provable lot↔bank-investment funding links.
-
-    * ``by_ref``: lot reference/source_ref → list of (instrument, cost_basis).
-    * ``by_date_amount``: (acquired_on, cost_basis) → list of instruments.
-    * ``instruments``: the set of all emitted-lot instruments.
-
-    A bank investment transaction provably funds a lot when:
-      (a) its ``reference_number`` exactly matches a lot's ``reference`` or
-          ``source_ref``; OR
-      (b) its ``(transaction_date, amount)`` exactly matches a lot's
-          ``(acquired_on, cost_basis)`` AND that key is deterministic (exactly
-          one lot instrument matches).
-
-    When neither holds but a potential date-or-amount collision exists, the lot
-    is suppressed conservatively (the funding is not provably deterministic, so
-    emitting both would risk double-counting the investment asset).
-    """
-
-    by_ref: dict[str, list[tuple[str, Decimal]]]
-    by_date_amount: dict[tuple[datetime.date, Decimal], list[str]]
-    instruments: set[str]
-
-
-def _build_funding_map(
-    lot_entries: tuple[InvestmentLotEntry, ...],
-) -> _InvestmentFundingMap:
-    """Build the provable-funding lookup from emitted lots."""
-    by_ref: dict[str, list[tuple[str, Decimal]]] = {}
-    by_date_amount: dict[tuple[datetime.date, Decimal], list[str]] = {}
-    instruments: set[str] = set()
-    for lot in lot_entries:
-        instruments.add(lot.instrument)
-        key = (lot.acquired_on, Decimal(lot.cost_basis).quantize(Decimal("0.01")))
-        by_date_amount.setdefault(key, []).append(lot.instrument)
-        for ref in (lot.reference, lot.source_ref):
-            if ref:
-                by_ref.setdefault(ref, []).append(
-                    (lot.instrument, Decimal(lot.cost_basis))
-                )
-    return _InvestmentFundingMap(by_ref, by_date_amount, instruments)
-
-
-def _check_investment_funding(
-    txn: Transaction, fmap: _InvestmentFundingMap
-) -> tuple[str | None, Decimal | None]:
-    """Return ``(instrument, amount)`` if ``txn`` provably funds an emitted lot.
-
-    Returns ``(None, None)`` when not provable. The rules (no fuzzy matching):
-
-    1. Exact reference: ``txn.reference_number`` matches a lot's ``reference``
-       or ``source_ref``. If the ref maps to exactly one instrument, it's
-       provable. **Do not** early-return when the ref maps to several
-       instruments — fall through to the deterministic date+amount check below,
-       which may still disambiguate. Early-returning on a shared reference would
-       skip that disambiguation and leave the bank leg in a double-count window
-       (emitted as an ordinary investment whose lot is also projected).
-    2. Exact date+amount: ``(txn.transaction_date, txn.amount)`` matches a
-       lot's ``(acquired_on, cost_basis)`` AND exactly one instrument shares
-       that key (deterministic).
-
-    The amount is returned so the caller can verify the full funding match.
-    """
-    ref = (txn.reference_number or "").strip()
-    if ref and ref in fmap.by_ref:
-        matches = fmap.by_ref[ref]
-        if len(matches) == 1:
-            instr, amt = matches[0]
-            return (instr, amt)
-        # Multiple instruments share this ref — ambiguous on the reference
-        # alone. Fall through: a deterministic exact date+amount match may
-        # still single out one instrument and remap the bank leg provably.
-    date = txn.transaction_date
-    if date is not None:
-        key = (date, Decimal(txn.amount).quantize(Decimal("0.01")))
-        matches = fmap.by_date_amount.get(key)
-        if matches and len(matches) == 1:
-            return (matches[0], Decimal(txn.amount).quantize(Decimal("0.01")))
-    return (None, None)
-
-
-def _ambiguous_funding_instruments(
-    txn: Transaction, fmap: _InvestmentFundingMap
-) -> set[str]:
-    """Instruments with a *potential* (but not provable) funding link to ``txn``.
-
-    Used to suppress lots conservatively when a bank investment transaction
-    shares a reference, date, or amount with a lot but the link is not
-    provably deterministic (so emitting both would risk double-counting the
-    investment asset). Reached only when :func:`_check_investment_funding`
-    returned ``(None, None)`` — i.e. no single-instrument reference and no
-    deterministic exact date+amount match — so every branch here is the
-    conservative fallback for a *potential* link.
-    """
-    potential: set[str] = set()
-    # A reference shared by multiple instruments is a potential-but-not-provable
-    # funding link: the bank leg may fund any of them, and we cannot tell which.
-    # Suppress every instrument sharing the ref so none is double-counted.
-    ref = (txn.reference_number or "").strip()
-    if ref and ref in fmap.by_ref and len(fmap.by_ref[ref]) != 1:
-        for instr, _amt in fmap.by_ref[ref]:
-            potential.add(instr)
-    date = txn.transaction_date
-    if date is not None:
-        amount = Decimal(txn.amount).quantize(Decimal("0.01"))
-        # Same date OR same amount (but not the deterministic exact pair, which
-        # _check_investment_funding would have caught as provable).
-        for (lot_date, lot_amt), instrs in fmap.by_date_amount.items():
-            if lot_date == date or lot_amt == amount:
-                if not (lot_date == date and lot_amt == amount and len(instrs) == 1):
-                    potential.update(instrs)
-    return potential
-
-
-# ---------------------------------------------------------------------------
 # Top-level projection
 # ---------------------------------------------------------------------------
 
@@ -1362,7 +1224,8 @@ async def project(
     card_payments_ambiguous_mask = 0
     imprecise = 0
     self_pairs = 0
-    investment_funding_remapped = 0
+    investment_unresolved_purchases = 0
+    investment_unresolved_redemptions = 0
     source_currencies: set[str] = set()
     prices: list[PriceDirective] = []
 
@@ -1518,32 +1381,36 @@ async def project(
                 if t.id is not None:
                     st_seen_ids.add(t.id)
 
-    # ---- investment lots (loaded BEFORE the linear pass so funding dedup
-    #      can remap bank investment legs that provably fund an emitted lot).
-    lot_entries: tuple[InvestmentLotEntry, ...] = ()
+    # ---- CAS investments: aggregate valuation only --------------------------
+    # Projection deliberately does NOT consume InvestmentLot rows. Those rows
+    # remain a first-class ingestion fact (the model, normalization, backfill and
+    # dashboard views are untouched), but the *journal* is built solely from each
+    # portfolio's authoritative BalanceSnapshot history.
+    #
+    # Why: reconciling per-lot cost basis against per-statement CAS aggregates is
+    # not determined by this data. A bank row does not name the portfolio it
+    # funded, and a CAS value change is purchases minus redemptions PLUS market
+    # movement, so the cash-flow component is unrecoverable. Every attempt to
+    # bridge that gap either double counted, deleted assets, drove an asset
+    # balance negative, or let a later statement rewrite an earlier balance.
+    # See the preserved design note for what a correct cost-basis feature needs.
+    #: Projection-relevant policy diagnostics ONLY. Lot-normalization reasons
+    #: (non-MF, missing cost facts, ...) are deliberately NOT surfaced here: the
+    #: authoritative aggregate *includes* those holdings' value, so reporting
+    #: them as "excluded" would imply value was omitted when it was not. The
+    #: core investment service still exposes them on its own dashboard surface.
     investment_excluded: tuple[str, ...] = ()
-    disposal_suppressed: frozenset[str] = frozenset()
-    investment_load: _InvestmentProjectionLoad | None = None
-    investment_market_prices: tuple[PriceDirective, ...] = ()
-    if config.project_investments:
-        investment_load = await _load_investment_lot_entries(
-            session, current_valuations
-        )
-        lot_entries = investment_load.entries
-        investment_market_prices = investment_load.market_prices
-        disposal_suppressed = investment_load.disposal_suppressed
-        investment_excluded = await _investment_excluded_reasons(session)
-        if disposal_suppressed:
-            investment_excluded = tuple(
-                dict.fromkeys((*investment_excluded, "disposal_history_unresolved"))
-            )
-        if investment_load.market_price_conflicts:
-            investment_excluded = tuple(
-                dict.fromkeys((*investment_excluded, "current_price_conflict"))
-            )
-
-    fmap = _build_funding_map(lot_entries)
-    funding_suppressed: set[str] = set()
+    #: Whether CAS aggregates are being projected at all. Gates both the
+    #: unresolved-leg policy and the valuation emission below.
+    cas_portfolios_projected = bool(
+        config.project_investments and scope_sources.cas_portfolio_keys
+    )
+    portfolio_values: dict[str, _PortfolioValuation] = {}
+    # Read once: the valuation account names derive a non-reversible portfolio
+    # token from it. Projection only READS the secret; the migration creates it.
+    secret = get_setting(PORTFOLIO_TOKEN_SECRET_KEY)
+    if cas_portfolios_projected:
+        portfolio_values = await _load_portfolio_valuations(session)
 
     # Linear pass over the remaining (eligible, non-self-transfer) txns.
     for txn in eligible:
@@ -1621,28 +1488,45 @@ async def project(
                 unknown += 1
             if category in IMPRECISE_CATEGORY_SLUGS:
                 imprecise += 1
-            # Investment funding double-count prevention: if this investment-
-            # category transaction provably funds an emitted lot, remap the
-            # bank leg's contra to INVESTMENT_EQUITY_OPENING so the investment
-            # asset is counted once (in the lot), not twice. If there is a
-            # potential but not provable link, suppress the lot conservatively.
+            # Every bank investment leg is UNRESOLVED by policy. No funding
+            # matching, no remapping, no netting against the CAS aggregate: the
+            # source data cannot say which portfolio a bank row funded, so any
+            # inferred link would be fabricated. The asset stays where it
+            # honestly belongs and the ambiguity is reported instead.
+            #
+            # An explicit operator ``category_mappings`` entry outranks this (and
+            # every other generated policy) — ``contra_account()`` documents that
+            # contract, and silently bypassing a configured account would leave
+            # the operator's holdings account understated with no signal.
             contra_override = None
             kind_override = None
-            if category in INVESTMENT_CATEGORY_SLUGS and lot_entries:
-                instr, _funding_amt = _check_investment_funding(txn, fmap)
-                if instr is not None:
+            explicit_mapping = category in config.category_mappings
+            if (
+                category in INVESTMENT_CATEGORY_SLUGS
+                and not explicit_mapping
+                and cas_portfolios_projected
+            ):
+                if txn.direction == "debit":
+                    # A purchase: the money really did move into investments, so
+                    # the asset stays in Assets:Investments:Unallocated. The CAS
+                    # aggregate may also contain it, which is a possible overlap
+                    # an operator must interpret — reported, never netted.
+                    investment_unresolved_purchases += 1
+                else:
+                    # A redemption with no projected lot to retire. It must NOT
+                    # post a negative amount to Assets:Investments:Unallocated:
+                    # that account only holds this projection's own unmatched
+                    # purchases, while a redemption usually disposes of holdings
+                    # acquired before the cutover that were never projected.
+                    # Netting it there drives an asset negative — meaningless
+                    # accounting, and a fatal Paisa "Negative Balance" diagnosis.
                     contra_override = normalize_policy_account(
-                        INVESTMENT_EQUITY_OPENING,
+                        REPAYMENT_CLEARING_ACCOUNT,
                         backend=backend,
-                        label="investment_funding_remap",
+                        label="investment_redemption_unallocated",
                     )
                     kind_override = KIND_INVESTMENT
-                    investment_funding_remapped += 1
-                else:
-                    # Potential but not provable: suppress the matching lot(s)
-                    # so we never emit both a lot AND an unresolved bank leg
-                    # pointing at Assets:Investments.
-                    funding_suppressed.update(_ambiguous_funding_instruments(txn, fmap))
+                    investment_unresolved_redemptions += 1
             entries.append(
                 _build_standard_entry(
                     txn,
@@ -1665,34 +1549,77 @@ async def project(
 
     declared = sorted({a.name for a in accounts_by_id.values()})
 
-    # Apply investment-funding suppression: lots whose funding link is potential
-    # but not provably deterministic are removed so the investment asset is
-    # never double-counted (the bank leg still captures the bank decrease).
-    if funding_suppressed:
-        lot_entries = tuple(
-            lot for lot in lot_entries if lot.instrument not in funding_suppressed
+    # ---- CAS aggregate valuation entries ----------------------------------
+    # One balanced opening + forward deltas per portfolio, dated at each
+    # statement. No lots, no market prices, no netting against bank legs.
+    valuation_entries: list[ProjectedEntry] = []
+    valuation_portfolios: list[str] = []
+    valuation_total = Decimal("0.00")
+    valuation_unrepresented: list[str] = []
+    if cas_portfolios_projected:
+        equity_account = normalize_policy_account(
+            EQUITY_REVALUATION, backend=backend, label="investment_revaluation"
         )
-        # Current market prices are independent from cost but still cannot
-        # outlive their holding commodity. FX directives are in ``prices`` and
-        # are untouched here.
-        surviving_instruments = {lot.instrument for lot in lot_entries}
-        investment_market_prices = tuple(
-            price
-            for price in investment_market_prices
-            if price.currency in surviving_instruments
-        )
-        investment_excluded = tuple(
-            dict.fromkeys((*investment_excluded, "investment_funding_unresolved"))
+        # Iterate RAW source identities (matching native net worth's grouping),
+        # but derive the account/report identity from the normalized key. Two
+        # raw keys that normalize alike post to the same private account, where
+        # their independent series sum — which is exactly what native does.
+        represented_normalized: set[str] = set()
+        for raw_portfolio, series in sorted(portfolio_values.items()):
+            if not series.points:
+                continue
+            normalized = normalize_portfolio_key(raw_portfolio)
+            token = portfolio_token(raw_portfolio, secret)
+            account = normalize_policy_account(
+                investment_valuation_account(token),
+                backend=backend,
+                label="investment_valuation",
+            )
+            portfolio_entries = _valuation_entries(
+                series,
+                cutover=cutover,
+                account=account,
+                equity_account=equity_account,
+                reason="cas_aggregate_valuation",
+            )
+            # A portfolio whose whole history is zero needs no posting but IS
+            # represented: its true value (nothing) is in the ledger exactly.
+            represented_normalized.add(normalized)
+            if not portfolio_entries:
+                continue
+            valuation_entries.extend(portfolio_entries)
+            valuation_total += series.points[-1][1]
+        valuation_portfolios.extend(sorted(represented_normalized))
+        # A CAS portfolio with no authoritative INR snapshot has no value to
+        # project. Diagnosed, never invented.
+        valuation_unrepresented.extend(
+            sorted(scope_sources.cas_portfolio_keys - represented_normalized)
         )
 
-    # Market NAV/unit-price directives are appended only after both disposal
-    # and funding suppression, so a fully consumed/suppressed lot cannot leave
-    # an orphan commodity price.
-    prices.extend(investment_market_prices)
+    if valuation_entries:
+        # Valuation entries carry no txn_ids, so portfolios sharing a statement
+        # date would tie at (date, 0); break it on the deterministic account
+        # name so the rendered file stays byte-identical across runs.
+        entries.extend(valuation_entries)
+        entries.sort(
+            key=lambda e: (
+                e.date,
+                e.txn_ids[0] if e.txn_ids else 0,
+                e.postings[0].account if not e.txn_ids and e.postings else "",
+            )
+        )
+        investment_excluded = tuple(
+            dict.fromkeys((*investment_excluded, "valuation_only_no_cost_basis"))
+        )
+    if valuation_unrepresented:
+        investment_excluded = tuple(
+            dict.fromkeys((*investment_excluded, "portfolio_value_unavailable"))
+        )
 
     # Deduplicate price directives by (date, currency): the rate is a pure
     # function of (currency, date) from the configured map, so this collapses
     # same-day same-currency rows into one directive per backend file.
+    # Only FX directives reach here — CAS market prices are never emitted.
     deduped_prices = _dedupe_prices(prices)
     doc = LedgerDocument(
         cutover_date=cutover,
@@ -1700,7 +1627,6 @@ async def project(
         entries=tuple(entries),
         accounts_declared=tuple(declared),
         price_directives=deduped_prices,
-        lot_postings=lot_entries,
     )
     journal = render_document_for_backend(doc, backend)
 
@@ -1709,55 +1635,34 @@ async def project(
     for e in entries:
         kind_counts[e.kind] = kind_counts.get(e.kind, 0) + 1
 
-    surviving_pairs: frozenset[tuple[str, str]] = frozenset()
-    if investment_load is not None:
-        surviving_pairs = frozenset(
-            pair
-            for pair in investment_load.entry_portfolio_instruments
-            if pair[1] not in funding_suppressed
-        )
+    represented = set(valuation_portfolios)
     if not scope_sources.cas_portfolio_keys:
         cas_investment_scope = "none"
+        cas_investment_coverage = "none"
     elif not config.project_investments:
         cas_investment_scope = "excluded"
-    elif investment_load is None:
-        cas_investment_scope = "partial"
+        cas_investment_coverage = "excluded"
     else:
-        covered_portfolios = {portfolio for portfolio, _instrument in surviving_pairs}
-        valuation_covered = (
-            investment_load.active_valuation_portfolio_instruments <= surviving_pairs
-        )
-        valuation_complete = (
-            bool(current_valuations)
-            and investment_load.value_only_count == 0
-            and investment_load.quantity_mismatch_count == 0
-            and investment_load.missing_market_price_count == 0
-            and not investment_load.market_price_conflicts
-        )
+        # Value is represented when every CAS portfolio has an authoritative
+        # aggregate in the journal. Coverage is ALWAYS valuation_only: this
+        # projection never claims cost basis, gains or XIRR for CAS.
         cas_investment_scope = (
-            "included"
-            if scope_sources.cas_portfolio_keys <= covered_portfolios
-            and valuation_covered
-            and valuation_complete
-            else "partial"
+            "included" if scope_sources.cas_portfolio_keys <= represented else "partial"
         )
-    net_worth_scope_complete = (
+        cas_investment_coverage = "valuation_only" if represented else "none"
+
+    # Sources present is a different claim from total exact. Every bank
+    # investment leg is unresolved by policy, so any of them means the
+    # investment total may not match the dashboard's snapshot-based value.
+    net_worth_sources_complete = (
         not scope_sources.manual_asset_labels
         and not scope_sources.manual_liability_labels
         and cas_investment_scope in {"none", "included"}
     )
-    valuation_sources = (
-        investment_load.valuation_sources
-        if investment_load is not None
-        else tuple(_valuation_source_label(value) for value in current_valuations)
-    )
-    investment_value_only_count = sum(
-        _valuation_is_active(value)
-        and (
-            value.quantity is None
-            or (value.portfolio_key, value.instrument_id) not in surviving_pairs
-        )
-        for value in current_valuations
+    net_worth_scope_complete = (
+        net_worth_sources_complete
+        and investment_unresolved_purchases == 0
+        and investment_unresolved_redemptions == 0
     )
     return ProjectionReport(
         journal=journal,
@@ -1777,43 +1682,46 @@ async def project(
         projected_foreign_count=foreign_count,
         missing_fx_rate_count=missing_fx,
         source_currencies=tuple(sorted(source_currencies)),
-        investment_lot_count=len(lot_entries),
+        # Lot-related fields stay for backward compatibility but are ALWAYS
+        # empty/zero: this projection never consumes InvestmentLot rows.
+        investment_lot_count=0,
         investment_excluded=investment_excluded,
-        investment_disposal_unresolved=tuple(sorted(disposal_suppressed)),
+        investment_disposal_unresolved=(),
         imprecise_count=imprecise,
         card_payments_resolved=card_payments_resolved,
         card_payments_unresolved=card_payments_unresolved,
         card_payments_ambiguous_mask=card_payments_ambiguous_mask,
-        investment_funding_remapped=investment_funding_remapped,
-        investment_funding_unresolved=tuple(sorted(funding_suppressed)),
+        investment_funding_remapped=0,
+        investment_funding_unresolved=(),
         kind_counts=kind_counts,
         investment_current_valuation_count=len(current_valuations),
-        investment_market_price_count=len(investment_market_prices),
-        investment_market_price_conflicts=(
-            investment_load.market_price_conflicts
-            if investment_load is not None
-            else ()
+        investment_market_price_count=0,
+        investment_market_price_conflicts=(),
+        investment_value_only_count=sum(
+            _valuation_is_active(value) for value in current_valuations
         ),
-        investment_value_only_count=investment_value_only_count,
-        investment_quantity_mismatch_count=(
-            investment_load.quantity_mismatch_count
-            if investment_load is not None
-            else sum(_valuation_is_active(value) for value in current_valuations)
+        investment_quantity_mismatch_count=0,
+        investment_missing_market_price_count=0,
+        investment_valuation_sources=tuple(
+            _valuation_source_label(value) for value in current_valuations
         ),
-        investment_missing_market_price_count=(
-            investment_load.missing_market_price_count
-            if investment_load is not None
-            else 0
-        ),
-        investment_valuation_sources=valuation_sources,
         cas_portfolio_count=len(scope_sources.cas_portfolio_labels),
         cas_portfolio_labels=scope_sources.cas_portfolio_labels,
         cas_investment_scope=cas_investment_scope,
+        cas_investment_coverage=cas_investment_coverage,
+        investment_cost_basis_portfolios=(),
+        investment_valuation_portfolios=tuple(sorted(valuation_portfolios)),
+        investment_valuation_entry_count=len(valuation_entries),
+        investment_valuation_total=valuation_total,
+        investment_valuation_unrepresented=tuple(sorted(valuation_unrepresented)),
+        investment_unresolved_purchases=investment_unresolved_purchases,
+        investment_unresolved_redemptions=investment_unresolved_redemptions,
         manual_asset_count=len(scope_sources.manual_asset_labels),
         manual_asset_labels=scope_sources.manual_asset_labels,
         manual_liability_count=len(scope_sources.manual_liability_labels),
         manual_liability_labels=scope_sources.manual_liability_labels,
         net_worth_scope_complete=net_worth_scope_complete,
+        net_worth_sources_complete=net_worth_sources_complete,
     )
 
 

@@ -88,7 +88,25 @@ function render(data) {
         // only renders when it carries a nonzero/meaningful value so an empty
         // projection shows nothing.
         const diag = [];
-        diag.push(['Net-worth scope', (d.net_worth_scope_complete ? 'complete' : 'INCOMPLETE') + ' · CAS ' + d.cas_portfolio_count + ' (' + d.cas_investment_scope + ')' + ' · manual assets ' + d.manual_asset_count + ' · manual liabilities ' + d.manual_liability_count]);
+        if (d.net_worth_sources_complete && !d.net_worth_scope_complete) {
+            const why = [];
+            if (d.investment_unresolved_purchases) why.push(d.investment_unresolved_purchases + ' unresolved purchase(s)');
+            if (d.investment_unresolved_redemptions) why.push(d.investment_unresolved_redemptions + ' unresolved redemption(s)');
+            diag.push(['Net-worth exactness', 'All sources are present, but the investment total may not match native net worth' + (why.length ? ' — ' + why.join('; ') : '') + ' · this is not a faithful native net-worth view']);
+        }
+        if ((d.investment_valuation_portfolios || []).length) {
+            diag.push(['CAS valuation (aggregate only)', d.investment_valuation_portfolios.length + ' portfolio(s) · ' + (d.investment_valuation_total || '0.00') + ' INR at authoritative statement value · no cost basis, gains or XIRR — CAS lots are never projected']);
+        }
+        if (d.investment_unresolved_purchases) {
+            diag.push(['Unresolved investment purchases', d.investment_unresolved_purchases + ' bank leg(s) keep their Assets:Investments:Unallocated asset · NOT netted against any CAS aggregate (a bank row does not name the portfolio it funded), so investments may be counted twice']);
+        }
+        if (d.investment_unresolved_redemptions) {
+            diag.push(['Unresolved investment redemptions', d.investment_unresolved_redemptions + ' redemption(s) post to Equity:Transfers In rather than driving Assets:Investments:Unallocated negative (they usually dispose of pre-cutover holdings this projection never carried)']);
+        }
+        if ((d.investment_valuation_unrepresented || []).length) {
+            diag.push(['CAS value not represented', d.investment_valuation_unrepresented.length + ' portfolio(s) have no authoritative INR snapshot to project']);
+        }
+        diag.push(['Net-worth scope', (d.net_worth_scope_complete ? 'complete' : 'INCOMPLETE') + ' · CAS ' + d.cas_portfolio_count + ' (' + d.cas_investment_scope + '/' + (d.cas_investment_coverage || 'none') + ')' + ' · manual assets ' + d.manual_asset_count + ' · manual liabilities ' + d.manual_liability_count]);
         if ((d.cas_portfolio_labels || []).length) {
             diag.push(['CAS portfolio labels', d.cas_portfolio_labels.join(', ')]);
         }
@@ -100,12 +118,6 @@ function render(data) {
         }
         if (d.imprecise_count) {
             diag.push(['Imprecise categories', d.imprecise_count + ' (emi_loan/cash_withdrawal → conservative Expenses clearing)']);
-        }
-        if (d.investment_lot_count || d.investment_funding_remapped || (d.investment_funding_unresolved || []).length) {
-            diag.push(['Investment lots', d.investment_lot_count + ' projected · ' + d.investment_funding_remapped + ' funding-remapped · ' + (d.investment_funding_unresolved || []).length + ' suppressed']);
-        }
-        if (d.investment_current_valuation_count) {
-            diag.push(['CAS valuation', d.investment_current_valuation_count + ' source positions · ' + d.investment_market_price_count + ' market prices · ' + d.investment_value_only_count + ' value-only/outside lots · ' + d.investment_quantity_mismatch_count + ' quantity mismatch · ' + d.investment_missing_market_price_count + ' missing price · ' + (d.investment_market_price_conflicts || []).length + ' conflicts suppressed']);
         }
         if (d.projected_foreign_count || d.missing_fx_rate_count) {
             diag.push(['Foreign currency', d.projected_foreign_count + ' projected (' + (d.source_currencies || []).join(', ') + ') · ' + d.missing_fx_rate_count + ' missing rate']);

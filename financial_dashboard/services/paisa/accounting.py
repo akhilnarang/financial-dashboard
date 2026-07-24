@@ -46,6 +46,10 @@ KIND_SELF_TRANSFER = "self_transfer"
 KIND_CARD_PAYMENT = "card_payment"
 KIND_OPENING = "opening"
 KIND_LOT = "investment_lot"
+#: A valuation-only CAS portfolio balance: an authoritative market value with no
+#: cost basis, acquisition date or commodity. Distinct from :data:`KIND_LOT` so a
+#: consumer can tell cost-basis fidelity from value-only representation.
+KIND_VALUATION = "investment_valuation"
 KIND_UNKNOWN = "unknown"
 
 
@@ -188,6 +192,7 @@ __all__ = [
     "KIND_INCOME",
     "KIND_INVESTMENT",
     "KIND_LOT",
+    "KIND_VALUATION",
     "KIND_OPENING",
     "KIND_REPAYMENT",
     "KIND_SELF_TRANSFER",

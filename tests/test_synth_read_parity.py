@@ -498,9 +498,16 @@ async def test_projection_card_payments_resolved_and_unresolved(loaded):
         )
 
 
-async def test_projection_investment_lot_emitted(loaded):
-    """The complete CAS lot is emitted (not suppressed): its instrument carries
-    no free-standing disposal, so investment_lot_count >= 1."""
+async def test_projection_investment_value_is_represented(loaded):
+    """Every CAS portfolio's value reaches the journal.
+
+    The synthetic portfolios carry value-only holdings and quantity mismatches,
+    so their lots cannot describe today's holdings truthfully. Rather than emit
+    a partial set of lots (and silently omit the rest of the portfolio's value),
+    projection falls each portfolio back to its authoritative aggregate value.
+    That is the whole point of the valuation-only path: the ledger represents
+    the portfolio's real worth exactly once, without fabricating cost basis.
+    """
     scenario, _engine, maker = loaded
     async with maker() as session:
         all_ids = tuple(
@@ -527,10 +534,26 @@ async def test_projection_investment_lot_emitted(loaded):
             project_investments=True,
         )
         report = await project(session, config)
-        assert report.investment_lot_count >= 1, (
-            f"expected the complete lot emitted, got {report.investment_lot_count}; "
+
+        # Value-only holdings / quantity mismatches mean no portfolio can be
+        # represented at cost, so all of them use the valuation fallback.
+        assert report.cas_investment_coverage == "valuation_only", (
+            f"coverage={report.cas_investment_coverage}; "
             f"excluded={report.investment_excluded}"
         )
+        assert report.investment_cost_basis_portfolios == ()
+        assert len(report.investment_valuation_portfolios) == (
+            report.cas_portfolio_count
+        )
+        # No portfolio is left unrepresented, and the value is real.
+        assert report.investment_valuation_unrepresented == ()
+        assert report.investment_valuation_total > 0
+        assert report.cas_investment_scope == "included"
+        # No lot is emitted alongside the aggregate — that would double count.
+        assert report.investment_lot_count == 0
+        assert "valuation_only_no_cost_basis" in report.investment_excluded
+        # CAS being fully valued still does not make net worth complete.
+        assert report.net_worth_scope_complete is False
 
 
 async def test_projection_invalid_currency_skipped_as_invalid(loaded):

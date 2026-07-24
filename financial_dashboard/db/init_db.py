@@ -632,6 +632,28 @@ async def init_db(engine) -> None:
         # and isolates malformed uploads; the marker makes later boots O(1).
         await _backfill_legacy_investment_lots(conn)
 
+        # --- Paisa portfolio-token secret -----------------------------------
+        # The valuation-only CAS fallback names an account per portfolio. A
+        # portfolio key is a PAN, so the account segment is a keyed HMAC under
+        # this per-installation secret rather than the key itself — someone
+        # holding only the generated journal cannot recover the PAN. Seeded
+        # here (once, idempotently) because projection is strictly read-only
+        # and must never create it; without a secret the projection degrades to
+        # a single shared valuation account instead of leaking the key.
+        from financial_dashboard.services.paisa.portfolio_identity import (
+            PORTFOLIO_TOKEN_SECRET_KEY,
+            new_portfolio_token_secret,
+        )
+
+        await conn.execute(
+            text(
+                "INSERT INTO settings (key, value, updated_at) "
+                "VALUES (:key, :value, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(key) DO NOTHING"
+            ),
+            {"key": PORTFOLIO_TOKEN_SECRET_KEY, "value": new_portfolio_token_secret()},
+        )
+
         # --- Extension sync-state: Paisa singleton + dirty-revision triggers ---
         # ``create_all`` builds extension_sync_state on fresh + legacy DBs (it
         # only creates missing tables). Idempotently seed the Paisa singleton

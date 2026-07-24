@@ -58,6 +58,27 @@ INVESTMENT_ASSET_ROOT = "Assets:Investments"
 #: "Equity:Opening/Investment" maps to this backend-valid (slash-free) name.
 INVESTMENT_EQUITY_OPENING = "Equity:Opening Balances:Investment"
 
+#: The asset root the *valuation-only* CAS fallback posts to. Deliberately a
+#: sibling of :data:`INVESTMENT_ASSET_ROOT` rather than a child: a balance under
+#: this root is an authoritative portfolio *market value* carrying no cost basis,
+#: no acquisition date and no commodity, so it must never be mistaken for — or
+#: aggregated with — a cost-annotated lot. A portfolio is represented by exactly
+#: one of the two roots, never both, so the two can be summed without double
+#: counting.
+INVESTMENT_VALUATION_ROOT = "Assets:Investments:Valuation"
+
+#: The equity contra a valuation-only balance posts against. Distinct from every
+#: opening-balances contra because these postings are *revaluations*: the delta
+#: between two CAS statement values is a change in market value, not a capital
+#: contribution and not income. Naming it explicitly keeps an operator from
+#: reading the movement as a realized gain.
+EQUITY_REVALUATION = "Equity:Revaluation:Investments"
+
+#: The portfolio-less valuation account used when no installation secret exists
+#: to derive a non-reversible portfolio token. Merging portfolios is the safe
+#: degradation; emitting a raw PAN into the journal is not.
+INVESTMENT_VALUATION_SHARED = INVESTMENT_VALUATION_ROOT
+
 #: The contra account an investment-category transaction (purchase or
 #: redemption) posts against. This is an **asset movement**, never an expense
 #: or income: money moves between the bank and an undifferentiated investments
@@ -221,8 +242,11 @@ class LedgerDocument(NamedTuple):
     responsible for the date-ordered entries. ``price_directives`` is the
     deduplicated set of FX prices the projection resolved (empty unless the
     ``priced`` non-INR policy emitted a foreign entry with a configured rate).
-    ``lot_postings`` carries the conservative investment-lot openings, emitted
-    only when ``paisa.project_investments`` is enabled and complete lots exist.
+    ``lot_postings`` is the generic renderer capability for cost-basis lot
+    openings. **The Paisa projection never populates it** — CAS is projected as
+    an authoritative aggregate valuation with no cost basis. The capability is
+    retained for a future, separately reviewed cost-basis feature and is still
+    covered by renderer-syntax tests.
     """
 
     cutover_date: datetime.date | None
@@ -487,6 +511,22 @@ def investment_asset_account(instrument: str) -> str:
 def normalize_investment_equity() -> str:
     """The investment opening equity contra, validated (identity for ledger)."""
     return validate(INVESTMENT_EQUITY_OPENING)
+
+
+def investment_valuation_account(token: str | None) -> str:
+    """The valuation-only asset account for an opaque portfolio *token*.
+
+    ``token`` is the keyed, non-reversible handle from
+    :mod:`financial_dashboard.services.paisa.portfolio_identity` — never a raw
+    portfolio key. ``None`` (no installation secret) collapses to the shared
+    portfolio-less account rather than leaking the source identifier.
+    """
+    if not token:
+        return INVESTMENT_VALUATION_SHARED
+    segment = "".join(ch for ch in str(token) if ch.isalnum() or ch == "-")
+    if not segment:
+        return INVESTMENT_VALUATION_SHARED
+    return f"{INVESTMENT_VALUATION_ROOT}:{segment}"
 
 
 def check_lot_consistent(lot: InvestmentLotEntry) -> None:

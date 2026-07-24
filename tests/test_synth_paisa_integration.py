@@ -449,11 +449,11 @@ async def test_investment_projection_gate_on_emits_complete_lot_and_excluded_rea
     try:
         async with maker() as session:
             # The loader creates exactly one complete lot from the MF
-            # acquisition fact (INE000A01020). That instrument carries NO
-            # redemption (the disposal lives on INE000A01045), so the projection
-            # EMITS the lot rather than suppressing it — the canonical lot is
-            # shown, never overstated, while the free-standing disposal on a
-            # separate instrument is still reported unresolved.
+            # acquisition fact (INE000A01020). The portfolio it belongs to also
+            # holds value-only positions, so the lot alone cannot represent the
+            # portfolio's worth — projection falls the portfolio back to its
+            # authoritative aggregate value and drops the lot, rather than
+            # emitting a partial lot set that omits the rest of the value.
             lots_before = (await session.execute(select(InvestmentLot))).scalars().all()
             assert len(lots_before) == 1
             assert lots_before[0].instrument_id == "INE000A01020"
@@ -468,30 +468,37 @@ async def test_investment_projection_gate_on_emits_complete_lot_and_excluded_rea
 
         # Read-only: projection changed no core rows.
         assert before == after
-        # The complete lot is EMITTED (its instrument has no disposal).
-        assert report.investment_lot_count == 1
-        assert "Assets:Investments:INE000A01020" in report.journal
-        # The disposal lives on a different instrument and stays unresolved.
-        assert "INE000A01045" in report.investment_disposal_unresolved
-        assert "INE000A01020" not in report.investment_disposal_unresolved
-        # The per-transaction exclusion reasons still surface: the demat
-        # movement (not_mutual_fund), the redemption (disposal_transaction) and
-        # the nav-less purchase (missing_lot_facts); plus the instrument-level
-        # suppression label (disposal_history_unresolved) for the disposal ISIN.
+        # The portfolio is represented by its aggregate value, not by a partial
+        # lot set: no lot, no commodity holding, and no fabricated cost.
+        assert report.investment_lot_count == 0
+        assert "Assets:Investments:INE000A01020" not in report.journal
+        assert report.investment_valuation_portfolios
+        assert report.investment_valuation_total > 0
+        assert "valuation_only_no_cost_basis" in report.investment_excluded
+        # Lot-level disposal tracking is no longer part of the projection:
+        # CAS is projected from portfolio aggregates, so per-instrument
+        # suppression state is always empty here (the core lot service still
+        # computes it for the dashboard).
+        assert report.investment_disposal_unresolved == ()
+        # Paisa reports only its own policy diagnostics. Lot-classification
+        # reasons (not_mutual_fund, missing_lot_facts, ...) belong to the core
+        # investment service: the authoritative aggregate INCLUDES those
+        # holdings' value, so listing them here would imply value was omitted.
         excluded = set(report.investment_excluded)
-        assert "not_mutual_fund" in excluded
-        assert "disposal_transaction" in excluded
-        assert "missing_lot_facts" in excluded
-        assert "disposal_history_unresolved" in excluded
+        assert excluded == {"valuation_only_no_cost_basis"}
     finally:
         await engine.dispose()
 
 
 async def test_investment_projection_suppression_invents_no_cost(tmp_path):
-    """The disposal-only instrument (INE000A01045) is suppressed conservatively:
-    no lot, no cost basis and no asset account is invented for it. The complete
-    lot's instrument (INE000A01020) — which has no disposal — IS emitted with
-    its real CAS cost basis, never an invented figure."""
+    """No cost basis or asset account is invented for a suppressed instrument.
+
+    The disposal-only instrument (INE000A01045) is suppressed conservatively.
+    The portfolio also holds value-only positions, so it uses the valuation-only
+    path: its value is represented in aggregate and NO commodity lot is emitted.
+    Asserted structurally — a bare amount substring would also match the
+    aggregate valuation and so could pass without a lot existing at all.
+    """
     db = _synthetic_db(tmp_path)
     scenario = build_scenario(profile="smoke")
     await load_scenario(scenario, db)
@@ -505,10 +512,20 @@ async def test_investment_projection_suppression_invents_no_cost(tmp_path):
             report = await project(
                 session, _config(bank_ids, cutover, project_investments=True)
             )
-        # The disposal instrument is suppressed: no lot account for it.
+        # No commodity lot account is emitted for ANY instrument.
         assert "Assets:Investments:INE000A01045" not in report.journal
-        # The complete lot's real cost basis (50000.00 = 500 * 100) appears;
-        # no invented figure for the suppressed disposal instrument.
-        assert "50000.00" in report.journal
+        assert report.investment_disposal_unresolved == ()
+        # No commodity lot at all under the valuation-only path — so no cost
+        # basis is asserted for any instrument, invented or otherwise.
+        assert report.investment_lot_count == 0
+        assert report.document.lot_postings == ()
+        assert not any(
+            line.lstrip().startswith("Assets:Investments:INE")
+            for line in report.journal.splitlines()
+        )
+        # The value is still represented, as an aggregate carrying no cost.
+        assert report.investment_valuation_portfolios
+        assert report.investment_valuation_total > 0
+        assert "{" not in report.journal  # no cost annotation anywhere
     finally:
         await engine.dispose()
