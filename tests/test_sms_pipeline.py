@@ -132,6 +132,224 @@ async def test_process_sms_row_happy_path_creates_transaction(session, monkeypat
     assert sms.parsed_at is not None
 
 
+# 2026-08-20 20:00 UTC is 2026-08-21 01:30 IST. So the initiated leg's date,
+# taken from receipt, matches the in-body date of the other legs.
+_INITIATED_RECEIVED_AT = datetime.datetime(2026, 8, 20, 20, 0, 0, tzinfo=datetime.UTC)
+_RTGS_UTR = "HDFCR00000000000000000"
+
+
+def _fake_rtgs_parse_sms(bank, body, *, sender=None, received_at=None):
+    """Stand in for the pinned parser. Map a marker body to the ParsedSms the
+    real HDFC and IDFC RTGS parsers emit. This keeps the pipeline test free of
+    the parser version. bank-sms-parser tests the parsers."""
+    amt = Money(amount=Decimal("123456.78"), currency="INR")
+    if body.startswith("INITIATED_"):
+        return ParsedSms(
+            email_type="hdfc_account_rtgs_debit_alert",
+            bank="hdfc",
+            transaction=SmsTransactionAlert(
+                direction="debit",
+                amount=amt,
+                transaction_date=None,
+                transaction_time=None,
+                account_mask=body.split("_", 1)[1],
+                channel="rtgs",
+            ),
+        )
+    if body == "DEPOSITED":
+        return ParsedSms(
+            email_type="hdfc_account_rtgs_deposited_alert",
+            bank="hdfc",
+            ledger_role="completion",
+            transaction=SmsTransactionAlert(
+                direction="debit",
+                amount=amt,
+                transaction_date=datetime.date(2026, 8, 21),
+                transaction_time=datetime.time(1, 6, 23),
+                counterparty="SAMPLE NAME",
+                reference_number=_RTGS_UTR,
+                channel="rtgs",
+            ),
+        )
+    if body == "IDFC_CREDIT":
+        return ParsedSms(
+            email_type="idfc_account_rtgs_credit_alert",
+            bank="idfc",
+            transaction=SmsTransactionAlert(
+                direction="credit",
+                amount=amt,
+                transaction_date=datetime.date(2026, 8, 21),
+                counterparty="SAMPLE NAME",
+                reference_number=_RTGS_UTR,
+                channel="rtgs",
+                account_mask="XXXXXXX0002",
+                balance=Money(amount=Decimal("99999.99"), currency="INR"),
+            ),
+        )
+    raise AssertionError(f"unexpected body marker: {body!r}")
+
+
+async def _ingest(session, link_ctx, *, bank, body, sms_id):
+    from financial_dashboard.services.sms_pipeline import process_sms_row
+
+    sms = SmsMessage(
+        id=sms_id,
+        bank=bank,
+        sender="VK-BANK",
+        body=body,
+        received_at=_INITIATED_RECEIVED_AT,
+    )
+    session.add(sms)
+    await session.flush()
+    async with session.begin_nested():
+        outcome = await process_sms_row(session, sms, link_ctx)
+    return sms, outcome
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_rtgs_settlement_fuses_and_pairs(session, monkeypatch):
+    """Run the full self-transfer: the HDFC 'initiated' debit, the IDFC RTGS
+    credit, and the HDFC 'Money Deposited' settlement. The settlement leg opens
+    no row. It stamps its UTR onto the one initiated debit. That debit then
+    pairs with the IDFC credit as a self_transfer. The end state is exactly two
+    rows. Both are self_transfer."""
+    from financial_dashboard.db.models import Transaction
+    from financial_dashboard.services.linker import build_link_context
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms", _fake_rtgs_parse_sms
+    )
+    link_ctx = await build_link_context(session)
+    _, ini = await _ingest(
+        session, link_ctx, bank="hdfc", body="INITIATED_XX0001", sms_id=1
+    )
+    _, cred = await _ingest(
+        session, link_ctx, bank="idfc", body="IDFC_CREDIT", sms_id=2
+    )
+    dep_sms, dep = await _ingest(
+        session, link_ctx, bank="hdfc", body="DEPOSITED", sms_id=3
+    )
+
+    # The settlement leg makes no new row. It links to the initiated debit.
+    assert dep.status == "parsed"
+    assert dep.transaction_id == ini.transaction_id
+    assert dep_sms.transaction_id == ini.transaction_id
+
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 2  # One HDFC debit and one IDFC credit. No third row.
+
+    debit = await session.get(Transaction, ini.transaction_id)
+    credit = await session.get(Transaction, cred.transaction_id)
+    assert debit.reference_number == _RTGS_UTR  # the UTR is stamped on
+    assert debit.account_mask == "XX0001"  # the source account stays
+    assert debit.category == "self_transfer"
+    assert credit.category == "self_transfer"
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_rtgs_settlement_ambiguous_skips(session, monkeypatch):
+    """Two initiated candidates match: two RTGS of the same amount on one day.
+    The settlement leg cannot know which one to complete. So it skips. This is
+    fail-closed. It makes no stamp and no new row."""
+    from financial_dashboard.db.models import Transaction
+    from financial_dashboard.services.linker import build_link_context
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms", _fake_rtgs_parse_sms
+    )
+    link_ctx = await build_link_context(session)
+    await _ingest(session, link_ctx, bank="hdfc", body="INITIATED_XX0001", sms_id=1)
+    await _ingest(session, link_ctx, bank="hdfc", body="INITIATED_XX0009", sms_id=2)
+
+    dep_sms, dep = await _ingest(
+        session, link_ctx, bank="hdfc", body="DEPOSITED", sms_id=3
+    )
+    assert dep.status == "skipped"
+    assert dep.transaction_id is None
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 2  # Both initiated debits stay. No third row.
+    assert all(r.reference_number is None for r in rows)  # neither row got a ref
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_rtgs_settlement_no_twin_skips(session, monkeypatch):
+    """No initiated candidate matches: the settlement arrives with no
+    submission. The settlement leg skips. This is fail-closed. It opens no row
+    of its own."""
+    from financial_dashboard.db.models import Transaction
+    from financial_dashboard.services.linker import build_link_context
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.sms_pipeline.parse_sms", _fake_rtgs_parse_sms
+    )
+    link_ctx = await build_link_context(session)
+    dep_sms, dep = await _ingest(
+        session, link_ctx, bank="hdfc", body="DEPOSITED", sms_id=1
+    )
+    assert dep.status == "skipped"
+    assert dep.transaction_id is None
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 0
+
+
+@pytest.mark.anyio
+async def test_process_sms_row_completion_matches_truncated_primary(
+    session, monkeypatch
+):
+    """A completion leg carries the full reference. Its primary's alert
+    truncated that reference. The completion must find the primary by the
+    shortened form and stamp the full reference onto it. It makes no new row."""
+    from financial_dashboard.db.models import Transaction
+    from financial_dashboard.services.linker import build_link_context
+
+    full_ref = "IN00000000000000"
+    # The primary: an outward NEFT debit whose alert truncated the UTR to a
+    # prefix (six-plus chars, so the ICICI debit parser stores it as a ref).
+    primary = Transaction(
+        bank="icici",
+        email_type="icici_account_debit_info_alert",
+        direction="debit",
+        amount=Decimal("2000.00"),
+        currency="INR",
+        transaction_date=datetime.date(2026, 8, 21),
+        reference_number="IN000000",
+        account_mask="XX000",
+        channel="neft",
+        source="sms",
+        sms_message_id=10,
+    )
+    session.add(primary)
+    await session.flush()
+
+    def _fake(bank, body, *, sender=None, received_at=None):
+        return ParsedSms(
+            email_type="icici_account_neft_completion_alert",
+            bank="icici",
+            ledger_role="completion",
+            transaction=SmsTransactionAlert(
+                direction="debit",
+                amount=Money(amount=Decimal("2000.00"), currency="INR"),
+                transaction_date=datetime.date(2026, 8, 21),
+                transaction_time=datetime.time(15, 2, 16),
+                reference_number=full_ref,
+                channel="neft",
+            ),
+        )
+
+    monkeypatch.setattr("financial_dashboard.services.sms_pipeline.parse_sms", _fake)
+    link_ctx = await build_link_context(session)
+    _, out = await _ingest(
+        session, link_ctx, bank="icici", body="ICICI_COMPLETION", sms_id=20
+    )
+
+    assert out.status == "parsed"
+    assert out.transaction_id == primary.id
+    rows = (await session.execute(select(Transaction))).scalars().all()
+    assert len(rows) == 1  # no new row
+    stamped = await session.get(Transaction, primary.id)
+    assert stamped.reference_number == full_ref
+
+
 @pytest.mark.anyio
 async def test_process_sms_row_clears_stale_parse_error_on_success(session):
     """A row that previously failed (status=error, parse_error set) and is

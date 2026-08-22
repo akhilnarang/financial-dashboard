@@ -505,8 +505,60 @@ async def _gather_fuzzy_candidates(
     return candidates
 
 
+def _references_prove_distinct(
+    incoming_ref: str,
+    incoming_email_type: object,
+    channel: Channel,
+    candidate: Transaction,
+) -> bool:
+    """Return whether the reference proves ``candidate`` is a different event.
+
+    A bank gives one reference to one transaction. So two rows are different
+    transactions when all of these are true: they come from the same template
+    on the same channel, each carries a non-empty reference, and the references
+    differ. Keep the scope narrow:
+
+    - The rows must share the same ``email_type`` and the same ``source``
+      (channel). Only then are the two references the same kind. Do not split a
+      cross-channel pair: an SMS and an email for one event can carry different
+      reference formats. Do not split an ``sms+email`` row: it is already a
+      merged pair. Balance resolves those, not the reference.
+    - A shortened form of the same reference is not a difference. A provider can
+      truncate its own reference across two messages.
+    """
+    candidate_ref = (candidate.reference_number or "").strip()
+    if not candidate_ref or not incoming_ref:
+        return False
+    if candidate.email_type != incoming_email_type:
+        return False
+    if candidate.source != channel:
+        return False
+    if candidate_ref == incoming_ref:
+        return False
+    return not _shortened_reference_match(incoming_ref, candidate_ref)
+
+
+def _is_source_row(
+    candidate: Transaction, channel: Channel, source_id: int | None
+) -> bool:
+    """Return whether ``candidate`` is the row the incoming message already owns.
+
+    A reparse feeds a message back through the matcher. The message may already
+    own a row. On the incoming channel, that row carries this ``source_id``. The
+    reference split must not treat that row as a different event.
+    """
+    if source_id is None:
+        return False
+    if channel == "sms":
+        return candidate.sms_message_id == source_id
+    return candidate.email_id == source_id
+
+
 def _decide(
-    candidates: list[Transaction], txn_data: dict, channel: Channel
+    candidates: list[Transaction],
+    txn_data: dict,
+    channel: Channel,
+    source_id: int | None = None,
 ) -> MatchDecision:
     """The unified balance/slot decision, run on the gathered candidate
     list. Returns match / insert / defer.
@@ -556,6 +608,27 @@ def _decide(
         )
 
     # Step 3 — incoming has no balance.
+    # Reference split. This is authoritative, like the balance split above. Drop
+    # any candidate that a differing same-template reference proves distinct. Two
+    # same-amount card-bill payments on one day with different bank references
+    # are two payments. They are not a duplicate to merge. Do not defer them to
+    # a manual prompt. If the split empties the set, the incoming row is new.
+    incoming_ref = (txn_data.get("reference_number") or "").strip()
+    if incoming_ref:
+        # Keep the row the incoming message already owns. A reparse can change a
+        # message's reference. Without this guard, the split would drop that own
+        # row and insert a duplicate. See _is_source_row.
+        candidates = [
+            c
+            for c in candidates
+            if _is_source_row(c, channel, source_id)
+            or not _references_prove_distinct(
+                incoming_ref, txn_data.get("email_type"), channel, c
+            )
+        ]
+        if not candidates:
+            return MatchDecision("insert")
+
     balanceless = [c for c in candidates if c.balance is None]
     open_bl = [c for c in balanceless if _slot_open(c, channel)]
     if len(candidates) == 1 and len(balanceless) == 1 and len(open_bl) == 1:
@@ -667,6 +740,7 @@ async def find_match(
     channel: Channel = "sms",
     *,
     evidence: MatchEvidence | None = None,
+    source_id: int | None = None,
 ) -> MatchDecision:
     """Decide whether an incoming ``txn_data`` matches an existing row,
     is a new transaction, or is too ambiguous to decide.
@@ -779,7 +853,7 @@ async def find_match(
 
     candidates = await _gather_fuzzy_candidates(session, txn_data)
     if candidates:
-        decision = _decide(candidates, txn_data, channel)
+        decision = _decide(candidates, txn_data, channel, source_id=source_id)
         _record_match_evidence(
             evidence,
             path="fuzzy",
@@ -1047,7 +1121,8 @@ async def merge_transaction(
             return MergeTransactionResult("enriched", existing, EnrichmentDiff())
         return await _insert_new(session, channel, txn_data, sms_message_id, email_id)
 
-    decision = await find_match(session, txn_data, channel)
+    source_id = sms_message_id if channel == "sms" else email_id
+    decision = await find_match(session, txn_data, channel, source_id=source_id)
     if decision.action == "insert":
         try:
             async with session.begin_nested():
@@ -1063,7 +1138,7 @@ async def merge_transaction(
         except IntegrityError as exc:
             if not is_duplicate_transaction_error(exc):
                 raise
-            decision = await find_match(session, txn_data, channel)
+            decision = await find_match(session, txn_data, channel, source_id=source_id)
             # A ref-duplicate that re-resolves to insert or defer is still a
             # hard duplicate we can't enrich — re-raise the original error.
             if decision.action != "match":
