@@ -286,6 +286,173 @@ async def test_find_match_empty_reference_treated_as_null(
     assert match.action == "insert"
 
 
+@pytest.mark.anyio
+async def test_find_match_distinct_reference_same_template_inserts(
+    session: AsyncSession,
+):
+    """Two card-bill payments of the same amount on one day carry different bank
+    references. They are two payments. The balance-less path must split on the
+    differing same-template reference. It must insert. It must not defer to a
+    merge prompt. This repeats a real case: two HDFC 'Online Payment ... vide
+    Ref# ...' SMS with the same amount and card on one day and two references."""
+    existing = Transaction(
+        bank="hdfc",
+        email_type="hdfc_cc_payment_received_alert",
+        direction="credit",
+        amount=Decimal("50000"),
+        currency="INR",
+        transaction_date=date(2026, 8, 20),
+        transaction_time=time(10, 27),
+        reference_number="231RI76LV8KJ1B8",
+        card_mask="XXXX0000",
+        source="sms",
+        sms_message_id=1,  # The SMS slot is full. Without the split this defers.
+    )
+    session.add(existing)
+    await session.flush()
+
+    decision = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "email_type": "hdfc_cc_payment_received_alert",
+            "direction": "credit",
+            "amount": Decimal("50000"),
+            "currency": "INR",
+            "transaction_date": date(2026, 8, 20),
+            "transaction_time": time(10, 27),
+            "reference_number": "2312EBGD9WQ39NP",
+            "card_mask": "XXXX0000",
+        },
+        "sms",
+    )
+    assert decision.action == "insert"
+
+
+@pytest.mark.anyio
+async def test_find_match_distinct_reference_cross_channel_does_not_split(
+    session: AsyncSession,
+):
+    """A differing reference must not split a cross-channel pair. An SMS and an
+    email for one event can carry different reference formats. The email row
+    still has an open SMS slot. So the incoming SMS enriches it. It must not
+    insert a duplicate."""
+    existing = Transaction(
+        bank="hdfc",
+        email_type="hdfc_cc_payment_received_alert",
+        direction="credit",
+        amount=Decimal("50000"),
+        currency="INR",
+        transaction_date=date(2026, 8, 20),
+        transaction_time=time(10, 27),
+        reference_number="EMAIL-REF-A",
+        card_mask="XXXX0000",
+        source="email",
+        email_id=5,  # The email slot is full. The SMS slot is open, so enrichable.
+    )
+    session.add(existing)
+    await session.flush()
+
+    decision = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "email_type": "hdfc_cc_payment_received_alert",
+            "direction": "credit",
+            "amount": Decimal("50000"),
+            "currency": "INR",
+            "transaction_date": date(2026, 8, 20),
+            "transaction_time": time(10, 27),
+            "reference_number": "SMS-REF-B",
+            "card_mask": "XXXX0000",
+        },
+        "sms",
+    )
+    assert decision.action == "match"
+    assert decision.transaction.id == existing.id
+
+
+@pytest.mark.anyio
+async def test_find_match_shortened_reference_same_template_does_not_split(
+    session: AsyncSession,
+):
+    """A shortened form of the same reference is not a difference. A provider
+    can truncate its own reference across two messages. So the split must not
+    fire, and it must not make a new row."""
+    existing = Transaction(
+        bank="hdfc",
+        email_type="hdfc_cc_payment_received_alert",
+        direction="credit",
+        amount=Decimal("50000"),
+        currency="INR",
+        transaction_date=date(2026, 8, 20),
+        transaction_time=time(10, 27),
+        reference_number="231RI76LV8KJ1B8",
+        card_mask="XXXX0000",
+        source="sms",
+        sms_message_id=1,
+    )
+    session.add(existing)
+    await session.flush()
+
+    decision = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "email_type": "hdfc_cc_payment_received_alert",
+            "direction": "credit",
+            "amount": Decimal("50000"),
+            "currency": "INR",
+            "transaction_date": date(2026, 8, 20),
+            "transaction_time": time(10, 27),
+            "reference_number": "231RI76LV8KJ1B",  # suffix-truncated form
+            "card_mask": "XXXX0000",
+        },
+        "sms",
+    )
+    assert decision.action != "insert"
+
+
+@pytest.mark.anyio
+async def test_find_match_reparse_changed_reference_keeps_own_row(
+    session: AsyncSession,
+):
+    """A reparse can change a message's reference. The split must not drop the
+    row the message already owns and insert a duplicate. Passing the message's
+    own source_id keeps that row and lets the slot logic defer instead."""
+    existing = Transaction(
+        bank="hdfc",
+        email_type="hdfc_cc_payment_received_alert",
+        direction="credit",
+        amount=Decimal("50000"),
+        currency="INR",
+        transaction_date=date(2026, 8, 20),
+        transaction_time=time(10, 27),
+        reference_number="OLD-REF-A",
+        card_mask="XXXX0000",
+        source="sms",
+        sms_message_id=7,
+    )
+    session.add(existing)
+    await session.flush()
+
+    incoming = {
+        "bank": "hdfc",
+        "email_type": "hdfc_cc_payment_received_alert",
+        "direction": "credit",
+        "amount": Decimal("50000"),
+        "currency": "INR",
+        "transaction_date": date(2026, 8, 20),
+        "transaction_time": time(10, 27),
+        "reference_number": "NEW-REF-B",
+        "card_mask": "XXXX0000",
+    }
+    # Without the guard, the split drops the message's own row and inserts.
+    assert (await find_match(session, incoming, "sms")).action == "insert"
+    # With the guard, sms_message_id 7 is the message's own row, so no insert.
+    assert (await find_match(session, incoming, "sms", source_id=7)).action != "insert"
+
+
 def test_compute_diff_email_does_not_overwrite_transaction_date_with_later_value():
     """Repro: a Kotak digital-transaction email carries no transaction date,
     so the pipeline fills it from the email's received_at. Re-handling that
@@ -2012,7 +2179,7 @@ async def test_merge_insert_integrity_error_re_resolves_to_enrich(
 
     ref = "IMPS:RACE-001"
 
-    async def _racing_find_match(sess, txn_data, channel="sms"):
+    async def _racing_find_match(sess, txn_data, channel="sms", **_kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             # Simulate the concurrent commit landing between find_match and
@@ -2083,7 +2250,7 @@ async def test_merge_insert_integrity_error_reraises_when_still_unresolvable(
     )
     await session.flush()
 
-    async def _always_insert(sess, txn_data, channel="sms"):
+    async def _always_insert(sess, txn_data, channel="sms", **_kwargs):
         return txn_merge_mod.MatchDecision("insert")
 
     monkeypatch.setattr(txn_merge_mod, "find_match", _always_insert)

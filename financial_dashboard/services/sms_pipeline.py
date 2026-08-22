@@ -13,6 +13,8 @@ from decimal import Decimal
 from typing import Literal
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from bank_sms_parser import parse_sms
 from bank_sms_parser.exceptions import ParseError, UnsupportedSmsTypeError
 from bank_sms_parser.models import ParsedSms
@@ -113,6 +115,102 @@ DECLINED_DIRECTION = "declined"
 # settlement is a later message, or a redundant echo of an earlier one. Both
 # are notify-only here. See bank_sms_parser ParsedSms.ledger_role.
 NOTIFY_ONLY_ROLES = ("provisional", "restatement")
+
+# A parser sets `ledger_role="completion"` on a message that supplies a field an
+# earlier message left out. The field is usually a reference. The earlier
+# message recorded the event. A completion message does not open its own row.
+# The consumer stamps the reference onto the earlier row. See bank_sms_parser
+# ParsedSms.ledger_role.
+COMPLETION_ROLE = "completion"
+
+
+async def _complete_reference(
+    session: AsyncSession, sms_row: SmsMessage, txn_data: dict
+) -> ProcessSmsOutcome:
+    """Stamp a completion leg's reference onto its one matching primary row.
+
+    Build the match from the completion leg itself: same bank, direction,
+    channel, amount, currency, and date. The primary row must already have an
+    account. Its reference must be missing, or a shortened form of this leg's
+    reference. A shortened form covers a primary whose alert truncated the
+    reference. Act only when exactly one row matches. On zero rows or more than
+    one, skip and make no row. This rule is fail-closed.
+
+    On a match, write the full reference onto the row. Write the counterparty
+    too when the row has none. Then run the reference self-transfer rule, so the
+    event can net against its opposite leg. A reparse repeats this safely.
+    """
+    from sqlalchemy import func as sa_func, select
+
+    from financial_dashboard.db.models import Transaction
+    from financial_dashboard.services.categorization.self_transfer import (
+        apply_reference_self_transfer_rule,
+    )
+    from financial_dashboard.services.txn_merge import _shortened_reference_match
+
+    reference = (txn_data.get("reference_number") or "").strip()
+    channel = txn_data.get("channel")
+    # A completion leg must name a reference and a channel. Without both it
+    # cannot identify its primary row. The channel also stops the query from
+    # matching unrelated debits that have no channel.
+    if not reference or not channel:
+        sms_row.status = "skipped"
+        sms_row.parse_error = "completion leg: no reference or channel to complete"
+        return ProcessSmsOutcome(status="skipped", transaction_id=None)
+
+    # A reparse must not act twice. If this SMS already completed a row, and
+    # that row now carries this reference, keep the link and stop.
+    if sms_row.transaction_id is not None:
+        existing = await session.get(Transaction, sms_row.transaction_id)
+        if (
+            existing is not None
+            and (existing.reference_number or "").strip() == reference
+        ):
+            sms_row.status = "parsed"
+            sms_row.parse_error = None
+            return ProcessSmsOutcome(status="parsed", transaction_id=existing.id)
+
+    result = await session.execute(
+        select(Transaction)
+        .where(
+            Transaction.bank == txn_data["bank"],
+            Transaction.direction == txn_data["direction"],
+            Transaction.channel == channel,
+            Transaction.amount == txn_data["amount"],
+            sa_func.coalesce(Transaction.currency, "INR")
+            == (txn_data.get("currency") or "INR"),
+            Transaction.transaction_date == txn_data["transaction_date"],
+            Transaction.account_mask.is_not(None),
+        )
+        .limit(10)
+    )
+    # The primary either has no reference yet, or a shortened form of this one.
+    # A candidate with a different full reference is a different event. Drop it.
+    candidates = [
+        c
+        for c in result.scalars().all()
+        if not (c.reference_number or "").strip()
+        or _shortened_reference_match(c.reference_number, reference)
+    ]
+    if len(candidates) != 1:
+        sms_row.status = "skipped"
+        sms_row.transaction_id = None
+        sms_row.parse_error = (
+            f"completion leg: no unique primary row to complete "
+            f"(found {len(candidates)}); left unpaired"
+        )
+        return ProcessSmsOutcome(status="skipped", transaction_id=None)
+
+    primary = candidates[0]
+    primary.reference_number = reference
+    if primary.counterparty is None and txn_data.get("counterparty"):
+        primary.counterparty = txn_data["counterparty"]
+    sms_row.status = "parsed"
+    sms_row.transaction_id = primary.id
+    sms_row.parse_error = None
+    await session.flush()
+    await apply_reference_self_transfer_rule(session, primary)
+    return ProcessSmsOutcome(status="parsed", transaction_id=primary.id)
 
 
 async def process_sms_row(
@@ -234,6 +332,13 @@ async def process_sms_row(
             transaction_id=None,
             primary_notification=primary,
         )
+
+    # 2b. Completion leg. The parser marks this message ledger_role="completion".
+    # It supplies a reference for an event an earlier message recorded. It opens
+    # no row of its own. Route it to the completion step before merge, so its
+    # transaction never reaches the matcher.
+    if parsed.ledger_role == COMPLETION_ROLE:
+        return await _complete_reference(session, sms_row, txn_data)
 
     # 3. Merge.
     outcome, txn_row, diff = await merge_transaction(
