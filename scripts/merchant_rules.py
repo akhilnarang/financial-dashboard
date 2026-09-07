@@ -23,6 +23,7 @@ from financial_dashboard.services.categorization.merchant_rules import (
     list_merchant_rules,
     load_merchant_rules,
 )
+from financial_dashboard.services.settings import load_all_settings
 
 
 async def _main() -> None:
@@ -62,6 +63,7 @@ async def _main() -> None:
     args = parser.parse_args()
 
     await init_db()
+    await load_all_settings()
 
     if args.cmd == "list":
         async with async_session() as session:
