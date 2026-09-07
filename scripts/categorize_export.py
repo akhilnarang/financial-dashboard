@@ -22,9 +22,6 @@ from financial_dashboard.db import async_session, init_db
 from financial_dashboard.db.models import Transaction
 from financial_dashboard.services import settings as settings_mod
 from financial_dashboard.services.categorization.engine import categorize_one
-from financial_dashboard.services.categorization.merchant_rules import (
-    load_merchant_rules,
-)
 from financial_dashboard.services.categorization.review_io import (
     EXPORT_FIELDS,
     build_export_row,
@@ -32,7 +29,6 @@ from financial_dashboard.services.categorization.review_io import (
 from financial_dashboard.services.settings import (
     get_active_llm_key,
     get_setting,
-    load_all_settings,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,8 +83,6 @@ async def _main() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 
     await init_db()
-    await load_all_settings()
-    await load_merchant_rules()
 
     if args.provider:
         settings_mod._cache["categorization.llm_provider"] = args.provider
