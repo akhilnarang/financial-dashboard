@@ -82,41 +82,6 @@ def _projection(
     )
 
 
-def _where(
-    *,
-    transaction_id: int | None = None,
-    transaction_ids: list[int] | None = None,
-    account_id: int | None = None,
-    date_from: datetime.date | None = None,
-    date_to: datetime.date | None = None,
-    direction: str | None = None,
-    category: str | None = None,
-    search: str | None = None,
-    excluded: bool | None = None,
-    amount: Decimal | None = None,
-    bank: str | None = None,
-    source: str | None = None,
-    review_status: str | None = None,
-    reference: str | None = None,
-) -> list:
-    return build_transaction_filter_clauses(
-        transaction_id=transaction_id,
-        transaction_ids=transaction_ids,
-        account_id=account_id,
-        date_from=date_from,
-        date_to=date_to,
-        direction=direction,
-        category=category,
-        search=search,
-        excluded=excluded,
-        amount=amount,
-        bank=bank,
-        source=source,
-        review_status=review_status,
-        reference=reference,
-    )
-
-
 def _statement(**filters: object) -> Select:
     return select(
         Transaction.id,
@@ -138,7 +103,7 @@ def _statement(**filters: object) -> Select:
         Transaction.category_model,
         Transaction.review_status,
         Transaction.review_reason,
-    ).where(*_where(**cast(Any, filters)))
+    ).where(*build_transaction_filter_clauses(**cast(Any, filters)))
 
 
 async def get_transaction(
