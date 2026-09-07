@@ -14,7 +14,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import AuditAction, AuditInteraction, utc_now
+from financial_dashboard.db.models import AuditInteraction, utc_now
 
 PROCESSING_LEASE = datetime.timedelta(minutes=5)
 
@@ -257,27 +257,3 @@ async def mark_authorization_changed(
     if result.rowcount == 1:
         await cancel_for_authorization_change(session, interaction_id)
     return result.rowcount == 1
-
-
-def new_action(
-    *,
-    interaction_id: int,
-    action_type: str,
-    target_type: str,
-    target_id: int,
-    arguments_json: str | None,
-    before_json: str | None,
-    after_json: str | None,
-    undoable: bool,
-) -> AuditAction:
-    return AuditAction(
-        interaction_id=interaction_id,
-        action_type=action_type,
-        target_type=target_type,
-        target_id=target_id,
-        arguments_json=arguments_json,
-        before_json=before_json,
-        after_json=after_json,
-        status="applied",
-        undo_status="available" if undoable else None,
-    )

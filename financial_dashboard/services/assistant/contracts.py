@@ -117,7 +117,6 @@ class ListTransactions(StrictModel):
 
 class ListCategories(StrictModel):
     name: Literal["list_categories"]
-    active_only: StrictBool = True
 
 
 ToolCall: TypeAlias = Annotated[
@@ -184,17 +183,12 @@ class CategoryProposal(StrictModel):
         return values
 
 
-class Mutation(StrictModel):
-    outcome: Literal["mutation"]
-    tool: ApplyTransactionChanges
-    explanation: StrictStr = Field(default="", max_length=500)
-
-
 class ToolCalls(StrictModel):
     """Application-owned reads or one complete atomic mutation request."""
 
     outcome: Literal["tool_calls"]
     calls: list[ToolCall] = Field(min_length=1, max_length=4)
+    explanation: StrictStr = Field(default="", max_length=500)
 
 
 class Error(StrictModel):
@@ -206,7 +200,7 @@ class Error(StrictModel):
 
 
 AssistantResponse: TypeAlias = Annotated[
-    Answer | Clarification | CategoryProposal | ToolCalls | Mutation | Error,
+    Answer | Clarification | CategoryProposal | ToolCalls | Error,
     Field(discriminator="outcome"),
 ]
 
@@ -242,15 +236,6 @@ def response_json_schema() -> dict[str, object]:
         dict[str, object],
         _openai_strict_schema(AssistantResponseEnvelope.model_json_schema()),
     )
-
-
-def json_object_envelope_schema() -> dict[str, object]:
-    """Return a portable JSON subset; server validation remains authoritative."""
-    return {
-        "type": "object",
-        "properties": {"response": {"type": "object"}},
-        "required": ["response"],
-    }
 
 
 def parse_response(data: object) -> AssistantResponse:

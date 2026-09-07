@@ -39,10 +39,9 @@ def build_prompt(context: PromptContext) -> str:
         '- {"outcome":"category_proposal","transaction_id":1,'
         '"explanation":"...","candidates":[{"slug":"...",'
         '"reason":"...","confidence":0.5}, ...]}',
-        '- {"outcome":"mutation","tool":APPLY,"explanation":"..."}',
-        '- {"outcome":"tool_calls","calls":[READ|APPLY, ...]}',
+        '- {"outcome":"tool_calls","calls":[READ|APPLY, ...],"explanation":"..."}',
         '- {"outcome":"error","message":"...","code":"..."}',
-        "READ is get_transaction(transaction_id), list_categories(active_only), or",
+        "READ is get_transaction(transaction_id), list_categories(), or",
         "list_transactions with optional transaction_ids/account_id/date_from/date_to/",
         "direction/amount/bank/source/category/review_status/reference/search/excluded/limit.",
         'APPLY is {"name":"apply_transaction_changes","transaction_id":1,',

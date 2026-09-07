@@ -1,13 +1,6 @@
 """Telegram-safe rendering primitives shared by assistant delivery paths."""
 
-import html
-
 TELEGRAM_MESSAGE_LIMIT = 4096
-
-
-def escape_html(value: object) -> str:
-    """Escape an untrusted value for Telegram HTML parse mode."""
-    return html.escape(str(value), quote=True)
 
 
 def split_plain_text(
