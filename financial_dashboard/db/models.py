@@ -20,6 +20,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy import text as sql_text
 
 from financial_dashboard.db.enums import PaymentStatus
 
@@ -30,6 +31,13 @@ class Base(DeclarativeBase):
 
 def utc_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.UTC)
+
+
+def as_utc(value: datetime.datetime) -> datetime.datetime:
+    """Restore UTC awareness lost by SQLite's timezone-naive DateTime adapter."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.UTC)
+    return value.astimezone(datetime.UTC)
 
 
 class EmailSource(Base):
@@ -632,6 +640,7 @@ class Transaction(Base):
     balance: Mapped[Decimal | None] = mapped_column(Numeric(precision=12, scale=2))
     raw_description: Mapped[str | None] = mapped_column(Text)
     note: Mapped[str | None] = mapped_column(Text)
+    attachment_path: Mapped[str | None] = mapped_column(Text)
     exclude_from_cashflow: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("0"), nullable=False
     )
@@ -735,3 +744,247 @@ class MerchantRule(Base):
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime, default=utc_now
     )
+
+
+class TelegramConversation(Base):
+    """Durable reply-thread state for the transaction assistant."""
+
+    __tablename__ = "telegram_conversations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    transaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("transactions.id"), index=True
+    )
+    started_by: Mapped[str] = mapped_column(String, nullable=False)
+    started_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    last_activity_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now, onupdate=utc_now
+    )
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="active", server_default="active"
+    )
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    pending_confirmation_kind: Mapped[str | None] = mapped_column(String)
+    pending_confirmation_json: Mapped[str | None] = mapped_column(Text)
+    pending_confirmation_state_hash: Mapped[str | None] = mapped_column(String)
+    pending_confirmation_source_interaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("audit_interactions.id")
+    )
+    pending_confirmation_expires_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime
+    )
+
+    __table_args__ = (
+        Index("ix_telegram_conversations_chat_status", "chat_id", "status"),
+        Index("ix_telegram_conversations_expires_at", "expires_at"),
+    )
+
+
+class AuditInteraction(Base):
+    """Idempotency, replay, model, and processing audit record for one update."""
+
+    __tablename__ = "audit_interactions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_update_id: Mapped[str | None] = mapped_column(String, unique=True)
+    inbound_chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    inbound_message_id: Mapped[int | None] = mapped_column(Integer)
+    reply_to_message_id: Mapped[int | None] = mapped_column(Integer)
+    user_text: Mapped[str | None] = mapped_column(Text)
+    inbound_payload_json: Mapped[str | None] = mapped_column(Text)
+    trigger: Mapped[str] = mapped_column(String, nullable=False)
+    conversation_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("telegram_conversations.id"), index=True
+    )
+    transaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("transactions.id"), index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="claimed", server_default="claimed", index=True
+    )
+    outcome: Mapped[str | None] = mapped_column(String)
+    worker_token: Mapped[str | None] = mapped_column(String)
+    processing_lease_until: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    assistant_text: Mapped[str | None] = mapped_column(Text)
+    model_input_json: Mapped[str | None] = mapped_column(Text)
+    model_output_json: Mapped[str | None] = mapped_column(Text)
+    model_explanation: Mapped[str | None] = mapped_column(Text)
+    provider: Mapped[str | None] = mapped_column(String)
+    model: Mapped[str | None] = mapped_column(String)
+    prompt_version: Mapped[str | None] = mapped_column(String)
+    output_mode: Mapped[str | None] = mapped_column(String)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String)
+    error_detail: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    claimed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    processing_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        Index("ix_audit_interactions_state_lease", "status", "processing_lease_until"),
+        Index("ix_audit_interactions_created_at", "created_at"),
+    )
+
+
+class CategoryReviewDecision(Base):
+    """Persisted candidate set used by proactive reviews and inline buttons."""
+
+    __tablename__ = "category_review_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    transaction_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("transactions.id"), nullable=False, index=True
+    )
+    source_interaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("audit_interactions.id"), index=True
+    )
+    category_input_hash: Mapped[str] = mapped_column(String, nullable=False)
+    candidates_json: Mapped[str] = mapped_column(Text, nullable=False)
+    proposed_slug: Mapped[str | None] = mapped_column(String)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    threshold: Mapped[float | None] = mapped_column(Float)
+    gate_reason: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="active", server_default="active", index=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    selected_slug: Mapped[str | None] = mapped_column(String)
+    consumed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    superseded_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        Index("ix_category_review_decisions_tx_status", "transaction_id", "status"),
+        Index("ix_category_review_decisions_expires_at", "expires_at"),
+    )
+
+
+class TelegramOutboundDelivery(Base):
+    """Durable outbound message, owned by exactly one interaction or decision."""
+
+    __tablename__ = "telegram_outbound_deliveries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    interaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("audit_interactions.id")
+    )
+    category_review_decision_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("category_review_decisions.id")
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    recipient_chat_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    transaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("transactions.id"), index=True
+    )
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    parse_mode: Mapped[str | None] = mapped_column(String)
+    reply_markup_json: Mapped[str | None] = mapped_column(Text)
+    delivery_token: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending", server_default="pending", index=True
+    )
+    delivery_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    worker_token: Mapped[str | None] = mapped_column(String)
+    delivery_lease_until: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    last_attempt_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    delivered_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        CheckConstraint(
+            "(interaction_id IS NOT NULL) + (category_review_decision_id IS NOT NULL) = 1",
+            name="ck_telegram_outbound_exactly_one_owner",
+        ),
+        Index(
+            "uq_telegram_outbound_interaction_ordinal",
+            "interaction_id",
+            "ordinal",
+            unique=True,
+            sqlite_where=sql_text("interaction_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_telegram_outbound_decision_ordinal",
+            "category_review_decision_id",
+            "ordinal",
+            unique=True,
+            sqlite_where=sql_text("category_review_decision_id IS NOT NULL"),
+        ),
+    )
+
+
+class TelegramMessageContext(Base):
+    """Maps every physical Telegram message to the logical records it carries."""
+
+    __tablename__ = "telegram_message_contexts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    conversation_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("telegram_conversations.id"), index=True
+    )
+    transaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("transactions.id"), index=True
+    )
+    interaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("audit_interactions.id"), index=True
+    )
+    outbound_delivery_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("telegram_outbound_deliveries.id"), index=True
+    )
+    context_kind: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint("chat_id", "message_id", name="uq_telegram_message_context"),
+    )
+
+
+class AuditAction(Base):
+    """One auditable financial mutation and its optional Undo lifecycle."""
+
+    __tablename__ = "audit_actions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    interaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("audit_interactions.id"), index=True
+    )
+    transaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("transactions.id"), index=True
+    )
+    action_type: Mapped[str] = mapped_column(String, nullable=False)
+    target_type: Mapped[str] = mapped_column(String, nullable=False)
+    target_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    arguments_json: Mapped[str | None] = mapped_column(Text)
+    before_json: Mapped[str | None] = mapped_column(Text)
+    after_json: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="applied", server_default="applied", index=True
+    )
+    undo_status: Mapped[str | None] = mapped_column(String)
+    undone_by_interaction_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("audit_interactions.id")
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    undone_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    error_code: Mapped[str | None] = mapped_column(String)
+
+    __table_args__ = (Index("ix_audit_actions_created_at", "created_at"),)

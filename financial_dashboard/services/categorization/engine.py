@@ -18,6 +18,13 @@ from financial_dashboard.services.categorization.rules import (
     match_rules,
 )
 from financial_dashboard.services.categorization.polarity import resolve_direction
+from financial_dashboard.services.categorization.review_decisions import (
+    candidates_from_result,
+    create_or_reuse_decision,
+)
+from financial_dashboard.services.categorization.decision_lifecycle import (
+    supersede_active_decisions,
+)
 from financial_dashboard.services.categorization.self_transfer import (
     apply_reference_self_transfer_rule,
 )
@@ -115,6 +122,7 @@ async def categorize_one(
         txn.category_vocab_version = get_vocab_version()
         txn.categorized_at = utc_now()
         txn.review_status = None
+        await supersede_active_decisions(session, txn.id)
         return "rule"
 
     if not use_llm:
@@ -161,13 +169,30 @@ async def categorize_one(
     txn.category_vocab_version = get_vocab_version()
     txn.categorized_at = utc_now()
 
-    if result.slug == NEEDS_REVIEW or result.confidence < _confidence_threshold():
+    proposed_slug: str | None = None
+    gate_reason: str | None = None
+    threshold = _confidence_threshold()
+    if result.slug == NEEDS_REVIEW or result.confidence < threshold:
         resolved, _ = resolve_direction("unknown", txn.direction, account_type)
+        if result.slug != NEEDS_REVIEW:
+            proposed, proposal_changed = resolve_direction(
+                result.slug, txn.direction, account_type
+            )
+            proposed_slug = None if proposal_changed else proposed
         txn.category = resolved
         txn.review_status = "pending"
         txn.review_reason = result.reason
+        gate_reason = (
+            result.reason
+            if result.slug == NEEDS_REVIEW
+            and result.reason.startswith("invalid model category slug:")
+            else "model abstained"
+            if result.slug == NEEDS_REVIEW
+            else f"confidence {result.confidence:.2f} below {threshold:.2f}"
+        )
     else:
         resolved, changed = resolve_direction(result.slug, txn.direction, account_type)
+        proposed_slug = resolved
         txn.category = resolved
         if changed:
             # The model gave a directionally-impossible slug — it was confused,
@@ -176,8 +201,28 @@ async def categorize_one(
             txn.review_reason = f"direction fallback: model said {result.slug}"
             txn.category_confidence = min(result.confidence, 0.4)
             txn.review_status = "pending"
+            gate_reason = f"{result.slug} is incompatible with {txn.direction}"
         else:
             txn.review_status = None
+            await supersede_active_decisions(session, txn.id)
+    if txn.review_status == "pending":
+        compatible_candidates = [
+            candidate
+            for candidate in candidates_from_result(result)
+            if resolve_direction(
+                str(candidate["category"]), txn.direction, account_type
+            ).slug
+            == candidate["category"]
+        ]
+        await create_or_reuse_decision(
+            session,
+            txn,
+            candidates=compatible_candidates,
+            gate_reason=gate_reason,
+            proposed_slug=proposed_slug,
+            confidence=result.confidence,
+            threshold=threshold,
+        )
     return "llm"
 
 

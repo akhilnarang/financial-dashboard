@@ -47,3 +47,32 @@ def build_input_payload(txn: Transaction, account_type: str | None) -> InputPayl
 def compute_input_hash(payload: InputPayload) -> str:
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def build_confirmation_payload(
+    txn: Transaction, account_type: str | None
+) -> dict[str, object]:
+    """Build the state fingerprint used by pending confirmations.
+
+    Confirmation state includes both the mutable fields a pending action may
+    change and the classifier input hash. This lets a later affirmative reply
+    fail closed when enrichment or another edit changed the transaction.
+    """
+    return {
+        "category": txn.category,
+        "note": txn.note,
+        "exclude_from_cashflow": txn.exclude_from_cashflow,
+        "category_input_hash": txn.category_input_hash,
+        "input_state": build_input_payload(txn, account_type),
+    }
+
+
+def compute_confirmation_hash(payload: dict[str, object]) -> str:
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def compute_transaction_confirmation_hash(
+    txn: Transaction, account_type: str | None
+) -> str:
+    return compute_confirmation_hash(build_confirmation_payload(txn, account_type))

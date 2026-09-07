@@ -89,6 +89,38 @@ Linking is performed inline during polling and in batch via the `relink_orphans(
 - When `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set, the app sends real-time transaction notifications to a Telegram chat after each new transaction is parsed.
 - Reply to a notification message to set a note on the transaction.
 
+#### Conversational transaction assistant
+
+Set `telegram.assistant_enabled` to `true` in Settings to enable the assistant.
+`/ask` starts a fresh conversation; otherwise only a reply to a bot message is
+accepted. Conversations retain their reply context for 24 hours, then expire.
+The assistant can answer questions about transactions, set or clear a note,
+set a category, exclude a transaction from cashflow, create an explicitly
+requested category, or create an explicitly requested merchant rule. Clear
+requests are applied directly; ambiguity produces a question or category
+buttons. Category-button choices and every assistant mutation are audited.
+Assistant category assignment accepts only active vocabulary entries. Existing
+web/API manual assignment remains compatible with historical inactive category
+slugs, while unknown slugs still require explicit creation.
+
+Replying to a transaction notification with one image or PDF attaches the
+receipt. A caption replaces the transaction note. Files are stored below
+`TRANSACTION_ATTACHMENT_ROOT` (default `./data/transaction_attachments`) and
+are served through the authenticated `/api/transactions/{id}/attachment`
+endpoint; PDFs download while images display inline. The assistant does not
+OCR receipts. The configured Telegram chat is the only authorized chat, and
+pending deliveries remain bound to the recipient captured when they were
+created.
+SQLite backups do not include receipt files. Include
+`TRANSACTION_ATTACHMENT_ROOT` in durable storage and back it up separately
+from the database.
+
+Open `/audit` for the interaction table and `/audit/{id}` for model, delivery,
+and mutation details. For offline evaluation, run
+`uv run python scripts/export_assistant_eval_data.py --output assistant-evals.jsonl`.
+The read-only export contains the user turn, model output, assistant response,
+outcome, and audited actions, without attachment files or Telegram file IDs.
+
 ### Poll Status and Progress Reporting
 - `GET /api/poll/status` returns a JSON object with `state` (idle/polling), `started_at`, `finished_at`, `last_stats`, `last_error`, and a `progress` dict (`{source, rule, email, detail}`) updated as each email is processed.
 - The dashboard polls this endpoint to display live progress during a poll.
@@ -354,6 +386,12 @@ scripts/
 | `ManualItem` | `manual_items` | User-maintained asset/liability sources such as property, cash, or loans |
 | `Category` | `categories` | Controlled vocabulary of transaction category slugs (editable; seeded at init) |
 | `MerchantRule` | `merchant_rules` | Editable substring→category rules; the deterministic layer that skips the LLM for known merchants |
+| `TelegramConversation` | `telegram_conversations` | Expiring `/ask` or transaction reply thread, including a pending typed confirmation |
+| `TelegramMessageContext` | `telegram_message_contexts` | Authoritative mapping from Telegram messages to conversations, transactions, interactions, and outbound rows |
+| `AuditInteraction` | `audit_interactions` | Idempotent assistant interaction state, model replay data, leases, and delivery outcome |
+| `TelegramOutboundDelivery` | `telegram_outbound_deliveries` | Durable, recipient-bound outbound message chunks owned by an interaction or category decision |
+| `AuditAction` | `audit_actions` | Audited financial mutation with before/after values and optional Undo lifecycle |
+| `CategoryReviewDecision` | `category_review_decisions` | Persisted ordered category candidates and compare-and-swap selection state |
 | `Setting` | `settings` | Small key/value store for app-level settings |
 | `ExtensionRun` | `extension_runs` | Audit/state row for a single extension operation (probe/generate/sync, manual or automatic); generic over `extension_id`, stores no credentials and never duplicates financial rows |
 | `ExtensionSyncState` | `extension_sync_state` | Per-extension current sync-state singleton (Paisa today): trigger-bumped `desired_revision` vs coordinator-advanced `applied_revision`, dirty window, published/remote/healthy hashes, retry backoff, diagnosis state, one-shot force-reload flag, and a single-flight lease. Exactly one row per extension; never stores credentials or duplicates financial rows |
@@ -610,6 +648,7 @@ erDiagram
         decimal balance
         text raw_description
         text note
+        text attachment_path
         boolean exclude_from_cashflow
         string category
         string category_method
@@ -628,7 +667,6 @@ erDiagram
     CATEGORIES {
         int id PK
         string slug UK
-        string display_label
         bool active
         datetime created_at
     }
@@ -640,6 +678,124 @@ erDiagram
         bool active
         int priority
         datetime created_at
+    }
+
+    TELEGRAM_CONVERSATIONS {
+        int id PK
+        int chat_id
+        string started_by
+        int transaction_id FK
+        datetime started_at
+        datetime last_activity_at
+        datetime expires_at
+        string status
+        text pending_confirmation_json
+        string pending_confirmation_kind
+        string pending_confirmation_state_hash
+        int pending_confirmation_source_interaction_id
+        datetime pending_confirmation_expires_at
+    }
+
+    TELEGRAM_MESSAGE_CONTEXTS {
+        int id PK
+        int chat_id
+        int message_id
+        int conversation_id FK
+        int transaction_id FK
+        int interaction_id FK
+        int outbound_delivery_id FK
+        string context_kind
+        datetime created_at
+    }
+
+    AUDIT_INTERACTIONS {
+        int id PK
+        int conversation_id FK
+        int transaction_id FK
+        string trigger
+        string telegram_update_id UK
+        int inbound_chat_id
+        int inbound_message_id
+        int reply_to_message_id
+        text user_text
+        text inbound_payload_json
+        text model_input_json
+        text model_output_json
+        text model_explanation
+        string provider
+        string model
+        string prompt_version
+        string output_mode
+        text assistant_text
+        int input_tokens
+        int output_tokens
+        int latency_ms
+        string outcome
+        string status
+        datetime processing_lease_until
+        string worker_token
+        string error_code
+        text error_detail
+        datetime created_at
+        datetime claimed_at
+        datetime processing_at
+        datetime completed_at
+    }
+
+    CATEGORY_REVIEW_DECISIONS {
+        int id PK
+        int transaction_id FK
+        int source_interaction_id FK
+        string category_input_hash
+        text candidates_json
+        string proposed_slug
+        float confidence
+        float threshold
+        string gate_reason
+        string status
+        string selected_slug
+        datetime created_at
+        datetime expires_at
+        datetime consumed_at
+        datetime superseded_at
+    }
+
+    TELEGRAM_OUTBOUND_DELIVERIES {
+        int id PK
+        int interaction_id FK
+        int category_review_decision_id FK
+        int ordinal
+        int recipient_chat_id
+        int transaction_id FK
+        text text
+        string parse_mode
+        text reply_markup_json
+        string delivery_token UK
+        string status
+        int delivery_attempts
+        datetime delivery_lease_until
+        string worker_token
+        datetime created_at
+        datetime last_attempt_at
+        datetime delivered_at
+    }
+
+    AUDIT_ACTIONS {
+        int id PK
+        int interaction_id FK
+        int transaction_id FK
+        string action_type
+        string target_type
+        int target_id
+        text arguments_json
+        text before_json
+        text after_json
+        string status
+        string undo_status
+        int undone_by_interaction_id FK
+        datetime created_at
+        datetime undone_at
+        string error_code
     }
 
     ACCOUNTS ||--o{ CARDS : has
@@ -662,6 +818,21 @@ erDiagram
     STATEMENT_UPLOADS ||--o{ TRANSACTIONS : imported_from_cc_statement
     BANK_STATEMENT_UPLOADS ||--o{ TRANSACTIONS : imported_from_bank_statement
     CATEGORIES ||--o{ TRANSACTIONS : categorizes
+    TRANSACTIONS ||--o{ TELEGRAM_CONVERSATIONS : discusses
+    TELEGRAM_CONVERSATIONS ||--o{ TELEGRAM_MESSAGE_CONTEXTS : contains
+    TRANSACTIONS ||--o{ TELEGRAM_MESSAGE_CONTEXTS : identifies
+    AUDIT_INTERACTIONS ||--o{ TELEGRAM_MESSAGE_CONTEXTS : maps
+    TELEGRAM_OUTBOUND_DELIVERIES ||--o{ TELEGRAM_MESSAGE_CONTEXTS : records_physical_messages
+    TELEGRAM_CONVERSATIONS ||--o{ AUDIT_INTERACTIONS : owns
+    AUDIT_INTERACTIONS o|--o{ TELEGRAM_CONVERSATIONS : confirms
+    TRANSACTIONS ||--o{ AUDIT_INTERACTIONS : targets
+    TRANSACTIONS ||--o{ CATEGORY_REVIEW_DECISIONS : proposes
+    TRANSACTIONS ||--o{ TELEGRAM_OUTBOUND_DELIVERIES : targets
+    TRANSACTIONS ||--o{ AUDIT_ACTIONS : records
+    AUDIT_INTERACTIONS ||--o{ CATEGORY_REVIEW_DECISIONS : originates
+    AUDIT_INTERACTIONS ||--o{ TELEGRAM_OUTBOUND_DELIVERIES : owns
+    CATEGORY_REVIEW_DECISIONS ||--o{ TELEGRAM_OUTBOUND_DELIVERIES : owns
+    AUDIT_INTERACTIONS ||--o{ AUDIT_ACTIONS : records
 ```
 
 `transactions.category` references `categories.slug` as a soft (application-enforced) link — SQLite foreign-key enforcement is intentionally off, so there is no DB-level FK constraint.
@@ -683,6 +854,10 @@ Relationship notes:
 - `(account_id, card_mask)` is unique on `cards`.
 - `balance_snapshots` has a check constraint requiring exactly one source foreign key among `account_id`, `cas_upload_id`, and `manual_item_id`.
 - `balance_snapshots` has SQLite partial unique indexes for account, investment, and manual snapshot upserts: `(account_id, category, as_of_date)`, `(portfolio_key, category, as_of_date)`, and `(manual_item_id, as_of_date)`.
+- `telegram_outbound_deliveries` requires exactly one owner (`interaction_id` or `category_review_decision_id`) and has partial unique indexes on `(interaction_id, ordinal)` and `(category_review_decision_id, ordinal)`.
+- `telegram_message_contexts` uniquely maps `(chat_id, message_id)` to the logical interaction/outbound row; `telegram_outbound_deliveries.delivery_token` is globally unique for Ref-token recovery.
+- `telegram_outbound_deliveries` rows with either `abandoned` or `cancelled` status remain visible in the audit surface; cancellation preserves the delivery history when authorization changes.
+- Pending confirmations use a hash over category, note, cashflow exclusion, and the current categorization input state. Their nullable source-interaction foreign key binds an affirmative reply to the application-rendered clarification that authorized it. `audit_interactions.output_mode` records whether provider output used a strict schema or fallback JSON mode.
 - `(portfolio_key, statement_date)` is unique on `cas_uploads` so re-importing the same CAS period replaces the prior upload.
 - `investment_lots` carries a natural unique key `(cas_upload_id, source_ref, instrument_id, acquired_on, reference, source_occurrence)`. `source_occurrence` preserves genuine multiplicity inside one source statement, while idempotent normalization cannot insert the same occurrence twice. Rows repeated by overlapping CAS periods remain attached to every contributing upload; the investment service exposes a deterministic canonical multiset keyed by portfolio/source transaction identity/instrument/date/reference/quantity/cost and retains all contributing upload provenance. A lot is only created when the source states quantity, per-unit cost, cost basis, currency and acquisition date explicitly and consistently (`quantity * unit_cost == cost_basis` to the penny); value-only holdings and demat movements (CAS prints no cost) are excluded and reported as diagnostics, never fabricated into a lot. Acquisition cost facts are never derived from a current NAV/value. Current valuation facts are read separately from the latest statement per portfolio and preserve demat-account/folio identity even when the same ISIN is held in several sources. These rows are **not** consumed by the Paisa projection, which represents CAS as an aggregate valuation only; they remain available to the dashboard and to a future cost-basis feature.
 - `snapshot_holdings` has nullable investment-detail columns (`instrument_id`, `quantity`, `unit_price`, `currency`, `cost_basis`, `acquired_on`). CAS ingestion still aggregates holdings by asset class for the net-worth breakdown, so these stay NULL on those rows; they are populated only when a holding represents a single instrument the CAS explicitly priced.

@@ -73,3 +73,4 @@ def test_parse_result_clamps_and_defaults():
         {"category": "made_up", "confidence": 0.9, "reason": "y"}, ["groceries"]
     )
     assert bad.slug == NEEDS_REVIEW
+    assert bad.reason == "invalid model category slug: made_up"
