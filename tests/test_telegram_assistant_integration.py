@@ -23,7 +23,6 @@ from financial_dashboard.services import telegram
 from financial_dashboard.services.assistant.contracts import (
     Answer,
     Clarification,
-    Mutation,
     ToolCalls,
 )
 from financial_dashboard.services.assistant.orchestrator import (
@@ -119,17 +118,19 @@ async def test_successful_multi_field_mutation_commits_as_one_action(session):
     )
     session.add(transaction)
     await session.flush()
-    response = Mutation(
-        outcome="mutation",
-        tool={
-            "name": "apply_transaction_changes",
-            "transaction_id": transaction.id,
-            "changes": {
-                "note": {"op": "set", "value": "weekly groceries"},
-                "category": {"op": "set", "value": "groceries"},
-                "exclude_from_cashflow": {"op": "set", "value": True},
+    response = ToolCalls(
+        outcome="tool_calls",
+        calls=[
+            {
+                "name": "apply_transaction_changes",
+                "transaction_id": transaction.id,
+                "changes": {
+                    "note": {"op": "set", "value": "weekly groceries"},
+                    "category": {"op": "set", "value": "groceries"},
+                    "exclude_from_cashflow": {"op": "set", "value": True},
+                },
             },
-        },
+        ],
     )
 
     result = await run_turn(
@@ -141,7 +142,7 @@ async def test_successful_multi_field_mutation_commits_as_one_action(session):
         transaction_id=transaction.id,
     )
 
-    assert result.response.outcome == "mutation"
+    assert result.response.outcome == "tool_calls"
     assert result.mutation is not None
     assert transaction.note == "weekly groceries"
     assert transaction.category == "groceries"
@@ -588,13 +589,15 @@ async def test_authorization_change_rejects_final_mutation(session):
     )
     session.add(transaction)
     await session.flush()
-    response = Mutation(
-        outcome="mutation",
-        tool={
-            "name": "apply_transaction_changes",
-            "transaction_id": transaction.id,
-            "changes": {"note": {"op": "set", "value": "must not commit"}},
-        },
+    response = ToolCalls(
+        outcome="tool_calls",
+        calls=[
+            {
+                "name": "apply_transaction_changes",
+                "transaction_id": transaction.id,
+                "changes": {"note": {"op": "set", "value": "must not commit"}},
+            }
+        ],
     )
 
     result = await run_turn(
@@ -616,13 +619,15 @@ async def test_question_turn_cannot_apply_ordinary_provider_mutation(session):
     )
     session.add(transaction)
     await session.flush()
-    response = Mutation(
-        outcome="mutation",
-        tool={
-            "name": "apply_transaction_changes",
-            "transaction_id": transaction.id,
-            "changes": {"note": {"op": "set", "value": "restaurant"}},
-        },
+    response = ToolCalls(
+        outcome="tool_calls",
+        calls=[
+            {
+                "name": "apply_transaction_changes",
+                "transaction_id": transaction.id,
+                "changes": {"note": {"op": "set", "value": "restaurant"}},
+            }
+        ],
     )
 
     result = await run_turn(
@@ -676,13 +681,15 @@ async def test_chat_change_during_provider_work_cancels_interaction(
                 setting = await other.get(Setting, "telegram.chat_id")
                 setting.value = "88"
                 await other.commit()
-            response = Mutation(
-                outcome="mutation",
-                tool={
-                    "name": "apply_transaction_changes",
-                    "transaction_id": transaction.id,
-                    "changes": {"note": {"op": "set", "value": "blocked"}},
-                },
+            response = ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": transaction.id,
+                        "changes": {"note": {"op": "set", "value": "blocked"}},
+                    }
+                ],
             )
             return StructuredResult(
                 response,
@@ -1134,13 +1141,15 @@ async def test_unmapped_old_notification_reply_recovers_transaction(
     monkeypatch.setattr(
         "financial_dashboard.services.assistant.orchestrator._provider_from_application_settings",
         lambda: SequenceProvider(
-            Mutation(
-                outcome="mutation",
-                tool={
-                    "name": "apply_transaction_changes",
-                    "transaction_id": transaction.id,
-                    "changes": {"note": {"op": "set", "value": "fresh basket"}},
-                },
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": transaction.id,
+                        "changes": {"note": {"op": "set", "value": "fresh basket"}},
+                    }
+                ],
             )
         ),
     )
@@ -1269,13 +1278,15 @@ async def test_reply_to_individual_ask_result_uses_its_transaction_target(
     monkeypatch.setattr(
         "financial_dashboard.services.assistant.orchestrator._provider_from_application_settings",
         lambda: SequenceProvider(
-            Mutation(
-                outcome="mutation",
-                tool={
-                    "name": "apply_transaction_changes",
-                    "transaction_id": transaction.id,
-                    "changes": {"note": {"op": "set", "value": "groceries"}},
-                },
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": transaction.id,
+                        "changes": {"note": {"op": "set", "value": "groceries"}},
+                    }
+                ],
             )
         ),
     )

@@ -1,11 +1,8 @@
 """Reply-thread and pending-confirmation persistence."""
 
-import datetime
 import json
-from typing import cast
+import datetime
 
-from sqlalchemy import select
-from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import TelegramConversation, utc_now
@@ -35,22 +32,6 @@ async def start_conversation(
     return row
 
 
-async def active_conversation(
-    session: AsyncSession, *, chat_id: int, transaction_id: int | None = None
-) -> TelegramConversation | None:
-    now = utc_now()
-    query = select(TelegramConversation).where(
-        TelegramConversation.chat_id == chat_id,
-        TelegramConversation.status == "active",
-        TelegramConversation.expires_at > now,
-    )
-    if transaction_id is not None:
-        query = query.where(TelegramConversation.transaction_id == transaction_id)
-    return await session.scalar(
-        query.order_by(TelegramConversation.last_activity_at.desc()).limit(1)
-    )
-
-
 async def touch_conversation(
     session: AsyncSession, conversation: TelegramConversation
 ) -> None:
@@ -58,24 +39,6 @@ async def touch_conversation(
     conversation.last_activity_at = now
     conversation.expires_at = now + CONVERSATION_TTL
     await session.flush()
-
-
-async def expire_conversations(session: AsyncSession) -> int:
-    from sqlalchemy import update
-
-    result = cast(
-        CursorResult,
-        await session.execute(
-            update(TelegramConversation)
-            .where(
-                TelegramConversation.status == "active",
-                TelegramConversation.expires_at <= utc_now(),
-            )
-            .values(status="expired")
-            .execution_options(synchronize_session="fetch")
-        ),
-    )
-    return result.rowcount
 
 
 def set_pending_confirmation(

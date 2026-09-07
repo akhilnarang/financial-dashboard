@@ -169,11 +169,6 @@ def _find_closing_quote(text: str, start: int, closing: str) -> int | None:
     return None
 
 
-def intent_is_negated(text: str) -> bool:
-    """Return whether the turn explicitly denies or withdraws an action."""
-    return bool(_NEGATION_CUE.search(text))
-
-
 def has_global_no_change(text: str) -> bool:
     """Return whether the turn explicitly forbids all changes."""
     for clause in re.split(r"[,.;:!?\n]", text):
@@ -334,7 +329,7 @@ def evidence_is_current(user_text: str, evidence: str) -> bool:
     return bool(cleaned) and cleaned.casefold() in user_text.casefold()
 
 
-def _mentions_category(text: str, category_slug: str) -> bool:
+def mentions_category(text: str, category_slug: str) -> bool:
     words = normalize_text(category_slug.replace("_", " ")).strip().casefold()
     normalized = normalize_text(text).casefold()
     if not words:
@@ -367,7 +362,7 @@ def category_creation_is_explicit(
         return False
     if not _CATEGORY_CREATE_CUE.search(evidence):
         return False
-    return _mentions_category(evidence, category_slug)
+    return mentions_category(evidence, category_slug)
 
 
 def merchant_rule_is_explicit(
@@ -390,7 +385,7 @@ def merchant_rule_is_explicit(
         cue = _DURABLE_RULE_CUE.search(clause)
         return bool(
             cue
-            and _mentions_category(clause, category_slug)
+            and mentions_category(clause, category_slug)
             and not negates_target(clause, category_slug)
             and not negates_target(clause, cue.group(0))
         )

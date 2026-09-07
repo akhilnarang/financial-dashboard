@@ -40,7 +40,6 @@ from financial_dashboard.services.assistant.contracts import (
     CategoryProposal,
     Clarification,
     Error,
-    Mutation,
     ToolCalls,
     GetTransaction,
     ListCategories,
@@ -232,11 +231,7 @@ async def _dispatch_read(session: AsyncSession, call: object) -> object:
     if isinstance(call, GetTransaction):
         return await get_transaction(session, call.transaction_id)
     if isinstance(call, ListCategories):
-        return (
-            await get_active_slugs(session)
-            if call.active_only
-            else await get_active_slugs(session)
-        )
+        return await get_active_slugs(session)
     if isinstance(call, ListTransactions):
         try:
             date_from = (
@@ -486,31 +481,6 @@ async def run_turn(
                         )
                     )
                 return completed(response, None, decision_id)
-            return completed(response, mutation)
-        if isinstance(response, Mutation):
-            if transaction_id != response.tool.transaction_id:
-                return completed(
-                    Error(
-                        outcome="error",
-                        message="I need one unambiguous transaction target for a change.",
-                        code="ambiguous_target",
-                    )
-                )
-            try:
-                await _lock_authorized_chat(session, authorized_chat_id)
-                mutation = await apply_transaction_changes(
-                    session,
-                    response.tool,
-                    current_user_message=user_message,
-                    interaction_id=interaction_id,
-                    direction_policy=_request_direction_policy(
-                        response.tool, user_message, direction_policy
-                    ),
-                )
-            except MutationRejected as exc:
-                return completed(
-                    Error(outcome="error", message=str(exc), code="mutation_rejected")
-                )
             return completed(response, mutation)
         if isinstance(response, ToolCalls):
             mutation_calls = [

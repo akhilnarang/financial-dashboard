@@ -2,7 +2,6 @@
 
 import json
 import re
-from difflib import SequenceMatcher
 from typing import NamedTuple, cast
 
 from sqlalchemy import select, update
@@ -28,6 +27,7 @@ from financial_dashboard.services.assistant.intent_policy import (
     has_non_mutating_intent,
     instruction_view,
     merchant_rule_is_explicit,
+    mentions_category,
     negates_target,
     parse_instruction,
 )
@@ -74,21 +74,6 @@ _NEGATION = (
     r"cannot|can t|will not|won t|would not|wouldn t|must not|mustn t|"
     r"could not|couldn t|may not|might not)"
 )
-
-
-def _contains_phrase(text: str, phrase: str) -> bool:
-    return bool(phrase and re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text))
-
-
-def _contains_close_category(text: str, category: str) -> bool:
-    target = category.replace("_", " ")
-    width = len(target.split())
-    tokens = text.split()
-    return any(
-        SequenceMatcher(None, target, " ".join(tokens[index : index + width])).ratio()
-        >= 0.82
-        for index in range(max(0, len(tokens) - width + 1))
-    )
 
 
 def _category_assignment_is_negated(text: str) -> bool:
@@ -202,9 +187,7 @@ def _validate_ordinary_intent(
                 raise MutationRejected(
                     "negated instructions cannot change transaction data"
                 )
-            if not _contains_phrase(normalized, value) and not _contains_close_category(
-                normalized, value
-            ):
+            if not mentions_category(normalized, value):
                 raise MutationRejected(
                     "category value must be supported by the current message"
                 )

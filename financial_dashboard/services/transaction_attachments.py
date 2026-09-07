@@ -204,38 +204,6 @@ async def attach_downloaded_attachment(
     return AttachmentMutation(transaction_id, stored.relative_path, old_path, action.id)
 
 
-async def attach_transaction_attachment(
-    session: AsyncSession,
-    transaction_id: int,
-    url: str,
-    *,
-    declared_size: int | None,
-    caption: str | None = None,
-    interaction_id: int | None = None,
-    worker_token: str | None = None,
-    client: httpx.AsyncClient | None = None,
-) -> AttachmentMutation:
-    """Download and attach one receipt, cleaning the new file on DB failure."""
-    stored = await download_attachment(
-        url,
-        transaction_id=transaction_id,
-        declared_size=declared_size,
-        client=client,
-    )
-    try:
-        return await attach_downloaded_attachment(
-            session,
-            transaction_id,
-            stored,
-            caption=caption,
-            interaction_id=interaction_id,
-            worker_token=worker_token,
-        )
-    except BaseException:
-        remove_attachment(stored.relative_path)
-        raise
-
-
 def cleanup_replaced_attachment(relative_path: str | None) -> bool:
     """Delete an old file after commit, logging a recoverable warning on failure."""
     if not relative_path:
