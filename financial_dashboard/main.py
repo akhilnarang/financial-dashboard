@@ -17,6 +17,7 @@ from financial_dashboard.services.settings import (
     start_services,
     stop_services,
 )
+from financial_dashboard.services.transaction_attachments import attachment_root
 from financial_dashboard.web import get_router
 
 logging.basicConfig(
@@ -39,6 +40,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("Initializing database...")
     await init_db()
+    attachment_root()
     logger.info("Database ready")
 
     # Refuse to boot with no master key if encrypted data already exists,

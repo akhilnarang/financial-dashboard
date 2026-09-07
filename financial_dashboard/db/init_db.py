@@ -196,6 +196,23 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
         except Exception:
             await conn.execute(text("ALTER TABLE transactions ADD COLUMN note TEXT"))
         try:
+            await conn.execute(text("SELECT attachment_path FROM transactions LIMIT 0"))
+        except Exception:
+            # A transaction has at most one operator-supplied receipt.  The
+            # path is relative to the configured attachment root and is kept
+            # separate from the source statement upload path.
+            await conn.execute(
+                text("ALTER TABLE transactions ADD COLUMN attachment_path TEXT")
+            )
+        try:
+            await conn.execute(
+                text("SELECT output_mode FROM audit_interactions LIMIT 0")
+            )
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE audit_interactions ADD COLUMN output_mode TEXT")
+            )
+        try:
             await conn.execute(
                 text("SELECT exclude_from_cashflow FROM transactions LIMIT 0")
             )

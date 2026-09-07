@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Assistant Audit - Ledger{% endblock %}
+{% block content %}
+<div class="section-header"><h2>Assistant audit</h2></div>
+
+<form method="get" class="filter-bar" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.7rem;margin-bottom:1rem;">
+    <label>Status<input name="status" value="{{ filters.status or '' }}"></label>
+    <label>Trigger<input name="trigger" value="{{ filters.trigger or '' }}"></label>
+    <label>Transaction<input name="transaction_id" type="number" min="1" value="{{ filters.transaction_id or '' }}"></label>
+    <label>Action<input name="action_type" value="{{ filters.action_type or '' }}"></label>
+    <label>From<input name="date_from" type="date" value="{{ filters.date_from or '' }}"></label>
+    <label>To<input name="date_to" type="date" value="{{ filters.date_to or '' }}"></label>
+    <button type="submit">Filter</button>
+</form>
+
+<div class="table" style="overflow-x:auto;">
+<table>
+    <thead><tr><th>Time</th><th>ID</th><th>Trigger</th><th>Transaction</th><th>Outcome</th><th>Status</th><th>Message</th></tr></thead>
+    <tbody>
+    {% for row in interactions %}
+    <tr>
+        <td>{{ row.created_at.strftime('%d %b %Y %H:%M:%S') }}</td>
+        <td><a href="/audit/{{ row.id }}">#{{ row.id }}</a></td>
+        <td>{{ row.trigger }}</td>
+        <td>{% if row.transaction_id %}<a href="/transactions/{{ row.transaction_id }}">#{{ row.transaction_id }}</a>{% endif %}</td>
+        <td>{{ row.outcome or '' }}</td>
+        <td><span class="badge">{{ row.status }}</span></td>
+        <td>{{ (row.user_text or '')[:100] }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7">No matching audit interactions.</td></tr>
+    {% endfor %}
+    </tbody>
+</table>
+</div>
+{% if terminal_proactive %}
+<h3>Abandoned or cancelled category notifications</h3>
+<div class="table" style="overflow-x:auto;">
+<table>
+    <thead><tr><th>Time</th><th>Delivery</th><th>Decision</th><th>Part</th><th>Transaction</th><th>Status</th><th>Recipient</th><th>Attempts</th><th>Last attempt</th><th>Message/buttons</th></tr></thead>
+    <tbody>{% for delivery in terminal_proactive %}<tr>
+        <td>{{ delivery.created_at.strftime('%d %b %Y %H:%M:%S') }}</td>
+        <td>#{{ delivery.id }}</td>
+        <td>#{{ delivery.category_review_decision_id }}</td>
+        <td>{{ delivery.ordinal }}</td>
+        <td>{% if delivery.transaction_id %}<a href="/transactions/{{ delivery.transaction_id }}">#{{ delivery.transaction_id }}</a>{% endif %}</td>
+        <td>{{ delivery.status }}</td>
+        <td>{{ delivery.recipient_chat_id }}</td>
+        <td>{{ delivery.delivery_attempts }}</td>
+        <td>{{ delivery.last_attempt_at or '' }}</td>
+        <td>{{ delivery.text[:100] }}{% if delivery.reply_markup_json %}<br>{{ delivery.reply_markup_json }}{% endif %}</td>
+    </tr>{% endfor %}</tbody>
+</table>
+</div>
+{% endif %}
+<nav style="display:flex;gap:.7rem;margin-top:1rem;">
+    {% if page > 1 %}<a href="?page={{ page - 1 }}{% if pagination_query %}&amp;{{ pagination_query }}{% endif %}">Previous</a>{% endif %}
+    {% if has_next %}<a href="?page={{ page + 1 }}{% if pagination_query %}&amp;{{ pagination_query }}{% endif %}">Next</a>{% endif %}
+</nav>
+{% endblock %}

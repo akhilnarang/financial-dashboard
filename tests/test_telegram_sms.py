@@ -2,10 +2,14 @@
 
 from datetime import date, time
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from financial_dashboard.db import TelegramMessageContext
 from financial_dashboard.services.txn_merge import EnrichmentDiff
 
 
@@ -216,6 +220,40 @@ async def test_send_enrichment_notification_inline_format_with_txn_info():
     assert "Zomato" in text
     assert "filled channel=upi" in text
     assert "via SMS" in text
+
+
+@pytest.mark.anyio
+async def test_enrichment_notification_records_reply_context(session, monkeypatch):
+    from financial_dashboard.services import telegram
+
+    maker = async_sessionmaker(
+        session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    monkeypatch.setattr(telegram, "async_session", maker)
+    monkeypatch.setattr(telegram, "tg_app", object())
+
+    async def fake_send(app, *, chat_id, text):
+        assert text.splitlines()[0].endswith("#42")
+        return SimpleNamespace(message_id=700)
+
+    monkeypatch.setattr(telegram, "_send_with_retry", fake_send)
+
+    await telegram.send_enrichment_notification(
+        42,
+        EnrichmentDiff(filled={"channel": "upi"}),
+        12345,
+        source="email",
+    )
+
+    async with maker() as verification:
+        mapping = await verification.scalar(
+            select(TelegramMessageContext).where(
+                TelegramMessageContext.chat_id == 12345,
+                TelegramMessageContext.message_id == 700,
+            )
+        )
+    assert mapping.transaction_id == 42
+    assert mapping.context_kind == "enrichment"
 
 
 @pytest.mark.anyio

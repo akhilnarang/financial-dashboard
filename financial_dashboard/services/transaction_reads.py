@@ -3,7 +3,7 @@
 import datetime
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer, joinedload, noload
 
@@ -23,6 +23,88 @@ from financial_dashboard.services.cc_disambiguation import (
 from financial_dashboard.services.read_helpers import bound_text, order_batch
 
 _DETAIL_TEXT_LIMIT = 50_000
+
+
+def build_transaction_filter_clauses(
+    *,
+    transaction_id: int | None = None,
+    transaction_ids: list[int] | None = None,
+    account_id: int | None = None,
+    card_id: int | None = None,
+    email_id: int | None = None,
+    sms_message_id: int | None = None,
+    statement_upload_id: int | None = None,
+    bank_statement_upload_id: int | None = None,
+    date_from: datetime.date | None = None,
+    date_to: datetime.date | None = None,
+    direction: str | None = None,
+    amount: Decimal | None = None,
+    bank: str | None = None,
+    email_type: str | None = None,
+    source: str | None = None,
+    category: str | None = None,
+    review_status: str | None = None,
+    reference_number: str | None = None,
+    reference: str | None = None,
+    search: str | None = None,
+    excluded: bool | None = None,
+) -> list:
+    """Build the shared, allowlisted transaction filter population.
+
+    Both the public API reader and the assistant reader use this function so
+    exact filters and cashflow exclusion semantics cannot drift.
+    """
+    clauses = []
+    equality_filters = (
+        (Transaction.id, transaction_id),
+        (Transaction.account_id, account_id),
+        (Transaction.card_id, card_id),
+        (Transaction.email_id, email_id),
+        (Transaction.sms_message_id, sms_message_id),
+        (Transaction.statement_upload_id, statement_upload_id),
+        (Transaction.bank_statement_upload_id, bank_statement_upload_id),
+        (Transaction.amount, amount),
+    )
+    clauses.extend(
+        column == value for column, value in equality_filters if value is not None
+    )
+    if transaction_ids is not None:
+        clauses.append(Transaction.id.in_(transaction_ids))
+    if date_from is not None:
+        clauses.append(Transaction.transaction_date >= date_from)
+    if date_to is not None:
+        clauses.append(Transaction.transaction_date <= date_to)
+    text_filters = (
+        (Transaction.direction, direction),
+        (Transaction.email_type, email_type),
+        (Transaction.source, source),
+        (Transaction.category, category),
+        (Transaction.review_status, review_status),
+        (Transaction.reference_number, reference_number or reference),
+    )
+    clauses.extend(
+        column == value.strip() for column, value in text_filters if value is not None
+    )
+    if bank is not None:
+        clauses.append(func.lower(Transaction.bank) == bank.strip().lower())
+    if search is not None and search.strip():
+        term = f"%{search.strip().lower()}%"
+        clauses.append(
+            or_(
+                func.lower(Transaction.bank).like(term),
+                func.lower(Transaction.counterparty).like(term),
+                func.lower(Transaction.reference_number).like(term),
+                func.lower(Transaction.channel).like(term),
+                func.lower(Transaction.category).like(term),
+                func.lower(Transaction.note).like(term),
+                func.lower(Transaction.raw_description).like(term),
+            )
+        )
+    if excluded is True:
+        clauses.append(Transaction.exclude_from_cashflow.is_(True))
+    elif excluded is False:
+        clauses.append(Transaction.exclude_from_cashflow.is_not(True))
+    return clauses
 
 
 def _transaction_read(row: Transaction) -> transaction_schemas.TransactionRead:
@@ -79,38 +161,25 @@ def _filters(
     reference_number: str | None,
 ) -> list:
     """Build exact-match clauses for optional transaction filters."""
-    clauses = []
-    equality_filters = (
-        (Transaction.id, transaction_id),
-        (Transaction.account_id, account_id),
-        (Transaction.card_id, card_id),
-        (Transaction.email_id, email_id),
-        (Transaction.sms_message_id, sms_message_id),
-        (Transaction.statement_upload_id, statement_upload_id),
-        (Transaction.bank_statement_upload_id, bank_statement_upload_id),
-        (Transaction.amount, amount),
+    return build_transaction_filter_clauses(
+        transaction_id=transaction_id,
+        account_id=account_id,
+        card_id=card_id,
+        email_id=email_id,
+        sms_message_id=sms_message_id,
+        statement_upload_id=statement_upload_id,
+        bank_statement_upload_id=bank_statement_upload_id,
+        date_from=date_from,
+        date_to=date_to,
+        direction=direction,
+        amount=amount,
+        bank=bank,
+        email_type=email_type,
+        source=source,
+        category=category,
+        review_status=review_status,
+        reference_number=reference_number,
     )
-    clauses.extend(
-        column == value for column, value in equality_filters if value is not None
-    )
-    if date_from is not None:
-        clauses.append(Transaction.transaction_date >= date_from)
-    if date_to is not None:
-        clauses.append(Transaction.transaction_date <= date_to)
-    text_filters = (
-        (Transaction.direction, direction),
-        (Transaction.email_type, email_type),
-        (Transaction.source, source),
-        (Transaction.category, category),
-        (Transaction.review_status, review_status),
-        (Transaction.reference_number, reference_number),
-    )
-    clauses.extend(
-        column == value.strip() for column, value in text_filters if value is not None
-    )
-    if bank is not None:
-        clauses.append(func.lower(Transaction.bank) == bank.strip().lower())
-    return clauses
 
 
 async def list_transactions(
@@ -313,6 +382,8 @@ async def get_transaction_detail(
         category_vocab_version=row.category_vocab_version,
         categorized_at=row.categorized_at,
         review_reason=row.review_reason,
+        attachment_path=row.attachment_path,
+        has_attachment=row.attachment_path is not None,
         last_notified_at=row.last_notified_at,
         notify_attempts=row.notify_attempts,
         notified_channel=row.notified_channel,

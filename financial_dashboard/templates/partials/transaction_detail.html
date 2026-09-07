@@ -55,6 +55,12 @@
         <dt>Raw Description</dt>
         <dd style="white-space: pre-wrap; word-break: break-word;">{{ txn.raw_description or "" }}</dd>
     </div>
+    {% if txn.attachment_path %}
+    <div>
+        <dt>Receipt</dt>
+        <dd><a href="/api/transactions/{{ txn.id }}/attachment">Open attachment</a></dd>
+    </div>
+    {% endif %}
     <div>
         <dt>Email Type</dt>
         <dd><span class="badge">{{ txn.email_type }}</span></dd>

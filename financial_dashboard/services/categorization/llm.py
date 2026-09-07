@@ -22,10 +22,16 @@ LLM_TIMEOUT_MS = (
 )
 
 
+class LlmCandidate(NamedTuple):
+    slug: str
+    confidence: float
+
+
 class LlmResult(NamedTuple):
     slug: str
     confidence: float
     reason: str
+    candidates: tuple[LlmCandidate, ...] = ()
 
 
 # A short, evidenced note per bank on how to read its raw narration codes.
@@ -81,7 +87,10 @@ def build_prompt(
         "Choose exactly ONE category slug from this list:",
         ", ".join(active_slugs),
         f'If none fit, return "{NEEDS_REVIEW}".',
-        "Return JSON: {category, confidence (0..1), reason (one short sentence)}.",
+        "Return JSON with category, confidence (0..1), reason (one short sentence), "
+        "and candidates: an ordered list of zero to three plausible category "
+        "objects, each {category, confidence (0..1)}. Include the primary "
+        "category when you have one; use an empty list when none fit.",
         "",
         "IMPORTANT: 'direction: credit' = money RECEIVED — use an income category "
         "(refund, salary, interest, cashback_rewards, repayment, other_income); "
@@ -126,5 +135,34 @@ def parse_result(data: Mapping[str, Any], active_slugs: list[str]) -> LlmResult:
     conf = max(0.0, min(1.0, conf))
     reason = str(data.get("reason", ""))[:300]
     if slug != NEEDS_REVIEW and slug not in active_slugs:
-        return LlmResult(NEEDS_REVIEW, conf, reason or "model returned unknown slug")
-    return LlmResult(slug, conf, reason)
+        # Preserve the gate that caused review.  The engine uses this reason
+        # when creating the durable review decision, so an invalid model slug
+        # is not misreported as a deliberate abstention.
+        return LlmResult(
+            NEEDS_REVIEW,
+            conf,
+            f"invalid model category slug: {slug}",
+        )
+    raw_candidates = data.get("candidates", [])
+    candidates: list[LlmCandidate] = []
+    if isinstance(raw_candidates, Sequence) and not isinstance(
+        raw_candidates, (str, bytes)
+    ):
+        for item in raw_candidates:
+            if not isinstance(item, Mapping):
+                continue
+            candidate = str(item.get("category", item.get("slug", ""))).strip()
+            if candidate not in active_slugs or candidate in {
+                c.slug for c in candidates
+            }:
+                continue
+            try:
+                candidate_conf = float(item.get("confidence", 0.0))
+            except ValueError, TypeError:
+                candidate_conf = 0.0
+            candidates.append(
+                LlmCandidate(candidate, max(0.0, min(1.0, candidate_conf)))
+            )
+            if len(candidates) == 3:
+                break
+    return LlmResult(slug, conf, reason, tuple(candidates))

@@ -5,6 +5,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from financial_dashboard.integrations.email import orchestrator as fetch_orchestrator
+from financial_dashboard.db import async_session
 from financial_dashboard.services.categorization.merchant_rules import (
     load_merchant_rules,
 )
@@ -13,8 +14,10 @@ from financial_dashboard.services.categorization.sweep import (
     run_review_notify,
     run_rule_sweep,
 )
+from financial_dashboard.services.categorization.vocabulary import refresh_vocab_cache
 from financial_dashboard.services.reminders import check_and_send_reminders
 from financial_dashboard.services.settings import get_setting_int
+from financial_dashboard.services.assistant.delivery import recover_assistant_work
 
 if TYPE_CHECKING:
     from financial_dashboard.services.extensions import ExtensionManager
@@ -23,11 +26,42 @@ logger = logging.getLogger(__name__)
 
 
 async def run_categorization_cycle() -> None:
+    # Reuse the existing fetch-cycle lifecycle for assistant lease recovery;
+    # this avoids introducing a second process-wide polling loop.
+    try:
+        async with async_session() as session:
+            await recover_assistant_work(session)
+            await session.commit()
+    except Exception:
+        # Categorization remains useful during first-boot/test lifecycles where
+        # the assistant tables have not been created yet.
+        logger.exception("Assistant interaction recovery failed")
     # Refresh merchant-rule cache first so CLI edits land without a restart.
     await load_merchant_rules()
     await run_rule_sweep()
     await run_llm_sweep()
     await run_review_notify()
+    # Category creation can happen through web/API/manual paths in another
+    # worker. Refresh only after those services have committed their writes so
+    # a rolled-back transaction never leaks a vocabulary version into cache.
+    async with async_session() as session:
+        await refresh_vocab_cache(session)
+    try:
+        from financial_dashboard.services.assistant.orchestrator import (
+            resume_claimed_interactions,
+        )
+        from financial_dashboard.services import telegram
+        from financial_dashboard.services.settings import (
+            is_telegram_assistant_enabled,
+        )
+
+        if is_telegram_assistant_enabled():
+            await resume_claimed_interactions(
+                bot=telegram.tg_app.bot if telegram.tg_app is not None else None
+            )
+            await telegram.dispatch_pending_deliveries()
+    except Exception:
+        logger.exception("Assistant delivery recovery failed")
 
 
 def make_poll_status() -> dict:
