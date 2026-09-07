@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from typing import Literal, Mapping
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.config import get_fernet, settings
 from financial_dashboard.db import EmailSource, Setting, async_session
@@ -529,9 +528,10 @@ async def assert_master_key_or_no_secrets(session) -> None:
     raise SystemExit(message)
 
 
-async def load_all_settings(session: AsyncSession) -> dict[str, str]:
+async def load_all_settings() -> dict[str, str]:
     """Read all rows from DB, merge with registry defaults, populate cache."""
-    rows = (await session.execute(select(Setting))).scalars().all()
+    async with async_session() as session:
+        rows = (await session.execute(select(Setting))).scalars().all()
 
     db_values = {row.key: row.value for row in rows}
 

@@ -20,11 +20,15 @@ import sys
 
 from financial_dashboard.config import settings
 from financial_dashboard.db import async_session, init_db
+from financial_dashboard.services.categorization.merchant_rules import (
+    load_merchant_rules,
+)
 from financial_dashboard.services.categorization.review_io import apply_reviewed_rows
 from financial_dashboard.services.categorization.vocabulary import (
     canonicalize_slug,
     is_valid_slug,
 )
+from financial_dashboard.services.settings import load_all_settings
 
 
 async def _main() -> None:
@@ -82,6 +86,8 @@ async def _main() -> None:
 
     print(f"applying to {settings.db_url}")
     await init_db()
+    await load_all_settings()
+    await load_merchant_rules()
 
     async with async_session() as session:
         result = await apply_reviewed_rows(session, rows)

@@ -289,8 +289,7 @@ async def test_paisa_password_encrypted_at_rest_and_round_trips(settings_db):
 
     assert get_fernet().decrypt(row.value.encode()).decode() == "s3cret-paisa"
 
-    async with settings_db() as session:
-        await load_all_settings(session)
+    await load_all_settings()
     assert get_setting("paisa.auth_password") == "s3cret-paisa"
 
 

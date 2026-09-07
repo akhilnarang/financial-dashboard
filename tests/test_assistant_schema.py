@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import inspect
@@ -8,7 +9,17 @@ from financial_dashboard.db.init_db import init_db
 
 
 @pytest.mark.anyio
-async def test_assistant_schema_builds_and_migrates_idempotently(tmp_path: Path):
+async def test_assistant_schema_builds_and_migrates_idempotently(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(
+        "financial_dashboard.services.settings.load_all_settings",
+        AsyncMock(return_value={}),
+    )
+    monkeypatch.setattr(
+        "financial_dashboard.services.categorization.merchant_rules.load_merchant_rules",
+        AsyncMock(),
+    )
     database = tmp_path / "assistant-schema.db"
     engine = create_async_engine(f"sqlite+aiosqlite:///{database}")
     try:
