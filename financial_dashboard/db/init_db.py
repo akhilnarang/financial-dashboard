@@ -820,11 +820,11 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
     # function-local: breaks cycle with services.settings (settings imports db at top)
     from financial_dashboard.services.settings import load_all_settings
 
-    await load_all_settings()
-
     # function-local: breaks cycle with categorization (merchant_rules imports db at top)
     from financial_dashboard.services.categorization.merchant_rules import (
         load_merchant_rules,
     )
 
-    await load_merchant_rules()
+    async with AsyncSession(engine) as session:
+        await load_all_settings(session)
+        await load_merchant_rules(session)
