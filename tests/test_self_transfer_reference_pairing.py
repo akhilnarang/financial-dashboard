@@ -3,7 +3,11 @@ from decimal import Decimal
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import Transaction
+from financial_dashboard.db.models import (
+    CategoryReviewDecision,
+    TelegramOutboundDelivery,
+    Transaction,
+)
 from financial_dashboard.services.categorization import engine
 from financial_dashboard.services.categorization.self_transfer import (
     REFERENCE_PAIR_RULESET_VERSION,
@@ -44,6 +48,55 @@ def _assert_reference_rule(txn: Transaction) -> None:
     assert txn.categorized_at is not None
     assert txn.review_status is None
     assert txn.review_reason is None
+
+
+async def test_reference_pair_supersedes_active_decisions_for_both_legs(
+    session: AsyncSession,
+):
+    debit = _transaction(
+        bank="hdfc",
+        direction="debit",
+        reference_number="PAIR-WITH-REVIEWS",
+        account_mask="XX7702",
+    )
+    credit = _transaction(
+        bank="icici",
+        direction="credit",
+        reference_number="PAIR-WITH-REVIEWS",
+        account_mask="XX214",
+    )
+    session.add_all([debit, credit])
+    await session.flush()
+    decisions = []
+    deliveries = []
+    for ordinal, txn in enumerate((debit, credit)):
+        decision = CategoryReviewDecision(
+            transaction_id=txn.id,
+            category_input_hash=f"stale-{ordinal}",
+            candidates_json='[{"category":"groceries"}]',
+            gate_reason="old review",
+        )
+        session.add(decision)
+        await session.flush()
+        delivery = TelegramOutboundDelivery(
+            category_review_decision_id=decision.id,
+            recipient_chat_id=7,
+            ordinal=0,
+            transaction_id=txn.id,
+            text="choose",
+            delivery_token=f"pair-stale-{ordinal}",
+            status="pending",
+        )
+        session.add(delivery)
+        decisions.append(decision)
+        deliveries.append(delivery)
+    await session.flush()
+
+    assert await apply_reference_self_transfer_rule(session, credit)
+
+    assert all(decision.status == "superseded" for decision in decisions)
+    assert all(delivery.status == "cancelled" for delivery in deliveries)
+    assert debit.category == credit.category == "self_transfer"
 
 
 async def test_ingest_matching_opposite_reference_marks_both_legs(

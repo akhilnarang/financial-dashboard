@@ -27,11 +27,12 @@ Each lane is asserted at the layer it belongs to:
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import financial_dashboard.services.categorization.engine as eng
 import financial_dashboard.services.categorization.sweep as sweep
-from financial_dashboard.db.models import Account, Transaction
+from financial_dashboard.db.models import Account, CategoryReviewDecision, Transaction
 from financial_dashboard.services.categorization import llm
 from financial_dashboard.services.categorization.merchant_rules import (
     load_merchant_rules,
@@ -418,6 +419,35 @@ async def test_llm_needs_review_slug_routes_to_review(
     assert txn.category == "expense"  # debit + unknown default
     assert txn.review_status == "pending"
     assert txn.category != llm.NEEDS_REVIEW
+
+
+async def test_llm_invalid_slug_preserves_review_gate_reason(session, monkeypatch):
+    async def fake_classify(**kwargs):
+        return llm.parse_result(
+            {"category": "made_up", "confidence": 0.9, "reason": "bad output"},
+            ["groceries"],
+        )
+
+    monkeypatch.setattr(eng, "_llm_classify", fake_classify)
+    txn = Transaction(
+        bank="testbank",
+        email_type="x",
+        direction="debit",
+        amount=Decimal("99"),
+        counterparty="MYSTERY MERCHANT",
+        raw_description="MYSTERY MERCHANT",
+    )
+    session.add(txn)
+    await session.flush()
+
+    await eng.categorize_one(session, txn, use_llm=True)
+    assert txn.review_reason == "invalid model category slug: made_up"
+    decision = await session.scalar(
+        select(CategoryReviewDecision).where(
+            CategoryReviewDecision.transaction_id == txn.id
+        )
+    )
+    assert decision.gate_reason == "invalid model category slug: made_up"
 
 
 async def test_empty_input_skips_the_llm_call(session: AsyncSession, monkeypatch):

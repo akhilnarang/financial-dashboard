@@ -31,6 +31,10 @@ class Settings(BaseSettings):
 
     db_url: str = "sqlite+aiosqlite:///./data/financial_dashboard.db"
 
+    # Telegram receipt files live outside SQLite. Paths persisted on a
+    # transaction are always relative to this root.
+    transaction_attachment_root: str = "./data/transaction_attachments"
+
     # Deployment-level opt-in for the optional Paisa integration. When false,
     # Paisa is not registered, routed, or started and its SQLite dirty-tracking
     # triggers are absent. Changing this requires an application restart.

@@ -17,15 +17,44 @@ from typing import cast
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, RetryAfter
-from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 from sqlalchemy.exc import OperationalError
 
 from financial_dashboard.db import Transaction, async_session
-from financial_dashboard.services.settings import get_telegram_chat_id
+from financial_dashboard.services.settings import (
+    get_telegram_chat_id,
+    is_telegram_assistant_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
 tg_app: Application | None = None
+
+_SMS_DUPLICATE_HEADER = re.compile(
+    r"^\s*⚠️\s+(?:<b>)?[^<\n]+?(?:</b>)?\s+"
+    r"(?:DEBIT|CREDIT)\s+SMS\s+#\d+\s*$",
+    re.IGNORECASE,
+)
+
+
+def is_sms_duplicate_prompt(text: str) -> bool:
+    """Identify the exact deferred-SMS prompt in Bot API or rendered form."""
+    first_line = text.splitlines()[0] if text else ""
+    return bool(_SMS_DUPLICATE_HEADER.fullmatch(first_line))
+
+
+def _telegram_file_base_url(base_url: str) -> str:
+    """Derive PTB's file endpoint from the configured Bot API endpoint."""
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/bot"):
+        return f"{normalized[:-4]}/file/bot"
+    return f"{normalized}/file/bot"
 
 
 async def init_telegram(token: str, base_url: str | None = None):
@@ -37,7 +66,9 @@ async def init_telegram(token: str, base_url: str | None = None):
     global tg_app
     builder = Application.builder().token(token)
     if base_url:
-        builder = builder.base_url(base_url)
+        builder = builder.base_url(base_url).base_file_url(
+            _telegram_file_base_url(base_url)
+        )
     app = builder.build()
     # Application.updater is Optional in the PTB type stubs because some
     # builders (webhook mode, custom updater=None) intentionally produce
@@ -46,13 +77,22 @@ async def init_telegram(token: str, base_url: str | None = None):
     # loud failure if PTB ever changes the default.
     updater = app.updater
     assert updater is not None, "Application.builder().build() returned no updater"
-    app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, _handle_reply))
+    app.add_handler(CommandHandler("ask", _handle_ask))
+    app.add_handler(
+        MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, _handle_reply)
+    )
+    app.add_handler(
+        MessageHandler(
+            (filters.PHOTO | filters.Document.ALL) & filters.REPLY,
+            _handle_attachment_reply,
+        )
+    )
     app.add_handler(CallbackQueryHandler(_handle_callback))
     try:
         await app.initialize()
         await app.start()
         await updater.start_polling(
-            drop_pending_updates=True, allowed_updates=["message", "callback_query"]
+            drop_pending_updates=False, allowed_updates=["message", "callback_query"]
         )
     except Exception:
         try:
@@ -65,6 +105,29 @@ async def init_telegram(token: str, base_url: str | None = None):
             pass
         raise
     tg_app = app
+    async with async_session() as session:
+        from financial_dashboard.services.assistant.delivery import (
+            recover_assistant_work,
+        )
+
+        await recover_assistant_work(session)
+        await session.commit()
+    if is_telegram_assistant_enabled():
+        from financial_dashboard.services.assistant.orchestrator import (
+            resume_claimed_interactions,
+        )
+
+        try:
+            await resume_claimed_interactions(bot=app.bot)
+        except Exception:
+            logger.exception(
+                "Assistant interaction recovery failed at Telegram startup"
+            )
+    if is_telegram_assistant_enabled():
+        try:
+            await dispatch_pending_deliveries()
+        except Exception:
+            logger.exception("Assistant delivery recovery failed at Telegram startup")
     logger.info("Telegram bot started")
 
 
@@ -103,7 +166,15 @@ def build_account_label(account, card) -> str:
     return ""
 
 
-async def _send_with_retry(app, *, chat_id, text, parse_mode="HTML", attempts=3):
+async def _send_with_retry(
+    app,
+    *,
+    chat_id,
+    text,
+    parse_mode="HTML",
+    reply_markup=None,
+    attempts=3,
+):
     """Send a message with retries on transient network errors.
 
     - Retries up to `attempts` total tries on `telegram.error.NetworkError`
@@ -116,9 +187,10 @@ async def _send_with_retry(app, *, chat_id, text, parse_mode="HTML", attempts=3)
     network_attempt = 0
     while True:
         try:
-            return await app.bot.send_message(
-                chat_id=chat_id, text=text, parse_mode=parse_mode
-            )
+            kwargs = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+            if reply_markup is not None:
+                kwargs["reply_markup"] = reply_markup
+            return await app.bot.send_message(**kwargs)
         except RetryAfter as e:
             retry_after = e.retry_after
             # PTB v22.2+ will switch retry_after from float seconds to
@@ -235,7 +307,20 @@ async def send_transaction_notification(
 
         text = "\n".join(lines)
 
-        await _send_with_retry(app, chat_id=chat_id, text=text)
+        sent = await _send_with_retry(app, chat_id=chat_id, text=text)
+        from financial_dashboard.services.assistant.message_context import (
+            record_physical_message,
+        )
+
+        async with async_session() as session:
+            await record_physical_message(
+                session,
+                chat_id=chat_id,
+                message_id=int(sent.message_id),
+                transaction_id=txn_id or None,
+                context_kind="transaction_notification",
+            )
+            await session.commit()
     except Exception as e:
         logger.warning(
             "Failed to send Telegram notification for txn #%s: %s", txn_id, e
@@ -285,10 +370,199 @@ async def send_bulk_summary(
         logger.warning("Failed to send Telegram bulk summary: %s", e)
 
 
+def _reply_markup_from_json(raw: str | None) -> InlineKeyboardMarkup | None:
+    if not raw:
+        return None
+    import json
+
+    rows = json.loads(raw)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    str(button["text"]), callback_data=str(button["callback_data"])
+                )
+                for button in row
+            ]
+            for row in rows
+        ]
+    )
+
+
+async def dispatch_saved_delivery(delivery_id: int) -> bool:
+    """Send one already committed outbox row without repeating its owner work."""
+    app = tg_app
+    if app is None or not is_telegram_assistant_enabled():
+        return False
+    from financial_dashboard.db import (
+        AuditInteraction,
+        CategoryReviewDecision,
+        TelegramOutboundDelivery,
+    )
+    from financial_dashboard.db.models import utc_now
+    from sqlalchemy import func, select, update
+    from financial_dashboard.services.assistant.audit import mark_authorization_changed
+    from financial_dashboard.services.assistant.delivery import (
+        abandon_exhausted,
+        claim_delivery,
+        mark_delivery_delivered,
+        mark_delivery_unknown,
+        refresh_interaction_delivery_status,
+    )
+    from financial_dashboard.services.assistant.message_context import (
+        record_physical_message,
+    )
+
+    async with async_session() as session:
+        saved = await session.get(TelegramOutboundDelivery, delivery_id)
+        if saved is None or saved.status in {"delivered", "cancelled", "abandoned"}:
+            return saved is not None and saved.status == "delivered"
+        if saved.recipient_chat_id != get_telegram_chat_id():
+            saved.status = "cancelled"
+            if saved.interaction_id is not None:
+                await mark_authorization_changed(session, saved.interaction_id)
+            await session.commit()
+            return False
+        delivery, worker_token = await claim_delivery(session, delivery_id)
+        if delivery is None:
+            await abandon_exhausted(session)
+            if saved.interaction_id is not None:
+                await refresh_interaction_delivery_status(session, saved.interaction_id)
+            await session.commit()
+            return False
+        recipient_chat_id = delivery.recipient_chat_id
+        text = delivery.text
+        parse_mode = delivery.parse_mode
+        reply_markup = _reply_markup_from_json(delivery.reply_markup_json)
+        await session.commit()
+
+    try:
+        sent = await _send_with_retry(
+            app,
+            chat_id=recipient_chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        async with async_session() as session:
+            await mark_delivery_unknown(
+                session, delivery_id, worker_token, error=str(exc)[:500]
+            )
+            await abandon_exhausted(session)
+            delivery = await session.get(TelegramOutboundDelivery, delivery_id)
+            if delivery is not None and delivery.interaction_id is not None:
+                await refresh_interaction_delivery_status(
+                    session, delivery.interaction_id
+                )
+            await session.commit()
+        return False
+
+    async with async_session() as session:
+        delivery = await session.get(TelegramOutboundDelivery, delivery_id)
+        if delivery is None:
+            return False
+        if not await mark_delivery_delivered(session, delivery_id, worker_token):
+            await session.rollback()
+            settled = await session.get(
+                TelegramOutboundDelivery, delivery_id, populate_existing=True
+            )
+            return settled is not None and settled.status == "delivered"
+        conversation_id = None
+        context_kind = "category_review"
+        if delivery.interaction_id is not None:
+            interaction = await session.get(AuditInteraction, delivery.interaction_id)
+            conversation_id = interaction.conversation_id if interaction else None
+            context_kind = (
+                "query_result"
+                if delivery.transaction_id is not None
+                else "assistant_response"
+            )
+        elif delivery.category_review_decision_id is not None:
+            if delivery.ordinal == 0:
+                active_decision = select(CategoryReviewDecision.id).where(
+                    CategoryReviewDecision.id == delivery.category_review_decision_id,
+                    CategoryReviewDecision.status == "active",
+                    CategoryReviewDecision.source_interaction_id.is_(None),
+                )
+                await session.execute(
+                    update(Transaction)
+                    .where(
+                        Transaction.id == delivery.transaction_id,
+                        Transaction.review_status == "pending",
+                        active_decision.exists(),
+                    )
+                    .values(
+                        review_status="notified",
+                        last_notified_at=utc_now(),
+                        notify_attempts=func.coalesce(Transaction.notify_attempts, 0)
+                        + 1,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+        await record_physical_message(
+            session,
+            chat_id=recipient_chat_id,
+            message_id=int(sent.message_id),
+            context_kind=context_kind,
+            conversation_id=conversation_id,
+            transaction_id=delivery.transaction_id,
+            interaction_id=delivery.interaction_id,
+            outbound_delivery_id=delivery.id,
+        )
+        if delivery.interaction_id is not None:
+            await refresh_interaction_delivery_status(session, delivery.interaction_id)
+        await session.commit()
+    return True
+
+
+async def dispatch_pending_deliveries(*, limit: int = 50) -> int:
+    """Replay pending outbox rows through the same idempotent dispatcher."""
+    from sqlalchemy import select
+
+    from financial_dashboard.db import TelegramOutboundDelivery
+
+    async with async_session() as session:
+        ids = list(
+            (
+                await session.scalars(
+                    select(TelegramOutboundDelivery.id)
+                    .where(
+                        TelegramOutboundDelivery.status.in_(
+                            ["pending", "delivery_unknown"]
+                        )
+                    )
+                    .order_by(TelegramOutboundDelivery.id)
+                    .limit(limit)
+                )
+            ).all()
+        )
+    sent = 0
+    for delivery_id in ids:
+        sent += int(await dispatch_saved_delivery(delivery_id))
+    return sent
+
+
 async def _handle_callback(update: Update, context) -> None:
     """Route callback queries to appropriate handlers."""
     query = update.callback_query
     if not query or not query.data:
+        return
+
+    if query.data.startswith(("cat:v1:", "undo:v1:")):
+        if not query.message or query.message.chat.id != get_telegram_chat_id():
+            await query.answer("Unauthorized")
+            return
+        if not is_telegram_assistant_enabled():
+            await query.answer("Assistant is disabled")
+            return
+        await _call_assistant(
+            update,
+            context,
+            trigger="category_button" if query.data.startswith("cat:") else "undo",
+        )
         return
 
     if query.data.startswith("paid:"):
@@ -304,6 +578,45 @@ async def _handle_callback(update: Update, context) -> None:
         await _handle_cc_pay_pick_callback(update, context)
         return
     await query.answer("Unknown action")
+
+
+async def _call_assistant(update: Update, context, *, trigger: str) -> bool:
+    """Invoke the assistant through its narrow Telegram-facing entrypoint."""
+    if not is_telegram_assistant_enabled():
+        return False
+    try:
+        from financial_dashboard.services.assistant.orchestrator import (
+            handle_telegram_update,
+        )
+    except ImportError:
+        logger.warning("Telegram assistant orchestrator is unavailable")
+        return False
+    await handle_telegram_update(update, context, trigger=trigger)
+    return True
+
+
+async def _handle_ask(update: Update, context) -> None:
+    msg = update.message
+    if not msg or msg.chat_id != get_telegram_chat_id():
+        return
+    if not is_telegram_assistant_enabled():
+        await msg.reply_text("/ask is disabled")
+        return
+    await _call_assistant(update, context, trigger="ask")
+
+
+async def _handle_attachment_reply(update: Update, context) -> None:
+    msg = update.message
+    if not msg or msg.chat_id != get_telegram_chat_id():
+        return
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        return
+    if msg.reply_to_message.from_user.id != context.bot.id:
+        return
+    if not is_telegram_assistant_enabled():
+        await msg.reply_text("Assistant is disabled")
+        return
+    await _call_assistant(update, context, trigger="attachment")
 
 
 async def _handle_reply(update: Update, context) -> None:
@@ -323,9 +636,17 @@ async def _handle_reply(update: Update, context) -> None:
     ):
         return
 
+    if is_telegram_assistant_enabled():
+        await _call_assistant(update, context, trigger="reply")
+        return
+
     # Parse transaction ID from the first line of the notification (e.g., "#1234")
     original_text = msg.reply_to_message.text
     first_line = original_text.splitlines()[0] if original_text else ""
+    # SMS duplicate notifications use ``SMS #<sms-id>`` and never identify a
+    # transaction.  Keep the compatibility parser deliberately narrow.
+    if is_sms_duplicate_prompt(original_text):
+        return
     match = re.search(r"#(\d+)\s*$", first_line)
     if not match:
         return
@@ -424,14 +745,32 @@ async def send_enrichment_notification(
             money = format_money(txn_info.get("amount", 0), txn_info.get("currency"))
             bank = html.escape(str(txn_info.get("bank", "")).upper())
             counterparty = html.escape(str(txn_info.get("counterparty", "") or ""))
-            header = f"\U0001f504 <b>{bank}</b> #{txn_id} {sign}{money}"
+            header = f"\U0001f504 <b>{bank}</b> {sign}{money}"
             if counterparty:
                 header += f" {counterparty}"
-            header += f" — {diff_text} ({badge})"
+            header += f" — {diff_text} ({badge}) #{txn_id}"
             text = header
         else:
-            text = f"\U0001f504 #{txn_id} enriched {badge} — {diff_text}"
-        await _send_with_retry(app, chat_id=chat_id, text=text)
+            text = f"\U0001f504 enriched {badge} — {diff_text} #{txn_id}"
+        sent = await _send_with_retry(app, chat_id=chat_id, text=text)
+        # Enrichment messages are replyable assistant context even though they
+        # are emitted by legacy source paths. Persist the physical mapping after
+        # send; the trailing transaction id remains a guarded recovery fallback
+        # for the crash window between Telegram accepting the message and this
+        # write completing.
+        async with async_session() as session:
+            from financial_dashboard.services.assistant.message_context import (
+                record_physical_message,
+            )
+
+            await record_physical_message(
+                session,
+                chat_id=chat_id,
+                message_id=int(sent.message_id),
+                context_kind="enrichment",
+                transaction_id=txn_id,
+            )
+            await session.commit()
     except Exception as e:
         logger.warning(
             "Failed to send enrichment notification for txn #%s: %s", txn_id, e
