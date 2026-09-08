@@ -358,8 +358,12 @@ async def test_disabled_assistant_does_not_dispatch_persisted_output(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("dispatch_ok", "expected_sent", "expected_attempts"),
+    [(True, 1, 0), (False, 0, 1)],
+)
 async def test_enabled_review_notification_persists_outbox_before_dispatch(
-    session, monkeypatch
+    session, monkeypatch, dispatch_ok, expected_sent, expected_attempts
 ):
     from financial_dashboard.services.categorization import sweep
     from financial_dashboard.services import telegram
@@ -399,7 +403,7 @@ async def test_enabled_review_notification_persists_outbox_before_dispatch(
 
     async def fake_dispatch(delivery_id):
         dispatched.append(delivery_id)
-        return True
+        return dispatch_ok
 
     monkeypatch.setattr(telegram, "dispatch_saved_delivery", fake_dispatch)
     settings_service._cache.update(
@@ -411,7 +415,7 @@ async def test_enabled_review_notification_persists_outbox_before_dispatch(
         }
     )
 
-    assert await sweep.run_review_notify() == 1
+    assert await sweep.run_review_notify() == expected_sent
 
     async with maker() as verification:
         delivery = await verification.scalar(select(TelegramOutboundDelivery))
@@ -421,6 +425,9 @@ async def test_enabled_review_notification_persists_outbox_before_dispatch(
     assert "Ref: " in delivery.text
     assert delivery.reply_markup_json is not None
     assert "cat:v1:" in delivery.reply_markup_json
+    async with maker() as verification:
+        saved_transaction = await verification.get(Transaction, transaction.id)
+    assert saved_transaction.notify_attempts == expected_attempts
 
 
 @pytest.mark.anyio

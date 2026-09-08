@@ -350,15 +350,26 @@ async def test_single_quoted_contraction_is_only_note_payload(session):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "message",
+    ("message", "note", "category"),
     [
-        "set note to Amazon Fresh and category to groceries",
-        "Amazon Fresh, groceries",
-        "this was Amazon Fresh, note that and categorize it as groceries",
+        (
+            "set note to Amazon Fresh and category to groceries",
+            "Amazon Fresh",
+            "groceries",
+        ),
+        ("Amazon Fresh, groceries", "Amazon Fresh", "groceries"),
+        (
+            "this was Amazon Fresh, note that and categorize it as groceries",
+            "Amazon Fresh",
+            "groceries",
+        ),
+        ("This was lunch with a friend", "lunch with a friend", "food"),
     ],
 )
-async def test_combined_note_and_category_instruction_applies_both(session, message):
-    await ensure_category(session, "groceries")
+async def test_combined_note_and_category_instruction_applies_both(
+    session, message, note, category
+):
+    await ensure_category(session, category)
     txn = _txn()
     session.add(txn)
     await session.flush()
@@ -366,8 +377,8 @@ async def test_combined_note_and_category_instruction_applies_both(session, mess
         name="apply_transaction_changes",
         transaction_id=txn.id,
         changes={
-            "note": {"op": "set", "value": "Amazon Fresh"},
-            "category": {"op": "set", "value": "groceries"},
+            "note": {"op": "set", "value": note},
+            "category": {"op": "set", "value": category},
         },
     )
 
@@ -376,8 +387,28 @@ async def test_combined_note_and_category_instruction_applies_both(session, mess
         request,
         current_user_message=message,
     )
-    assert result.after["note"] == "Amazon Fresh"
-    assert result.after["category"] == "groceries"
+    assert result.after["note"] == note
+    assert result.after["category"] == category
+
+
+@pytest.mark.anyio
+async def test_similar_adjective_does_not_authorize_a_category(session):
+    await ensure_category(session, "expense")
+    txn = _txn()
+    session.add(txn)
+    await session.flush()
+    request = ApplyTransactionChanges(
+        name="apply_transaction_changes",
+        transaction_id=txn.id,
+        changes={"category": {"op": "set", "value": "expense"}},
+    )
+
+    with pytest.raises(MutationRejected, match="supported by the current message"):
+        await apply_transaction_changes(
+            session,
+            request,
+            current_user_message="wow this was expensive",
+        )
 
 
 @pytest.mark.anyio
@@ -532,9 +563,18 @@ async def test_note_value_matching_field_noun_cannot_erase_denied_action(session
 
 
 @pytest.mark.anyio
-async def test_declining_category_creation_does_not_deny_existing_assignment(session):
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Set the category to groceries, don't create a category",
+        "Actually this was groceries, keep the note",
+        "No, groceries",
+    ],
+)
+async def test_category_only_instruction_preserves_note(session, message):
     await ensure_category(session, "groceries")
     txn = _txn()
+    txn.note = "original"
     session.add(txn)
     await session.flush()
     request = ApplyTransactionChanges(
@@ -546,9 +586,10 @@ async def test_declining_category_creation_does_not_deny_existing_assignment(ses
     result = await apply_transaction_changes(
         session,
         request,
-        current_user_message="Set the category to groceries, don't create a category",
+        current_user_message=message,
     )
     assert result.after["category"] == "groceries"
+    assert result.after["note"] == "original"
 
 
 @pytest.mark.anyio
@@ -737,30 +778,6 @@ async def test_rejected_mutation_fence_does_not_dirty_paisa_revision(session):
     await session.refresh(state)
 
     assert state.desired_revision == 7
-
-
-@pytest.mark.anyio
-async def test_assistant_create_rejects_near_duplicate_category(session):
-    await ensure_category(session, "groceries")
-    txn = _txn()
-    session.add(txn)
-    await session.flush()
-    request = ApplyTransactionChanges(
-        name="apply_transaction_changes",
-        transaction_id=txn.id,
-        changes={"category": {"op": "set", "value": "grocieis"}},
-        create_category={
-            "slug": "grocieis",
-            "intent_evidence": "create category grocieis",
-        },
-    )
-
-    with pytest.raises(MutationRejected, match="matches existing"):
-        await apply_transaction_changes(
-            session,
-            request,
-            current_user_message="create category grocieis",
-        )
 
 
 @pytest.mark.anyio

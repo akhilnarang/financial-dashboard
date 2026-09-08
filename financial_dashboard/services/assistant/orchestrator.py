@@ -46,10 +46,7 @@ from financial_dashboard.services.assistant.contracts import (
     ListTransactions,
     parse_response,
 )
-from financial_dashboard.services.assistant.contracts import (
-    CategoryCreationConfirmation,
-    MerchantRuleConfirmation,
-)
+from financial_dashboard.services.assistant.contracts import MerchantRuleConfirmation
 from financial_dashboard.services.assistant.intent_policy import (
     POLICY_VERSION,
     derive_merchant_pattern,
@@ -81,11 +78,20 @@ from financial_dashboard.services.categorization.hashing import (
     compute_transaction_confirmation_hash,
     compute_input_hash,
 )
+
 from financial_dashboard.services.categorization.vocabulary import get_active_slugs
 from financial_dashboard.services.categorization.decision_lifecycle import (
     supersede_active_decisions,
 )
 from financial_dashboard.services.categorization.normalize import normalize_text
+
+_UNSUPPORTED_AGGREGATE = re.compile(
+    r"\b(?:total|sum|average|breakdown)\b"
+    r"|\bhow\s+much\b.{0,80}\b(?:spend|spent|income|earn|earned|expense|cash\s*flow)\b"
+    r"|\b(?:spending|expenses|income|cash\s*flow)\b.{0,80}"
+    r"\b(?:today|week|month|quarter|year|between|from|through)\b",
+    re.IGNORECASE,
+)
 
 
 class OrchestrationResult(NamedTuple):
@@ -181,15 +187,10 @@ async def _lock_authorized_chat(
 
 
 def _confirmation_question(
-    pending: CategoryCreationConfirmation | MerchantRuleConfirmation,
+    pending: MerchantRuleConfirmation,
     target: AssistantTransaction,
 ) -> str:
     """Render confirmations from validated application state, never model prose."""
-    if isinstance(pending, CategoryCreationConfirmation):
-        return (
-            f"Create category '{pending.slug}' and assign it to "
-            f"transaction #{pending.transaction_id}? Reply yes to confirm."
-        )
     try:
         pattern = derive_merchant_pattern(target.counterparty)
     except ValueError as exc:
@@ -318,6 +319,17 @@ async def run_turn(
     renew_lease: Callable[[], Awaitable[bool]] | None = None,
 ) -> OrchestrationResult:
     """Run at most four model steps and leave all writes uncommitted."""
+    if transaction_id is None and _UNSUPPORTED_AGGREGATE.search(user_message):
+        return OrchestrationResult(
+            Error(
+                outcome="error",
+                message=(
+                    "Aggregate financial reports aren't supported here yet. "
+                    "Use the dashboard cashflow report for totals."
+                ),
+                code="unsupported_aggregate",
+            )
+        )
     target = (
         await get_transaction(session, transaction_id)
         if transaction_id is not None
@@ -443,14 +455,7 @@ async def run_turn(
                                     changes={
                                         "category": {
                                             "op": "set",
-                                            "value": (
-                                                pending.slug
-                                                if isinstance(
-                                                    pending,
-                                                    CategoryCreationConfirmation,
-                                                )
-                                                else pending.category
-                                            ),
+                                            "value": (pending.category),
                                         }
                                     },
                                 ),
@@ -534,11 +539,14 @@ async def run_turn(
                         )
                     except MutationRejected:
                         raise
-            except MutationRejected as exc:
+            except MutationRejected:
                 return completed(
                     Error(
                         outcome="error",
-                        message=str(exc),
+                        message=(
+                            "I couldn't safely apply that. Please state exactly "
+                            "which transaction field to change and its value."
+                        ),
                         code="mutation_rejected",
                     )
                 )
@@ -590,15 +598,7 @@ async def claim_pending_confirmation(
     if not isinstance(pending, dict):
         return None
     try:
-        if pending.get("kind") == "create_category":
-            typed = CategoryCreationConfirmation.model_validate(pending)
-            request = ApplyTransactionChanges(
-                name="apply_transaction_changes",
-                transaction_id=typed.transaction_id,
-                changes={"category": {"op": "set", "value": typed.slug}},
-                create_category={"slug": typed.slug, "intent_evidence": typed.slug},
-            )
-        elif pending.get("kind") == "merchant_rule":
+        if pending.get("kind") == "merchant_rule":
             typed = MerchantRuleConfirmation.model_validate(pending)
             request = ApplyTransactionChanges(
                 name="apply_transaction_changes",
@@ -845,7 +845,7 @@ def _response_text(result: OrchestrationResult, transaction_id: int | None) -> s
     return "Done."
 
 
-def _transaction_result_text(transaction: AssistantTransaction) -> str:
+def _transaction_result_text(transaction: AssistantTransaction | Transaction) -> str:
     date = str(transaction.transaction_date or "unknown date")
     currency = transaction.currency or "INR"
     lines = [
@@ -972,7 +972,7 @@ async def _queue_result(
         delivery_ids.append(delivery.id)
     if transaction_id is None and len(result.transaction_ids) > 1:
         for transaction_result_id in result.transaction_ids:
-            transaction_result = await get_transaction(session, transaction_result_id)
+            transaction_result = await session.get(Transaction, transaction_result_id)
             if transaction_result is None:
                 continue
             for chunk in split_plain_text(

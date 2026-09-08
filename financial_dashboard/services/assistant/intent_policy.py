@@ -1,17 +1,11 @@
 """Pure, versioned checks for high-impact assistant intent."""
 
 import re
-from difflib import SequenceMatcher
 from typing import NamedTuple
 
 from financial_dashboard.services.categorization.normalize import normalize_text
 
 POLICY_VERSION = "v1"
-_CATEGORY_CREATE_CUE = re.compile(
-    r"\b(?:create|add|make|new)\b.{0,32}\b(?:category|classification)\b"
-    r"|\b(?:category|classification)\b.{0,32}\b(?:create|add|make|new)\b",
-    re.IGNORECASE,
-)
 _DURABLE_RULE_CUE = re.compile(
     r"\b(?:always|every\s+time|from\s+now\s+on|going\s+forward)\b"
     r"|\b(?:create|add|make)\b.{0,32}\b(?:merchant\s+)?rule\b",
@@ -206,9 +200,9 @@ def _safe_shorthand_note(payload: str) -> bool:
     normalized = normalize_text(payload).strip()
     return bool(
         normalized
+        and normalized not in {"no", "ok", "okay", "yes", "yeah", "sure"}
         and "?" not in payload
         and not _NEGATION_CUE.search(payload)
-        and not _CATEGORY_CREATE_CUE.search(payload)
         and not _DURABLE_RULE_CUE.search(payload)
         and not _AMBIGUOUS_INTENT.search(payload)
         and not re.search(
@@ -221,6 +215,16 @@ def _safe_shorthand_note(payload: str) -> bool:
 
 
 def _parse_note_shorthand(text: str) -> InstructionParts | None:
+    preserve = re.fullmatch(
+        r"\s*(?P<context>(?:actually\s+)?(?:this|it)\s+was\s+"
+        r"[^,.;:!?\n]+?)\s*,\s*(?:keep|leave|preserve)\s+"
+        r"(?:the\s+)?note(?:\s+(?:unchanged|as\s+is))?\s*[.!]?\s*",
+        text,
+        re.IGNORECASE,
+    )
+    if preserve is not None:
+        return InstructionParts(preserve.group("context"), None, False, False)
+
     contextual = re.fullmatch(
         r"(?P<prefix>\s*this\s+was\s+)(?P<payload>[^,.;:!?\n]+?)"
         r"(?P<suffix>,\s*note\s+that\b.*)",
@@ -237,9 +241,20 @@ def _parse_note_shorthand(text: str) -> InstructionParts | None:
                 True,
             )
 
+    direct_context = re.fullmatch(
+        r"\s*(?:actually\s+)?(?:this|it)\s+was\s+"
+        r"(?P<payload>[^,.;:!?\n]+?)\s*[.!]?\s*",
+        text,
+        re.IGNORECASE,
+    )
+    if direct_context is not None:
+        payload = direct_context.group("payload").strip()
+        if _safe_shorthand_note(payload):
+            return InstructionParts(text, payload, False, True)
+
     bare = re.fullmatch(
         r"\s*(?P<payload>[^,.;:!?\n]+?)\s*,\s*"
-        r"(?P<category>[A-Za-z][\w -]*?)\s*",
+        r"(?P<category>[A-Za-z][\w -]*?)\s*[.!]?\s*",
         text,
     )
     if bare is None:
@@ -334,35 +349,7 @@ def mentions_category(text: str, category_slug: str) -> bool:
     normalized = normalize_text(text).casefold()
     if not words:
         return False
-    if re.search(rf"(?<!\w){re.escape(words)}(?!\w)", normalized):
-        return True
-    width = len(words.split())
-    tokens = normalized.split()
-    return any(
-        SequenceMatcher(None, words, " ".join(tokens[index : index + width])).ratio()
-        >= 0.82
-        for index in range(max(0, len(tokens) - width + 1))
-    )
-
-
-def category_creation_is_explicit(
-    user_text: str,
-    evidence: str,
-    category_slug: str,
-) -> bool:
-    """Authorize vocabulary growth only from a direct current-turn request."""
-    denied_targets = (category_slug, "category", "classification")
-    if any(
-        negates_target(text, target)
-        for text in (user_text, evidence)
-        for target in denied_targets
-    ):
-        return False
-    if not evidence_is_current(user_text, evidence):
-        return False
-    if not _CATEGORY_CREATE_CUE.search(evidence):
-        return False
-    return mentions_category(evidence, category_slug)
+    return bool(re.search(rf"(?<!\w){re.escape(words)}(?!\w)", normalized))
 
 
 def merchant_rule_is_explicit(

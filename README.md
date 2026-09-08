@@ -95,13 +95,14 @@ Set `telegram.assistant_enabled` to `true` in Settings to enable the assistant.
 `/ask` starts a fresh conversation; otherwise only a reply to a bot message is
 accepted. Conversations retain their reply context for 24 hours, then expire.
 The assistant can answer questions about transactions, set or clear a note,
-set a category, exclude a transaction from cashflow, create an explicitly
-requested category, or create an explicitly requested merchant rule. Clear
+set an existing category, exclude a transaction from cashflow, or create an
+explicitly requested merchant rule. Aggregate financial questions are rejected
+until the assistant has a report-backed totals tool. Clear
 requests are applied directly; ambiguity produces a question or category
 buttons. Category-button choices and every assistant mutation are audited.
 Assistant category assignment accepts only active vocabulary entries. Existing
 web/API manual assignment remains compatible with historical inactive category
-slugs, while unknown slugs still require explicit creation.
+slugs; the assistant rejects unknown slugs.
 
 Replying to a transaction notification with one image or PDF attaches the
 receipt. A caption replaces the transaction note. Files are stored below
