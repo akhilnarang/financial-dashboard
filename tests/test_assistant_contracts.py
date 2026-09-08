@@ -8,15 +8,15 @@ def test_response_contract_accepts_typed_tool_calls_and_pending_confirmation():
     response = parse_response(
         {
             "outcome": "clarification",
-            "question": "Should I create groceries?",
+            "question": "Should I create this merchant rule?",
             "pending_confirmation": {
-                "kind": "create_category",
+                "kind": "merchant_rule",
                 "transaction_id": 7,
-                "slug": "groceries",
+                "category": "groceries",
             },
         }
     )
-    assert response.pending_confirmation.slug == "groceries"
+    assert response.pending_confirmation.category == "groceries"
 
 
 def test_extra_fields_and_unknown_tools_fail_closed():
@@ -27,6 +27,20 @@ def test_extra_fields_and_unknown_tools_fail_closed():
             {
                 "outcome": "tool_calls",
                 "calls": [{"name": "execute_sql", "sql": "select 1"}],
+            }
+        )
+    with pytest.raises(ValidationError):
+        parse_response(
+            {
+                "outcome": "tool_calls",
+                "calls": [
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": 1,
+                        "changes": {"category": {"op": "set", "value": "new"}},
+                        "create_category": {"slug": "new", "intent_evidence": "new"},
+                    }
+                ],
             }
         )
 

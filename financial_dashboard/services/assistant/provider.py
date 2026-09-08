@@ -254,14 +254,18 @@ def provider_from_settings(
     reasoning_effort: str = "",
 ) -> AssistantProvider:
     """Construct the assistant adapter from existing categorization settings."""
-
-    if provider == "gemini":
-        return GeminiProvider(api_key=api_key, model=model)
-    if provider != "openai":
+    if provider not in {"gemini", "openai"}:
         raise ProviderFailure(f"unsupported assistant provider: {provider}")
-    return OpenAICompatibleProvider(
-        api_key=api_key,
-        model=model,
-        base_url=base_url,
-        reasoning_effort=reasoning_effort,
-    )
+    if not api_key.strip():
+        raise ProviderFailure(f"{provider} API key is missing")
+    try:
+        if provider == "gemini":
+            return GeminiProvider(api_key=api_key, model=model)
+        return OpenAICompatibleProvider(
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            reasoning_effort=reasoning_effort,
+        )
+    except Exception as exc:
+        raise ProviderFailure(f"failed to configure {provider} provider") from exc

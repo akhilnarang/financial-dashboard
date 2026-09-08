@@ -67,13 +67,6 @@ class TransactionChanges(StrictModel):
     exclude_from_cashflow: SetBoolValue | None = None
 
 
-class CreateCategory(StrictModel):
-    slug: StrictStr = Field(
-        min_length=1, max_length=100, pattern=r"^[a-z0-9][a-z0-9_-]*$"
-    )
-    intent_evidence: StrictStr = Field(min_length=1, max_length=240)
-
-
 class MerchantRuleRequest(StrictModel):
     category: StrictStr = Field(min_length=1, max_length=100)
     intent_evidence: StrictStr = Field(min_length=1, max_length=240)
@@ -88,7 +81,6 @@ class ApplyTransactionChanges(StrictModel):
     name: Literal["apply_transaction_changes"]
     transaction_id: StrictInt = Field(gt=0)
     changes: TransactionChanges
-    create_category: CreateCategory | None = None
     merchant_rule: MerchantRuleRequest | None = None
 
 
@@ -136,14 +128,6 @@ class Clarification(StrictModel):
     pending_confirmation: "PendingConfirmation | None" = None
 
 
-class CategoryCreationConfirmation(StrictModel):
-    kind: Literal["create_category"]
-    transaction_id: StrictInt = Field(gt=0)
-    slug: StrictStr = Field(
-        min_length=1, max_length=100, pattern=r"^[a-z0-9][a-z0-9_-]*$"
-    )
-
-
 class MerchantRuleConfirmation(StrictModel):
     kind: Literal["merchant_rule"]
     transaction_id: StrictInt = Field(gt=0)
@@ -155,10 +139,7 @@ class MerchantRuleConfirmation(StrictModel):
         return value.lower().strip()
 
 
-PendingConfirmation: TypeAlias = Annotated[
-    CategoryCreationConfirmation | MerchantRuleConfirmation,
-    Field(discriminator="kind"),
-]
+PendingConfirmation: TypeAlias = MerchantRuleConfirmation
 
 
 class CategoryCandidate(StrictModel):

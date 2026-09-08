@@ -4,6 +4,7 @@ import pytest
 from financial_dashboard.services.assistant.provider import (
     GeminiProvider,
     ProviderFailure,
+    provider_from_settings,
 )
 from financial_dashboard.services.assistant.prompt import PromptContext
 
@@ -13,6 +14,11 @@ def test_provider_schema_has_object_root_for_strict_openai_mode():
     assert schema["type"] == "object"
     assert schema["required"] == ["response"]
     assert schema["additionalProperties"] is False
+
+
+def test_provider_configuration_rejects_a_missing_key():
+    with pytest.raises(ProviderFailure):
+        provider_from_settings(provider="openai", api_key="", model="test")
 
 
 @pytest.mark.anyio

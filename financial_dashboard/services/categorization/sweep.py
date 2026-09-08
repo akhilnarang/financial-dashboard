@@ -258,13 +258,16 @@ async def run_review_notify(*, max_attempts: int = 5) -> int:
                         separators=(",", ":"),
                     )
                 await session.commit()
-                if all(
+                delivered = all(
                     [
                         await dispatch_saved_delivery(delivery.id)
                         for delivery in deliveries
                     ]
-                ):
+                )
+                if delivered:
                     sent += 1
+                else:
+                    txn.notify_attempts = (txn.notify_attempts or 0) + 1
                 continue
             try:
                 await _send_with_retry(

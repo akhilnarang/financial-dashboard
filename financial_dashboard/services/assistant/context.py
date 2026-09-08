@@ -3,17 +3,26 @@
 import json
 from collections.abc import Mapping, Sequence
 
+from financial_dashboard.services.categorization.normalize import (
+    redact_names,
+    redact_pii,
+)
+from financial_dashboard.services.settings import get_redact_name_tokens
+
 MAX_HISTORY_TURNS = 12
 MAX_CONTEXT_CHARS = 18_000
 
 
 def bounded_history(history: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
     result = []
+    name_tokens = get_redact_name_tokens()
     for turn in history[-MAX_HISTORY_TURNS:]:
         result.append(
             {
                 "role": str(turn.get("role", ""))[:30],
-                "text": str(turn.get("text", ""))[:1500],
+                "text": redact_names(
+                    redact_pii(str(turn.get("text", ""))), name_tokens
+                )[:1500],
             }
         )
     return result
