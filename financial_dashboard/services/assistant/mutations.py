@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.db.models import (
     AuditAction,
     Account,
-    Category,
     CategoryReviewDecision,
     MerchantRule,
     Setting,
@@ -20,7 +19,6 @@ from financial_dashboard.db.models import (
 )
 from financial_dashboard.services.assistant.contracts import ApplyTransactionChanges
 from financial_dashboard.services.assistant.intent_policy import (
-    category_creation_is_explicit,
     derive_merchant_pattern,
     has_ambiguous_intent,
     has_global_no_change,
@@ -40,11 +38,7 @@ from financial_dashboard.services.categorization.decision_lifecycle import (
     supersede_active_decisions,
 )
 from financial_dashboard.services.categorization.merchant_rules import add_merchant_rule
-from financial_dashboard.services.categorization.vocabulary import (
-    canonicalize_slug,
-    is_valid_slug,
-    refresh_vocab_cache,
-)
+from financial_dashboard.services.categorization.vocabulary import refresh_vocab_cache
 from financial_dashboard.services.categorization.normalize import normalize_text
 from financial_dashboard.services.categorization.polarity import resolve_direction
 from financial_dashboard.services.transactions import (
@@ -187,7 +181,9 @@ def _validate_ordinary_intent(
                 raise MutationRejected(
                     "negated instructions cannot change transaction data"
                 )
-            if not mentions_category(normalized, value):
+            if not instruction.note_shorthand and not mentions_category(
+                normalized, value
+            ):
                 raise MutationRejected(
                     "category value must be supported by the current message"
                 )
@@ -281,7 +277,6 @@ async def _apply_transaction_changes(
         changes.note is None
         and changes.category is None
         and changes.exclude_from_cashflow is None
-        and request.create_category is None
         and request.merchant_rule is None
     ):
         raise MutationRejected("empty transaction change set")
@@ -303,16 +298,6 @@ async def _apply_transaction_changes(
     ):
         raise MutationRejected("exclude_from_cashflow must be boolean")
 
-    if request.create_category is not None:
-        if not confirmed_pending and not category_creation_is_explicit(
-            instruction_text,
-            request.create_category.intent_evidence,
-            request.create_category.slug,
-        ):
-            raise MutationRejected("category creation requires current-message intent")
-        if changes.category is None:
-            raise MutationRejected("new category must be selected")
-
     # A merchant-rule-only request still targets the transaction's existing
     # category.  Keeping the local value in sync with the row lets the
     # category equality guard validate the rule without requiring a redundant
@@ -321,32 +306,12 @@ async def _apply_transaction_changes(
     if changes.category is not None:
         category = changes.category.value if changes.category.op == "set" else ""
         if changes.category.op == "set" and category is not None:
-            if (
-                request.create_category is not None
-                and category != request.create_category.slug
-            ):
-                raise MutationRejected("created category and selected category differ")
             resolved, corrected = await resolve_assistant_category_slug(
                 session, category
             )
-            if request.create_category is not None:
-                if resolved is not None:
-                    raise MutationRejected(
-                        f"new category matches existing category '{resolved}'"
-                    )
-                category = canonicalize_slug(category)
-                if (
-                    not is_valid_slug(category)
-                    or await session.scalar(
-                        select(Category.id).where(Category.slug == category)
-                    )
-                    is not None
-                ):
-                    raise MutationRejected("invalid new category")
-            else:
-                if resolved is None:
-                    raise MutationRejected("invalid category")
-                category = resolved
+            if resolved is None:
+                raise MutationRejected("invalid category")
+            category = resolved
             if corrected or category != changes.category.value:
                 changes = changes.model_copy(
                     update={
@@ -373,8 +338,6 @@ async def _apply_transaction_changes(
         merchant_category, _ = await resolve_assistant_category_slug(
             session, request.merchant_rule.category
         )
-        if merchant_category is None and request.create_category is not None:
-            merchant_category = category
         if merchant_category is None or merchant_category != category:
             raise MutationRejected(
                 "merchant rule category must be the transaction category"
@@ -382,7 +345,7 @@ async def _apply_transaction_changes(
         if not confirmed_pending and not merchant_rule_is_explicit(
             instruction_text,
             request.merchant_rule.intent_evidence,
-            merchant_category,
+            request.merchant_rule.category,
         ):
             raise MutationRejected("merchant rule requires current-message intent")
         merchant_pattern = derive_merchant_pattern(txn.counterparty)
@@ -418,7 +381,7 @@ async def _apply_transaction_changes(
             txn.id,
             cast(str, category),
             actor="telegram_assistant",
-            create=request.create_category is not None,
+            create=False,
             direction_policy=direction_policy,
             preserve_decision_id=consumed_decision_id,
         )

@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from financial_dashboard.db.models import CategoryReviewDecision, Transaction
+from financial_dashboard.services import settings as settings_service
 from financial_dashboard.services.assistant.transaction_reads import (
     MAX_CONTEXT_ROWS,
     get_transaction,
@@ -28,7 +29,12 @@ def _transaction(**overrides: object) -> Transaction:
 
 @pytest.mark.anyio
 async def test_get_transaction_uses_compact_allowlisted_projection(session):
-    transaction = _transaction(raw_description="merchant metadata")
+    settings_service._cache["categorization.hidden_identifiers"] = "Alice"
+    transaction = _transaction(
+        raw_description="merchant metadata",
+        reference_number="123456789",
+        note="lunch with Alice",
+    )
     session.add(transaction)
     await session.flush()
 
@@ -37,6 +43,8 @@ async def test_get_transaction_uses_compact_allowlisted_projection(session):
     assert result is not None
     assert result.id == transaction.id
     assert result.counterparty == "PUREBERRYSMUMBAI"
+    assert result.reference_number == "[redacted-num]"
+    assert result.note == "lunch with [redacted-name]"
     assert not hasattr(result, "raw_description")
     assert not hasattr(result, "balance")
 

@@ -18,6 +18,11 @@ from financial_dashboard.db.models import CategoryReviewDecision, Transaction
 from financial_dashboard.services.transaction_reads import (
     build_transaction_filter_clauses,
 )
+from financial_dashboard.services.categorization.normalize import (
+    redact_names,
+    redact_pii,
+)
+from financial_dashboard.services.settings import get_redact_name_tokens
 
 MAX_CONTEXT_ROWS = 20
 MAX_FIELD_LENGTH = 2_000
@@ -54,8 +59,17 @@ def _bounded(value: str | None) -> str | None:
     return value[:MAX_FIELD_LENGTH]
 
 
+def _redacted(value: str | None, name_tokens: tuple[str, ...]) -> str | None:
+    if value is None:
+        return None
+    return _bounded(redact_names(redact_pii(value), name_tokens))
+
+
 def _projection(
-    row: Any, *, review_gate_reason: str | None = None
+    row: Any,
+    *,
+    name_tokens: tuple[str, ...],
+    review_gate_reason: str | None = None,
 ) -> AssistantTransaction:
     """Convert a SQL row using only the explicit assistant allowlist."""
     return AssistantTransaction(
@@ -65,14 +79,14 @@ def _projection(
         amount=row.amount,
         currency=row.currency,
         transaction_date=row.transaction_date,
-        counterparty=_bounded(row.counterparty),
-        reference_number=_bounded(row.reference_number),
+        counterparty=_redacted(row.counterparty, name_tokens),
+        reference_number=_redacted(row.reference_number, name_tokens),
         channel=_bounded(row.channel),
         account_id=row.account_id,
         card_id=row.card_id,
         category=_bounded(row.category),
         category_method=_bounded(row.category_method),
-        note=_bounded(row.note),
+        note=_redacted(row.note, name_tokens),
         exclude_from_cashflow=bool(row.exclude_from_cashflow),
         category_confidence=row.category_confidence,
         category_model=_bounded(row.category_model),
@@ -124,7 +138,11 @@ async def get_transaction(
         .order_by(CategoryReviewDecision.id.desc())
         .limit(1)
     )
-    return _projection(row, review_gate_reason=gate_reason)
+    return _projection(
+        row,
+        name_tokens=get_redact_name_tokens(),
+        review_gate_reason=gate_reason,
+    )
 
 
 async def list_transactions(
@@ -172,4 +190,5 @@ async def list_transactions(
         .offset(offset)
         .limit(limit)
     )
-    return [_projection(row) for row in result]
+    name_tokens = get_redact_name_tokens()
+    return [_projection(row, name_tokens=name_tokens) for row in result]

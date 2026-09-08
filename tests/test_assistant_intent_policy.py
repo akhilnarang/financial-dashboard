@@ -1,24 +1,10 @@
 import pytest
 
 from financial_dashboard.services.assistant.intent_policy import (
-    category_creation_is_explicit,
     derive_merchant_pattern,
     is_direct_affirmative,
     merchant_rule_is_explicit,
 )
-
-
-def test_stored_or_invented_evidence_cannot_authorize_category_creation():
-    assert not category_creation_is_explicit(
-        "categorize this",
-        "create a new category called pet care",
-        "pet_care",
-    )
-    assert category_creation_is_explicit(
-        "Please create a new category called pet care",
-        "create a new category called pet care",
-        "pet_care",
-    )
 
 
 def test_merchant_rule_requires_durable_current_message_and_category():

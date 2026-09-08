@@ -61,6 +61,17 @@ async def test_orchestrator_returns_answer(session):
 
 
 @pytest.mark.anyio
+async def test_orchestrator_refuses_unsupported_aggregate_questions(session):
+    provider = FakeProvider([])
+
+    result = await run_turn(session, provider, user_message="how much did I spend?")
+
+    assert result.response.outcome == "error"
+    assert result.response.code == "unsupported_aggregate"
+    assert provider.calls == 0
+
+
+@pytest.mark.anyio
 async def test_orchestrator_renews_lease_between_provider_tool_rounds(session):
     txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
     session.add(txn)

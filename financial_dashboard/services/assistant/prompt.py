@@ -33,8 +33,7 @@ def build_prompt(context: PromptContext) -> str:
         "response must be exactly one of these typed objects:",
         '- {"outcome":"answer","text":"..."}',
         '- {"outcome":"clarification","question":"...",'
-        '"pending_confirmation":null|{"kind":"create_category",'
-        '"transaction_id":1,"slug":"..."}|{"kind":"merchant_rule",'
+        '"pending_confirmation":null|{"kind":"merchant_rule",'
         '"transaction_id":1,"category":"..."}}',
         '- {"outcome":"category_proposal","transaction_id":1,'
         '"explanation":"...","candidates":[{"slug":"...",'
@@ -46,16 +45,19 @@ def build_prompt(context: PromptContext) -> str:
         "direction/amount/bank/source/category/review_status/reference/search/excluded/limit.",
         'APPLY is {"name":"apply_transaction_changes","transaction_id":1,',
         '"changes":{optional note/category/exclude_from_cashflow patches},',
-        'optional "create_category":{"slug":"...","intent_evidence":"..."},',
         'optional "merchant_rule":{"category":"...","intent_evidence":"..."}}.',
         'A note patch is {"op":"set","value":"..."} or {"op":"clear"}.',
         'A category patch is {"op":"set","value":"slug"} or',
         '{"op":"clear","value":null}. An exclusion patch is',
         '{"op":"set","value":true|false}. Omitted fields stay unchanged.',
         "A category proposal must contain exactly 2 or 3 existing category slugs.",
-        "For category creation or a durable merchant rule, include an exact substring",
+        "Categories must already exist; never propose creating a category.",
+        "For a durable merchant rule, include an exact substring",
         "from the current user message as intent_evidence.",
         "Merchant-rule pattern and priority are server-derived; never provide them.",
+        "No aggregate financial-report tool is available. Never calculate or estimate",
+        "totals, spending, income, cashflow, averages, or breakdowns from transaction rows.",
+        "Say that aggregate reports are not supported yet.",
         "",
         "=== CURRENT USER MESSAGE (trusted for intent only) ===",
         _quoted(context.user_message, 4000),
