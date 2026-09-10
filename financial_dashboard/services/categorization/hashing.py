@@ -1,10 +1,7 @@
-"""Stable content hash over the classifier's input fields.
+"""Stable fingerprints for enrichment retries and delayed assistant writes.
 
-Written on every categorization path but not yet read: the requeue query
-(select_needs_work_stmt) keys off category_method/vocab_version, not this hash.
-TODO: compare the stored hash against a freshly computed one to requeue
-non-manual rows whose inputs changed (e.g. an SMS row later enriched by an email
-merge, or a reparse). Gate any such requeue so it doesn't stampede the LLM.
+Enrichment compares classifier inputs before requeuing unresolved LLM results;
+the sweep also retries them after vocabulary changes.
 """
 
 import hashlib
@@ -52,16 +49,20 @@ def compute_input_hash(payload: InputPayload) -> str:
 def build_confirmation_payload(
     txn: Transaction, account_type: str | None
 ) -> dict[str, object]:
-    """Build the state fingerprint used by pending confirmations.
+    """Build the state fingerprint for delayed assistant writes and confirmations.
 
     Confirmation state includes both the mutable fields a pending action may
-    change and the classifier input hash. This lets a later affirmative reply
-    fail closed when enrichment or another edit changed the transaction.
+    change, transaction context, and the classifier input hash. Model responses
+    and later affirmative replies must fail closed after an intervening edit.
     """
     return {
         "category": txn.category,
         "note": txn.note,
         "exclude_from_cashflow": txn.exclude_from_cashflow,
+        "transaction_date": txn.transaction_date,
+        "account_id": txn.account_id,
+        "card_id": txn.card_id,
+        "reference_number": txn.reference_number,
         "category_input_hash": txn.category_input_hash,
         "input_state": build_input_payload(txn, account_type),
     }

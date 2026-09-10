@@ -218,12 +218,12 @@ async def current_transaction_state_hash(
 async def current_confirmation_state_hash(
     session: AsyncSession, transaction_id: int
 ) -> str | None:
-    txn = await session.get(Transaction, transaction_id)
+    txn = await session.get(Transaction, transaction_id, populate_existing=True)
     if txn is None:
         return None
     account_type = None
     if txn.account_id is not None:
-        account = await session.get(Account, txn.account_id)
+        account = await session.get(Account, txn.account_id, populate_existing=True)
         account_type = account.type if account is not None else None
     return compute_transaction_confirmation_hash(txn, account_type)
 
@@ -330,6 +330,11 @@ async def run_turn(
                 code="unsupported_aggregate",
             )
         )
+    expected_state_hash = (
+        await current_confirmation_state_hash(session, transaction_id)
+        if transaction_id is not None
+        else None
+    )
     target = (
         await get_transaction(session, transaction_id)
         if transaction_id is not None
@@ -412,6 +417,37 @@ async def run_turn(
                     code="invalid_model_output",
                 )
             )
+        writes_target = (
+            isinstance(response, CategoryProposal)
+            or isinstance(response, Clarification)
+            and response.pending_confirmation is not None
+            or isinstance(response, ToolCalls)
+            and any(
+                isinstance(call, ApplyTransactionChanges) for call in response.calls
+            )
+        )
+        if writes_target:
+            try:
+                await _lock_authorized_chat(session, authorized_chat_id)
+            except AuthorizationChanged:
+                return completed(
+                    Error(
+                        outcome="error",
+                        message="Telegram authorization changed.",
+                        code="authorization_changed",
+                    )
+                )
+            if transaction_id is not None and (
+                await current_confirmation_state_hash(session, transaction_id)
+                != expected_state_hash
+            ):
+                return completed(
+                    Error(
+                        outcome="error",
+                        message="That transaction changed while I was processing. Please reply again.",
+                        code="transaction_changed",
+                    )
+                )
         if isinstance(response, (Answer, Clarification, CategoryProposal)):
             if isinstance(response, Clarification):
                 pending = response.pending_confirmation
@@ -441,7 +477,6 @@ async def run_turn(
                         response = response.model_copy(
                             update={"question": _confirmation_question(pending, target)}
                         )
-                        await _lock_authorized_chat(session, authorized_chat_id)
                         await _persist_pending(
                             session,
                             conversation_id,
@@ -473,7 +508,6 @@ async def run_turn(
                         )
             if isinstance(response, CategoryProposal):
                 try:
-                    await _lock_authorized_chat(session, authorized_chat_id)
                     decision_id = await _save_proposal(
                         session, response, target, interaction_id
                     )
@@ -526,7 +560,6 @@ async def run_turn(
                     )
                 if mutation_calls:
                     call = mutation_calls[0]
-                    await _lock_authorized_chat(session, authorized_chat_id)
                     try:
                         mutation = await apply_transaction_changes(
                             session,
