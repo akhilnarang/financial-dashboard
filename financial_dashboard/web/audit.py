@@ -78,10 +78,31 @@ async def audit_detail(
     detail = await get_audit_detail(session, interaction_id)
     if detail is None:
         return HTMLResponse("<p>Audit interaction not found.</p>", status_code=404)
+    try:
+        output = json.loads(detail.interaction.model_output_json or "{}")
+    except ValueError:
+        output = {}
+    search = output.get("merchant_search") if isinstance(output, dict) else None
+    sources = search.get("sources") if isinstance(search, dict) else None
+    merchant_sources = (
+        [
+            source
+            for source in sources[:3]
+            if isinstance(source, dict)
+            and isinstance(source.get("url"), str)
+            and source["url"].startswith(("https://", "http://"))
+        ]
+        if isinstance(sources, list)
+        else []
+    )
     return templates.TemplateResponse(
         request,
         "partials/audit_detail.html",
-        {"detail": detail, "pretty_json": _pretty_json},
+        {
+            "detail": detail,
+            "pretty_json": _pretty_json,
+            "merchant_sources": merchant_sources,
+        },
     )
 
 
