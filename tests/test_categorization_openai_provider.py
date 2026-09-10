@@ -25,20 +25,11 @@ _FIELDS = {
 
 def _make_mock_client(content):
     """Build a mock AsyncOpenAI client whose chat.completions.create returns *content*."""
-    mock_message = MagicMock()
-    mock_message.content = content
-    mock_choice = MagicMock()
-    mock_choice.message = mock_message
-    mock_response = MagicMock()
-    mock_response.choices = [mock_choice]
-
-    mock_create = AsyncMock(return_value=mock_response)
-    mock_completions = MagicMock()
-    mock_completions.create = mock_create
-    mock_chat = MagicMock()
-    mock_chat.completions = mock_completions
     mock_client = MagicMock()
-    mock_client.chat = mock_chat
+    mock_create = AsyncMock(
+        return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=content))])
+    )
+    mock_client.chat.completions.create = mock_create
     mock_client.base_url = "https://api.openai.com/v1/"
     mock_client.responses.create = AsyncMock()
     mock_client.with_options.return_value = mock_client
