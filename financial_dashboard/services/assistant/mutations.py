@@ -121,8 +121,26 @@ def _cashflow_polarity_is_explicit(text: str, excluded: bool) -> bool:
     )
 
 
-def _validate_ordinary_intent(
-    request: ApplyTransactionChanges, current_user_message: str
+async def _category_evidence(
+    session: AsyncSession, instruction: str, category: str
+) -> str:
+    """Resolve spelling only in an explicit category field, never arbitrary prose."""
+    if mentions_category(instruction, category):
+        return category
+    for match in re.finditer(
+        r"\bcategory\s*:?\s+(?:to\s+)?([\w-]+)", instruction, re.IGNORECASE
+    ):
+        spelling = match.group(1)
+        resolved, _ = await resolve_assistant_category_slug(session, spelling)
+        if resolved == category:
+            return spelling
+    return category
+
+
+async def _validate_ordinary_intent(
+    session: AsyncSession,
+    request: ApplyTransactionChanges,
+    current_user_message: str,
 ) -> None:
     """Bind ordinary patches to declarative current-turn evidence."""
     raw = current_user_message.strip()
@@ -174,7 +192,10 @@ def _validate_ordinary_intent(
             raise MutationRejected("clearing a note requires current-message intent")
     if changes.category is not None:
         if changes.category.op == "set":
-            value = normalize_text(changes.category.value or "").replace("_", " ")
+            evidence = await _category_evidence(
+                session, instruction_text, changes.category.value or ""
+            )
+            value = normalize_text(evidence).replace("_", " ")
             if negates_target(
                 instruction_text, value
             ) or _category_assignment_is_negated(instruction_text):
@@ -281,7 +302,7 @@ async def _apply_transaction_changes(
     ):
         raise MutationRejected("empty transaction change set")
     if not confirmed_pending:
-        _validate_ordinary_intent(request, current_user_message)
+        await _validate_ordinary_intent(session, request, current_user_message)
     before = _snapshot(txn)
     merchant_before: dict[str, object] | None = None
     merchant_after: dict[str, object] | None = None
@@ -345,7 +366,9 @@ async def _apply_transaction_changes(
         if not confirmed_pending and not merchant_rule_is_explicit(
             instruction_text,
             request.merchant_rule.intent_evidence,
-            request.merchant_rule.category,
+            await _category_evidence(
+                session, instruction_text, request.merchant_rule.category
+            ),
         ):
             raise MutationRejected("merchant rule requires current-message intent")
         merchant_pattern = derive_merchant_pattern(txn.counterparty)

@@ -7,6 +7,7 @@ structured-output flag.
 """
 
 from collections.abc import Mapping, Sequence
+from math import isfinite
 from typing import Any, NamedTuple
 
 from financial_dashboard.services.categorization.fewshot import FewShotExample
@@ -87,20 +88,32 @@ def build_prompt(
         "Choose exactly ONE category slug from this list:",
         ", ".join(active_slugs),
         f'If none fit, return "{NEEDS_REVIEW}".',
+        "The unknown category is reserved for empty input handled by the system; "
+        "use needs_review when a transaction's purpose is ambiguous.",
         "Return JSON with category, confidence (0..1), reason (one short sentence), "
         "and candidates: an ordered list of zero to three plausible category "
         "objects, each {category, confidence (0..1)}. Include the primary "
         "category when you have one; use an empty list when none fit.",
         "",
-        "IMPORTANT: 'direction: credit' = money RECEIVED — use an income category "
-        "(refund, salary, interest, cashback_rewards, repayment, other_income); "
-        "NEVER a spending category.",
-        "'direction: debit' = money SPENT — use a spending category.",
-        "A credit from an individual paying you back = repayment; "
-        "a credit from a merchant = refund.",
+        "Classify the transaction purpose using merchant identity and narration; "
+        "an itemized receipt is not required for a recognizable merchant. "
+        "groceries covers grocery/quick-commerce purchases; dining covers "
+        "prepared food and drinks. Confidence measures support for the category, "
+        "not whether you know the individual items purchased.",
+        "A bank-account credit is money received; a debit is money sent. "
+        "Transfers, investments and credit-card payments are not ordinary spending.",
+        "On a credit_card account, a credit reduces the card balance: use "
+        "credit_card_payment for paying the card bill, refund for a merchant refund, "
+        "or cashback_rewards for rewards. It is never salary, interest, "
+        "other_income or repayment. A card debit is usually a purchase or charge.",
+        "A bank-account credit from an individual paying you back = repayment; "
+        "a merchant returning a purchase payment = refund.",
         "Do NOT use self_transfer (handled separately). For money moved to/from another "
         "person, use 'repayment' for a credit or 'expense'/the specific spending category "
-        "for a debit.",
+        "for a debit only when the purpose supports it. Use family or reimbursement "
+        "when the context establishes that purpose. Unclear person-to-person "
+        "transfers and payment gateways alone do not establish a spending purpose; "
+        "return needs_review when the distinction remains unclear.",
         "",
     ]
     if examples:
@@ -112,6 +125,9 @@ def build_prompt(
             )
         lines.append("")
     lines.append("Transaction to categorize:")
+    lines.append(f"bank: {fields.get('bank')}")
+    lines.append(f"account_type: {fields.get('account_type')}")
+    lines.append(f"email_type: {fields.get('email_type')}")
     lines.append(f"direction: {fields.get('direction')}")
     lines.append(f"amount: {fields.get('amount')} {fields.get('currency')}")
     lines.append(f"channel: {fields.get('channel')}")
@@ -132,7 +148,7 @@ def parse_result(data: Mapping[str, Any], active_slugs: list[str]) -> LlmResult:
         conf = float(data.get("confidence", 0.0))
     except ValueError, TypeError:
         conf = 0.0
-    conf = max(0.0, min(1.0, conf))
+    conf = max(0.0, min(1.0, conf)) if isfinite(conf) else 0.0
     reason = str(data.get("reason", ""))[:300]
     if slug != NEEDS_REVIEW and slug not in active_slugs:
         # Preserve the gate that caused review.  The engine uses this reason
@@ -161,7 +177,12 @@ def parse_result(data: Mapping[str, Any], active_slugs: list[str]) -> LlmResult:
             except ValueError, TypeError:
                 candidate_conf = 0.0
             candidates.append(
-                LlmCandidate(candidate, max(0.0, min(1.0, candidate_conf)))
+                LlmCandidate(
+                    candidate,
+                    max(0.0, min(1.0, candidate_conf))
+                    if isfinite(candidate_conf)
+                    else 0.0,
+                )
             )
             if len(candidates) == 3:
                 break

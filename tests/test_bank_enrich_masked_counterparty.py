@@ -125,9 +125,25 @@ async def test_a_row_with_no_description_gains_the_narration(maker):
     assert "Selftransfer" in stored.raw_description
 
 
-async def test_the_narration_is_filled_even_when_the_name_is_kept(maker):
+@pytest.mark.parametrize("method", ["llm", "manual"])
+async def test_the_narration_is_filled_even_when_the_name_is_kept(maker, method):
     """The two fields are independent: a real name must not block the narration."""
-    row_id = await _store(maker, counterparty="ANJALIJY OTESHNA")
+    from financial_dashboard.services.categorization.hashing import (
+        build_input_payload,
+        compute_input_hash,
+    )
+
+    row_id = await _store(
+        maker,
+        counterparty="ALICE SMITH",
+        category="repayment",
+        category_method=method,
+        review_status="notified",
+    )
+    async with maker() as session:
+        row = await session.get(Transaction, row_id)
+        row.category_input_hash = compute_input_hash(build_input_payload(row, None))
+        await session.commit()
 
     count = await _enrich(
         row_id, counterparty="SOMEONE ELSE", narration="IMPS/1/REMARK/Selftransfer"
@@ -135,8 +151,10 @@ async def test_the_narration_is_filled_even_when_the_name_is_kept(maker):
 
     stored = await _read(maker, row_id)
     assert count == 1
-    assert stored.counterparty == "ANJALIJY OTESHNA"
+    assert stored.counterparty == "ALICE SMITH"
     assert stored.raw_description == "IMPS/1/REMARK/Selftransfer"
+    assert stored.category_method == ("pending_llm" if method == "llm" else "manual")
+    assert stored.review_status == (None if method == "llm" else "notified")
 
 
 async def test_an_existing_narration_is_never_overwritten(maker):

@@ -1,3 +1,5 @@
+import json
+
 from financial_dashboard.services.assistant.contracts import response_json_schema
 import pytest
 
@@ -41,11 +43,26 @@ async def test_gemini_attempts_full_schema_then_records_json_fallback():
     provider.client = type(
         "Client", (), {"aio": type("Aio", (), {"models": Models()})()}
     )()
-    result = await provider.complete(PromptContext("why"))
+    tool_result = {
+        "tool": "list_transactions",
+        "result": {
+            "items": [
+                {"id": index, "note": "synthetic transaction context " * 6}
+                for index in range(20)
+            ]
+        },
+    }
+    result = await provider.complete(
+        PromptContext("show transactions", tool_results=[tool_result])
+    )
     assert result.output_mode == "validated_json_object"
     assert calls[0]["config"].response_json_schema == response_json_schema()
     assert calls[0]["config"].response_schema is None
     assert calls[1]["config"].response_json_schema is None
+    supplied_results = calls[1]["contents"].split(
+        "=== TOOL RESULTS (quoted data) ===\n", 1
+    )[1]
+    assert json.loads(supplied_results) == tool_result
 
 
 @pytest.mark.anyio

@@ -38,11 +38,13 @@ def _needs_llm(txn: Transaction) -> bool:
     """Whether a row is still eligible for the LLM pass at write time.
 
     Mirrors select_needs_work_stmt(llm=True) minus the vocab-version filter: safe
-    to re-run on never-evaluated, pending_llm, or prior 'unknown' rows, but never
+    to re-run on never-evaluated, pending_llm, unknown, or unresolved review rows,
+    but never
     on a 'manual'/'rule'/finalised-'llm' row (guards the select→process window).
     """
     return txn.category_method in (None, "pending_llm") or (
-        txn.category == "unknown" and txn.category_method == "llm"
+        txn.category_method == "llm"
+        and (txn.category == "unknown" or txn.review_status in ("pending", "notified"))
     )
 
 
