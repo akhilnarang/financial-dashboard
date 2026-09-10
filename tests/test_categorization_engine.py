@@ -1,9 +1,15 @@
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import Transaction
+from financial_dashboard.db.models import (
+    AuditInteraction,
+    CategoryReviewDecision,
+    TelegramOutboundDelivery,
+    Transaction,
+)
 from financial_dashboard.services.categorization import engine as eng
 from financial_dashboard.services.categorization import llm
 
@@ -26,6 +32,57 @@ async def test_rule_hit_sets_method_rule_without_llm(session: AsyncSession):
     assert txn.category == "interest"
     assert txn.category_method == "rule"
     assert txn.category_input_hash is not None
+
+
+async def test_confident_rule_supersedes_stale_review_and_cancels_buttons(
+    session: AsyncSession,
+):
+    txn = Transaction(
+        bank="testbank",
+        email_type="x",
+        direction="credit",
+        amount=Decimal("10"),
+        channel="interest",
+        review_status="pending",
+    )
+    session.add(txn)
+    await session.flush()
+    source = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="reply",
+        status="ready_to_send",
+        outcome="clarification",
+    )
+    session.add(source)
+    await session.flush()
+    decision = CategoryReviewDecision(
+        transaction_id=txn.id,
+        source_interaction_id=source.id,
+        category_input_hash="stale",
+        candidates_json='[{"category": "interest"}]',
+        gate_reason="old review",
+    )
+    session.add(decision)
+    await session.flush()
+    delivery = TelegramOutboundDelivery(
+        interaction_id=source.id,
+        recipient_chat_id=7,
+        ordinal=0,
+        transaction_id=txn.id,
+        text="choose",
+        delivery_token="stale-button-token",
+        status="pending",
+    )
+    session.add(delivery)
+    await session.flush()
+
+    assert await eng.categorize_one(session, txn, use_llm=False) == "rule"
+
+    assert decision.status == "superseded"
+    assert delivery.status == "cancelled"
+    assert source.status == "delivery_failed"
+    assert source.outcome == "clarification"
+    assert txn.category == "interest"
 
 
 async def test_rule_pass_no_match_marks_pending_llm(session: AsyncSession):
@@ -78,6 +135,13 @@ async def test_llm_low_confidence_routes_to_review(session: AsyncSession, monkey
     )  # debit + low-confidence 'unknown' -> direction default
     assert txn.review_status == "pending"
     assert txn.review_reason == "unsure"
+    decision = await session.scalar(
+        select(CategoryReviewDecision).where(
+            CategoryReviewDecision.transaction_id == txn.id
+        )
+    )
+    assert decision is not None
+    assert decision.proposed_slug == "groceries"
 
 
 async def test_llm_direction_flip_routes_to_review(session: AsyncSession, monkeypatch):

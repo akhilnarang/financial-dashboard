@@ -24,14 +24,22 @@ Each lane is asserted at the layer it belongs to:
   model call intercepted at ``_llm_classify`` so no provider is contacted.
 """
 
+import json
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import financial_dashboard.services.categorization.engine as eng
 import financial_dashboard.services.categorization.sweep as sweep
-from financial_dashboard.db.models import Account, Transaction
+from financial_dashboard.db.models import (
+    Account,
+    AuditAction,
+    AuditInteraction,
+    CategoryReviewDecision,
+    Transaction,
+)
 from financial_dashboard.services.categorization import llm
 from financial_dashboard.services.categorization.merchant_rules import (
     load_merchant_rules,
@@ -124,8 +132,9 @@ async def test_polarity_flips_directionally_impossible_llm_slug_and_queues_for_r
     assert "refund" in (txn.review_reason or "")
 
 
+@pytest.mark.parametrize("manual_edit", [False, True])
 async def test_polarity_keeps_directionally_consistent_llm_slug(
-    session: AsyncSession, monkeypatch
+    session: AsyncSession, monkeypatch, manual_edit
 ):
     """A confident, directionally-consistent LLM answer is stored unchanged,
     with no review queueing. ``_llm_classify`` is the seam: a real provider is
@@ -133,7 +142,31 @@ async def test_polarity_keeps_directionally_consistent_llm_slug(
     await ensure_category(session, "groceries")
 
     async def fake_classify(**kwargs):
-        return llm.LlmResult("groceries", 0.95, "grocery store")
+        if manual_edit:
+            async with AsyncSession(bind=session.bind) as other:
+                await other.execute(
+                    update(Transaction)
+                    .where(Transaction.id == txn.id)
+                    .values(
+                        category="shopping",
+                        category_method="manual",
+                        category_confidence=1.0,
+                    )
+                )
+                await other.commit()
+        return llm.LlmResult(
+            "groceries",
+            0.95,
+            "grocery store",
+            merchant_search={
+                "status": "completed",
+                "model": "gpt-5.6-luna",
+                "merchant": "ACME GROCERS",
+                "city": "",
+                "description": "Grocery store",
+                "sources": [{"url": "https://example.com/acme", "title": "ACME"}],
+            },
+        )
 
     monkeypatch.setattr(eng, "_llm_classify", fake_classify)
 
@@ -146,13 +179,40 @@ async def test_polarity_keeps_directionally_consistent_llm_slug(
         raw_description="ACME GROCERS",
     )
     session.add(txn)
-    await session.flush()
+    await session.commit()
 
     method = await eng.categorize_one(session, txn, use_llm=True)
-    assert method == "llm"
-    assert txn.category == "groceries"
-    assert txn.category_confidence == 0.95
+    assert method == ("skip" if manual_edit else "llm")
+    assert txn.category == ("shopping" if manual_edit else "groceries")
+    assert txn.category_confidence == (1.0 if manual_edit else 0.95)
     assert txn.review_status is None
+    await session.commit()
+    audit = await session.scalar(
+        select(AuditInteraction).where(AuditInteraction.transaction_id == txn.id)
+    )
+    assert audit.status == "completed"
+    assert audit.inbound_chat_id == 0 and audit.trigger == "merchant_lookup"
+    output = json.loads(audit.model_output_json)
+    assert output["merchant_search"]["sources"][0]["url"] == "https://example.com/acme"
+    action = await session.scalar(
+        select(AuditAction).where(AuditAction.interaction_id == audit.id)
+    )
+    if manual_edit:
+        assert txn.category_method == "manual"
+        assert output["applied_category"] is None
+        assert "changed" in output["gate_reason"]
+        assert action is None
+        assert audit.model == "gpt-5.6-luna"
+        return
+    assert audit.outcome == "classified"
+    assert output["applied_category"] == "groceries" and output["gate_reason"] is None
+    assert action.action_type == "categorize_transaction" and action.undo_status is None
+    assert json.loads(action.before_json) == output["before"]
+    assert json.loads(action.after_json) == {
+        "category": "groceries",
+        "confidence": 0.95,
+        "method": "llm",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +422,18 @@ async def test_llm_low_confidence_routes_to_review_at_the_model_boundary(
     async def fake_classify(*, fields, examples, active_slugs):
         captured["fields"] = fields
         captured["active_slugs"] = active_slugs
-        return llm.LlmResult("groceries", 0.10, "unsure")
+        return llm.LlmResult(
+            "groceries",
+            0.10,
+            "unsure",
+            merchant_search={
+                "status": "completed",
+                "merchant": "MYSTERY MERCHANT",
+                "city": "",
+                "description": "Ambiguous merchant",
+                "sources": [{"url": "https://example.com/mystery", "title": "Mystery"}],
+            },
+        )
 
     monkeypatch.setattr(eng, "_llm_classify", fake_classify)
 
@@ -382,7 +453,21 @@ async def test_llm_low_confidence_routes_to_review_at_the_model_boundary(
     # Low confidence -> 'unknown' -> direction default (debit -> expense).
     assert txn.category == "expense"
     assert txn.review_status == "pending"
-    assert txn.review_reason == "unsure"
+    assert txn.review_reason.startswith("unsure\nMerchant lookup: completed")
+    assert "https://example.com/mystery" in txn.review_reason
+    await session.commit()
+    audit = await session.scalar(
+        select(AuditInteraction).where(AuditInteraction.transaction_id == txn.id)
+    )
+    assert audit.outcome == "needs_review"
+    output = json.loads(audit.model_output_json)
+    assert output["applied_category"] == "expense" and "below" in output["gate_reason"]
+    decision = await session.scalar(
+        select(CategoryReviewDecision).where(
+            CategoryReviewDecision.transaction_id == txn.id
+        )
+    )
+    assert decision.source_interaction_id is None and decision.status == "active"
     # The model boundary really was the seam: the call saw the engine's
     # fields dict and the active-slug list (with 'self_transfer' filtered out).
     assert captured["fields"]["counterparty"] == "MYSTERY MERCHANT"
@@ -418,6 +503,35 @@ async def test_llm_needs_review_slug_routes_to_review(
     assert txn.category == "expense"  # debit + unknown default
     assert txn.review_status == "pending"
     assert txn.category != llm.NEEDS_REVIEW
+
+
+async def test_llm_invalid_slug_preserves_review_gate_reason(session, monkeypatch):
+    async def fake_classify(**kwargs):
+        return llm.parse_result(
+            {"category": "made_up", "confidence": 0.9, "reason": "bad output"},
+            ["groceries"],
+        )
+
+    monkeypatch.setattr(eng, "_llm_classify", fake_classify)
+    txn = Transaction(
+        bank="testbank",
+        email_type="x",
+        direction="debit",
+        amount=Decimal("99"),
+        counterparty="MYSTERY MERCHANT",
+        raw_description="MYSTERY MERCHANT",
+    )
+    session.add(txn)
+    await session.flush()
+
+    await eng.categorize_one(session, txn, use_llm=True)
+    assert txn.review_reason == "invalid model category slug: made_up"
+    decision = await session.scalar(
+        select(CategoryReviewDecision).where(
+            CategoryReviewDecision.transaction_id == txn.id
+        )
+    )
+    assert decision.gate_reason == "invalid model category slug: made_up"
 
 
 async def test_empty_input_skips_the_llm_call(session: AsyncSession, monkeypatch):

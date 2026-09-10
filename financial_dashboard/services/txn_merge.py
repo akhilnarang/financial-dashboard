@@ -24,6 +24,7 @@ from financial_dashboard.core.masks import (
     normalize_mask,
 )
 from financial_dashboard.db import Transaction
+from financial_dashboard.services.categorization.engine import requeue_after_enrichment
 from financial_dashboard.services.categorization.self_transfer import (
     apply_reference_self_transfer_rule,
 )
@@ -1230,6 +1231,7 @@ async def apply_transaction_enrichment(
 
     await session.flush()
     await apply_reference_self_transfer_rule(session, match)
+    await requeue_after_enrichment(session, match)
     return diff
 
 

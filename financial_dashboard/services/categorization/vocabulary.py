@@ -77,20 +77,39 @@ def get_vocab_version() -> int:
 
 
 async def bump_vocab_version(session: AsyncSession) -> int:
-    """Persist a bumped vocab version via the CALLER's session and update the
-    in-memory settings cache. Takes the session so it works under the test
-    fixture DB (save_settings would open the app-global DB instead)."""
-    new_version = get_vocab_version() + 1
+    """Persist a bumped version in the caller transaction.
+
+    The database is authoritative.  In particular, do not update the process
+    cache until the caller commits, otherwise a rollback leaks a version.
+    """
     await session.execute(
         text(
             "INSERT INTO settings (key, value) VALUES "
-            "('category_vocab_version', :v) "
-            "ON CONFLICT(key) DO UPDATE SET value = :v"
+            "('category_vocab_version', '2') "
+            "ON CONFLICT(key) DO UPDATE SET value = "
+            "CAST(settings.value AS INTEGER) + 1"
         ),
-        {"v": str(new_version)},
     )
-    settings_mod._cache["category_vocab_version"] = str(new_version)
-    return new_version
+    # Read the value written in this transaction.  The expression above is
+    # evaluated by SQLite while holding the write lock, so concurrent category
+    # creation cannot lose an increment.
+    value = await session.scalar(
+        text("SELECT value FROM settings WHERE key = 'category_vocab_version'")
+    )
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("category vocabulary version is not numeric") from exc
+
+
+async def refresh_vocab_cache(session: AsyncSession) -> int:
+    """Refresh the in-memory version after a successful commit."""
+    value = await session.scalar(
+        text("SELECT value FROM settings WHERE key = 'category_vocab_version'")
+    )
+    if value is not None:
+        settings_mod._cache["category_vocab_version"] = str(value)
+    return get_vocab_version()
 
 
 async def ensure_category(session: AsyncSession, slug: str) -> bool:

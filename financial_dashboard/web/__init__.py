@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from financial_dashboard.web import (
     accounts,
+    audit,
     bank_statements,
     cas,
     cashflow,
@@ -24,6 +25,7 @@ from financial_dashboard.web import (
 def get_router(*, paisa_enabled: bool = True) -> APIRouter:
     router = APIRouter()
     router.include_router(dashboard.router)
+    router.include_router(audit.router)
     router.include_router(transactions.router)
     router.include_router(cashflow.router)
     router.include_router(emails.router)

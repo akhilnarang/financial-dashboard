@@ -71,6 +71,13 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
         category="Telegram",
         label="Enable Telegram Integration",
     ),
+    "telegram.assistant_enabled": SettingDef(
+        default="false",
+        data_type="bool",
+        category="Telegram",
+        label="Enable Transaction Assistant",
+        description="Allow /ask, conversational replies, category buttons, and receipt attachments",
+    ),
     "telegram.notify_transactions": SettingDef(
         default="true",
         data_type="bool",
@@ -347,6 +354,11 @@ def should_notify_transactions() -> bool:
 
 def get_telegram_chat_id() -> int:
     return get_setting_int("telegram.chat_id")
+
+
+def is_telegram_assistant_enabled() -> bool:
+    """Return the single rollout flag for all conversational Telegram paths."""
+    return get_setting_bool("telegram.assistant_enabled", False)
 
 
 def get_telegram_bot_token() -> str:

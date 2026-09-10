@@ -13,6 +13,27 @@ from financial_dashboard.db import (
 pytestmark = pytest.mark.anyio
 
 
+async def test_note_api_clear_preserves_empty_response_and_stores_null(client, session):
+    transaction = Transaction(
+        bank="hdfc",
+        email_type="test",
+        direction="debit",
+        amount=Decimal("10.00"),
+        note="old note",
+    )
+    session.add(transaction)
+    await session.flush()
+
+    response = await client.post(
+        f"/api/transactions/{transaction.id}/note", json={"note": "   "}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "note": ""}
+    await session.refresh(transaction)
+    assert transaction.note is None
+
+
 def _reconciliation(matched_id: int, imported_id: int) -> dict:
     return {
         "matched": [

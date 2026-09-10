@@ -9,6 +9,9 @@ from financial_dashboard.services.categorization.hashing import (
     build_input_payload,
     compute_input_hash,
 )
+from financial_dashboard.services.categorization.decision_lifecycle import (
+    supersede_active_decisions,
+)
 from financial_dashboard.services.categorization.rules import is_fd_counterparty
 from financial_dashboard.services.categorization.vocabulary import get_vocab_version
 
@@ -129,6 +132,8 @@ async def apply_reference_self_transfer_rule(
         return False
 
     await _mark_self_transfer(session, txn)
+    await supersede_active_decisions(session, txn.id)
     for match in matches:
         await _mark_self_transfer(session, match)
+        await supersede_active_decisions(session, match.id)
     return True

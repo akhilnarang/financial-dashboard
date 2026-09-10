@@ -9,6 +9,9 @@ from financial_dashboard.services.categorization.llm import (
 def test_prompt_lists_slugs_and_redacts():
     prompt = build_prompt(
         fields={
+            "bank": "hdfc",
+            "account_type": "credit_card",
+            "email_type": "cc_transaction",
             "counterparty": "UPI to 9876543210",
             "raw_description": "card 1234567890123456 grocery",
             "direction": "debit",
@@ -23,6 +26,9 @@ def test_prompt_lists_slugs_and_redacts():
     assert NEEDS_REVIEW in prompt
     assert "1234567890123456" not in prompt
     assert "9876543210" not in prompt
+    assert "bank: hdfc" in prompt
+    assert "account_type: credit_card" in prompt
+    assert "email_type: cc_transaction" in prompt
 
 
 def test_prompt_flags_dr_cr_as_a_direction_marker_for_banks_with_the_bug():
@@ -73,3 +79,13 @@ def test_parse_result_clamps_and_defaults():
         {"category": "made_up", "confidence": 0.9, "reason": "y"}, ["groceries"]
     )
     assert bad.slug == NEEDS_REVIEW
+    assert bad.reason == "invalid model category slug: made_up"
+    malformed = parse_result(
+        {
+            "category": "groceries",
+            "confidence": "NaN",
+            "candidates": [{"category": "groceries", "confidence": "NaN"}],
+        },
+        ["groceries"],
+    )
+    assert malformed.confidence == malformed.candidates[0].confidence == 0.0

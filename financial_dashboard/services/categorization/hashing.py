@@ -1,14 +1,12 @@
-"""Stable content hash over the classifier's input fields.
+"""Stable fingerprints for enrichment retries and delayed assistant writes.
 
-Written on every categorization path but not yet read: the requeue query
-(select_needs_work_stmt) keys off category_method/vocab_version, not this hash.
-TODO: compare the stored hash against a freshly computed one to requeue
-non-manual rows whose inputs changed (e.g. an SMS row later enriched by an email
-merge, or a reparse). Gate any such requeue so it doesn't stampede the LLM.
+Enrichment compares classifier inputs before requeuing unresolved LLM results;
+the sweep also retries them after vocabulary changes.
 """
 
 import hashlib
 import json
+from decimal import Decimal
 from typing import TypedDict
 
 from financial_dashboard.db.models import Transaction
@@ -47,3 +45,39 @@ def build_input_payload(txn: Transaction, account_type: str | None) -> InputPayl
 def compute_input_hash(payload: InputPayload) -> str:
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def build_confirmation_payload(
+    txn: Transaction, account_type: str | None
+) -> dict[str, object]:
+    """Build the state fingerprint for delayed assistant writes and confirmations.
+
+    Confirmation state includes both the mutable fields a pending action may
+    change, transaction context, and the classifier input hash. Model responses
+    and later affirmative replies must fail closed after an intervening edit.
+    """
+    input_state = build_input_payload(txn, account_type)
+    # SQLite restores Numeric scale on reload; 50 and 50.00 are the same money.
+    input_state["amount"] = str(Decimal(input_state["amount"]).normalize())
+    return {
+        "category": txn.category,
+        "note": txn.note,
+        "exclude_from_cashflow": txn.exclude_from_cashflow,
+        "transaction_date": txn.transaction_date,
+        "account_id": txn.account_id,
+        "card_id": txn.card_id,
+        "reference_number": txn.reference_number,
+        "category_input_hash": txn.category_input_hash,
+        "input_state": input_state,
+    }
+
+
+def compute_confirmation_hash(payload: dict[str, object]) -> str:
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def compute_transaction_confirmation_hash(
+    txn: Transaction, account_type: str | None
+) -> str:
+    return compute_confirmation_hash(build_confirmation_payload(txn, account_type))
