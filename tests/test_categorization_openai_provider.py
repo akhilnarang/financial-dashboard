@@ -39,6 +39,9 @@ def _make_mock_client(content):
     mock_chat.completions = mock_completions
     mock_client = MagicMock()
     mock_client.chat = mock_chat
+    mock_client.base_url = "https://api.openai.com/v1/"
+    mock_client.responses.create = AsyncMock()
+    mock_client.with_options.return_value = mock_client
     return mock_client, mock_create
 
 
@@ -71,13 +74,19 @@ async def test_classify_known_slug(monkeypatch):
 
     assert result == LlmResult(slug="groceries", confidence=0.9, reason="food store")
     mock_create.assert_awaited_once()
+    mock_client.responses.create.assert_not_awaited()
 
 
 async def test_classify_unknown_slug_routes_to_needs_review(monkeypatch):
     from financial_dashboard.services.categorization import openai_provider
 
     content = json.dumps(
-        {"category": "unknown_slug_xyz", "confidence": 0.8, "reason": "unclear"}
+        {
+            "category": "unknown_slug_xyz",
+            "confidence": 0.8,
+            "reason": "unclear",
+            "merchant_lookup": {"name": "Alex Quinn", "city": ""},
+        }
     )
     mock_client, _ = _make_mock_client(content)
     monkeypatch.setattr(
@@ -87,16 +96,19 @@ async def test_classify_unknown_slug_routes_to_needs_review(monkeypatch):
     )
 
     result = await openai_provider.classify(
-        fields=_FIELDS,
+        fields={**_FIELDS, "counterparty": "Alex Quinn"},
+        name_tokens=["Alex"],
         examples=[],
         active_slugs=["groceries", "dining"],
         api_key="test-key",
-        model="gpt-4o-mini",
+        model="gpt-5.6-luna",
         base_url="",
     )
 
     assert result.slug == NEEDS_REVIEW
     assert result.confidence == 0.8
+    assert result.merchant_search is None
+    mock_client.responses.create.assert_not_awaited()
 
 
 async def test_classify_none_content_handled(monkeypatch):
@@ -125,7 +137,14 @@ async def test_classify_none_content_handled(monkeypatch):
 async def test_classify_base_url_forwarded_to_client(monkeypatch):
     from financial_dashboard.services.categorization import openai_provider
 
-    content = json.dumps({"category": "groceries", "confidence": 0.7, "reason": "r"})
+    content = json.dumps(
+        {
+            "category": "groceries",
+            "confidence": 0.2,
+            "reason": "r",
+            "merchant_lookup": {"name": "ACME GROCERS", "city": ""},
+        }
+    )
     mock_client, _ = _make_mock_client(content)
     mock_cls = MagicMock(return_value=mock_client)
     monkeypatch.setattr(openai_provider, "AsyncOpenAI", mock_cls)
@@ -135,7 +154,7 @@ async def test_classify_base_url_forwarded_to_client(monkeypatch):
         examples=[],
         active_slugs=["groceries"],
         api_key="my-key",
-        model="gpt-4o-mini",
+        model="gpt-5.6-luna",
         base_url="https://proxy.example/v1",
     )
 
@@ -144,6 +163,7 @@ async def test_classify_base_url_forwarded_to_client(monkeypatch):
         base_url="https://proxy.example/v1",
         timeout=30.0,
     )
+    mock_client.responses.create.assert_not_awaited()
 
 
 async def test_classify_empty_base_url_passes_none_to_client(monkeypatch):
@@ -242,6 +262,121 @@ async def test_classify_ignores_an_unknown_reasoning_effort(monkeypatch):
     sent = mock_create.await_args.kwargs
     assert sent["reasoning_effort"] is omit
     assert sent["temperature"] == 0.0
+
+
+async def test_uncertain_merchant_uses_public_search_then_reconsiders(monkeypatch):
+    from financial_dashboard.services.categorization import openai_provider
+
+    client, classify = _make_mock_client(
+        json.dumps(
+            {
+                "category": "needs_review",
+                "confidence": 0.2,
+                "reason": "unfamiliar merchant",
+                "merchant_lookup": {"name": "Pureberrys", "city": "Mumbai"},
+            }
+        )
+    )
+    second, _ = _make_mock_client(
+        json.dumps(
+            {
+                "category": "dining",
+                "confidence": 0.85,
+                "reason": "juice bar",
+            }
+        )
+    )
+    classify.side_effect = [
+        classify.return_value,
+        second.chat.completions.create.return_value,
+    ]
+    source = MagicMock(
+        type="url_citation", url="https://example.com/pureberrys", title="Pureberrys"
+    )
+    client.responses.create.return_value = MagicMock(
+        id="resp_search",
+        status="completed",
+        output_text="Pureberrys is a juice bar in Mumbai.",
+        output=[
+            MagicMock(type="web_search_call", status="completed"),
+            MagicMock(
+                type="message",
+                content=[MagicMock(type="output_text", annotations=[source])],
+            ),
+        ],
+    )
+    monkeypatch.setattr(openai_provider, "AsyncOpenAI", MagicMock(return_value=client))
+
+    result = await openai_provider.classify(
+        fields={
+            **_FIELDS,
+            "counterparty": "PUREBERRYSMUMBAI",
+            "raw_description": "private receipt 1234567890",
+        },
+        examples=[],
+        active_slugs=["groceries", "dining"],
+        api_key="secret-key",
+        model="gpt-5.6-luna",
+        base_url="",
+        reasoning_effort="medium",
+    )
+
+    assert result.slug == "dining" and result.confidence == 0.85
+    search = client.responses.create.await_args.kwargs
+    assert json.loads(search["input"]) == {"merchant": "Pureberrys", "city": "Mumbai"}
+    assert all(
+        private not in json.dumps(search)
+        for private in ("250.00", "receipt", "1234567890", "secret-key")
+    )
+    assert search["max_tool_calls"] == 1 and search["store"] is False
+    assert search["tools"] == [{"type": "web_search", "search_context_size": "low"}]
+    client.responses.create.assert_awaited_once()
+    assert classify.await_count == 2
+    assert "tools" not in classify.await_args.kwargs
+    assert "untrusted data" in classify.await_args.kwargs["messages"][0]["content"]
+    assert result.merchant_search["sources"] == [
+        {"url": source.url, "title": source.title}
+    ]
+    assert result.merchant_search["initial"]["category"] == "needs_review"
+
+
+async def test_unsourced_merchant_description_cannot_change_category(monkeypatch):
+    from financial_dashboard.services.categorization import openai_provider
+
+    client, classify = _make_mock_client(
+        json.dumps(
+            {
+                "category": "needs_review",
+                "confidence": 0.2,
+                "reason": "unclear",
+                "merchant_lookup": {"name": "ACME GROCERS", "city": ""},
+            }
+        )
+    )
+    client.responses.create.return_value = MagicMock(
+        id="resp_search",
+        status="completed",
+        output_text="ACME GROCERS is definitely a store.",
+        output=[
+            MagicMock(type="web_search_call", status="completed"),
+            MagicMock(
+                type="message", content=[MagicMock(type="output_text", annotations=[])]
+            ),
+        ],
+    )
+    monkeypatch.setattr(openai_provider, "AsyncOpenAI", MagicMock(return_value=client))
+    result = await openai_provider.classify(
+        fields=_FIELDS,
+        examples=[],
+        active_slugs=["groceries"],
+        api_key="secret-key",
+        model="gpt-5.6-luna",
+        base_url="",
+    )
+    assert result.slug == "needs_review" and result.confidence == 0.2
+    assert result.merchant_search["status"] == "no_evidence"
+    assert result.merchant_search["sources"] == []
+    classify.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

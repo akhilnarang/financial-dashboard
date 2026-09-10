@@ -1,4 +1,5 @@
 from html import unescape
+import json
 import re
 from urllib.parse import parse_qs, urlparse
 
@@ -68,7 +69,20 @@ async def test_audit_detail_shows_model_and_action_evidence(session, client):
         outcome="mutation",
         assistant_text="Saved note.",
         model_input_json='{"prompt":"bounded"}',
-        model_output_json='{"outcome":"mutation"}',
+        model_output_json=json.dumps(
+            {
+                "outcome": "mutation",
+                "merchant_search": {
+                    "sources": [
+                        {
+                            "url": "https://example.com/merchant",
+                            "title": "Merchant website",
+                        },
+                        {"url": "javascript:alert(1)", "title": "Invalid source"},
+                    ]
+                },
+            }
+        ),
         model_explanation="bounded explanation",
         provider="fake",
         model="test-model",
@@ -90,6 +104,8 @@ async def test_audit_detail_shows_model_and_action_evidence(session, client):
     assert "assistant-v7" in response.text
     assert "json_schema" in response.text
     assert 'class="app-header"' in response.text
+    assert 'href="https://example.com/merchant"' in response.text
+    assert 'href="javascript:' not in response.text
 
 
 @pytest.mark.anyio
