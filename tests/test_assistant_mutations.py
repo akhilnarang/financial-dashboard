@@ -781,7 +781,10 @@ async def test_rejected_mutation_fence_does_not_dirty_paisa_revision(session):
 
 
 @pytest.mark.anyio
-async def test_assistant_corrected_category_can_authorize_merchant_rule(session):
+@pytest.mark.parametrize("model_category", ["grocieis", "groceries"])
+async def test_assistant_corrected_category_can_authorize_merchant_rule(
+    session, model_category
+):
     await ensure_category(session, "groceries")
     txn = _txn()
     txn.counterparty = "PUREBERRYSMUMBAI"
@@ -790,9 +793,9 @@ async def test_assistant_corrected_category_can_authorize_merchant_rule(session)
     request = ApplyTransactionChanges(
         name="apply_transaction_changes",
         transaction_id=txn.id,
-        changes={"category": {"op": "set", "value": "grocieis"}},
+        changes={"category": {"op": "set", "value": model_category}},
         merchant_rule={
-            "category": "grocieis",
+            "category": model_category,
             "intent_evidence": "always make a merchant rule for grocieis",
         },
     )

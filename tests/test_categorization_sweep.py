@@ -52,7 +52,22 @@ async def test_rule_sweep_categorizes_interest_rows(memdb):
         assert row.category_method == "rule"
 
 
-async def test_rule_sweep_marks_unmatched_pending_and_terminates(memdb):
+async def test_sweeps_retry_review_once_after_vocabulary_changes(memdb, monkeypatch):
+    from sqlalchemy import select
+
+    from financial_dashboard.db.models import Category, CategoryReviewDecision
+    from financial_dashboard.services import settings
+    from financial_dashboard.services.categorization import engine, llm
+
+    monkeypatch.setitem(settings._cache, "category_vocab_version", "1")
+    monkeypatch.setitem(settings._cache, "categorization.enabled", "true")
+    monkeypatch.setattr(sweep, "get_active_llm_key", lambda: "test-key")
+    result = llm.LlmResult(llm.NEEDS_REVIEW, 0.3, "ambiguous")
+
+    async def classify(**kwargs):
+        return result
+
+    monkeypatch.setattr(engine, "_llm_classify", classify)
     # An unmatched row becomes 'pending_llm' after the rule sweep, and a second
     # sweep finds zero never-touched rows (returns 0) — this is what lets the
     # backfill loop terminate with full coverage instead of re-evaluating forever.
@@ -76,36 +91,34 @@ async def test_rule_sweep_marks_unmatched_pending_and_terminates(memdb):
     assert second == 0  # nothing left untouched → backfill loop would terminate
 
     async with memdb() as s:
-        from sqlalchemy import select
-
         row = (await s.execute(select(Transaction))).scalars().one()
         assert row.category_method == "pending_llm"
         assert row.category is None
 
-
-def test_needs_llm_eligibility_guard():
-    """The re-check that closes the select→process window: eligible for the LLM
-    pass on never-evaluated / pending_llm / prior-'unknown' rows, but never on a
-    manual (or already-finalised) row — so a manual set mid-batch isn't clobbered."""
-    from financial_dashboard.db.models import Transaction
-
-    def txn(method, category=None):
-        return Transaction(
-            bank="b",
-            email_type="x",
-            direction="debit",
-            amount=Decimal("1"),
-            category_method=method,
-            category=category,
-        )
-
-    assert sweep._needs_llm(txn(None)) is True
-    assert sweep._needs_llm(txn("pending_llm")) is True
-    assert sweep._needs_llm(txn("llm", "unknown")) is True  # stale-unknown reprocess
-    # authoritative / finalised → never touched
-    assert sweep._needs_llm(txn("manual", "gift")) is False
-    assert sweep._needs_llm(txn("rule", "interest")) is False
-    assert sweep._needs_llm(txn("llm", "groceries")) is False
+    assert await sweep.run_llm_sweep() == 1
+    assert await sweep.run_llm_sweep() == 0
+    async with memdb() as s:
+        row = (await s.scalars(select(Transaction))).one()
+        assert row.category == "expense"
+        assert row.review_status == "pending"
+        row.review_status = "notified"
+        s.add(Category(slug="groceries", active=True))
+        await s.commit()
+    monkeypatch.setitem(settings._cache, "category_vocab_version", "2")
+    assert await sweep.run_llm_sweep() == 1
+    assert await sweep.run_llm_sweep() == 0
+    async with memdb() as s:
+        row = (await s.scalars(select(Transaction))).one()
+        assert row.category == "expense"
+        assert row.review_status == "pending"
+        assert row.category_vocab_version == 2
+        decisions = (await s.scalars(select(CategoryReviewDecision))).all()
+        assert [decision.status for decision in decisions] == ["superseded", "active"]
+        row.category_method = "manual"
+        row.category_vocab_version = 1
+        row.review_status = "notified"
+        await s.commit()
+    assert await sweep.run_llm_sweep() == 0
 
 
 async def test_review_notify_links_id_and_escapes_fields(memdb, monkeypatch):

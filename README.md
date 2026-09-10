@@ -103,6 +103,12 @@ buttons. Category-button choices and every assistant mutation are audited.
 Assistant category assignment accepts only active vocabulary entries. Existing
 web/API manual assignment remains compatible with historical inactive category
 slugs; the assistant rejects unknown slugs.
+If the transaction changes during a model call, the assistant asks for a new
+reply instead of applying the stale result.
+
+Unresolved LLM categorizations retry once after a vocabulary change, or when
+source enrichment changes the classifier input. Manual categories remain
+authoritative. These retries do not lower the confidence threshold.
 
 Replying to a transaction notification with one image or PDF attaches the
 receipt. A caption replaces the transaction note. Files are stored below
@@ -858,7 +864,7 @@ Relationship notes:
 - `telegram_outbound_deliveries` requires exactly one owner (`interaction_id` or `category_review_decision_id`) and has partial unique indexes on `(interaction_id, ordinal)` and `(category_review_decision_id, ordinal)`.
 - `telegram_message_contexts` uniquely maps `(chat_id, message_id)` to the logical interaction/outbound row; `telegram_outbound_deliveries.delivery_token` is globally unique for Ref-token recovery.
 - `telegram_outbound_deliveries` rows with either `abandoned` or `cancelled` status remain visible in the audit surface; cancellation preserves the delivery history when authorization changes.
-- Pending confirmations use a hash over category, note, cashflow exclusion, and the current categorization input state. Their nullable source-interaction foreign key binds an affirmative reply to the application-rendered clarification that authorized it. `audit_interactions.output_mode` records whether provider output used a strict schema or fallback JSON mode.
+- Pending confirmations and in-flight assistant writes check a hash over category, note, cashflow exclusion, date, account/card/reference identifiers, and the current categorization input state. The pending confirmation's nullable source-interaction foreign key binds an affirmative reply to the application-rendered clarification that authorized it. `audit_interactions.output_mode` records whether provider output used a strict schema or fallback JSON mode.
 - `(portfolio_key, statement_date)` is unique on `cas_uploads` so re-importing the same CAS period replaces the prior upload.
 - `investment_lots` carries a natural unique key `(cas_upload_id, source_ref, instrument_id, acquired_on, reference, source_occurrence)`. `source_occurrence` preserves genuine multiplicity inside one source statement, while idempotent normalization cannot insert the same occurrence twice. Rows repeated by overlapping CAS periods remain attached to every contributing upload; the investment service exposes a deterministic canonical multiset keyed by portfolio/source transaction identity/instrument/date/reference/quantity/cost and retains all contributing upload provenance. A lot is only created when the source states quantity, per-unit cost, cost basis, currency and acquisition date explicitly and consistently (`quantity * unit_cost == cost_basis` to the penny); value-only holdings and demat movements (CAS prints no cost) are excluded and reported as diagnostics, never fabricated into a lot. Acquisition cost facts are never derived from a current NAV/value. Current valuation facts are read separately from the latest statement per portfolio and preserve demat-account/folio identity even when the same ISIN is held in several sources. These rows are **not** consumed by the Paisa projection, which represents CAS as an aggregate valuation only; they remain available to the dashboard and to a future cost-basis feature.
 - `snapshot_holdings` has nullable investment-detail columns (`instrument_id`, `quantity`, `unit_price`, `currency`, `cost_basis`, `acquired_on`). CAS ingestion still aggregates holdings by asset class for the net-worth breakdown, so these stay NULL on those rows; they are populated only when a holding represents a single instrument the CAS explicitly priced.

@@ -48,6 +48,24 @@ async def resolve_account_type(session: AsyncSession, txn: Transaction) -> str |
     return account.type if account else None
 
 
+async def requeue_after_enrichment(session: AsyncSession, txn: Transaction) -> None:
+    """Retry unresolved model results only when classifier inputs changed."""
+    if txn.category_method != "llm" or (
+        txn.category != "unknown" and txn.review_status not in ("pending", "notified")
+    ):
+        return
+    account_type = await resolve_account_type(session, txn)
+    if (
+        compute_input_hash(build_input_payload(txn, account_type))
+        == txn.category_input_hash
+    ):
+        return
+    txn.category_method = "pending_llm"
+    txn.review_status = None
+    txn.review_reason = None
+    await supersede_active_decisions(session, txn.id)
+
+
 def _active_model_name() -> str:
     """Return the model identifier for whichever provider is currently selected."""
     provider = get_setting("categorization.llm_provider") or "gemini"
@@ -206,6 +224,10 @@ async def categorize_one(
             txn.review_status = None
             await supersede_active_decisions(session, txn.id)
     if txn.review_status == "pending":
+        # A new model attempt needs a fresh review and delivery, even if its
+        # candidates match an earlier, already-notified decision.
+        await supersede_active_decisions(session, txn.id)
+        txn.notify_attempts = 0
         compatible_candidates = [
             candidate
             for candidate in candidates_from_result(result)
@@ -236,7 +258,8 @@ def select_needs_work_stmt(*, llm: bool, limit: int):
 
     llm=False: rule pass — rows never evaluated (method IS NULL).
     llm=True: LLM pass — 'pending_llm' rows, brand-new NULL rows, OR a prior LLM
-    'unknown' whose vocabulary is now stale (a new slug may now fit).
+    'unknown' or unresolved review whose vocabulary is now stale (a new slug
+    may now fit). Review rows already have direction-default categories.
     """
     current_vocab = get_vocab_version()
     if not llm:
@@ -253,7 +276,10 @@ def select_needs_work_stmt(*, llm: bool, limit: int):
             Transaction.category_method.is_(None)
             | (Transaction.category_method == "pending_llm")
             | (
-                (Transaction.category == "unknown")
+                (
+                    (Transaction.category == "unknown")
+                    | Transaction.review_status.in_(("pending", "notified"))
+                )
                 & (Transaction.category_method == "llm")
                 & (
                     Transaction.category_vocab_version.is_(None)

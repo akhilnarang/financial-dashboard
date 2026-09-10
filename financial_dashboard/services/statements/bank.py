@@ -49,6 +49,7 @@ from financial_dashboard.core.masks import mask_last4
 from financial_dashboard.integrations.parsers import parse_bank_statement_pdf
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.categorization.rules import is_fd_counterparty
+from financial_dashboard.services.categorization.engine import requeue_after_enrichment
 from financial_dashboard.services.categorization.self_transfer import (
     apply_reference_self_transfer_rule,
 )
@@ -1007,6 +1008,7 @@ async def enrich_matched_transactions(recon: dict) -> int:
                 changed = True
 
             if changed:
+                await requeue_after_enrichment(session, txn)
                 enriched += 1
                 entry["enriched"] = True
 

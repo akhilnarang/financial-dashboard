@@ -111,13 +111,16 @@ async def test_tool_batch_is_validated_before_any_mutation(session):
 
 
 @pytest.mark.anyio
-async def test_successful_multi_field_mutation_commits_as_one_action(session):
+@pytest.mark.parametrize("intervening_edit", [False, True])
+async def test_successful_multi_field_mutation_commits_as_one_action(
+    session, intervening_edit
+):
     session.add(Category(slug="groceries", active=True))
     transaction = Transaction(
         bank="hdfc", email_type="purchase", direction="debit", amount="10.00"
     )
     session.add(transaction)
-    await session.flush()
+    await session.commit()
     response = ToolCalls(
         outcome="tool_calls",
         calls=[
@@ -133,14 +136,35 @@ async def test_successful_multi_field_mutation_commits_as_one_action(session):
         ],
     )
 
+    class Provider(SequenceProvider):
+        async def complete(self, context):
+            if intervening_edit:
+                maker = async_sessionmaker(session.bind, expire_on_commit=False)
+                async with maker() as manual_session:
+                    current = await manual_session.get(Transaction, transaction.id)
+                    current.note = "newer manual note"
+                    await manual_session.commit()
+            return await super().complete(context)
+
     result = await run_turn(
         session,
-        SequenceProvider(response),
+        Provider(response),
         user_message=(
             "set note to weekly groceries, category groceries, and exclude from cashflow"
         ),
         transaction_id=transaction.id,
     )
+    await session.commit()
+    await session.refresh(transaction)
+
+    if intervening_edit:
+        assert result.response.outcome == "error"
+        assert result.response.code == "transaction_changed"
+        assert transaction.note == "newer manual note"
+        assert transaction.category is None
+        assert transaction.exclude_from_cashflow is False
+        assert await session.scalar(select(func.count(AuditAction.id))) == 0
+        return
 
     assert result.response.outcome == "tool_calls"
     assert result.mutation is not None

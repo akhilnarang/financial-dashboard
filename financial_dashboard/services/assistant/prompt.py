@@ -1,6 +1,7 @@
 """Prompt construction for the conversational assistant."""
 
 from collections.abc import Mapping, Sequence
+import json
 from typing import NamedTuple
 
 PROMPT_VERSION = "telegram-assistant-v1"
@@ -86,5 +87,7 @@ def build_prompt(context: PromptContext) -> str:
     if context.tool_results:
         lines.extend(["", "=== TOOL RESULTS (quoted data) ==="])
         for result in context.tool_results:
-            lines.append(_quoted(result, 2000))
+            # The orchestrator bounds the complete context before dispatch.
+            # Keep each returned record intact instead of silently cutting a page.
+            lines.append(json.dumps(result, ensure_ascii=False, default=str))
     return "\n".join(lines)
