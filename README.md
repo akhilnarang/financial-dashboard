@@ -112,14 +112,16 @@ authoritative. These retries do not lower the confidence threshold.
 
 With `gpt-5.6-luna` on the official OpenAI endpoint, an uncertain classifier
 can request a merchant-name lookup before asking for review. The lookup receives
-only a validated merchant name and a city already present in the source text,
-never the transaction amount, notes, identifiers, or conversation history.
+only the model-inferred merchant name and optional city, with the existing
+numeric-PII and configured-name redaction applied before search. The transaction
+amount, notes, and conversation history are not forwarded to the search call.
 One Responses API web-search call and one reconsideration share a 30-second
 deadline. Search failures or inconclusive evidence retain the original review;
 successful results still pass the existing category and direction checks.
 Other models and OpenAI-compatible endpoints keep their existing behavior.
-Names containing digits or handles are skipped; business identity is a model
-judgment, not a deterministic guarantee. Search adds API usage only when this
+Merchant names may contain digits, punctuation, and non-English text. Names and
+cities need not be exact copies of narration; identity is a model judgment.
+Empty merchant names, oversized queries, and handles are still skipped. Search adds API usage only when this
 fallback runs.
 
 Each attempted lookup is recorded under `trigger=merchant_lookup` in `/audit`,

@@ -58,13 +58,13 @@ async def classify(
     if search_enabled:
         prompt += (
             "\nIf uncertain specifically because a public merchant business is "
-            'unfamiliar, also return merchant_lookup: {"name": "exact merchant '
-            'name copied from counterparty", "city": "exact city copied from '
-            'counterparty or description, or empty"}. A concatenated name and '
-            "city such as PUREBERRYSMUMBAI may be split. Otherwise omit merchant_lookup. Never "
+            'unfamiliar, also return merchant_lookup: {"name": "public merchant '
+            'name", "city": "city if reasonably inferred from context, otherwise empty"}. '
+            "Infer the business name from abbreviations or concatenated narration. "
+            "Otherwise omit merchant_lookup. Never "
             "request lookup for people, personal transfers, payment gateways, "
             "bank names, handles, references or missing payment purpose. Do not "
-            "infer a location or include any other transaction details."
+            "include any other transaction details or personal identifiers."
         )
     client = AsyncOpenAI(
         api_key=api_key,
@@ -88,51 +88,24 @@ async def classify(
     if (
         not search_enabled
         or str(client.base_url).rstrip("/") != "https://api.openai.com/v1"
-        or (fields.get("channel") or "").casefold() in {"imps", "neft", "rtgs", "p2p"}
-        or re.search(
-            r"\b(?:p2p|person[- ]to[- ]person|self[- ]transfer)\b",
-            fields.get("raw_description") or "",
-            re.IGNORECASE,
-        )
         or (result.slug != NEEDS_REVIEW and result.confidence >= confidence_threshold)
         or not isinstance(lookup, dict)
     ):
         return result
     merchant, city = lookup.get("name"), lookup.get("city", "")
-    counterparty = redact_names(redact_pii(fields.get("counterparty")), name_tokens)
-    if "@" in counterparty or "[redacted-" in counterparty:
+    if not isinstance(merchant, str) or not isinstance(city, str):
         return result
-    joined = (
-        isinstance(merchant, str)
-        and isinstance(city, str)
-        and bool(city)
-        and (merchant + city).casefold() == counterparty.casefold()
+    # Let the model infer identity; redact the proposed query before searching.
+    merchant, city = (
+        re.sub(
+            r"\[redacted-[a-z]+\]", "", redact_names(redact_pii(value), name_tokens)
+        ).strip()
+        for value in (merchant, city)
     )
-    # Fail closed on identifiers, redaction markers and invented query context.
-    # ponytail: alphabetic merchant names only; widen when a real numeric brand needs it.
-    for value, original, required in (
-        (merchant, counterparty, True),
-        (city, counterparty + " " + (fields.get("raw_description") or ""), False),
+    if not merchant or any(
+        len(value) > 80 or "@" in value for value in (merchant, city)
     ):
-        if value == "" and not required:
-            continue
-        if (
-            not isinstance(value, str)
-            or not re.fullmatch(r"[A-Za-z][A-Za-z .&'-]{1,79}", value)
-            or (
-                not joined
-                and not re.search(
-                    rf"(?<![\w@]){re.escape(value)}(?![\w@])",
-                    re.sub(
-                        r"\[redacted-[a-z]+\]",
-                        "",
-                        redact_names(redact_pii(original), name_tokens),
-                    ),
-                    re.IGNORECASE,
-                )
-            )
-        ):
-            return result
+        return result
     evidence = {
         "status": "failed",
         "model": model,

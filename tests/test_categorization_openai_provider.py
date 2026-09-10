@@ -256,6 +256,7 @@ async def test_classify_ignores_an_unknown_reasoning_effort(monkeypatch):
 
 
 async def test_uncertain_merchant_uses_public_search_then_reconsiders(monkeypatch):
+    """Inferred numeric/Unicode names work without copying private identifiers into search."""
     from financial_dashboard.services.categorization import openai_provider
 
     client, classify = _make_mock_client(
@@ -264,7 +265,7 @@ async def test_uncertain_merchant_uses_public_search_then_reconsiders(monkeypatc
                 "category": "needs_review",
                 "confidence": 0.2,
                 "reason": "unfamiliar merchant",
-                "merchant_lookup": {"name": "Pureberrys", "city": "Mumbai"},
+                "merchant_lookup": {"name": "Café 24", "city": "Montréal 1234567890"},
             }
         )
     )
@@ -273,7 +274,7 @@ async def test_uncertain_merchant_uses_public_search_then_reconsiders(monkeypatc
             {
                 "category": "dining",
                 "confidence": 0.85,
-                "reason": "juice bar",
+                "reason": "café",
             }
         )
     )
@@ -282,12 +283,12 @@ async def test_uncertain_merchant_uses_public_search_then_reconsiders(monkeypatc
         second.chat.completions.create.return_value,
     ]
     source = MagicMock(
-        type="url_citation", url="https://example.com/pureberrys", title="Pureberrys"
+        type="url_citation", url="https://example.com/cafe24", title="Café 24"
     )
     client.responses.create.return_value = MagicMock(
         id="resp_search",
         status="completed",
-        output_text="Pureberrys is a juice bar in Mumbai.",
+        output_text="Café 24 is a café in Montréal.",
         output=[
             MagicMock(type="web_search_call", status="completed"),
             MagicMock(
@@ -301,7 +302,7 @@ async def test_uncertain_merchant_uses_public_search_then_reconsiders(monkeypatc
     result = await openai_provider.classify(
         fields={
             **_FIELDS,
-            "counterparty": "PUREBERRYSMUMBAI",
+            "counterparty": "CAFE24",
             "raw_description": "private receipt 1234567890",
         },
         examples=[],
@@ -314,7 +315,7 @@ async def test_uncertain_merchant_uses_public_search_then_reconsiders(monkeypatc
 
     assert result.slug == "dining" and result.confidence == 0.85
     search = client.responses.create.await_args.kwargs
-    assert json.loads(search["input"]) == {"merchant": "Pureberrys", "city": "Mumbai"}
+    assert json.loads(search["input"]) == {"merchant": "Café 24", "city": "Montréal"}
     assert all(
         private not in json.dumps(search)
         for private in ("250.00", "receipt", "1234567890", "secret-key")
