@@ -110,6 +110,26 @@ Unresolved LLM categorizations retry once after a vocabulary change, or when
 source enrichment changes the classifier input. Manual categories remain
 authoritative. These retries do not lower the confidence threshold.
 
+With `gpt-5.6-luna` on the official OpenAI endpoint, an uncertain classifier
+can request a merchant-name lookup before asking for review. The lookup receives
+only a validated merchant name and a city already present in the source text,
+never the transaction amount, notes, identifiers, or conversation history.
+One Responses API web-search call and one reconsideration share a 30-second
+deadline. Search failures or inconclusive evidence retain the original review;
+successful results still pass the existing category and direction checks.
+Other models and OpenAI-compatible endpoints keep their existing behavior.
+Names containing digits or handles are skipped; business identity is a model
+judgment, not a deterministic guarantee. Search adds API usage only when this
+fallback runs.
+
+Each attempted lookup is recorded under `trigger=merchant_lookup` in `/audit`,
+including the initial result, source links, reconsidered result, and applied
+category with its before/after action. Results made stale by an intervening
+transaction edit are recorded but not applied. These background records use
+`inbound_chat_id=0` to indicate no
+Telegram event. Merchant descriptions and linked pages are untrusted evidence;
+they do not authorize merchant rules or new categories.
+
 Replying to a transaction notification with one image or PDF attaches the
 receipt. A caption replaces the transaction note. Files are stored below
 `TRANSACTION_ATTACHMENT_ROOT` (default `./data/transaction_attachments`) and

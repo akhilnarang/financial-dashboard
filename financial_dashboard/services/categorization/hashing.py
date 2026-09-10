@@ -6,6 +6,7 @@ the sweep also retries them after vocabulary changes.
 
 import hashlib
 import json
+from decimal import Decimal
 from typing import TypedDict
 
 from financial_dashboard.db.models import Transaction
@@ -55,6 +56,9 @@ def build_confirmation_payload(
     change, transaction context, and the classifier input hash. Model responses
     and later affirmative replies must fail closed after an intervening edit.
     """
+    input_state = build_input_payload(txn, account_type)
+    # SQLite restores Numeric scale on reload; 50 and 50.00 are the same money.
+    input_state["amount"] = str(Decimal(input_state["amount"]).normalize())
     return {
         "category": txn.category,
         "note": txn.note,
@@ -64,7 +68,7 @@ def build_confirmation_payload(
         "card_id": txn.card_id,
         "reference_number": txn.reference_number,
         "category_input_hash": txn.category_input_hash,
-        "input_state": build_input_payload(txn, account_type),
+        "input_state": input_state,
     }
 
 

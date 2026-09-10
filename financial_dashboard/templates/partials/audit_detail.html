@@ -17,6 +17,7 @@
 <h3>User message</h3><div class="audit-json">{{ row.user_text or '' }}</div>
 <h3>Assistant response</h3><div class="audit-json">{{ row.assistant_text or '' }}</div>
 {% if row.model_explanation %}<h3>Model explanation</h3><div class="audit-json">{{ row.model_explanation }}</div>{% endif %}
+{% if merchant_sources %}<h3>Merchant lookup sources</h3><ul>{% for source in merchant_sources %}<li><a href="{{ source.url }}" rel="noopener noreferrer">{{ source.title or source.url }}</a></li>{% endfor %}</ul>{% endif %}
 {% if row.error_code %}<h3>Error</h3><div class="audit-json">{{ row.error_code }}: {{ row.error_detail or '' }}</div>{% endif %}
 {% if row.model_input_json %}<h3>Model input</h3><div class="audit-json">{{ pretty_json(row.model_input_json) }}</div>{% endif %}
 {% if row.model_output_json %}<h3>Model output</h3><div class="audit-json">{{ pretty_json(row.model_output_json) }}</div>{% endif %}

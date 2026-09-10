@@ -33,6 +33,8 @@ class LlmResult(NamedTuple):
     confidence: float
     reason: str
     candidates: tuple[LlmCandidate, ...] = ()
+    # Transport-owned evidence; never populated from classifier JSON.
+    merchant_search: dict[str, Any] | None = None
 
 
 # A short, evidenced note per bank on how to read its raw narration codes.
