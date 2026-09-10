@@ -165,7 +165,6 @@ async def classify(
                 tool_choice="required",
                 max_tool_calls=1,
                 max_output_tokens=2000,
-                include=["web_search_call.action.sources"],
                 store=False,
                 reasoning={"effort": effort} if effort else omit,
             )
