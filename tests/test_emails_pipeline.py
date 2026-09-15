@@ -838,7 +838,6 @@ async def test_completion_email_replaces_a_saved_label(
     replace it, as the settlement SMS does.
     """
     rule_id = await _seed_rule(session_maker, bank="hdfc")
-    email_id = await _seed_completion_email(session_maker, rule_id)
     async with session_maker() as s:
         s.add(
             _rtgs_submission_row(
