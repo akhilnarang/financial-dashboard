@@ -141,6 +141,11 @@ def _process_eml(
     txn = parsed.transaction
     if txn is None:
         return None, None
+    if parsed.ledger_role != "primary":
+        # A completion, provisional or restatement leg opens no row. This
+        # script inserts rows directly, with no matcher to complete an
+        # earlier one, so importing such a leg would double-count the event.
+        return None, None
     transaction_date = txn.transaction_date
     if transaction_date is None and received_at is not None:
         transaction_date = received_at.date()

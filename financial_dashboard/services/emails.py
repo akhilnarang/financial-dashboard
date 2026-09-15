@@ -7,6 +7,7 @@ from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import (
     Account,
@@ -251,6 +252,62 @@ def _process_email_full(bank: str, raw_bytes: bytes) -> ProcessedEmailParse:
     )
 
 
+# A completion message supplies a reference an earlier message left out. It
+# opens no row of its own. See bank_email_parser ParsedEmail.ledger_role.
+_COMPLETION_ROLE = "completion"
+
+
+async def complete_email_reference(
+    session: AsyncSession, email_row: Email, txn_data: dict
+) -> bool:
+    """Stamp a completion leg's reference onto its one primary row.
+
+    The fuzzy matcher cannot pair the two legs of an HDFC RTGS transfer. The
+    submission's time comes from the arrival of the email, which limits it to
+    a one-minute window, and the settlement follows minutes later. So this
+    matches on the reference and the amount instead. The matcher is shared
+    with the SMS pipeline, so both channels agree.
+
+    Args:
+        session: Open session. The caller owns the transaction; this
+            flushes but never commits.
+        email_row: The ``Email`` this leg came from. Its ``status`` and
+            ``error`` are set here.
+        txn_data: Normalized transaction fields. ``reference_number`` and
+            ``channel`` identify the primary row.
+
+    Returns:
+        True when a row was completed, False when this leg was skipped.
+        Fail-closed: on zero or more than one candidate it writes no row.
+    """
+    from financial_dashboard.services.categorization.self_transfer import (
+        apply_reference_self_transfer_rule,
+    )
+    from financial_dashboard.services.sms_pipeline import _find_completion_primary
+
+    reference = (txn_data.get("reference_number") or "").strip()
+    primary, count = await _find_completion_primary(session, txn_data)
+    if primary is None:
+        email_row.status = "skipped"
+        email_row.error = (
+            f"completion leg: no unique primary row to complete "
+            f"(found {count}); left unpaired"
+        )
+        return False
+
+    primary.reference_number = reference
+    if primary.counterparty is None and txn_data.get("counterparty"):
+        primary.counterparty = txn_data["counterparty"]
+    email_row.status = "parsed"
+    email_row.error = None
+    # Claim the row only if no other email holds it.
+    if primary.email_id is None:
+        primary.email_id = email_row.id
+    await session.flush()
+    await apply_reference_self_transfer_rule(session, primary)
+    return True
+
+
 _STATEMENT_KINDS = {
     EmailKind.CC_STATEMENT,
     EmailKind.BANK_STATEMENT,
@@ -266,6 +323,8 @@ class EmailDispatchResult(NamedTuple):
     password_hint: str | None
     stmt_result: dict | None
     recognized_non_transaction: bool
+    # Kept out of txn_data, which is unpacked into a Transaction row.
+    ledger_role: str = "primary"
 
 
 async def _dispatch_email_summary(
@@ -492,6 +551,7 @@ async def parse_email_by_kind(
         password_hint,
         stmt_result,
         recognized_non_transaction,
+        parsed_email.ledger_role if parsed_email else "primary",
     )
 
 
@@ -616,7 +676,12 @@ async def handle_polled_email(
 
             skip_txn_types = {"sbi_cc_transaction_declined"}
 
-            if txn_data and txn_data.get("email_type") in skip_txn_types:
+            if txn_data and dispatch_result.ledger_role == _COMPLETION_ROLE:
+                if await complete_email_reference(session, email_row, txn_data):
+                    stats["parsed"] += 1
+                else:
+                    stats["skipped"] += 1
+            elif txn_data and txn_data.get("email_type") in skip_txn_types:
                 email_row.status = "parsed"
                 email_row.error = None
                 stats["parsed"] += 1

@@ -492,6 +492,7 @@ async def test_parse_email_by_kind_threads_password_hint_for_statement_emails(
         transaction=None,
         password_hint="DOB in DDMMYYYY",
         statement=None,
+        ledger_role="primary",
     )
 
     monkeypatch.setattr(
@@ -554,6 +555,7 @@ async def test_parse_email_by_kind_transaction_does_not_route_to_summary(monkeyp
         statement=fake_summary,
         event_time_source="body",
         identifies_by="counterparty",
+        ledger_role="primary",
     )
 
     monkeypatch.setattr(emails_service, "parse_email", lambda bank, html: fake_parsed)

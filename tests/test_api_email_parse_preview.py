@@ -415,3 +415,91 @@ async def test_email_parse_preview_openapi_is_typed(client):
         "responses"
     ]["200"]["content"]["application/json"]["schema"]
     assert schema == {"$ref": "#/components/schemas/EmailParsePreviewResponse"}
+
+
+def _completion_parse(*, reference_number: str = "SAMPLER00000000000000"):
+    """A settlement leg: it completes a row instead of opening one."""
+    parsed = ParsedEmail(
+        bank="synthetic-bank",
+        email_type="synthetic_completed_alert",
+        ledger_role="completion",
+        transaction=TransactionAlert(
+            direction="debit",
+            amount=Money(amount=Decimal("12.34"), currency="INR"),
+            transaction_date=datetime.date(2030, 1, 2),
+            reference_number=reference_number,
+            channel="rtgs",
+        ),
+    )
+    return ProcessedEmailParse(
+        None,
+        {
+            "bank": parsed.bank,
+            "email_type": parsed.email_type,
+            "direction": "debit",
+            "amount": Decimal("12.34"),
+            "currency": "INR",
+            "transaction_date": datetime.date(2030, 1, 2),
+            "transaction_time": None,
+            "counterparty": None,
+            "card_mask": None,
+            "account_mask": None,
+            "reference_number": reference_number,
+            "channel": "rtgs",
+            "balance": None,
+            "raw_description": None,
+        },
+        None,
+        parsed,
+    )
+
+
+async def test_email_parse_preview_projects_completion_not_insert(
+    client, session, monkeypatch
+):
+    """A completion leg stamps a reference. It must not project an insert.
+
+    The preview reported "insert" before, which told the reader that a
+    reparse would open a second row for one money event.
+    """
+    email = await _email(session)
+    session.add(
+        Transaction(
+            bank="synthetic-bank",
+            email_type="synthetic_submission_alert",
+            direction="debit",
+            amount=Decimal("12.34"),
+            currency="INR",
+            transaction_date=datetime.date(2030, 1, 2),
+            account_mask="XX0000",
+            channel="rtgs",
+            source="email",
+        )
+    )
+    await session.commit()
+    _patch_raw_and_parse(monkeypatch, _completion_parse())
+
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 200, response.text
+    merge = response.json()["merge"]
+    assert merge["action"] == "completion"
+    assert merge["target_transaction_id"] is not None
+    assert merge["changed_fields"] == ["reference_number"]
+
+
+async def test_email_parse_preview_completion_without_a_row_names_no_target(
+    client, session, monkeypatch
+):
+    """No row to complete: the preview must name no target and change nothing."""
+    email = await _email(session)
+    await session.commit()
+    _patch_raw_and_parse(monkeypatch, _completion_parse())
+
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 200, response.text
+    merge = response.json()["merge"]
+    assert merge["action"] == "completion"
+    assert merge["target_transaction_id"] is None
+    assert merge["changed_fields"] == []

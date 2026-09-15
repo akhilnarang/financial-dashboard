@@ -58,7 +58,11 @@ from financial_dashboard.services.categorization.self_transfer import (
 from financial_dashboard.services.email_attachments import (
     lock_email_for_attachment,
 )
-from financial_dashboard.services.emails import parse_email_by_kind
+from financial_dashboard.services.emails import (
+    _COMPLETION_ROLE,
+    complete_email_reference,
+    parse_email_by_kind,
+)
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.reminders import check_payment_received
 from financial_dashboard.services.txn_merge import (
@@ -751,11 +755,17 @@ async def reparse_email(
         txn_id = None
         duplicate_error: str | None = None
         deferred_noop = False
+        completion_unpaired = False
         pending_payment_check: tuple[int, int, Decimal] | None = None
         pending_disambiguation: dict | None = None
         enrichment_diff = None
         joined_existing_row = False
-        if txn_data:
+        if txn_data and dispatch_result.ledger_role == _COMPLETION_ROLE:
+            # A completion leg opens no row of its own, on a reparse too.
+            completion_unpaired = not await complete_email_reference(
+                session, em, txn_data
+            )
+        elif txn_data:
             try:
                 (
                     txn_id,
@@ -842,6 +852,14 @@ async def reparse_email(
                 exc,
             )
 
+    if completion_unpaired:
+        logger.info("Reparse of email %d left unpaired (completion leg)", email_id)
+        return ReparseEmailResponse(
+            message="Completion leg: no unique row to complete — left unpaired.",
+            new_status="skipped",
+            txn_id=None,
+        )
+
     if deferred_noop:
         # Withheld duplicate re-deferred (no force_new). No row, still skipped.
         logger.info("Reparse of email %d re-deferred (possible duplicate)", email_id)
@@ -917,6 +935,19 @@ async def reparse_all_failed(
         )
         txn_data = dispatch_result.txn_data
         stmt_result = dispatch_result.stmt_result
+
+        if txn_data and dispatch_result.ledger_role == _COMPLETION_ROLE:
+            # A completion leg opens no row of its own, on a reparse too.
+            async with session.begin():
+                email = await lock_email_for_attachment(session, email_row.id)
+                if email is None:
+                    still_failed += 1
+                    continue
+                if await complete_email_reference(session, email, txn_data):
+                    succeeded += 1
+                else:
+                    skipped += 1
+            continue
 
         if (
             not txn_data
