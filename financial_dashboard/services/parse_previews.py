@@ -403,6 +403,7 @@ def _email_merge(
         "defer",
         "conflict",
         "multiple_linked",
+        "completion",
     ],
     *,
     target_id: int | None = None,
