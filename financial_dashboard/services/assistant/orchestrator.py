@@ -606,7 +606,7 @@ async def claim_pending_confirmation(
     *,
     replied_to_interaction_id: int,
 ) -> ApplyTransactionChanges | None:
-    """CAS-claim an application-authored pending action for a direct reply."""
+    """Use compare-and-swap to claim an application-authored pending action for a direct reply."""
     conversation = await session.get(TelegramConversation, conversation_id)
     if (
         conversation is None
@@ -677,7 +677,7 @@ async def run_pending_confirmation(
         raise MutationRejected("confirmation must be a direct affirmative")
     # Acquire SQLite's writer lock before reading the confirmation fingerprint.
     # Otherwise a concurrent manual edit could land between the freshness read
-    # and the confirmation CAS, allowing a stale action to proceed.
+    # and the confirmation compare-and-swap, allowing a stale action to proceed.
     await _lock_authorized_chat(session, authorized_chat_id)
     fresh_hash = None
     conversation = await session.get(TelegramConversation, conversation_id)

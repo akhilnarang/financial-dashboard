@@ -98,7 +98,7 @@ async def claim_processing(
     *,
     lease: datetime.timedelta = PROCESSING_LEASE,
 ) -> ProcessingClaim:
-    """CAS claim processing, reclaiming only an expired lease."""
+    """Use compare-and-swap to claim processing, reclaiming only an expired lease."""
     token = secrets.token_urlsafe(24)
     now = utc_now()
     until = now + lease

@@ -499,7 +499,7 @@ async def _apply_transaction_changes(
 async def undo_merchant_rule(
     session: AsyncSession, action_id: int, *, interaction_id: int | None = None
 ) -> bool:
-    """CAS-claim and reverse one merchant-rule action in this transaction."""
+    """Use compare-and-swap to claim and reverse one merchant-rule action in this transaction."""
     action = await session.get(AuditAction, action_id)
     if action is None or action.action_type != "merchant_rule":
         return False
