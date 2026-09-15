@@ -19,7 +19,7 @@ dependencies = [
     "bank-statement-parser",
     "cas-parser",
     "cc-parser",
-    "fastapi[standard]>=0.135,<1",
+    "fastapi[standard-no-fastapi-cloud-cli]>=0.135,<1",
     "cryptography>=49.0.0,<51",
     "python-telegram-bot>=22.7,<23",
     "python-dateutil>=2.9.0.post0",
@@ -36,6 +36,12 @@ entrypoint = "financial_dashboard.main:create_app"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
+
+[tool.uv]
+# Only resolve to artifacts that PyPI has served for three days. A freshly
+# published malicious version has had no time to be found and yanked, and
+# this repo handles the user's bank data.
+exclude-newer = "3 days"
 
 [tool.uv.sources]
 bank-email-parser = { git = "https://github.com/akhilnarang/bank-email-parser" }
