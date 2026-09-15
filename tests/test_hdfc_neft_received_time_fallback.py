@@ -135,6 +135,22 @@ def test_the_declaration_reaches_txn_data_as_a_column_value():
     assert txn_data["transaction_time_is_received_time"] is True
 
 
+def test_the_name_source_reaches_txn_data_as_a_column_value():
+    """HDFC prints the payee label the user saved, not the account holder.
+
+    The parser says so. The dashboard must record it, or every such row
+    claims a bank stated the name and a later label can replace it.
+    """
+    _error, txn_data, _hint, parsed = _process_email_full(
+        "hdfc", _raw_hdfc_neft("Sun, 26 Jul 2026 20:15:42 +0530")
+    )
+    assert parsed is not None
+    assert parsed.counterparty_source == "user_alias"
+    assert txn_data is not None
+    assert txn_data["counterparty"] == "Sample Payee"
+    assert txn_data["counterparty_source"] == "user_alias"
+
+
 def test_am_pm_disambiguation_still_runs_for_its_own_types():
     """The fallback is an elif before the AM/PM branch. Make sure that it did
     not remove the AM/PM step for types that read a true time."""

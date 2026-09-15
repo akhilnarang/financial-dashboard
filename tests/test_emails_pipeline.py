@@ -829,6 +829,77 @@ async def test_reparse_keeps_a_bank_name_over_an_incoming_label(
 
 
 @pytest.mark.anyio
+async def test_reparse_records_the_source_of_a_name_it_accepts(
+    session_maker, monkeypatch
+) -> None:
+    """A reparse that fills an empty name must state where the name came from.
+
+    The row holds no name, so the guard allows the write. The stored source
+    must follow the stored name. If it stays "bank", a later email that
+    carries the true name cannot replace the label.
+    """
+    rule_id = await _seed_rule(session_maker, bank="hdfc")
+    async with session_maker() as s:
+        em = Email(
+            provider="gmail",
+            message_id="reparse-alias-2",
+            sender="alerts@example.bank.in",
+            subject="Account update",
+            received_at=datetime.datetime(2026, 6, 2, 10, 0, tzinfo=datetime.UTC),
+            status="parsed",
+            rule_id=rule_id,
+        )
+        s.add(em)
+        await s.flush()
+        s.add(
+            Transaction(
+                bank="hdfc",
+                email_type="hdfc_account_neft_debit_alert",
+                direction="debit",
+                amount=Decimal("500"),
+                currency="INR",
+                transaction_date=datetime.date(2026, 6, 2),
+                counterparty=None,
+                counterparty_source="bank",
+                email_id=em.id,
+                source="email",
+            )
+        )
+        await s.commit()
+        email_id = em.id
+
+    txn_data = _txn_data(
+        bank="hdfc",
+        email_type="hdfc_account_neft_debit_alert",
+        transaction_date=datetime.date(2026, 6, 2),
+        transaction_time=None,
+        counterparty="My Saved Payee",
+        counterparty_source="user_alias",
+    )
+    _stub_parser_with_role(monkeypatch, txn_data, ledger_role="primary")
+    with (
+        patch(
+            "financial_dashboard.web.emails.load_or_fetch_raw_email",
+            new=AsyncMock(return_value=RawEmailResult(_raw_email(), None, "provider")),
+        ),
+        patch(
+            "financial_dashboard.web.emails.should_notify_transactions",
+            return_value=False,
+        ),
+    ):
+        app = _build_web_app(session_maker)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await client.post(f"/emails/{email_id}/reparse")
+
+    async with session_maker() as s:
+        row = (await s.execute(select(Transaction))).scalars().one()
+        assert row.counterparty == "My Saved Payee"
+        assert row.counterparty_source == "user_alias"
+
+
+@pytest.mark.anyio
 async def test_completion_email_replaces_a_saved_label(
     session_maker, monkeypatch
 ) -> None:
@@ -941,3 +1012,5 @@ def test_populate_still_imports_the_submission_leg():
     assert data is not None
     assert data["direction"] == "debit"
     assert data["account_mask"] == "XX0000"
+    assert data["counterparty"] == "Sample Payee"
+    assert data["counterparty_source"] == "user_alias"
