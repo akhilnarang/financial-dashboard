@@ -175,7 +175,7 @@ async def consume_decision(
     interaction_id: int | None = None,
     delivery_id: int | None = None,
 ) -> AuditAction | None:
-    """CAS-claim an active choice and apply category plus audit atomically."""
+    """Use compare-and-swap to claim an active choice and apply category plus audit atomically."""
     now = utc_now()
     decision = await session.get(CategoryReviewDecision, decision_id)
     if decision is None or decision.status != "active":

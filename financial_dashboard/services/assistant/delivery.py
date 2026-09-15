@@ -97,7 +97,7 @@ async def claim_delivery(
     *,
     lease: datetime.timedelta = DELIVERY_LEASE,
 ) -> DeliveryClaim:
-    """CAS claim pending or stale unknown/delivering delivery work."""
+    """Use compare-and-swap to claim pending or stale unknown/delivering delivery work."""
     token = secrets.token_urlsafe(24)
     now = utc_now()
     result = cast(
@@ -172,7 +172,7 @@ async def settle_delivery_from_callback(
         .where(
             TelegramOutboundDelivery.id == delivery_id,
             # A callback is proof that Telegram rendered the message even if
-            # recovery already moved the row to ``abandoned``.  Keep the CAS
+            # recovery already moved the row to ``abandoned``.  Keep the compare-and-swap
             # so a cancelled row (or a different delivery) cannot be revived.
             TelegramOutboundDelivery.status.in_(
                 ["pending", "delivering", "delivery_unknown", "abandoned"]
