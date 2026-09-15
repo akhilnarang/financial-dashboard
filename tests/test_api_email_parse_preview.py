@@ -417,11 +417,6 @@ async def test_email_parse_preview_openapi_is_typed(client):
     assert schema == {"$ref": "#/components/schemas/EmailParsePreviewResponse"}
 
 
-def _parser_has_ledger_role() -> bool:
-    """True when the installed parser carries ParsedEmail.ledger_role."""
-    return "ledger_role" in ParsedEmail.model_fields
-
-
 def _completion_parse(*, reference_number: str = "SAMPLER00000000000000"):
     """A settlement leg: it completes a row instead of opening one."""
     parsed = ParsedEmail(
@@ -459,10 +454,6 @@ def _completion_parse(*, reference_number: str = "SAMPLER00000000000000"):
     )
 
 
-@pytest.mark.skipif(
-    not _parser_has_ledger_role(),
-    reason="pinned bank-email-parser predates ParsedEmail.ledger_role",
-)
 async def test_email_parse_preview_projects_completion_not_insert(
     client, session, monkeypatch
 ):
@@ -497,10 +488,6 @@ async def test_email_parse_preview_projects_completion_not_insert(
     assert merge["changed_fields"] == ["reference_number"]
 
 
-@pytest.mark.skipif(
-    not _parser_has_ledger_role(),
-    reason="pinned bank-email-parser predates ParsedEmail.ledger_role",
-)
 async def test_email_parse_preview_completion_without_a_row_names_no_target(
     client, session, monkeypatch
 ):

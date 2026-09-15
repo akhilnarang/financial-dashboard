@@ -521,13 +521,6 @@ def _stub_parser_with_role(monkeypatch, txn_data, *, ledger_role):
     )
 
 
-def _parser_has_rtgs_completion() -> bool:
-    """True when the installed parser knows the HDFC RTGS shapes."""
-    from bank_email_parser.parsers.hdfc import _PARSERS
-
-    return any(p.email_type == "hdfc_account_rtgs_completed_alert" for p in _PARSERS)
-
-
 _RTGS_UTR = "SAMPLER00000000000000"
 
 
@@ -575,10 +568,6 @@ def _rtgs_completion_txn_data(**overrides) -> dict:
 
 
 @pytest.mark.anyio
-@pytest.mark.skipif(
-    not _parser_has_rtgs_completion(),
-    reason="pinned bank-email-parser predates ParsedEmail.ledger_role",
-)
 async def test_rtgs_completion_email_stamps_the_reference_and_makes_no_row(
     session_maker, monkeypatch
 ):
@@ -630,10 +619,6 @@ async def test_rtgs_completion_email_stamps_the_reference_and_makes_no_row(
 
 
 @pytest.mark.anyio
-@pytest.mark.skipif(
-    not _parser_has_rtgs_completion(),
-    reason="pinned bank-email-parser predates ParsedEmail.ledger_role",
-)
 async def test_rtgs_completion_email_skips_when_two_rows_match(
     session_maker, monkeypatch
 ):
@@ -797,10 +782,6 @@ async def test_reparse_completion_twice_is_idempotent(session_maker, monkeypatch
         assert rows[0].reference_number == _RTGS_UTR
 
 
-@pytest.mark.skipif(
-    not _parser_has_rtgs_completion(),
-    reason="pinned bank-email-parser predates the RTGS completion parser",
-)
 def test_populate_skips_a_completion_leg():
     """scripts/populate.py inserts rows with no matcher.
 
@@ -827,10 +808,6 @@ def test_populate_skips_a_completion_leg():
     assert data is None, "a completion leg must not be imported as a row"
 
 
-@pytest.mark.skipif(
-    not _parser_has_rtgs_completion(),
-    reason="pinned bank-email-parser predates the RTGS submission parser",
-)
 def test_populate_still_imports_the_submission_leg():
     """The leg that DOES own the row must still import."""
     from email.message import EmailMessage

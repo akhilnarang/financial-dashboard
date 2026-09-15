@@ -540,7 +540,7 @@ async def parse_email_by_kind(
         password_hint,
         stmt_result,
         recognized_non_transaction,
-        getattr(parsed_email, "ledger_role", "primary") or "primary",
+        parsed_email.ledger_role if parsed_email else "primary",
     )
 
 

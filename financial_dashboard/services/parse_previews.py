@@ -609,7 +609,7 @@ async def preview_email_parse(
                 identity_conflicts=_identity_conflicts(existing, txn_data),
                 linked_attribution_refresh=True,
             )
-        elif getattr(parsed, "ledger_role", "primary") == COMPLETION_ROLE:
+        elif parsed.ledger_role == COMPLETION_ROLE:
             # A completion leg does not enter the matcher. It stamps its
             # reference onto the one matching primary row, or skips. Project
             # that, so the preview matches execution instead of reporting
