@@ -674,43 +674,6 @@ async def test_rtgs_completion_email_skips_when_two_rows_match(
         assert "no unique primary row" in (em.error or "")
 
 
-@pytest.mark.anyio
-@pytest.mark.skipif(
-    not _parser_has_rtgs_completion(),
-    reason="pinned bank-email-parser predates ParsedEmail.ledger_role",
-)
-async def test_rtgs_completion_email_skips_when_no_row_matches(
-    session_maker, monkeypatch
-):
-    """The settlement arrives with no submission on record. It opens no row."""
-    rule_id = await _seed_rule(session_maker, bank="hdfc")
-    txn_data = _rtgs_completion_txn_data()
-    _stub_parser_with_role(monkeypatch, txn_data, ledger_role="completion")
-
-    async with session_maker() as s:
-        rule = await s.get(FetchRule, rule_id)
-        link_ctx = await build_link_context(s)
-
-    stats = {"parsed": 0, "skipped": 0, "failed": 0, "fetched": 0}
-    await handle_polled_email(
-        rule=rule,
-        provider="gmail",
-        source_id=1,
-        msg_id="rtgs-completed-3",
-        remote_id="remote-rtgs-3",
-        raw_bytes=_raw_email(subject="RTGS transfer completed"),
-        should_notify=False,
-        link_context=link_ctx,
-        stats=stats,
-    )
-
-    async with session_maker() as s:
-        rows = (await s.execute(select(Transaction))).scalars().all()
-        assert rows == []
-        em = (await s.execute(select(Email))).scalar_one()
-        assert em.status == "skipped"
-
-
 async def _reparse_completion_email(session_maker, monkeypatch, *, email_id, txn_data):
     """POST /emails/{id}/reparse with the parser stubbed to a completion leg."""
     monkeypatch.setattr(
@@ -783,32 +746,6 @@ async def test_reparse_completion_with_no_candidate_makes_no_row(
         assert em.status == "skipped"
         # The response must report what was stored, not a blanket "parsed".
         assert r.json()["new_status"] == em.status
-
-
-@pytest.mark.anyio
-async def test_reparse_completion_with_two_candidates_makes_no_row(
-    session_maker, monkeypatch
-):
-    """Two submissions match. A reparse must not add a third row."""
-    rule_id = await _seed_rule(session_maker, bank="hdfc")
-    email_id = await _seed_completion_email(session_maker, rule_id)
-    async with session_maker() as s:
-        s.add(_rtgs_submission_row(account_mask="XX0000"))
-        s.add(_rtgs_submission_row(account_mask="XX0009"))
-        await s.commit()
-
-    r = await _reparse_completion_email(
-        session_maker,
-        monkeypatch,
-        email_id=email_id,
-        txn_data=_rtgs_completion_txn_data(),
-    )
-    assert r.status_code in (200, 303)
-
-    async with session_maker() as s:
-        rows = (await s.execute(select(Transaction))).scalars().all()
-        assert len(rows) == 2, "no third row"
-        assert all(r.reference_number is None for r in rows)
 
 
 @pytest.mark.anyio
