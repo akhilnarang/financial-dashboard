@@ -358,6 +358,10 @@ refactor.
 
 ## Quality gates
 
+While you work, run the test files that cover what you changed. Run the
+whole suite once before you finish, and let CI catch the rest. The full
+suite takes five minutes, so a run after every edit wastes them.
+
 Run all of these before finishing a refactor:
 
 - `uv run ruff check financial_dashboard tests scripts`

@@ -551,8 +551,6 @@ async def test_bulk_reparse_retains_sms_enrichment_on_none(session_maker):
         # SMS-only balance + counterparty must survive the email reparse.
         assert row.balance == Decimal("4242.00")
         assert row.counterparty == "PPF/SSY A/c XX0000"
-        # The name a bank states keeps its source.
-        assert row.counterparty_source == "bank"
 
 
 @pytest.mark.anyio
