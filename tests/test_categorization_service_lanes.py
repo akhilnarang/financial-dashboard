@@ -133,11 +133,11 @@ async def test_polarity_flips_directionally_impossible_llm_slug_and_queues_for_r
 
 
 @pytest.mark.parametrize("manual_edit", [False, True])
-async def test_polarity_keeps_directionally_consistent_llm_slug(
+async def test_merchant_lookup_audits_category_and_preserves_intervening_manual_edit(
     session: AsyncSession, monkeypatch, manual_edit
 ):
-    """A confident, directionally-consistent LLM answer is stored unchanged,
-    with no review queueing. ``_llm_classify`` is the seam: a real provider is
+    """A lookup must audit its category, but must not overwrite an intervening edit.
+    ``_llm_classify`` is the seam: a real provider is
     never contacted."""
     await ensure_category(session, "groceries")
 
@@ -299,7 +299,9 @@ async def test_self_transfer_succeeds_on_different_accounts(session: AsyncSessio
         assert txn.review_status is None
 
 
-async def test_self_transfer_rule_short_circuits_the_engine(session: AsyncSession):
+async def test_self_transfer_rule_short_circuits_the_engine(
+    session: AsyncSession, monkeypatch
+):
     """Through the engine, a paired self-transfer leg returns ``'rule'``
     without consulting the LLM. The LLM seam raises if called."""
     a = Account(bank="hdfc", label="HDFC", type="bank_account")
@@ -329,10 +331,7 @@ async def test_self_transfer_rule_short_circuits_the_engine(session: AsyncSessio
     def fail_if_called(**kwargs):
         raise AssertionError("LLM must not be called for a self-transfer pair")
 
-    monkeypatch_target = pytest.importorskip(
-        "financial_dashboard.services.categorization.engine"
-    )
-    monkeypatch_target._llm_classify = fail_if_called  # noqa: SLF001
+    monkeypatch.setattr(eng, "_llm_classify", fail_if_called)
 
     method = await eng.categorize_one(session, credit, use_llm=True)
     assert method == "rule"

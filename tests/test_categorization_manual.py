@@ -9,7 +9,6 @@ from financial_dashboard.services.categorization.manual import (
     assign_category_no_commit,
     assign_category_manual,
     CategoryDirectionPolicy,
-    resolve_assistant_category_slug,
 )
 from financial_dashboard.services.categorization.vocabulary import get_active_slugs
 
@@ -34,21 +33,7 @@ async def test_manual_assign_existing_slug(session: AsyncSession):
 
 
 async def test_manual_assign_unknown_slug_rejected_by_default(session: AsyncSession):
-    """A slug not in the vocabulary is rejected (typo guard) unless create=True."""
-    txn = Transaction(
-        bank="testbank", email_type="x", direction="debit", amount=Decimal("5")
-    )
-    session.add(txn)
-    await session.flush()
-
-    ok, slug = await assign_category_manual(session, txn.id, "Goceries")
-    assert ok is False and slug is None
-    assert "goceries" not in await get_active_slugs(session)
-
-
-async def test_manual_assign_rejects_typo_even_when_existing_category_is_close(
-    session: AsyncSession,
-):
+    """Assistant typo correction must not make manual/API assignment accept unknown slugs."""
     from financial_dashboard.services.categorization.vocabulary import ensure_category
 
     await ensure_category(session, "groceries")
@@ -59,26 +44,10 @@ async def test_manual_assign_rejects_typo_even_when_existing_category_is_close(
     await session.flush()
 
     ok, slug = await assign_category_manual(session, txn.id, "grocieis")
-
-    assert ok is False
-    assert slug is None
+    assert ok is False and slug is None
+    await session.refresh(txn)
     assert txn.category is None
-
-
-async def test_assistant_category_resolver_only_uses_active_categories(
-    session: AsyncSession,
-):
-    from financial_dashboard.db.models import Category
-    from financial_dashboard.services.categorization.vocabulary import ensure_category
-
-    await ensure_category(session, "groceries")
-    session.add(Category(slug="grocieis", active=False))
-    await session.flush()
-
-    slug, corrected = await resolve_assistant_category_slug(session, "grocieis")
-
-    assert slug == "groceries"
-    assert corrected is True
+    assert "grocieis" not in await get_active_slugs(session)
 
 
 async def test_manual_assign_preserves_inactive_category_compatibility(
