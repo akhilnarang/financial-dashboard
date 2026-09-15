@@ -170,12 +170,10 @@ async def classify(
                             )
             # Never cut off qualifications about identity halfway through the
             # evidence used to reconsider a financial category.
-            evidence.update(
-                description=search.output_text
-                if len(search.output_text) <= 1500
-                else "",
-                sources=sources,
+            evidence["description"] = (
+                search.output_text if len(search.output_text) <= 1500 else ""
             )
+            evidence["sources"] = sources
             if (
                 search.status != "completed"
                 or not searched
