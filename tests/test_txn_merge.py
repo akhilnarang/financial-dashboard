@@ -61,6 +61,7 @@ def _make_txn(**fields):
         "channel": None,
         "balance": None,
         "raw_description": None,
+        "counterparty_source": "bank",
     }
     defaults.update(fields)
     txn = MagicMock()
@@ -87,7 +88,7 @@ def test_compute_diff_email_overwrites_existing_value():
     }
 
 
-def test_compute_diff_keeps_a_bank_name_over_a_user_alias():
+def test_compute_diff_keeps_a_bank_name_over_a_user_alias() -> None:
     """HDFC prints the payee label the user saved, not the account holder.
 
     Such a name must not replace one a bank stated, or a transfer row loses
@@ -102,7 +103,7 @@ def test_compute_diff_keeps_a_bank_name_over_a_user_alias():
     assert diff.overwritten == {}
 
 
-def test_compute_diff_lets_a_bank_name_replace_a_stored_alias():
+def test_compute_diff_lets_a_bank_name_replace_a_stored_alias() -> None:
     """An alias fills an empty name, so a bank must be able to displace it.
 
     An SMS never overwrites otherwise, so without this the nickname that
@@ -989,6 +990,60 @@ async def test_merge_transaction_enrich_fills_null(session: AsyncSession):
     assert row.enriched_at is not None
     assert "counterparty" in diff.filled
     assert "channel" in diff.filled
+
+
+@pytest.mark.anyio
+async def test_merge_transaction_stores_and_replaces_a_user_alias(
+    session: AsyncSession,
+) -> None:
+    """A label fills an empty name. A bank name then replaces it.
+
+    The stored source must follow the stored name, or the next write reads a
+    claim that no longer holds.
+    """
+    row = Transaction(
+        bank="hdfc",
+        email_type="hdfc_account_neft_debit_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 2),
+        transaction_time=time(14, 23),
+        reference_number="NEFT:1234",
+        source="sms",
+        counterparty=None,
+    )
+    session.add(row)
+    await session.flush()
+
+    base = {
+        "bank": "hdfc",
+        "email_type": "hdfc_account_neft_debit_alert",
+        "direction": "debit",
+        "amount": Decimal("500"),
+        "currency": "INR",
+        "transaction_date": date(2026, 5, 2),
+        "transaction_time": time(14, 23),
+        "reference_number": "NEFT:1234",
+    }
+
+    _, filled, _ = await merge_transaction(
+        session,
+        "email",
+        {**base, "counterparty": "My Payee", "counterparty_source": "user_alias"},
+        email_id=101,
+    )
+    assert filled.counterparty == "My Payee"
+    assert filled.counterparty_source == "user_alias"
+
+    _, replaced, _ = await merge_transaction(
+        session,
+        "sms",
+        {**base, "counterparty": "SAMPLE BENEFICIARY"},
+        sms_message_id=102,
+    )
+    assert replaced.counterparty == "SAMPLE BENEFICIARY"
+    assert replaced.counterparty_source == "bank"
 
 
 @pytest.mark.anyio

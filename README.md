@@ -603,6 +603,7 @@ erDiagram
         time transaction_time
         bool transaction_time_is_received_time
         string counterparty
+        string counterparty_source
         string card_mask
         string account_mask
         string reference_number
