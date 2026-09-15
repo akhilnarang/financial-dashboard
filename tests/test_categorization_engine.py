@@ -16,24 +16,6 @@ from financial_dashboard.services.categorization import llm
 pytestmark = pytest.mark.anyio
 
 
-async def test_rule_hit_sets_method_rule_without_llm(session: AsyncSession):
-    txn = Transaction(
-        bank="testbank",
-        email_type="x",
-        direction="credit",
-        amount=Decimal("10"),
-        channel="interest",
-    )
-    session.add(txn)
-    await session.flush()
-
-    method = await eng.categorize_one(session, txn, use_llm=False)
-    assert method == "rule"
-    assert txn.category == "interest"
-    assert txn.category_method == "rule"
-    assert txn.category_input_hash is not None
-
-
 async def test_confident_rule_supersedes_stale_review_and_cancels_buttons(
     session: AsyncSession,
 ):
@@ -83,6 +65,8 @@ async def test_confident_rule_supersedes_stale_review_and_cancels_buttons(
     assert source.status == "delivery_failed"
     assert source.outcome == "clarification"
     assert txn.category == "interest"
+    assert txn.category_method == "rule"
+    assert txn.category_input_hash is not None
 
 
 async def test_rule_pass_no_match_marks_pending_llm(session: AsyncSession):

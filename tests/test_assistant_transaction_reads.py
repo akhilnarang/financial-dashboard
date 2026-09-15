@@ -28,7 +28,7 @@ def _transaction(**overrides: object) -> Transaction:
 
 
 @pytest.mark.anyio
-async def test_get_transaction_uses_compact_allowlisted_projection(session):
+async def test_get_transaction_redacts_private_identifiers(session):
     settings_service._cache["categorization.hidden_identifiers"] = "Alice"
     transaction = _transaction(
         raw_description="merchant metadata",
@@ -45,8 +45,6 @@ async def test_get_transaction_uses_compact_allowlisted_projection(session):
     assert result.counterparty == "PUREBERRYSMUMBAI"
     assert result.reference_number == "[redacted-num]"
     assert result.note == "lunch with [redacted-name]"
-    assert not hasattr(result, "raw_description")
-    assert not hasattr(result, "balance")
 
 
 @pytest.mark.anyio

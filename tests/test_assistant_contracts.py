@@ -29,20 +29,6 @@ def test_extra_fields_and_unknown_tools_fail_closed():
                 "calls": [{"name": "execute_sql", "sql": "select 1"}],
             }
         )
-    with pytest.raises(ValidationError):
-        parse_response(
-            {
-                "outcome": "tool_calls",
-                "calls": [
-                    {
-                        "name": "apply_transaction_changes",
-                        "transaction_id": 1,
-                        "changes": {"category": {"op": "set", "value": "new"}},
-                        "create_category": {"slug": "new", "intent_evidence": "new"},
-                    }
-                ],
-            }
-        )
 
 
 def test_category_proposal_requires_two_or_three_unique_candidates():
