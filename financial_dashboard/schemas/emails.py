@@ -214,6 +214,7 @@ class EmailMergePreview(BaseModel):
         "defer",
         "conflict",
         "multiple_linked",
+        "completion",
     ]
     target_transaction_id: int | None
     match_kind: Annotated[str | None, Field(max_length=32)]

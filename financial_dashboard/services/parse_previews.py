@@ -608,6 +608,25 @@ async def preview_email_parse(
                 identity_conflicts=_identity_conflicts(existing, txn_data),
                 linked_attribution_refresh=True,
             )
+        elif getattr(parsed, "ledger_role", "primary") == COMPLETION_ROLE:
+            # A completion leg does not enter the matcher. It stamps its
+            # reference onto the one matching primary row, or skips. Project
+            # that, so the preview matches execution instead of reporting
+            # insert/match/defer.
+            with session.no_autoflush:
+                primary, _count = await _find_completion_primary(session, txn_data)
+            changed = ["reference_number"] if primary is not None else []
+            if (
+                primary is not None
+                and primary.counterparty is None
+                and txn_data.get("counterparty")
+            ):
+                changed.append("counterparty")
+            merge = _email_merge(
+                "completion",
+                target_id=primary.id if primary is not None else None,
+                changed_fields=changed,
+            )
         elif (
             current_status == "skipped"
             and current_error

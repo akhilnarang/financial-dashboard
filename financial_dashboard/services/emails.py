@@ -259,10 +259,6 @@ _COMPLETION_ROLE = "completion"
 async def complete_email_reference(session, email_row, txn_data: dict) -> bool:
     """Stamp a completion leg's reference onto its one primary row.
 
-    TODO(preview): the email parse-preview does not know this role, so it
-    projects "insert" for a completion leg. The preview writes nothing, so
-    this misleads only the reader. The SMS preview has a "completion" action
-    that this one needs too (services/parse_previews.py).
 
     Return True when a row was completed, False when this leg was skipped.
     Fail-closed: on zero or more than one candidate it writes no row.
