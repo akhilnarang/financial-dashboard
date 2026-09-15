@@ -521,8 +521,7 @@ async def _apply_reparsed_transaction(
                     if key == "counterparty" and _alias_must_not_replace(
                         existing, txn_data
                     ):
-                        # A label the user chose must not replace a name a
-                        # bank stated, on a reparse as on the first parse.
+                        # Same rule as the matcher, on a reparse too.
                         continue
                     if previous_value is None:
                         refresh_diff.filled[key] = value

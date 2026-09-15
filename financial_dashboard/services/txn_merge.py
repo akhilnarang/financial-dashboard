@@ -295,8 +295,7 @@ def compute_enrichment_diff(
                 continue
             overwritten[f] = (old_val, new_val)
         elif f == "counterparty" and _bank_name_replaces_alias(existing, incoming):
-            # An SMS states the name that the bank holds. It replaces a label
-            # the user chose, which is the one case where an SMS wins.
+            # The one case where an SMS overwrites.
             overwritten[f] = (old_val, new_val)
         # channel == "sms" with both non-null and unequal: keep existing.
     return EnrichmentDiff(filled=filled, overwritten=overwritten)
@@ -1251,9 +1250,7 @@ async def apply_transaction_enrichment(
             txn_data.get("transaction_time_is_received_time")
         )
 
-    # The column describes the stored counterparty, so it must follow that
-    # value. Without this a row keeps the old provenance: a bank name would
-    # still claim to be a user label, and the next alias could replace it.
+    # The column describes the stored name, so it must follow it.
     if "counterparty" in diff.changed_fields:
         match.counterparty_source = str(txn_data.get("counterparty_source") or "bank")
 
