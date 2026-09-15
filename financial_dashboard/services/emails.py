@@ -7,6 +7,7 @@ from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import (
     Account,
@@ -256,18 +257,28 @@ def _process_email_full(bank: str, raw_bytes: bytes) -> ProcessedEmailParse:
 _COMPLETION_ROLE = "completion"
 
 
-async def complete_email_reference(session, email_row, txn_data: dict) -> bool:
+async def complete_email_reference(
+    session: AsyncSession, email_row: Email, txn_data: dict
+) -> bool:
     """Stamp a completion leg's reference onto its one primary row.
-
-
-    Return True when a row was completed, False when this leg was skipped.
-    Fail-closed: on zero or more than one candidate it writes no row.
 
     The fuzzy matcher cannot pair the two legs of an HDFC RTGS transfer. The
     submission's time comes from the arrival of the email, which limits it to
     a one-minute window, and the settlement follows minutes later. So this
     matches on the reference and the amount instead. The matcher is shared
     with the SMS pipeline, so both channels agree.
+
+    Args:
+        session: Open session. The caller owns the transaction; this
+            flushes but never commits.
+        email_row: The ``Email`` this leg came from. Its ``status`` and
+            ``error`` are set here.
+        txn_data: Normalized transaction fields. ``reference_number`` and
+            ``channel`` identify the primary row.
+
+    Returns:
+        True when a row was completed, False when this leg was skipped.
+        Fail-closed: on zero or more than one candidate it writes no row.
     """
     from financial_dashboard.services.categorization.self_transfer import (
         apply_reference_self_transfer_rule,
