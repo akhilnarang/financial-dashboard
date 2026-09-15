@@ -637,10 +637,13 @@ async def preview_email_parse(
             changed = ["reference_number"] if primary is not None else []
             if (
                 primary is not None
-                and primary.counterparty is None
                 and txn_data.get("counterparty")
+                and (
+                    primary.counterparty is None
+                    or _bank_name_replaces_alias(primary, txn_data)
+                )
             ):
-                changed.append("counterparty")
+                changed += ["counterparty", "counterparty_source"]
             merge = _email_merge(
                 "completion",
                 target_id=primary.id if primary is not None else None,

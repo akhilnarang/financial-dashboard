@@ -286,6 +286,7 @@ async def complete_email_reference(
         apply_reference_self_transfer_rule,
     )
     from financial_dashboard.services.sms_pipeline import _find_completion_primary
+    from financial_dashboard.services.txn_merge import _bank_name_replaces_alias
 
     reference = (txn_data.get("reference_number") or "").strip()
     primary, count = await _find_completion_primary(session, txn_data)
@@ -298,8 +299,11 @@ async def complete_email_reference(
         return False
 
     primary.reference_number = reference
-    if primary.counterparty is None and txn_data.get("counterparty"):
-        primary.counterparty = txn_data["counterparty"]
+    if (incoming_cp := txn_data.get("counterparty")) and (
+        primary.counterparty is None or _bank_name_replaces_alias(primary, txn_data)
+    ):
+        primary.counterparty = incoming_cp
+        primary.counterparty_source = str(txn_data.get("counterparty_source") or "bank")
     email_row.status = "parsed"
     email_row.error = None
     # Claim the row only if no other email holds it.

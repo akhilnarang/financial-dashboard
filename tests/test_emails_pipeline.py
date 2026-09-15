@@ -829,6 +829,52 @@ async def test_reparse_keeps_a_bank_name_over_an_incoming_label(
 
 
 @pytest.mark.anyio
+async def test_completion_email_replaces_a_saved_label(
+    session_maker, monkeypatch
+) -> None:
+    """The completion leg carries the name the bank holds.
+
+    The row may hold a label from the submission email. The completion must
+    replace it, as the settlement SMS does.
+    """
+    rule_id = await _seed_rule(session_maker, bank="hdfc")
+    email_id = await _seed_completion_email(session_maker, rule_id)
+    async with session_maker() as s:
+        s.add(
+            _rtgs_submission_row(
+                counterparty="My Saved Payee", counterparty_source="user_alias"
+            )
+        )
+        await s.commit()
+
+    txn_data = _rtgs_completion_txn_data()
+    txn_data["counterparty"] = "SAMPLE BENEFICIARY"
+    _stub_parser_with_role(monkeypatch, txn_data, ledger_role="completion")
+
+    async with session_maker() as s:
+        rule = await s.get(FetchRule, rule_id)
+        link_ctx = await build_link_context(s)
+
+    stats = {"parsed": 0, "skipped": 0, "failed": 0, "fetched": 0}
+    await handle_polled_email(
+        rule=rule,
+        provider="gmail",
+        source_id=1,
+        msg_id="rtgs-completed-alias",
+        remote_id="remote-rtgs-alias",
+        raw_bytes=_raw_email(subject="RTGS transfer completed"),
+        should_notify=False,
+        link_context=link_ctx,
+        stats=stats,
+    )
+
+    async with session_maker() as s:
+        row = (await s.execute(select(Transaction))).scalars().one()
+        assert row.counterparty == "SAMPLE BENEFICIARY"
+        assert row.counterparty_source == "bank"
+
+
+@pytest.mark.anyio
 async def test_reparse_completion_twice_is_idempotent(session_maker, monkeypatch):
     """A second reparse must not add a row or steal an existing email link."""
     rule_id = await _seed_rule(session_maker, bank="hdfc")
