@@ -939,11 +939,11 @@ async def reparse_all_failed(
         if txn_data and dispatch_result.ledger_role == _COMPLETION_ROLE:
             # A completion leg opens no row of its own, on a reparse too.
             async with session.begin():
-                em = await lock_email_for_attachment(session, email_row.id)
-                if em is None:
+                email = await lock_email_for_attachment(session, email_row.id)
+                if email is None:
                     still_failed += 1
                     continue
-                if await complete_email_reference(session, em, txn_data):
+                if await complete_email_reference(session, email, txn_data):
                     succeeded += 1
                 else:
                     skipped += 1
