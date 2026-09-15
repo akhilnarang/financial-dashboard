@@ -998,6 +998,8 @@ async def enrich_matched_transactions(recon: dict) -> int:
             )
             if new_value != existing and (writes_name or fd_upgrade):
                 txn.counterparty = new_value
+                # A statement narration is a name the bank states.
+                txn.counterparty_source = "bank"
                 changed = True
 
             # The statement narration is the only description these rows ever

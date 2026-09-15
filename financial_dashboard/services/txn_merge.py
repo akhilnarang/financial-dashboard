@@ -190,7 +190,7 @@ def _as_str(val: object) -> str | None:
     return val if isinstance(val, str) else None
 
 
-def _alias_must_not_replace(existing, incoming: dict) -> bool:
+def _alias_must_not_replace(existing: Transaction, incoming: dict) -> bool:
     """True when the incoming name is a user label and the stored one is not.
 
     A label the user chose, such as an HDFC payee nickname, must not replace
@@ -198,18 +198,18 @@ def _alias_must_not_replace(existing, incoming: dict) -> bool:
     """
     return (
         incoming.get("counterparty_source") == "user_alias"
-        and getattr(existing, "counterparty_source", "bank") != "user_alias"
+        and existing.counterparty_source != "user_alias"
     )
 
 
-def _bank_name_replaces_alias(existing, incoming: dict) -> bool:
+def _bank_name_replaces_alias(existing: Transaction, incoming: dict) -> bool:
     """True when a bank states a name and the stored one is a user label.
 
     Without this an alias that filled an empty name would stay forever: an
     SMS never overwrites, so the name the bank sends later cannot land.
     """
     return (
-        getattr(existing, "counterparty_source", "bank") == "user_alias"
+        existing.counterparty_source == "user_alias"
         and incoming.get("counterparty_source", "bank") != "user_alias"
     )
 
@@ -289,7 +289,9 @@ def compute_enrichment_diff(
                 # received_at on a later day. The earliest observation is the
                 # truer event date, mirroring the transaction_time rule above.
                 continue
-            if _is_information_downgrade(f, old_val, new_val):
+            if _is_information_downgrade(f, old_val, new_val) and not (
+                f == "counterparty" and _bank_name_replaces_alias(existing, incoming)
+            ):
                 continue
             if f == "counterparty" and _alias_must_not_replace(existing, incoming):
                 continue

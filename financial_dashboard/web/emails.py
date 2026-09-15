@@ -518,8 +518,10 @@ async def _apply_reparsed_transaction(
             for key, value in txn_data.items():
                 if value is not None and key not in _describes_the_stored_row:
                     previous_value = getattr(existing, key)
-                    if key == "counterparty" and _alias_must_not_replace(
-                        existing, txn_data
+                    if (
+                        key == "counterparty"
+                        and previous_value is not None
+                        and _alias_must_not_replace(existing, txn_data)
                     ):
                         # Same rule as the matcher, on a reparse too.
                         continue

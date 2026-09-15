@@ -881,6 +881,7 @@ async def enrich_matched_transactions(recon: dict) -> int:
                 continue  # already has a meaningful counterparty
 
             txn.counterparty = narration
+            txn.counterparty_source = "bank"
             enriched += 1
             entry["enriched"] = True
 

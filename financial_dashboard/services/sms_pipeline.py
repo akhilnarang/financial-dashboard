@@ -21,7 +21,11 @@ from bank_sms_parser.models import ParsedSms
 
 from financial_dashboard.db import SmsMessage, Transaction
 from financial_dashboard.services.linker import LinkContext, link_transaction
-from financial_dashboard.services.txn_merge import DUP_DEFER_NOTE, merge_transaction
+from financial_dashboard.services.txn_merge import (
+    DUP_DEFER_NOTE,
+    _bank_name_replaces_alias,
+    merge_transaction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -238,8 +242,11 @@ async def _complete_reference(
         return ProcessSmsOutcome(status="skipped", transaction_id=None)
 
     primary.reference_number = reference
-    if primary.counterparty is None and txn_data.get("counterparty"):
-        primary.counterparty = txn_data["counterparty"]
+    if (incoming_cp := txn_data.get("counterparty")) and (
+        primary.counterparty is None or _bank_name_replaces_alias(primary, txn_data)
+    ):
+        primary.counterparty = incoming_cp
+        primary.counterparty_source = str(txn_data.get("counterparty_source") or "bank")
     sms_row.status = "parsed"
     sms_row.transaction_id = primary.id
     sms_row.parse_error = None

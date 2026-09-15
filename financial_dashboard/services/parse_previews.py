@@ -28,6 +28,7 @@ from financial_dashboard.services.sms_pipeline import (
 )
 from financial_dashboard.services.txn_merge import (
     DUP_DEFER_PREFIX,
+    _alias_must_not_replace,
     MatchEvidence,
     compute_applied_enrichment_diff,
     find_match,
@@ -389,6 +390,12 @@ def _email_refresh_fields(existing: Transaction, txn_data: dict[str, Any]) -> li
         for field, value in txn_data.items()
         if value is not None and getattr(existing, field) != value
     ]
+    # The reparse refuses a user label over a stored name, so the preview must
+    # not offer it. counterparty_source rides along with the name it describes.
+    if "counterparty" in changed and _alias_must_not_replace(existing, txn_data):
+        changed = [
+            f for f in changed if f not in ("counterparty", "counterparty_source")
+        ]
     return changed
 
 
