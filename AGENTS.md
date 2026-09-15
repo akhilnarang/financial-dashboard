@@ -265,12 +265,20 @@ uv run python scripts/paisa_contract.py --skip-if-unavailable   # needs Docker
   `schemas/`). Examples in the repo: `CasEmailProcessResult`,
   `FetchSourceResult`, `MergeTransactionResult`, `ProcessedEmailParse`,
   `PdfAttachment`, `SmsIngestResult`, `RawEmailResult`.
+- **Annotate every parameter and the return type** on a new function,
+  including `session: AsyncSession` and ORM row parameters. A public
+  helper takes a Google-style docstring with `Args:` and `Returns:`
+  sections. A one-line summary alone is enough for a private helper
+  whose signature already says everything.
 - **No defensive `getattr(obj, "attr", default)`** for ORM columns or
   any attribute that is always present on the typed object. Use direct
   attribute access; let attribute errors surface. The only legitimate
   uses are: `request.app.state.<attr>` (state attrs may be unset before
   startup), dynamic-name `getattr(obj, field_name_variable)`, and
   module-level `def __getattr__` for lazy imports.
+  A field that a pinned sibling parser does not carry yet is NOT a
+  reason: bump the pin in `uv.lock` instead. A test stub that omits the
+  field is not a reason either: give the stub the field.
 
 ## Compatibility rules
 
@@ -318,6 +326,35 @@ Rules:
   path entries or a stale lockfile, fix that before pushing.
 - Sibling repo SHAs pinned by the committed lockfile can be inspected in
   `uv.lock` under the relevant `[[package]]` block.
+
+## Testing
+
+Tests protect behaviour at the boundaries this repo owns. Keep the suite
+small enough that a failure names a broken contract, not a private
+refactor.
+
+- **Strongly avoid new tests.** Extend a focused test that can cover the
+  changed behaviour. Add a case only for a contract that nothing covers.
+- **Cover the hot path, and at most one failure case per contract per
+  code path.** Two paths that can each write a row are two contracts: the
+  poller and the reparse route both need their own case. The same failure
+  mode repeated on both paths is one case too many. Parameterized
+  variations count as cases.
+- **Each case must name the regression it protects.** The check for this
+  is a negative control: break the guard, and the case must fail. A case
+  that still passes with its guard disabled protects nothing.
+- **Do not assert implementation details.** The absence of a field, a
+  `raw_description` value (debug-only, excluded from dumps), or a fact the
+  type checker already proves are not contracts.
+- **Give a test stub every field the real object carries.** An incomplete
+  `SimpleNamespace` fake drives defensive `getattr` into production code.
+  Fix the stub, not the caller.
+- **A money path earns more than one failure case.** A duplicate or
+  phantom ledger row is the worst failure in this repo, so a matcher or a
+  merge path keeps its zero-candidate, many-candidate, and idempotence
+  cases.
+- **Prune by behaviour, not by count.** When cases overlap, keep the one
+  whose failure best names the break.
 
 ## Quality gates
 
