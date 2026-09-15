@@ -492,3 +492,423 @@ async def test_reparse_multiple_transactions_returns_409(session_maker, monkeypa
 
     assert r.status_code == 409
     assert "more than one" in r.json()["detail"].lower()
+
+
+def _stub_parser_with_role(monkeypatch, txn_data, *, ledger_role):
+    """Stub the parser so it returns *txn_data* AND a ledger_role.
+
+    ``_stub_parser`` returns ``parsed_email=None``, which the pipeline reads
+    as ``ledger_role="primary"``. A completion leg needs the real field.
+    """
+    from bank_email_parser.models import Money, ParsedEmail, TransactionAlert
+
+    parsed = ParsedEmail(
+        email_type=txn_data["email_type"],
+        bank=txn_data["bank"],
+        ledger_role=ledger_role,
+        transaction=TransactionAlert(
+            direction=txn_data["direction"],
+            amount=Money(amount=txn_data["amount"], currency=txn_data["currency"]),
+            transaction_date=txn_data["transaction_date"],
+            reference_number=txn_data["reference_number"],
+            channel=txn_data["channel"],
+        ),
+    )
+    monkeypatch.setattr(
+        emails_mod,
+        "_process_email_full",
+        lambda bank, raw: ProcessedEmailParse(None, txn_data, None, parsed),
+    )
+
+
+def _parser_has_rtgs_completion() -> bool:
+    """True when the installed parser knows the HDFC RTGS shapes."""
+    from bank_email_parser.parsers.hdfc import _PARSERS
+
+    return any(p.email_type == "hdfc_account_rtgs_completed_alert" for p in _PARSERS)
+
+
+_RTGS_UTR = "SAMPLER00000000000000"
+
+
+def _rtgs_submission_row(**overrides) -> Transaction:
+    """The row that the RTGS submission leg opens.
+
+    It names the source account. It carries no reference. Its time comes from
+    the arrival of the message, which is what makes the fuzzy matcher refuse
+    the settlement leg minutes later.
+    """
+    base = dict(
+        bank="hdfc",
+        email_type="hdfc_account_rtgs_debit_alert",
+        direction="debit",
+        amount=Decimal("99999.99"),
+        currency="INR",
+        transaction_date=datetime.date(2026, 6, 2),
+        transaction_time=datetime.time(10, 4, 11),
+        transaction_time_is_received_time=True,
+        account_mask="XX0000",
+        channel="rtgs",
+        source="email",
+    )
+    base.update(overrides)
+    return Transaction(**base)
+
+
+def _rtgs_completion_txn_data(**overrides) -> dict:
+    return _txn_data(
+        bank="hdfc",
+        email_type="hdfc_account_rtgs_completed_alert",
+        direction="debit",
+        amount=Decimal("99999.99"),
+        currency="INR",
+        transaction_date=datetime.date(2026, 6, 2),
+        # Two and a half minutes after the submission: outside the
+        # one-minute arrival-time window that the submission row carries.
+        transaction_time=datetime.time(10, 6, 46),
+        counterparty=None,
+        account_mask=None,
+        reference_number=_RTGS_UTR,
+        channel="rtgs",
+        **overrides,
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    not _parser_has_rtgs_completion(),
+    reason="pinned bank-email-parser predates ParsedEmail.ledger_role",
+)
+async def test_rtgs_completion_email_stamps_the_reference_and_makes_no_row(
+    session_maker, monkeypatch
+):
+    """The settlement email completes the submission row.
+
+    The two legs arrive minutes apart, so the fuzzy matcher cannot pair them.
+    The completion path matches on the reference and the amount instead. The
+    ledger must end with ONE debit that carries the reference.
+    """
+    rule_id = await _seed_rule(session_maker, bank="hdfc")
+    async with session_maker() as s:
+        s.add(_rtgs_submission_row())
+        await s.commit()
+
+    txn_data = _rtgs_completion_txn_data()
+    _stub_parser_with_role(monkeypatch, txn_data, ledger_role="completion")
+    monkeypatch.setattr(emails_mod, "send_transaction_notification", AsyncMock())
+    monkeypatch.setattr(emails_mod, "send_bulk_summary", AsyncMock())
+    monkeypatch.setattr(emails_mod, "send_enrichment_notification", AsyncMock())
+    monkeypatch.setattr(emails_mod, "send_disambiguation_prompt", AsyncMock())
+
+    async with session_maker() as s:
+        rule = await s.get(FetchRule, rule_id)
+        link_ctx = await build_link_context(s)
+
+    stats = {"parsed": 0, "skipped": 0, "failed": 0, "fetched": 0}
+    await handle_polled_email(
+        rule=rule,
+        provider="gmail",
+        source_id=1,
+        msg_id="rtgs-completed-1",
+        remote_id="remote-rtgs-1",
+        raw_bytes=_raw_email(subject="RTGS transfer completed"),
+        should_notify=False,
+        link_context=link_ctx,
+        stats=stats,
+    )
+
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert len(rows) == 1, "the settlement leg must not open a second debit"
+        assert rows[0].reference_number == _RTGS_UTR
+        assert rows[0].account_mask == "XX0000", "the source account stays"
+        em = (await s.execute(select(Email))).scalar_one()
+        assert em.status == "parsed"
+        # The email claims the row it completed, because no other email held
+        # it. An email links through Transaction.email_id.
+        assert rows[0].email_id == em.id
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    not _parser_has_rtgs_completion(),
+    reason="pinned bank-email-parser predates ParsedEmail.ledger_role",
+)
+async def test_rtgs_completion_email_skips_when_two_rows_match(
+    session_maker, monkeypatch
+):
+    """Two submissions of one amount on one day. The settlement cannot know
+    which row to complete, so it skips. Fail-closed: no stamp, no new row."""
+    rule_id = await _seed_rule(session_maker, bank="hdfc")
+    async with session_maker() as s:
+        s.add(_rtgs_submission_row(account_mask="XX0000"))
+        s.add(_rtgs_submission_row(account_mask="XX0009"))
+        await s.commit()
+
+    txn_data = _rtgs_completion_txn_data()
+    _stub_parser_with_role(monkeypatch, txn_data, ledger_role="completion")
+
+    async with session_maker() as s:
+        rule = await s.get(FetchRule, rule_id)
+        link_ctx = await build_link_context(s)
+
+    stats = {"parsed": 0, "skipped": 0, "failed": 0, "fetched": 0}
+    await handle_polled_email(
+        rule=rule,
+        provider="gmail",
+        source_id=1,
+        msg_id="rtgs-completed-2",
+        remote_id="remote-rtgs-2",
+        raw_bytes=_raw_email(subject="RTGS transfer completed"),
+        should_notify=False,
+        link_context=link_ctx,
+        stats=stats,
+    )
+
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert len(rows) == 2, "both submissions stay, and no third row appears"
+        assert all(r.reference_number is None for r in rows)
+        em = (await s.execute(select(Email))).scalar_one()
+        assert em.status == "skipped"
+        assert "no unique primary row" in (em.error or "")
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    not _parser_has_rtgs_completion(),
+    reason="pinned bank-email-parser predates ParsedEmail.ledger_role",
+)
+async def test_rtgs_completion_email_skips_when_no_row_matches(
+    session_maker, monkeypatch
+):
+    """The settlement arrives with no submission on record. It opens no row."""
+    rule_id = await _seed_rule(session_maker, bank="hdfc")
+    txn_data = _rtgs_completion_txn_data()
+    _stub_parser_with_role(monkeypatch, txn_data, ledger_role="completion")
+
+    async with session_maker() as s:
+        rule = await s.get(FetchRule, rule_id)
+        link_ctx = await build_link_context(s)
+
+    stats = {"parsed": 0, "skipped": 0, "failed": 0, "fetched": 0}
+    await handle_polled_email(
+        rule=rule,
+        provider="gmail",
+        source_id=1,
+        msg_id="rtgs-completed-3",
+        remote_id="remote-rtgs-3",
+        raw_bytes=_raw_email(subject="RTGS transfer completed"),
+        should_notify=False,
+        link_context=link_ctx,
+        stats=stats,
+    )
+
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert rows == []
+        em = (await s.execute(select(Email))).scalar_one()
+        assert em.status == "skipped"
+
+
+async def _reparse_completion_email(session_maker, monkeypatch, *, email_id, txn_data):
+    """POST /emails/{id}/reparse with the parser stubbed to a completion leg."""
+    monkeypatch.setattr(
+        "financial_dashboard.web.emails.parse_email_by_kind",
+        AsyncMock(
+            return_value=EmailDispatchResult(
+                error=None,
+                txn_data=txn_data,
+                password_hint=None,
+                stmt_result=None,
+                recognized_non_transaction=False,
+                ledger_role="completion",
+            )
+        ),
+    )
+    with (
+        patch(
+            "financial_dashboard.web.emails.load_or_fetch_raw_email",
+            new=AsyncMock(return_value=RawEmailResult(_raw_email(), None, "provider")),
+        ),
+        patch(
+            "financial_dashboard.web.emails.should_notify_transactions",
+            return_value=False,
+        ),
+    ):
+        app = _build_web_app(session_maker)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            return await client.post(f"/emails/{email_id}/reparse")
+
+
+async def _seed_completion_email(session_maker, rule_id) -> int:
+    async with session_maker() as s:
+        em = Email(
+            provider="gmail",
+            message_id="rtgs-reparse-1",
+            sender="alerts@example.bank.in",
+            subject="RTGS transfer completed",
+            received_at=datetime.datetime(2026, 6, 2, 10, 6, 46, tzinfo=datetime.UTC),
+            status="skipped",
+            error="completion leg: no unique primary row to complete (found 0)",
+            rule_id=rule_id,
+        )
+        s.add(em)
+        await s.commit()
+        return em.id
+
+
+@pytest.mark.anyio
+async def test_reparse_completion_with_no_candidate_makes_no_row(
+    session_maker, monkeypatch
+):
+    """A reparse must stay fail-closed. It must not insert a phantom debit."""
+    rule_id = await _seed_rule(session_maker, bank="hdfc")
+    email_id = await _seed_completion_email(session_maker, rule_id)
+
+    r = await _reparse_completion_email(
+        session_maker,
+        monkeypatch,
+        email_id=email_id,
+        txn_data=_rtgs_completion_txn_data(),
+    )
+    assert r.status_code in (200, 303)
+
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert rows == [], "a reparse must not open a row for a completion leg"
+        em = await s.get(Email, email_id)
+        assert em.status == "skipped"
+        # The response must report what was stored, not a blanket "parsed".
+        assert r.json()["new_status"] == em.status
+
+
+@pytest.mark.anyio
+async def test_reparse_completion_with_two_candidates_makes_no_row(
+    session_maker, monkeypatch
+):
+    """Two submissions match. A reparse must not add a third row."""
+    rule_id = await _seed_rule(session_maker, bank="hdfc")
+    email_id = await _seed_completion_email(session_maker, rule_id)
+    async with session_maker() as s:
+        s.add(_rtgs_submission_row(account_mask="XX0000"))
+        s.add(_rtgs_submission_row(account_mask="XX0009"))
+        await s.commit()
+
+    r = await _reparse_completion_email(
+        session_maker,
+        monkeypatch,
+        email_id=email_id,
+        txn_data=_rtgs_completion_txn_data(),
+    )
+    assert r.status_code in (200, 303)
+
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert len(rows) == 2, "no third row"
+        assert all(r.reference_number is None for r in rows)
+
+
+@pytest.mark.anyio
+async def test_reparse_completion_stamps_the_unique_row(session_maker, monkeypatch):
+    """One submission matches. A reparse completes it and adds no row."""
+    rule_id = await _seed_rule(session_maker, bank="hdfc")
+    email_id = await _seed_completion_email(session_maker, rule_id)
+    async with session_maker() as s:
+        s.add(_rtgs_submission_row())
+        await s.commit()
+
+    r = await _reparse_completion_email(
+        session_maker,
+        monkeypatch,
+        email_id=email_id,
+        txn_data=_rtgs_completion_txn_data(),
+    )
+    assert r.status_code in (200, 303)
+
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].reference_number == _RTGS_UTR
+        em = await s.get(Email, email_id)
+        assert em.status == "parsed"
+
+
+@pytest.mark.anyio
+async def test_reparse_completion_twice_is_idempotent(session_maker, monkeypatch):
+    """A second reparse must not add a row or steal an existing email link."""
+    rule_id = await _seed_rule(session_maker, bank="hdfc")
+    email_id = await _seed_completion_email(session_maker, rule_id)
+    async with session_maker() as s:
+        s.add(_rtgs_submission_row())
+        await s.commit()
+
+    for _ in range(2):
+        r = await _reparse_completion_email(
+            session_maker,
+            monkeypatch,
+            email_id=email_id,
+            txn_data=_rtgs_completion_txn_data(),
+        )
+        assert r.status_code in (200, 303)
+
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].reference_number == _RTGS_UTR
+
+
+@pytest.mark.skipif(
+    not _parser_has_rtgs_completion(),
+    reason="pinned bank-email-parser predates the RTGS completion parser",
+)
+def test_populate_skips_a_completion_leg():
+    """scripts/populate.py inserts rows with no matcher.
+
+    A completion leg must not reach that insert, or importing both legs of one
+    transfer records two debits.
+
+    Skipped until the pinned bank-email-parser carries the RTGS parsers. The
+    dashboard installs that library from a git SHA, so this test needs the
+    version that this change depends on.
+    """
+    from email.message import EmailMessage
+
+    from scripts.populate import _process_eml
+
+    settlement = (
+        "Your RTGS transfer has been completed successfully. Transaction Details: "
+        "Amount: INR 99,999.99 Credited to beneficiary A/c ending: XX1111 "
+        "Date & Time: 15-01-2026 at 10:30:00 Reference Number: SAMPLER00000000000000"
+    )
+    msg = EmailMessage()
+    msg.set_content(settlement)
+    error, data = _process_eml("hdfc", msg.as_bytes())
+    assert error is None
+    assert data is None, "a completion leg must not be imported as a row"
+
+
+@pytest.mark.skipif(
+    not _parser_has_rtgs_completion(),
+    reason="pinned bank-email-parser predates the RTGS submission parser",
+)
+def test_populate_still_imports_the_submission_leg():
+    """The leg that DOES own the row must still import."""
+    from email.message import EmailMessage
+
+    from scripts.populate import _process_eml
+
+    submission = (
+        "You have successfully initiated a RTGS transaction of Rs. 99,999.99 from "
+        "your HDFC Bank A/c XX0000 for a transfer to payee Sample Payee using "
+        "HDFC Bank Online Banking."
+    )
+    msg = EmailMessage()
+    msg.set_content(submission)
+    error, data = _process_eml("hdfc", msg.as_bytes())
+    assert error is None
+    assert data is not None
+    assert data["direction"] == "debit"
+    assert data["account_mask"] == "XX0000"
