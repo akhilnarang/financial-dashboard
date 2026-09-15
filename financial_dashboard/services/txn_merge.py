@@ -190,6 +190,30 @@ def _as_str(val: object) -> str | None:
     return val if isinstance(val, str) else None
 
 
+def _alias_must_not_replace(existing, incoming: dict) -> bool:
+    """True when the incoming name is a user label and the stored one is not.
+
+    A label the user chose, such as an HDFC payee nickname, must not replace
+    a name that a bank stated.
+    """
+    return (
+        incoming.get("counterparty_source") == "user_alias"
+        and getattr(existing, "counterparty_source", "bank") != "user_alias"
+    )
+
+
+def _bank_name_replaces_alias(existing, incoming: dict) -> bool:
+    """True when a bank states a name and the stored one is a user label.
+
+    Without this an alias that filled an empty name would stay forever: an
+    SMS never overwrites, so the name the bank sends later cannot land.
+    """
+    return (
+        getattr(existing, "counterparty_source", "bank") == "user_alias"
+        and incoming.get("counterparty_source", "bank") != "user_alias"
+    )
+
+
 def _is_information_downgrade(field: str, old_val: object, new_val: object) -> bool:
     # Only the three string-valued fields below can degrade; every other
     # field short-circuits to False without touching old_val/new_val, so the
@@ -267,6 +291,12 @@ def compute_enrichment_diff(
                 continue
             if _is_information_downgrade(f, old_val, new_val):
                 continue
+            if f == "counterparty" and _alias_must_not_replace(existing, incoming):
+                continue
+            overwritten[f] = (old_val, new_val)
+        elif f == "counterparty" and _bank_name_replaces_alias(existing, incoming):
+            # An SMS states the name that the bank holds. It replaces a label
+            # the user chose, which is the one case where an SMS wins.
             overwritten[f] = (old_val, new_val)
         # channel == "sms" with both non-null and unequal: keep existing.
     return EnrichmentDiff(filled=filled, overwritten=overwritten)
@@ -1220,6 +1250,12 @@ async def apply_transaction_enrichment(
         match.transaction_time_is_received_time = bool(
             txn_data.get("transaction_time_is_received_time")
         )
+
+    # The column describes the stored counterparty, so it must follow that
+    # value. Without this a row keeps the old provenance: a bank name would
+    # still claim to be a user label, and the next alias could replace it.
+    if "counterparty" in diff.changed_fields:
+        match.counterparty_source = str(txn_data.get("counterparty_source") or "bank")
 
     if match.source != channel and match.source is not None:
         match.source = "sms+email"

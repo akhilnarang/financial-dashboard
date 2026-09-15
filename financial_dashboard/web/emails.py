@@ -67,6 +67,7 @@ from financial_dashboard.services.linker import build_link_context, link_transac
 from financial_dashboard.services.reminders import check_payment_received
 from financial_dashboard.services.txn_merge import (
     DUP_DEFER_NOTE,
+    _alias_must_not_replace,
     DUP_DEFER_PREFIX,
     EnrichmentDiff,
     find_match,
@@ -510,12 +511,19 @@ async def _apply_reparsed_transaction(
             _describes_the_stored_row = (
                 "transaction_time_is_received_time",
                 "identifies_by",
+                "counterparty_source",
             )
             previous_transaction_time = existing.transaction_time
             refresh_diff = EnrichmentDiff()
             for key, value in txn_data.items():
                 if value is not None and key not in _describes_the_stored_row:
                     previous_value = getattr(existing, key)
+                    if key == "counterparty" and _alias_must_not_replace(
+                        existing, txn_data
+                    ):
+                        # A label the user chose must not replace a name a
+                        # bank stated, on a reparse as on the first parse.
+                        continue
                     if previous_value is None:
                         refresh_diff.filled[key] = value
                     elif previous_value != value:
@@ -528,6 +536,11 @@ async def _apply_reparsed_transaction(
                 # time that came from message arrival.
                 existing.transaction_time_is_received_time = bool(
                     txn_data["transaction_time_is_received_time"]
+                )
+            if "counterparty" in refresh_diff.changed_fields:
+                # This column describes the stored name, so it must follow it.
+                existing.counterparty_source = str(
+                    txn_data.get("counterparty_source") or "bank"
                 )
             if refresh_diff.changed_fields:
                 enrichment_diff = refresh_diff

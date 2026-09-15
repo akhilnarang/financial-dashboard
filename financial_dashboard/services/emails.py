@@ -246,6 +246,9 @@ def _process_email_full(bank: str, raw_bytes: bytes) -> ProcessedEmailParse:
             # The parser declares which field shows the event. Record it: the
             # matcher needs it for a stored row and not only an incoming one.
             "identifies_by": parsed.identifies_by,
+            # The parser states where the name came from. Record it: the
+            # matcher needs it for a stored row and not only an incoming one.
+            "counterparty_source": parsed.counterparty_source,
         },
         password_hint,
         parsed,

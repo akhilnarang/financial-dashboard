@@ -617,6 +617,15 @@ class Transaction(Base):
     """Which field shows which event this row reports, when the counterparty
     cannot show it. The parser declares this fact. One of ``counterparty``,
     ``card_mask`` or ``none``."""
+    counterparty_source: Mapped[str] = mapped_column(
+        String,
+        default="bank",
+        server_default=text("'bank'"),
+        nullable=False,
+    )
+    """Where ``counterparty`` came from. The parser declares this fact. One of
+    ``bank`` or ``user_alias``. A user alias is a label the user chose, such as
+    an HDFC payee nickname, and must not replace a name a bank stated."""
     transaction_time_is_received_time: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("0"), nullable=False
     )

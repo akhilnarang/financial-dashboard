@@ -87,6 +87,37 @@ def test_compute_diff_email_overwrites_existing_value():
     }
 
 
+def test_compute_diff_keeps_a_bank_name_over_a_user_alias():
+    """HDFC prints the payee label the user saved, not the account holder.
+
+    Such a name must not replace one a bank stated, or a transfer row loses
+    the beneficiary and shows a nickname.
+    """
+    existing = _make_txn(counterparty="SAMPLE BENEFICIARY NAME")
+    incoming = {
+        "counterparty": "My Savings Payee",
+        "counterparty_source": "user_alias",
+    }
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.overwritten == {}
+
+
+def test_compute_diff_lets_a_bank_name_replace_a_stored_alias():
+    """An alias fills an empty name, so a bank must be able to displace it.
+
+    An SMS never overwrites otherwise, so without this the nickname that
+    filled the name first would stay on the row for good.
+    """
+    existing = _make_txn(
+        counterparty="My Savings Payee", counterparty_source="user_alias"
+    )
+    incoming = {"counterparty": "SAMPLE BENEFICIARY NAME"}
+    diff = compute_enrichment_diff(existing, incoming, "sms")
+    assert diff.overwritten == {
+        "counterparty": ("My Savings Payee", "SAMPLE BENEFICIARY NAME")
+    }
+
+
 def test_compute_diff_sms_does_not_overwrite_existing_value():
     existing = _make_txn(counterparty="Phone Pe Private Limited")
     incoming = {"counterparty": "PZCREDIT0000000"}
