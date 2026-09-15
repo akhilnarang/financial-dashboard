@@ -877,7 +877,11 @@ async def enrich_matched_transactions(recon: dict) -> int:
                 continue
 
             existing = (txn.counterparty or "").strip()
-            if existing and existing.lower() not in _GENERIC_COUNTERPARTIES:
+            if (
+                existing
+                and existing.lower() not in _GENERIC_COUNTERPARTIES
+                and txn.counterparty_source != "user_alias"
+            ):
                 continue  # already has a meaningful counterparty
 
             txn.counterparty = narration
