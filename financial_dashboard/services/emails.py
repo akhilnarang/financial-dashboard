@@ -246,6 +246,8 @@ def _process_email_full(bank: str, raw_bytes: bytes) -> ProcessedEmailParse:
             # The parser declares which field shows the event. Record it: the
             # matcher needs it for a stored row and not only an incoming one.
             "identifies_by": parsed.identifies_by,
+            # Stored, because the matcher reads it off the existing row too.
+            "counterparty_source": parsed.counterparty_source,
         },
         password_hint,
         parsed,
@@ -284,6 +286,7 @@ async def complete_email_reference(
         apply_reference_self_transfer_rule,
     )
     from financial_dashboard.services.sms_pipeline import _find_completion_primary
+    from financial_dashboard.services.txn_merge import _bank_name_replaces_alias
 
     reference = (txn_data.get("reference_number") or "").strip()
     primary, count = await _find_completion_primary(session, txn_data)
@@ -296,8 +299,11 @@ async def complete_email_reference(
         return False
 
     primary.reference_number = reference
-    if primary.counterparty is None and txn_data.get("counterparty"):
-        primary.counterparty = txn_data["counterparty"]
+    if (incoming_cp := txn_data.get("counterparty")) and (
+        primary.counterparty is None or _bank_name_replaces_alias(primary, txn_data)
+    ):
+        primary.counterparty = incoming_cp
+        primary.counterparty_source = str(txn_data.get("counterparty_source") or "bank")
     email_row.status = "parsed"
     email_row.error = None
     # Claim the row only if no other email holds it.

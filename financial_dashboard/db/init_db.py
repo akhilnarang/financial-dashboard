@@ -223,6 +223,20 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
             )
         try:
             await conn.execute(
+                text("SELECT counterparty_source FROM transactions LIMIT 0")
+            )
+        except Exception:
+            # Existing rows claim "bank", which is wrong for a row whose name
+            # came from a label. Nothing re-tags them. Correct such a row by
+            # hand if its name matters.
+            await conn.execute(
+                text(
+                    "ALTER TABLE transactions ADD COLUMN "
+                    "counterparty_source VARCHAR NOT NULL DEFAULT 'bank'"
+                )
+            )
+        try:
+            await conn.execute(
                 text(
                     "SELECT transaction_time_is_received_time FROM transactions LIMIT 0"
                 )

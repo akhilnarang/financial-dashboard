@@ -190,6 +190,46 @@ def _as_str(val: object) -> str | None:
     return val if isinstance(val, str) else None
 
 
+def _alias_must_not_replace(existing: Transaction, incoming: dict) -> bool:
+    """True when the incoming name is a user label and the stored one is not.
+
+    A label the user chose, such as an HDFC payee nickname, must not replace
+    a name that a bank stated.
+    """
+    return (
+        incoming.get("counterparty_source") == "user_alias"
+        and existing.counterparty_source != "user_alias"
+    )
+
+
+def _bank_name_replaces_alias(existing: Transaction, incoming: dict) -> bool:
+    """True when a bank states a name and the stored one is a user label.
+
+    Without this an alias that filled an empty name would stay forever: an
+    SMS never overwrites, so the name the bank sends later cannot land.
+    """
+    return (
+        existing.counterparty_source == "user_alias"
+        and incoming.get("counterparty_source", "bank") != "user_alias"
+    )
+
+
+def sync_counterparty_source(txn: Transaction, incoming: dict) -> None:
+    """Make the stored source follow the stored name.
+
+    Call this after a write of the name, and also when a write was refused
+    because the incoming name equals the stored one. A bank that states the
+    same text as a stored label still proves the text is a bank name, so the
+    column must stop claiming the label. If it keeps the claim, the next
+    label overwrites a name the bank has confirmed.
+    """
+    incoming_name = incoming.get("counterparty")
+    if not incoming_name or incoming_name != txn.counterparty:
+        # The stored name came from somewhere else. Say nothing about it.
+        return
+    txn.counterparty_source = str(incoming.get("counterparty_source") or "bank")
+
+
 def _is_information_downgrade(field: str, old_val: object, new_val: object) -> bool:
     # Only the three string-valued fields below can degrade; every other
     # field short-circuits to False without touching old_val/new_val, so the
@@ -265,8 +305,15 @@ def compute_enrichment_diff(
                 # received_at on a later day. The earliest observation is the
                 # truer event date, mirroring the transaction_time rule above.
                 continue
-            if _is_information_downgrade(f, old_val, new_val):
+            if _is_information_downgrade(f, old_val, new_val) and not (
+                f == "counterparty" and _bank_name_replaces_alias(existing, incoming)
+            ):
                 continue
+            if f == "counterparty" and _alias_must_not_replace(existing, incoming):
+                continue
+            overwritten[f] = (old_val, new_val)
+        elif f == "counterparty" and _bank_name_replaces_alias(existing, incoming):
+            # The one case where an SMS overwrites.
             overwritten[f] = (old_val, new_val)
         # channel == "sms" with both non-null and unequal: keep existing.
     return EnrichmentDiff(filled=filled, overwritten=overwritten)
@@ -1220,6 +1267,10 @@ async def apply_transaction_enrichment(
         match.transaction_time_is_received_time = bool(
             txn_data.get("transaction_time_is_received_time")
         )
+
+    # The column describes the stored name, so it must follow it. An equal
+    # name changes no field, and still settles the source.
+    sync_counterparty_source(match, txn_data)
 
     if match.source != channel and match.source is not None:
         match.source = "sms+email"

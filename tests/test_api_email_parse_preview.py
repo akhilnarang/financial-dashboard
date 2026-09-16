@@ -454,6 +454,39 @@ def _completion_parse(*, reference_number: str = "SAMPLER00000000000000"):
     )
 
 
+async def test_email_parse_preview_hides_a_refused_label(
+    client, session, monkeypatch
+) -> None:
+    """The reparse refuses a label over a stored name, so the preview must
+    not offer that change."""
+    email = await _email(session)
+    session.add(
+        Transaction(
+            bank="synthetic-bank",
+            email_type="synthetic_transaction_alert",
+            direction="debit",
+            amount=Decimal("12.34"),
+            currency="INR",
+            transaction_date=datetime.date(2030, 1, 2),
+            counterparty="SAMPLE BENEFICIARY",
+            counterparty_source="bank",
+            email_id=email.id,
+        )
+    )
+    await session.commit()
+    parse = _transaction_parse()
+    parse.txn_data["counterparty"] = "My Saved Payee"
+    parse.txn_data["counterparty_source"] = "user_alias"
+    _patch_raw_and_parse(monkeypatch, parse)
+
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 200, response.text
+    changed = response.json()["merge"]["changed_fields"]
+    assert "counterparty" not in changed
+    assert "counterparty_source" not in changed
+
+
 async def test_email_parse_preview_projects_completion_not_insert(
     client, session, monkeypatch
 ):

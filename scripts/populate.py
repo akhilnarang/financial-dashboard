@@ -166,6 +166,7 @@ def _process_eml(
         "transaction_date": transaction_date,
         "transaction_time": transaction_time,
         "counterparty": txn.counterparty,
+        "counterparty_source": parsed.counterparty_source,
         "card_mask": txn.card_mask,
         "account_mask": txn.account_mask,
         "reference_number": txn.reference_number,

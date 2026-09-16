@@ -226,6 +226,13 @@ async def test_process_sms_row_rtgs_settlement_fuses_and_pairs(session, monkeypa
     _, cred = await _ingest(
         session, link_ctx, bank="idfc", body="IDFC_CREDIT", sms_id=2
     )
+    # The email for this transfer names the payee by the label the user saved.
+    # The settlement below must replace it with the name the bank holds.
+    initiated = await session.get(Transaction, ini.transaction_id)
+    initiated.counterparty = "My Saved Payee"
+    initiated.counterparty_source = "user_alias"
+    await session.flush()
+
     dep_sms, dep = await _ingest(
         session, link_ctx, bank="hdfc", body="DEPOSITED", sms_id=3
     )
@@ -242,6 +249,9 @@ async def test_process_sms_row_rtgs_settlement_fuses_and_pairs(session, monkeypa
     credit = await session.get(Transaction, cred.transaction_id)
     assert debit.reference_number == _RTGS_UTR  # the UTR is stamped on
     assert debit.account_mask == "XX0001"  # the source account stays
+    # The bank's own name replaces the label, and takes the source with it.
+    assert debit.counterparty != "My Saved Payee"
+    assert debit.counterparty_source == "bank"
     assert debit.category == "self_transfer"
     assert credit.category == "self_transfer"
 

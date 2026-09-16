@@ -67,10 +67,12 @@ from financial_dashboard.services.linker import build_link_context, link_transac
 from financial_dashboard.services.reminders import check_payment_received
 from financial_dashboard.services.txn_merge import (
     DUP_DEFER_NOTE,
+    _alias_must_not_replace,
     DUP_DEFER_PREFIX,
     EnrichmentDiff,
     find_match,
     merge_transaction,
+    sync_counterparty_source,
 )
 from financial_dashboard.services.settings import (
     get_telegram_chat_id,
@@ -510,12 +512,20 @@ async def _apply_reparsed_transaction(
             _describes_the_stored_row = (
                 "transaction_time_is_received_time",
                 "identifies_by",
+                "counterparty_source",
             )
             previous_transaction_time = existing.transaction_time
             refresh_diff = EnrichmentDiff()
             for key, value in txn_data.items():
                 if value is not None and key not in _describes_the_stored_row:
                     previous_value = getattr(existing, key)
+                    if (
+                        key == "counterparty"
+                        and previous_value is not None
+                        and _alias_must_not_replace(existing, txn_data)
+                    ):
+                        # Same rule as the matcher, on a reparse too.
+                        continue
                     if previous_value is None:
                         refresh_diff.filled[key] = value
                     elif previous_value != value:
@@ -529,6 +539,9 @@ async def _apply_reparsed_transaction(
                 existing.transaction_time_is_received_time = bool(
                     txn_data["transaction_time_is_received_time"]
                 )
+            # This column describes the stored name, so it must follow it. An
+            # equal name changes no field, and still settles the source.
+            sync_counterparty_source(existing, txn_data)
             if refresh_diff.changed_fields:
                 enrichment_diff = refresh_diff
             existing.account_id = None

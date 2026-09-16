@@ -28,6 +28,8 @@ from financial_dashboard.services.sms_pipeline import (
 )
 from financial_dashboard.services.txn_merge import (
     DUP_DEFER_PREFIX,
+    _alias_must_not_replace,
+    _bank_name_replaces_alias,
     MatchEvidence,
     compute_applied_enrichment_diff,
     find_match,
@@ -265,10 +267,13 @@ async def preview_sms_parse(
             changed = ["reference_number"] if primary is not None else []
             if (
                 primary is not None
-                and primary.counterparty is None
                 and txn_data.get("counterparty")
+                and (
+                    primary.counterparty is None
+                    or _bank_name_replaces_alias(primary, txn_data)
+                )
             ):
-                changed.append("counterparty")
+                changed += ["counterparty", "counterparty_source"]
             merge = sms_schemas.SmsMergePreview(
                 action="completion",
                 target_transaction_id=primary.id if primary is not None else None,
@@ -389,6 +394,19 @@ def _email_refresh_fields(existing: Transaction, txn_data: dict[str, Any]) -> li
         for field, value in txn_data.items()
         if value is not None and getattr(existing, field) != value
     ]
+    # The reparse refuses a user label over a stored name, so the preview must
+    # not offer it. counterparty_source rides along with the name it describes.
+    if existing.counterparty is not None and _alias_must_not_replace(
+        existing, txn_data
+    ):
+        # The reparse refuses a label over a stored name. It still fills an
+        # empty one.
+        changed = [
+            f for f in changed if f not in ("counterparty", "counterparty_source")
+        ]
+    elif "counterparty" not in changed:
+        # The column follows the name it describes.
+        changed = [f for f in changed if f != "counterparty_source"]
     return changed
 
 
@@ -619,10 +637,13 @@ async def preview_email_parse(
             changed = ["reference_number"] if primary is not None else []
             if (
                 primary is not None
-                and primary.counterparty is None
                 and txn_data.get("counterparty")
+                and (
+                    primary.counterparty is None
+                    or _bank_name_replaces_alias(primary, txn_data)
+                )
             ):
-                changed.append("counterparty")
+                changed += ["counterparty", "counterparty_source"]
             merge = _email_merge(
                 "completion",
                 target_id=primary.id if primary is not None else None,

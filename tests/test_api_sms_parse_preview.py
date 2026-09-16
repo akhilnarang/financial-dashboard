@@ -85,6 +85,58 @@ async def test_sms_parse_preview_projects_insert_without_writes(
     )
 
 
+async def test_sms_parse_preview_shows_a_name_replacing_a_label(
+    client, session, monkeypatch
+) -> None:
+    """The settlement replaces a label with the name the bank holds.
+
+    The preview must show that, or it tells the reader that only the
+    reference changes.
+    """
+    primary = Transaction(
+        bank="synthetic-bank",
+        email_type="synthetic_debit_alert",
+        direction="debit",
+        amount=Decimal("12.34"),
+        currency="INR",
+        transaction_date=datetime.date(2030, 1, 2),
+        channel="neft",
+        account_mask="XX000",
+        counterparty="My Saved Payee",
+        counterparty_source="user_alias",
+        reference_number=None,
+        source="sms",
+    )
+    session.add(primary)
+    sms = await _sms(session)
+    await session.commit()
+
+    def _completion(*_args, **_kwargs):
+        return ParsedSms(
+            bank="synthetic-bank",
+            email_type="synthetic_neft_completion",
+            ledger_role="completion",
+            transaction=SmsTransactionAlert(
+                direction="debit",
+                amount=Money(amount=Decimal("12.34"), currency="INR"),
+                transaction_date=datetime.date(2030, 1, 2),
+                counterparty="SAMPLE BENEFICIARY",
+                reference_number="INFULLREF0002",
+                channel="neft",
+            ),
+        )
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.parse_previews.parse_sms", _completion
+    )
+    response = await client.post(f"/api/sms/{sms.id}/parse-preview")
+
+    assert response.status_code == 200, response.text
+    changed = response.json()["merge"]["changed_fields"]
+    assert "counterparty" in changed
+    assert "counterparty_source" in changed
+
+
 async def test_sms_parse_preview_projects_completion_without_writes(
     client, session, monkeypatch
 ):

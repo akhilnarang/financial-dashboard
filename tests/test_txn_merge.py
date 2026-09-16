@@ -17,6 +17,7 @@ from financial_dashboard.services.txn_merge import (
     find_match,
     is_duplicate_transaction_error,
     merge_transaction,
+    sync_counterparty_source,
 )
 
 
@@ -61,6 +62,7 @@ def _make_txn(**fields):
         "channel": None,
         "balance": None,
         "raw_description": None,
+        "counterparty_source": "bank",
     }
     defaults.update(fields)
     txn = MagicMock()
@@ -84,6 +86,37 @@ def test_compute_diff_email_overwrites_existing_value():
     assert diff.filled == {}
     assert diff.overwritten == {
         "counterparty": ("PZCREDIT0000000", "Phone Pe Private Limited")
+    }
+
+
+def test_compute_diff_keeps_a_bank_name_over_a_user_alias() -> None:
+    """HDFC prints the payee label the user saved, not the account holder.
+
+    Such a name must not replace one a bank stated, or a transfer row loses
+    the beneficiary and shows a nickname.
+    """
+    existing = _make_txn(counterparty="SAMPLE BENEFICIARY NAME")
+    incoming = {
+        "counterparty": "My Savings Payee",
+        "counterparty_source": "user_alias",
+    }
+    diff = compute_enrichment_diff(existing, incoming, "email")
+    assert diff.overwritten == {}
+
+
+def test_compute_diff_lets_a_bank_name_replace_a_stored_alias() -> None:
+    """An alias fills an empty name, so a bank must be able to displace it.
+
+    An SMS never overwrites otherwise, so without this the nickname that
+    filled the name first would stay on the row for good.
+    """
+    existing = _make_txn(
+        counterparty="My Savings Payee", counterparty_source="user_alias"
+    )
+    incoming = {"counterparty": "SAMPLE BENEFICIARY NAME"}
+    diff = compute_enrichment_diff(existing, incoming, "sms")
+    assert diff.overwritten == {
+        "counterparty": ("My Savings Payee", "SAMPLE BENEFICIARY NAME")
     }
 
 
@@ -958,6 +991,82 @@ async def test_merge_transaction_enrich_fills_null(session: AsyncSession):
     assert row.enriched_at is not None
     assert "counterparty" in diff.filled
     assert "channel" in diff.filled
+
+
+@pytest.mark.anyio
+async def test_merge_transaction_stores_and_replaces_a_user_alias(
+    session: AsyncSession,
+) -> None:
+    """A label fills an empty name. A bank name then replaces it.
+
+    The stored source must follow the stored name, or the next write reads a
+    claim that no longer holds.
+    """
+    row = Transaction(
+        bank="hdfc",
+        email_type="hdfc_account_neft_debit_alert",
+        direction="debit",
+        amount=Decimal("500"),
+        currency="INR",
+        transaction_date=date(2026, 5, 2),
+        transaction_time=time(14, 23),
+        reference_number="NEFT:1234",
+        source="sms",
+        counterparty=None,
+    )
+    session.add(row)
+    await session.flush()
+
+    base = {
+        "bank": "hdfc",
+        "email_type": "hdfc_account_neft_debit_alert",
+        "direction": "debit",
+        "amount": Decimal("500"),
+        "currency": "INR",
+        "transaction_date": date(2026, 5, 2),
+        "transaction_time": time(14, 23),
+        "reference_number": "NEFT:1234",
+    }
+
+    _, filled, _ = await merge_transaction(
+        session,
+        "email",
+        {**base, "counterparty": "My Payee", "counterparty_source": "user_alias"},
+        email_id=101,
+    )
+    assert filled.counterparty == "My Payee"
+    assert filled.counterparty_source == "user_alias"
+
+    _, replaced, _ = await merge_transaction(
+        session,
+        "sms",
+        {**base, "counterparty": "SAMPLE BENEFICIARY"},
+        sms_message_id=102,
+    )
+    assert replaced.counterparty == "SAMPLE BENEFICIARY"
+    assert replaced.counterparty_source == "bank"
+
+
+def test_a_bank_that_states_the_stored_label_clears_the_label_claim() -> None:
+    """A bank can send the same text the user saved as a label.
+
+    The name does not change, so no field changes. The text is still a name
+    the bank states. If the column keeps saying "user_alias", the next label
+    replaces a name the bank confirmed.
+    """
+    txn = _make_txn(counterparty="My Savings Payee", counterparty_source="user_alias")
+    sync_counterparty_source(txn, {"counterparty": "My Savings Payee"})
+    assert txn.counterparty_source == "bank"
+
+
+def test_a_refused_label_does_not_claim_the_stored_name() -> None:
+    """The guard refused the label, so the label owns nothing."""
+    txn = _make_txn(counterparty="SAMPLE BENEFICIARY NAME", counterparty_source="bank")
+    sync_counterparty_source(
+        txn,
+        {"counterparty": "My Savings Payee", "counterparty_source": "user_alias"},
+    )
+    assert txn.counterparty_source == "bank"
 
 
 @pytest.mark.anyio
