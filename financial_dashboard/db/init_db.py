@@ -237,6 +237,16 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
             )
         try:
             await conn.execute(
+                text("SELECT authorised_amount FROM transactions LIMIT 0")
+            )
+        except Exception:
+            # Null on every existing row. This value is correct: a row that
+            # nothing settled holds one amount only.
+            await conn.execute(
+                text("ALTER TABLE transactions ADD COLUMN authorised_amount NUMERIC")
+            )
+        try:
+            await conn.execute(
                 text(
                     "SELECT transaction_time_is_received_time FROM transactions LIMIT 0"
                 )

@@ -15,6 +15,7 @@ from financial_dashboard.services.txn_merge import (
     MatchDecision,
     compute_enrichment_diff,
     find_match,
+    qualifies_as_explicit_match,
     is_duplicate_transaction_error,
     merge_transaction,
     sync_counterparty_source,
@@ -2506,3 +2507,320 @@ async def test_merge_transaction_threads_reference_mismatch_metadata(
     assert diff.changed_fields == []
     assert result.deferral_reason == "reference_amount_mismatch"
     assert result.resolution_candidate_ids == ()
+
+
+@pytest.mark.anyio
+async def test_an_alert_after_a_settlement_reaches_the_row_it_settled(
+    session: AsyncSession,
+):
+    """A fuel pump authorises the amount on its display.
+
+    It adds a surcharge of about 1% at settlement. The statement therefore
+    bills 2,529.00 for a fill that the alert states as 2,500.00. The statement
+    can arrive first, and the alert for the same fill then states the
+    authorised amount.
+
+    That amount can also belong to a different purchase, so the code does not
+    merge the two. It offers the row and a person decides. Without the
+    authorised amount the alert reaches nothing, and the code stores the fill
+    a second time with no question asked.
+    """
+    txn_data = {
+        "bank": "hdfc",
+        "email_type": "hdfc_dc_transaction_alert",
+        "direction": "debit",
+        "amount": Decimal("2500.00"),
+        "currency": "INR",
+        "transaction_date": date(2026, 5, 2),
+        "transaction_time": time(14, 23),
+        "counterparty": "SAMPLE FUEL STATION",
+        "card_mask": "x1234",
+        "account_mask": None,
+        "reference_number": None,
+        "channel": None,
+        "balance": None,
+        "raw_description": None,
+    }
+    outcome, row, _ = await merge_transaction(
+        session, "sms", txn_data, sms_message_id=None
+    )
+    assert outcome == "created"
+
+    # The statement settles a larger amount. The row keeps the authorised
+    # amount.
+    row.authorised_amount = row.amount
+    row.amount = Decimal("2529.00")
+    await session.flush()
+
+    decision = await find_match(session, txn_data, "email")
+
+    assert decision.action == "defer"
+    assert decision.deferral_reason == "settled_amount_ambiguous"
+    assert decision.resolution_candidate_ids == (row.id,)
+
+
+@pytest.mark.anyio
+async def test_a_reference_hit_alone_does_not_use_the_authorised_amount(
+    session: AsyncSession,
+):
+    """A parser can scrape a reference that two purchases share.
+
+    One purchase is settled, so it holds an authorised amount. The other
+    purchase can state that same amount. A reference does not prove that the
+    two are one event, and a merge here overwrites the card and the merchant
+    of a real purchase. So the code defers and a person decides.
+    """
+    txn_data = {
+        "bank": "hdfc",
+        "email_type": "hdfc_dc_transaction_alert",
+        "direction": "debit",
+        "amount": Decimal("2500.00"),
+        "currency": "INR",
+        "transaction_date": date(2026, 5, 2),
+        "transaction_time": time(14, 23),
+        "counterparty": "SAMPLE FUEL STATION",
+        "card_mask": "x1234",
+        "account_mask": None,
+        "reference_number": "REUSEDREF123",
+        "channel": None,
+        "balance": None,
+        "raw_description": None,
+    }
+    _outcome, row, _diff = await merge_transaction(
+        session, "sms", txn_data, sms_message_id=None
+    )
+    row.authorised_amount = row.amount
+    row.amount = Decimal("2529.00")
+    await session.flush()
+
+    other_purchase = {
+        **txn_data,
+        "transaction_date": date(2026, 9, 16),
+        "card_mask": "x5678",
+        "counterparty": "UNRELATED STORE",
+    }
+    decision = await find_match(session, other_purchase, "email")
+
+    assert decision.action == "defer"
+    assert decision.deferral_reason == "reference_amount_mismatch"
+    assert row.card_mask == "x1234"
+    assert row.counterparty == "SAMPLE FUEL STATION"
+
+
+@pytest.mark.anyio
+async def test_a_settled_row_stays_eligible_for_an_explicit_merge(
+    session: AsyncSession,
+):
+    """A person can merge an alert into a row that a statement settled.
+
+    The row states the authorised amount of the alert, so the two are one
+    purchase. Without that amount the check refuses, and the person cannot
+    resolve the duplicate that they can see.
+    """
+    txn_data = {
+        "bank": "hdfc",
+        "email_type": "hdfc_dc_transaction_alert",
+        "direction": "debit",
+        "amount": Decimal("2500.00"),
+        "currency": "INR",
+        "transaction_date": date(2026, 5, 2),
+        "transaction_time": time(14, 23),
+        "counterparty": "SAMPLE FUEL STATION",
+        "card_mask": "x1234",
+        "account_mask": None,
+        "reference_number": None,
+        "channel": None,
+        "balance": None,
+        "raw_description": None,
+    }
+    _outcome, row, _diff = await merge_transaction(
+        session, "sms", txn_data, sms_message_id=None
+    )
+    row.authorised_amount = row.amount
+    row.amount = Decimal("2529.00")
+    await session.flush()
+
+    assert await qualifies_as_explicit_match(session, row, txn_data)
+
+
+@pytest.mark.anyio
+async def test_a_row_with_no_amount_is_not_an_explicit_match(session: AsyncSession):
+    """A callback can carry data that states no amount.
+
+    An unsettled row holds no authorised amount either. Two absent values are
+    not one event, so the check must refuse. A person taps this button, so the
+    data is not trusted.
+    """
+    txn_data = {
+        "bank": "hdfc",
+        "email_type": "hdfc_dc_transaction_alert",
+        "direction": "debit",
+        "amount": Decimal("2500.00"),
+        "currency": "INR",
+        "transaction_date": date(2026, 5, 2),
+        "transaction_time": time(14, 23),
+        "counterparty": "SAMPLE FUEL STATION",
+        "card_mask": "x1234",
+        "account_mask": None,
+        "reference_number": None,
+        "channel": None,
+        "balance": None,
+        "raw_description": None,
+    }
+    _outcome, row, _diff = await merge_transaction(
+        session, "sms", txn_data, sms_message_id=None
+    )
+    assert row.authorised_amount is None
+
+    assert not await qualifies_as_explicit_match(
+        session, row, {**txn_data, "amount": None}
+    )
+
+
+@pytest.mark.anyio
+async def test_a_different_purchase_does_not_take_a_settled_row(
+    session: AsyncSession,
+):
+    """The authorised amount of one purchase can be the amount of another.
+
+    A settled row holds 2,529.00 and authorised 2,500.00. A different purchase
+    of 2,500.00 on the same day reaches that row, because the row states the
+    amount. Merging would absorb a real purchase and overwrite its merchant,
+    so the code asks a person instead.
+    """
+    first = {
+        "bank": "hdfc",
+        "email_type": "hdfc_dc_transaction_alert",
+        "direction": "debit",
+        "amount": Decimal("2500.00"),
+        "currency": "INR",
+        "transaction_date": date(2026, 5, 2),
+        "transaction_time": time(14, 23),
+        "counterparty": "SAMPLE FUEL STATION",
+        "card_mask": "x1234",
+        "account_mask": None,
+        "reference_number": None,
+        "channel": None,
+        "balance": None,
+        "raw_description": None,
+    }
+    _outcome, row, _diff = await merge_transaction(
+        session, "sms", first, sms_message_id=None
+    )
+    row.authorised_amount = row.amount
+    row.amount = Decimal("2529.00")
+    await session.flush()
+
+    other = {**first, "counterparty": "OTHER MERCHANT"}
+    decision = await find_match(session, other, "email")
+
+    assert decision.action == "defer"
+    assert decision.deferral_reason == "settled_amount_ambiguous"
+    assert row.counterparty == "SAMPLE FUEL STATION"
+    assert row.amount == Decimal("2529.00")
+
+
+@pytest.mark.anyio
+async def test_a_settled_neighbour_does_not_block_an_exact_match(
+    session: AsyncSession,
+):
+    """A settled row can hold the authorised amount of another purchase.
+
+    An alert states that amount, and a second row states it now. The second
+    row is the stronger evidence, so it takes the alert. The settled
+    neighbour must not block the pairing, and must not be offered in its
+    place.
+    """
+    settled = Transaction(
+        account_id=None,
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",
+        direction="debit",
+        amount=Decimal("2529.00"),
+        authorised_amount=Decimal("2500.00"),
+        currency="INR",
+        transaction_date=date(2026, 5, 2),
+        transaction_time=time(14, 23),
+        counterparty="SAMPLE FUEL STATION",
+        card_mask="x1234",
+    )
+    exact = Transaction(
+        account_id=None,
+        bank="hdfc",
+        email_type="hdfc_dc_transaction_alert",
+        direction="debit",
+        amount=Decimal("2500.00"),
+        currency="INR",
+        transaction_date=date(2026, 5, 2),
+        transaction_time=time(14, 23),
+        counterparty="SAMPLE FUEL STATION",
+        card_mask="x1234",
+        sms_message_id=1,
+    )
+    session.add_all([settled, exact])
+    await session.flush()
+
+    decision = await find_match(
+        session,
+        {
+            "bank": "hdfc",
+            "email_type": "hdfc_dc_transaction_alert",
+            "direction": "debit",
+            "amount": Decimal("2500.00"),
+            "currency": "INR",
+            "transaction_date": date(2026, 5, 2),
+            "transaction_time": time(14, 23),
+            "counterparty": "SAMPLE FUEL STATION",
+            "card_mask": "x1234",
+            "account_mask": None,
+            "reference_number": None,
+            "channel": None,
+            "balance": None,
+            "raw_description": None,
+        },
+        "email",
+    )
+
+    assert decision.action == "match"
+    assert decision.transaction is not None
+    assert decision.transaction.id == exact.id
+
+
+@pytest.mark.anyio
+async def test_a_reference_mismatch_offers_the_row_it_found(session: AsyncSession):
+    """A reference can name a purchase that a statement settled.
+
+    The amounts then disagree and the code defers, because a reference alone
+    does not prove the event. The row is still the one the reference names, so
+    the prompt must offer it. Without a candidate the prompt has no button and
+    a person cannot resolve the alert at all.
+    """
+    txn_data = {
+        "bank": "hdfc",
+        "email_type": "hdfc_dc_transaction_alert",
+        "direction": "debit",
+        "amount": Decimal("2500.00"),
+        "currency": "INR",
+        "transaction_date": date(2026, 5, 2),
+        "transaction_time": time(14, 23),
+        "counterparty": "SAMPLE FUEL STATION",
+        "card_mask": "x1234",
+        "account_mask": None,
+        "reference_number": "REF123",
+        "channel": None,
+        "balance": None,
+        "raw_description": None,
+    }
+    _outcome, row, _diff = await merge_transaction(
+        session, "sms", txn_data, sms_message_id=None
+    )
+    row.authorised_amount = row.amount
+    row.amount = Decimal("2529.00")
+    await session.flush()
+
+    decision = await find_match(session, txn_data, "sms")
+
+    assert decision.action == "defer"
+    assert decision.deferral_reason == "reference_amount_mismatch"
+    assert decision.resolution_candidate_ids == (row.id,)
+    assert await qualifies_as_explicit_match(session, row, txn_data)

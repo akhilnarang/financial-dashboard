@@ -617,6 +617,16 @@ class Transaction(Base):
     """Which field shows which event this row reports, when the counterparty
     cannot show it. The parser declares this fact. One of ``counterparty``,
     ``card_mask`` or ``none``."""
+    authorised_amount: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 2),
+        nullable=True,
+    )
+    """The amount of this row before a statement stated the settled amount.
+
+    A card authorises one amount and settles a different amount. An alert that
+    arrives after the statement states the authorised amount. Duplicate
+    detection uses the amount. Without this column the late alert finds no row
+    and stores the purchase again. Null means the row has one amount only."""
     counterparty_source: Mapped[str] = mapped_column(
         String,
         default="bank",

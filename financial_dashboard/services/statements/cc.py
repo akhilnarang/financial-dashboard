@@ -248,25 +248,22 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
     return (txn_date, amount, direction)
 
 
-# How far a settled amount may sit from the amount the card authorised. A fuel
-# surcharge is about 1%, and a foreign charge moves with the settlement-day
-# rate. The band only widens the evidence set, so it must cover the real drift;
-# it never pairs two rows by itself.
+# The maximum difference between a settled amount and an authorised amount. A
+# fuel surcharge is about 1%. A foreign charge changes with the settlement-day
+# rate. The band widens the evidence set only. It must therefore cover the real
+# difference. It does not pair two rows.
 SETTLEMENT_BAND = Decimal("0.012")
 
 
 def settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
-    """Whether one amount can be the other's settled or authorised twin.
+    """Whether one amount can be the settled or authorised form of the other.
 
-    Read off the larger amount, so the answer does not depend on which side
-    asks.
+    The function reads the band from the larger amount. The answer is
+    therefore the same for both directions. Two equal amounts give a
+    difference of zero, and zero is inside every band.
     """
-    if settled == authorised:
-        return True
-    larger = max(abs(settled), abs(authorised))
-    if not larger:
-        return False
-    return abs(settled - authorised) <= larger * SETTLEMENT_BAND
+    gap, larger = abs(settled - authorised), max(abs(settled), abs(authorised))
+    return gap <= larger * SETTLEMENT_BAND
 
 
 # cc-parser tags a credit row that is bank-internal bookkeeping, not money
@@ -405,6 +402,20 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     return bool(db_narration) and db_narration == narration
 
 
+def _same_amount(txn: "ParsedCcTransaction", db_txn) -> bool:
+    """Whether a statement row and a DB row state the same amount.
+
+    The reachability set holds a band, because a settled amount and an
+    authorised amount are one purchase. A reassignment must not use that band.
+    It moves a row to a candidate by name alone, and two amounts one surcharge
+    apart can be two purchases. Such a pair must stay held back for a person.
+    """
+    try:
+        return parse_cc_amount(txn.amount) == Decimal(str(db_txn.amount))
+    except ValueError, InvalidOperation:
+        return False
+
+
 def _row_names_candidate(stmt_idx: int, cid: int, txn_by_idx, db_by_id) -> bool:
     """Whether a statement row names a DB candidate as its own.
 
@@ -493,7 +504,8 @@ def _resolve_contested_by_counterparty(
             named = [
                 cid
                 for cid in candidate_sets.get(stmt_idx, set())
-                if _row_names_candidate(stmt_idx, cid, txn_by_idx, db_by_id)
+                if _same_amount(txn_by_idx[stmt_idx], db_by_id[cid])
+                and _row_names_candidate(stmt_idx, cid, txn_by_idx, db_by_id)
             ]
             if len(named) != 1 or named[0] not in group_candidate_ids:
                 singled_out = False
@@ -593,6 +605,11 @@ def reconcile_statement(
     # Each key maps to a list of DB transactions (multiple txns can share the same key)
     db_pool: dict[tuple, list] = {}
     for db_txn in db_transactions:
+        # A statement states rupees. A row in another currency holds a
+        # different unit, so the two amounts are not comparable and the row is
+        # not a candidate for any statement row.
+        if (db_txn.currency or "INR") != "INR":
+            continue
         if db_txn.transaction_date and db_txn.amount is not None:
             key = _match_key(
                 db_txn.transaction_date, Decimal(str(db_txn.amount)), db_txn.direction
@@ -611,39 +628,42 @@ def reconcile_statement(
         key: list(rows) for key, rows in db_pool.items()
     }
 
-    # Bucketed by (date, direction) so a banded scan reads only the rows that
-    # share a day with the statement row, not the account's whole history.
-    by_date: dict[tuple[date_type, str], list[tuple[Decimal, list]]] = {}
-    for (key_date, key_amount, key_direction), rows in pool_snapshot.items():
-        by_date.setdefault((key_date, key_direction), []).append((key_amount, rows))
+    # Buckets the pool by day and direction. A banded scan then reads the rows
+    # of one day only. It does not read the whole account history.
+    by_day: dict[tuple[date_type, str], list[tuple[Decimal, int]]] = {}
+
+    for (day, amount, direction), rows in pool_snapshot.items():
+        bucket = by_day.setdefault((day, direction), [])
+        bucket.extend((amount, row.id) for row in rows)
 
     def _reachable(amount: Decimal, direction: str, txn_date: date_type) -> set[int]:
         """The DB rows that could be this statement row's transaction, across
         the window. Card-blind: see the note above.
 
-        The amount is a band, not a value. A card states one amount when it
-        authorises and another when it settles: a fuel surcharge lands after
-        the swipe, and a foreign charge is converted on the settlement day at
-        a different rate. The alert carries the authorised amount and the
-        statement carries the settled one, so the same purchase reaches the
-        two sources as two amounts. On an exact amount the stored row is
-        invisible here, the set empties, and the import reads "nothing can
-        already hold this" and stores the purchase a second time.
+        The amount is a band, not a value. A card states two amounts for one
+        purchase. It states the first amount when it authorises the purchase.
+        It states the second amount when the purchase settles. A fuel
+        surcharge is added at settlement. A foreign charge converts at the
+        settlement-day rate.
 
-        Widening only this set cannot pair the two rows or rewrite either
-        amount. It makes the row contended, so it is held back for a person
-        to resolve. A band is not identity: two purchases a surcharge apart
-        are as plausible as one purchase billed twice, and only a person can
-        tell them apart.
+        The alert states the authorised amount. The statement states the
+        settled amount. With an exact amount, the stored row is invisible
+        here. The set is then empty. An empty set means "no row can hold this
+        purchase", and the import stores the purchase a second time.
+
+        This set does not pair the two rows. It does not write either amount.
+        It makes the row contended, and the import holds the row back for a
+        person. A band is not an identity. Two purchases one surcharge apart
+        look the same as one purchase billed twice. Only a person can tell
+        them apart.
         """
         return {
-            db_txn.id
+            txn_id
             for offset in (0, -1, 1)
-            for key_amount, rows in by_date.get(
+            for row_amount, txn_id in by_day.get(
                 (txn_date + timedelta(days=offset), direction), ()
             )
-            if settles_within_band(amount, key_amount)
-            for db_txn in rows
+            if settles_within_band(amount, row_amount)
         }
 
     candidate_sets: dict[int, set[int]] = {}
@@ -902,13 +922,42 @@ def _calculate_adjustment_total(pairs, direction: str) -> str:
 _GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment done"}
 
 
-async def notify_statement_ambiguities(upload_id: int, recon: dict) -> None:
-    """Ask about every statement row the reconciler held back.
+def carry_resolved_answers(stored_json: str | None, recon: dict) -> None:
+    """Copy answered rows from the stored reconciliation onto a new one.
 
-    A held-back row has a candidate it could not be safely paired with, and
-    only a person can say whether the two are one purchase billed twice. Best
-    effort: a prompt that fails must not fail the import, because the row is
-    already visible on the statement page.
+    A person can answer a held row while a reparse computes. That answer is
+    already committed, and the new reconciliation does not know it. Writing
+    the new one over the stored one would revive the row: it asks again, and
+    an answer imports a second transaction.
+
+    A row is answered when it is imported. The reparse keeps everything else.
+    """
+    if not stored_json:
+        return
+    answered = {
+        row["stmt_idx"]: row
+        for row in reconciliation_from_json(stored_json).get("missing", [])
+        if row.get("imported")
+    }
+    if not answered:
+        return
+    for entry in recon.get("missing", []):
+        if prior := answered.get(entry.get("stmt_idx")):
+            entry["imported"] = True
+            entry["imported_txn_id"] = prior.get("imported_txn_id")
+            entry["ambiguous"] = False
+            entry["import_error"] = None
+            entry["resolution"] = prior.get("resolution")
+
+
+async def notify_statement_ambiguities(upload_id: int, recon: dict) -> None:
+    """Ask about every statement row that the import held back.
+
+    A held-back row has a candidate. The import cannot pair them safely. Only
+    a person can say if the two rows are one purchase billed twice.
+
+    This function is best effort. A prompt that fails must not fail the
+    import. The row is already visible on the statement page.
     """
     held = [
         entry
@@ -917,6 +966,17 @@ async def notify_statement_ambiguities(upload_id: int, recon: dict) -> None:
     ]
     if not held:
         return
+
+    try:
+        await _send_ambiguity_prompts(upload_id, held)
+    except Exception as exc:
+        # The import is already committed. The rows are on the statement page.
+        # A prompt that fails must therefore not fail the caller.
+        logger.warning("Statement ambiguity notification failed: %s", exc)
+
+
+async def _send_ambiguity_prompts(upload_id: int, held: list[dict]) -> None:
+    """Send one prompt per held-back row."""
 
     from financial_dashboard.services.settings import get_telegram_chat_id
     from financial_dashboard.services.telegram import send_statement_ambiguity_prompt
@@ -929,7 +989,24 @@ async def notify_statement_ambiguities(upload_id: int, recon: dict) -> None:
         upload = await session.get(StatementUpload, upload_id)
         if upload is None:
             return
+
+        # The stored reconciliation is correct, not the copy of the caller. A
+        # person can answer a row between the import and this call, and a
+        # reprocess can move that row out of ``missing`` and into ``matched``.
+        # So the prompts come from the stored rows that are still held, not
+        # from the rows of the caller.
+        if upload.reconciliation_data:
+            stored = reconciliation_from_json(upload.reconciliation_data)
+            held = [
+                row
+                for row in stored.get("missing", [])
+                if row.get("ambiguous") and not row.get("imported")
+            ]
+            if not held:
+                return
+
         bank = upload.bank
+
         for entry in held:
             candidate_ids = entry.get("candidate_transaction_ids") or []
             rows = (
@@ -937,6 +1014,7 @@ async def notify_statement_ambiguities(upload_id: int, recon: dict) -> None:
                     select(Transaction).where(Transaction.id.in_(candidate_ids))
                 )
             ).all()
+
             payload = {
                 "upload_id": upload_id,
                 "stmt_idx": entry["stmt_idx"],
@@ -949,6 +1027,7 @@ async def notify_statement_ambiguities(upload_id: int, recon: dict) -> None:
                     for row in rows
                 ],
             }
+
             try:
                 await send_statement_ambiguity_prompt(payload, chat_id)
             except Exception as exc:

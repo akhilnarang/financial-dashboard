@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Literal, NamedTuple
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,6 +46,7 @@ DeferralReason = Literal[
     "multiple_candidates",
     "source_slot_filled",
     "source_slot_conflict",
+    "settled_amount_ambiguous",
 ]
 
 # find_match's three terminal outcomes:
@@ -102,6 +103,54 @@ class MatchDecision(NamedTuple):
 # the manual-review queue can tell duplicate-defers apart from the other
 # `skipped` shapes (unsupported, _stub, non-transaction, ref-race). Asserted
 # in tests.
+def _amount_identifies(amount):
+    """Match a row by its amount, or by the amount a statement replaced.
+
+    A card authorises one amount and settles a different amount. When a
+    statement states the settled amount, the row keeps the authorised amount
+    in ``authorised_amount``. An alert for the same purchase states the
+    authorised amount, so the row must stay reachable. Without it the alert
+    finds no candidate and stores the purchase a second time.
+
+    A row reached only by its authorised amount is evidence, not a decision:
+    see ``_only_authorised`` and the defer in ``_decide``.
+    """
+    return or_(
+        Transaction.amount == amount,
+        Transaction.authorised_amount == amount,
+    )
+
+
+def _only_authorised(txn: Transaction, amount) -> bool:
+    """Whether a row states this amount only as the amount a card authorised.
+
+    Such a row can be the purchase that the statement settled. It can also be
+    a different purchase of the amount that this one authorised. Nothing here
+    tells them apart, so the caller must ask a person.
+    """
+    return amount != txn.amount and amount == txn.authorised_amount
+
+
+def _states_amount(txn: Transaction, amount, *, same_event: bool = False) -> bool:
+    """Whether a stored row states this amount, now or before a settlement.
+
+    A row keeps the amount a card authorised in ``authorised_amount`` when a
+    statement replaces it. An alert for the same purchase states the
+    authorised amount, so both amounts identify the one event. This is the
+    ``same_event`` says that the caller proved the event by other means, such
+    as a date and a card. Only such a caller may use the authorised amount. A
+    reference alone does not prove the event: a parser can scrape a reference
+    that two purchases share, and the authorised amount of one purchase says
+    nothing about the other.
+    """
+    if amount is None:
+        # A row with no amount states nothing. Two such rows are not one event.
+        return False
+    if amount == txn.amount:
+        return True
+    return same_event and amount == txn.authorised_amount
+
+
 DUP_DEFER_PREFIX = "[dup-defer]"
 DUP_DEFER_NOTE = (
     f"{DUP_DEFER_PREFIX} possible duplicate (no balance to confirm) — "
@@ -471,7 +520,7 @@ async def _gather_fuzzy_candidates(
         select(Transaction).where(
             Transaction.bank == txn_data["bank"],
             Transaction.direction == txn_data["direction"],
-            Transaction.amount == txn_data["amount"],
+            _amount_identifies(txn_data["amount"]),
             sa_func.coalesce(Transaction.currency, "INR") == incoming_currency,
             Transaction.transaction_date.is_not(None),
             Transaction.transaction_date >= date_lower,
@@ -620,6 +669,27 @@ def _decide(
     if not candidates:
         return MatchDecision("insert")
 
+    # A row reached only by its authorised amount can be the purchase that a
+    # statement settled, or a different purchase of that amount. The balance
+    # and the slot do not tell them apart, so a person decides.
+    #
+    # A row that states the amount now is stronger evidence, so it decides
+    # alone. A settled neighbour must not block it, and must not be offered
+    # in its place.
+    exact = [c for c in candidates if c.amount == txn_data.get("amount")]
+    if exact:
+        candidates = exact
+    else:
+        authorised_only = [
+            c for c in candidates if _only_authorised(c, txn_data.get("amount"))
+        ]
+        if authorised_only:
+            return MatchDecision(
+                "defer",
+                deferral_reason="settled_amount_ambiguous",
+                resolution_candidate_ids=tuple(c.id for c in authorised_only),
+            )
+
     incoming_balance = _quantize_balance(txn_data.get("balance"))
 
     # Step 1 — authoritative split: drop candidates with a DIFFERENT *known*
@@ -746,7 +816,7 @@ async def qualifies_as_explicit_match(
     if (
         target.bank != txn_data.get("bank")
         or target.direction != txn_data.get("direction")
-        or target.amount != txn_data.get("amount")
+        or not _states_amount(target, txn_data.get("amount"), same_event=True)
         or _normalized_currency(target.currency)
         != _normalized_currency(txn_data.get("currency"))
         or not _plausible_event_time(target, txn_data)
@@ -823,7 +893,7 @@ async def find_match(
         )
         rows = list(result.scalars().all())
         if len(rows) == 1:
-            if rows[0].amount != txn_data["amount"]:
+            if not _states_amount(rows[0], txn_data["amount"]):
                 # A reference hit with a different amount is not a safe event
                 # identity. Parsers can scrape boilerplate or non-unique refs
                 # (the historical Kotak collision shape), and merging here
@@ -838,10 +908,22 @@ async def find_match(
                     gates=("bank_direction_reference", "amount"),
                     reason="reference_amount_mismatch",
                 )
+                # A row is offered only when the incoming amount is the
+                # amount that its card authorised. The two are then one
+                # purchase that a statement settled, and a person can say so.
+                # Any other amount is the collision this branch exists for:
+                # two purchases share a scraped reference, and a button would
+                # invite a person to destroy one of them.
+                offered = (
+                    (rows[0].id,)
+                    if _only_authorised(rows[0], txn_data["amount"])
+                    else ()
+                )
                 return MatchDecision(
                     "defer",
                     kind="ref_amount_mismatch",
                     deferral_reason="reference_amount_mismatch",
+                    resolution_candidate_ids=offered,
                 )
             # Apply the same authoritative balance guard as the fuzzy path.
             # When both sources know the post-transaction balance and disagree,
@@ -1027,7 +1109,7 @@ async def _find_am_pm_alias_match(
         hi = center + timedelta(minutes=_FUZZY_MATCH_WINDOW_MINUTES)
         return lo, hi
 
-    from sqlalchemy import and_, or_
+    from sqlalchemy import and_
     from sqlalchemy import func as sa_func
 
     date_clauses = []
@@ -1056,7 +1138,7 @@ async def _find_am_pm_alias_match(
         select(Transaction).where(
             Transaction.bank == txn_data["bank"],
             Transaction.direction == txn_data["direction"],
-            Transaction.amount == txn_data["amount"],
+            _amount_identifies(txn_data["amount"]),
             sa_func.coalesce(Transaction.currency, "INR") == incoming_currency,
             Transaction.email_type.in_(AMBIGUOUS_12H_TIME_EMAIL_TYPES),
             Transaction.transaction_time.is_not(None),

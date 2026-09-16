@@ -601,11 +601,13 @@ def _parse_statement_ambiguity_callback(
         ids = [int(value) for value in raw_ids]
     except ValueError:
         return None
+
+    # stmt_idx is an index. Zero is therefore valid. The two ids are not.
     if any(value < 0 for value in ids):
         return None
-    # stmt_idx is an index, so zero is valid; the ids either side are not.
     if ids[0] <= 0 or (action == "merge" and ids[2] <= 0):
         return None
+
     transaction_id = ids[2] if action == "merge" else None
     return action, ids[0], ids[1], transaction_id
 
@@ -613,17 +615,17 @@ def _parse_statement_ambiguity_callback(
 async def send_statement_ambiguity_prompt(payload: dict, chat_id: int) -> None:
     """Ask which transaction a held-back statement row belongs to.
 
-    The card authorised one amount and the statement settled another, so the
-    reconciler could not tell one purchase billed twice from two purchases of
-    a similar size. Only a person can.
+    The card authorised one amount. The statement settled a different amount.
+    The import cannot tell one purchase billed twice from two purchases of a
+    similar size. Only a person can tell them apart.
     """
-    app = tg_app
-    if not app:
+    if not tg_app:
         return
 
     upload_id = int(payload["upload_id"])
     stmt_idx = int(payload["stmt_idx"])
     candidates = payload.get("candidates") or []
+
     bank = html.escape(str(payload.get("bank", "")).upper())
     amount = html.escape(str(payload.get("amount") or ""))
     narration = html.escape(str(payload.get("narration") or ""))
@@ -634,6 +636,8 @@ async def send_statement_ambiguity_prompt(payload: dict, chat_id: int) -> None:
         lines[-1] += f" · {narration}"
     if stmt_date:
         lines.append(stmt_date)
+
+    lines.append("The statement amount is near a stored one. Choose an action.")
 
     buttons = [
         [
@@ -652,9 +656,9 @@ async def send_statement_ambiguity_prompt(payload: dict, chat_id: int) -> None:
             )
         ]
     )
-    lines.append("The statement amount is near a stored one. Choose an action.")
+
     # TODO: Persist ambiguity prompts in a transactional outbox before dispatch.
-    await app.bot.send_message(
+    await tg_app.bot.send_message(
         chat_id=chat_id,
         text="\n".join(lines),
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -678,6 +682,7 @@ async def _handle_statement_ambiguity_callback(update: Update, context) -> None:
     if parsed is None:
         await query.answer("Invalid callback")
         return
+
     action, upload_id, stmt_idx, transaction_id = parsed
 
     from financial_dashboard.services.statement_ambiguity_resolution import (
@@ -694,17 +699,19 @@ async def _handle_statement_ambiguity_callback(update: Update, context) -> None:
         await query.answer(str(exc))
         return
     except OperationalError:
-        # A rival tap holds the upload write lock past the busy timeout.
+        # A second tap holds the upload write lock after the busy timeout.
         await query.answer("Busy, try again")
         return
 
     await query.answer()
+
     if result.status == "already_resolved":
         text = f"Already resolved as #{result.transaction_id}"
     elif result.status == "merged":
         text = f"Statement row merged into #{result.transaction_id}"
     else:
         text = f"Created #{result.transaction_id}"
+
     try:
         await query.edit_message_text(text)
     except Exception as exc:

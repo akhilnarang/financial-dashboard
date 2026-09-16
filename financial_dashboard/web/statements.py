@@ -59,6 +59,7 @@ from financial_dashboard.services.statements.cc import (
     enrich_matched_transactions,
     extract_pdf_from_email,
     group_recon_by_person,
+    carry_resolved_answers,
     import_missing_cc_txns,
     notify_statement_ambiguities,
     load_account_card_masks,
@@ -752,6 +753,12 @@ async def statement_reprocess(
     upload = await session.get(StatementUpload, upload_id)
     if upload is None:
         return RedirectResponse(url="/statements", status_code=303)
+
+    # A person can answer a held row while this reparse runs. That answer is
+    # already committed, so the new reconciliation must carry it. Without this
+    # the answer is lost, and the row asks again and imports a second time.
+    carry_resolved_answers(upload.reconciliation_data, recon)
+
     upload.bank = parsed.bank
     upload.card_number = parsed.card_number
     upload.statement_name = parsed.name

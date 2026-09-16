@@ -26,6 +26,7 @@ from financial_dashboard.services.statements.bank import (
     reconcile_bank_statement,
 )
 from financial_dashboard.services.statements.cc import (
+    carry_resolved_answers,
     notify_statement_ambiguities,
     enrich_matched_transactions,
     import_missing_cc_txns,
@@ -105,6 +106,10 @@ async def retry_cc_statement_upload(
             # first transaction and this one. Bail; nothing safe to
             # reconcile against.
             return False
+        # A person can answer a held row while this retry runs. Carry that
+        # answer, or the row asks again and imports a second time.
+        carry_resolved_answers(upload.reconciliation_data, recon)
+
         upload.status = "parsed"
         upload.bank = parsed.bank
         upload.card_number = parsed.card_number

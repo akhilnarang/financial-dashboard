@@ -598,6 +598,7 @@ erDiagram
         string email_type
         string direction
         decimal amount
+        decimal authorised_amount
         string currency
         date transaction_date
         time transaction_time
@@ -680,6 +681,7 @@ Relationship notes:
 - `(source_id, remote_id)` is unique on `emails` (provider-scoped deduplication).
 - `transactions` has a partial unique index on `(bank, reference_number, direction)` where `reference_number IS NOT NULL` (deduplicates transactions with known UTR/UPI reference numbers; direction is included so a debit and credit sharing a ref don't collide).
 - `transactions` also has a partial lookup index on `reference_number` where it is non-null; ingest uses it to find an opposite-direction leg on a different linked or masked account and mark both transactions as `self_transfer`.
+- `transactions.authorised_amount` is null until a statement replaces the amount of the row. A card authorises one amount and settles a different amount. A fuel surcharge is added at settlement, and a foreign charge converts at the settlement-day rate. When a person confirms that a statement row settles a stored row, `amount` gets the settled amount and this column keeps the authorised amount. An alert for the same purchase can arrive after the statement, and that alert states the authorised amount. Duplicate detection matches either amount.
 - `transactions.counterparty_source` is non-null and defaults to `bank`. It says where `counterparty` came from. A parser sets `user_alias` when the bank prints a label the user chose, such as an HDFC payee nickname. A label does not replace a name a bank states, and a bank name replaces a stored label. The column follows the name: a writer that changes one changes the other.
 - `transactions` has a composite lookup index on `(category, transaction_date)`. Category first because a category filter with no date bounds — a drill-through from a category link, say — would otherwise scan the table, both for the rows and for the `count()` the pager needs; `transaction_date` second so a filter carrying both a category and a date range satisfies them from the one index instead of narrowing on dates and re-checking the category per row.
 - `(account_id, card_mask)` is unique on `cards`.
