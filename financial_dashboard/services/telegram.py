@@ -300,6 +300,9 @@ async def _handle_callback(update: Update, context) -> None:
     if query.data.startswith("smsdup:v1:"):
         await _handle_sms_duplicate_callback(update, context)
         return
+    if query.data.startswith("stmtdup:v1:"):
+        await _handle_statement_ambiguity_callback(update, context)
+        return
     if query.data.startswith("cc_pay_pick:"):
         await _handle_cc_pay_pick_callback(update, context)
         return
@@ -578,6 +581,134 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
             )
         except Exception as exc:
             logger.warning("SMS duplicate account picker failed: %s", exc)
+
+
+def _parse_statement_ambiguity_callback(
+    data: str,
+) -> tuple[Literal["merge", "create_new"], int, int, int | None] | None:
+    if len(data.encode()) > 64:
+        return None
+    parts = data.split(":")
+    if len(parts) == 6 and parts[:3] == ["stmtdup", "v1", "m"]:
+        action: Literal["merge", "create_new"] = "merge"
+        raw_ids = parts[3:]
+    elif len(parts) == 5 and parts[:3] == ["stmtdup", "v1", "n"]:
+        action = "create_new"
+        raw_ids = parts[3:]
+    else:
+        return None
+    try:
+        ids = [int(value) for value in raw_ids]
+    except ValueError:
+        return None
+    if any(value < 0 for value in ids):
+        return None
+    # stmt_idx is an index, so zero is valid; the ids either side are not.
+    if ids[0] <= 0 or (action == "merge" and ids[2] <= 0):
+        return None
+    transaction_id = ids[2] if action == "merge" else None
+    return action, ids[0], ids[1], transaction_id
+
+
+async def send_statement_ambiguity_prompt(payload: dict, chat_id: int) -> None:
+    """Ask which transaction a held-back statement row belongs to.
+
+    The card authorised one amount and the statement settled another, so the
+    reconciler could not tell one purchase billed twice from two purchases of
+    a similar size. Only a person can.
+    """
+    app = tg_app
+    if not app:
+        return
+
+    upload_id = int(payload["upload_id"])
+    stmt_idx = int(payload["stmt_idx"])
+    candidates = payload.get("candidates") or []
+    bank = html.escape(str(payload.get("bank", "")).upper())
+    amount = html.escape(str(payload.get("amount") or ""))
+    narration = html.escape(str(payload.get("narration") or ""))
+    stmt_date = html.escape(str(payload.get("date") or ""))
+
+    lines = [f"⚠️ <b>{bank}</b> statement #{upload_id}", f"₹{amount}"]
+    if narration:
+        lines[-1] += f" · {narration}"
+    if stmt_date:
+        lines.append(stmt_date)
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"Merge into #{candidate['id']} (₹{candidate['amount']})",
+                callback_data=f"stmtdup:v1:m:{upload_id}:{stmt_idx}:{candidate['id']}",
+            )
+        ]
+        for candidate in candidates
+    ]
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "Create new",
+                callback_data=f"stmtdup:v1:n:{upload_id}:{stmt_idx}",
+            )
+        ]
+    )
+    lines.append("The statement amount is near a stored one. Choose an action.")
+    # TODO: Persist ambiguity prompts in a transactional outbox before dispatch.
+    await app.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML",
+    )
+
+
+async def _handle_statement_ambiguity_callback(update: Update, context) -> None:
+    """Resolve an authorized held-back statement row."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    if not query.message:
+        await query.answer("Message no longer available")
+        return
+    if query.message.chat.id != get_telegram_chat_id():
+        await query.answer("Unauthorized")
+        return
+
+    parsed = _parse_statement_ambiguity_callback(query.data)
+    if parsed is None:
+        await query.answer("Invalid callback")
+        return
+    action, upload_id, stmt_idx, transaction_id = parsed
+
+    from financial_dashboard.services.statement_ambiguity_resolution import (
+        StatementAmbiguityError,
+        resolve_statement_ambiguity,
+    )
+
+    try:
+        async with async_session() as session:
+            result = await resolve_statement_ambiguity(
+                session, upload_id, stmt_idx, action, transaction_id
+            )
+    except StatementAmbiguityError as exc:
+        await query.answer(str(exc))
+        return
+    except OperationalError:
+        # A rival tap holds the upload write lock past the busy timeout.
+        await query.answer("Busy, try again")
+        return
+
+    await query.answer()
+    if result.status == "already_resolved":
+        text = f"Already resolved as #{result.transaction_id}"
+    elif result.status == "merged":
+        text = f"Statement row merged into #{result.transaction_id}"
+    else:
+        text = f"Created #{result.transaction_id}"
+    try:
+        await query.edit_message_text(text)
+    except Exception as exc:
+        logger.warning("Statement ambiguity callback edit failed: %s", exc)
 
 
 async def send_disambiguation_prompt(payload: dict, chat_id: int) -> None:

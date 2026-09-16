@@ -255,7 +255,7 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
 SETTLEMENT_BAND = Decimal("0.012")
 
 
-def _settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
+def settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
     """Whether one amount can be the other's settled or authorised twin.
 
     Read off the larger amount, so the answer does not depend on which side
@@ -642,7 +642,7 @@ def reconcile_statement(
             for key_amount, rows in by_date.get(
                 (txn_date + timedelta(days=offset), direction), ()
             )
-            if _settles_within_band(amount, key_amount)
+            if settles_within_band(amount, key_amount)
             for db_txn in rows
         }
 
