@@ -1003,6 +1003,11 @@ async def enrich_matched_transactions(recon: dict) -> int:
                 # A statement narration is a name the bank states.
                 txn.counterparty_source = "bank"
                 changed = True
+            elif new_value == existing and writes_name:
+                # The statement states the name the row already holds. The
+                # text is a bank name, so the column must stop calling it a
+                # label, or the next label overwrites a confirmed name.
+                txn.counterparty_source = "bank"
 
             # The statement narration is the only description these rows ever
             # get. Fill it when absent; never overwrite one already stored.

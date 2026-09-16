@@ -72,6 +72,7 @@ from financial_dashboard.services.txn_merge import (
     EnrichmentDiff,
     find_match,
     merge_transaction,
+    sync_counterparty_source,
 )
 from financial_dashboard.services.settings import (
     get_telegram_chat_id,
@@ -538,11 +539,9 @@ async def _apply_reparsed_transaction(
                 existing.transaction_time_is_received_time = bool(
                     txn_data["transaction_time_is_received_time"]
                 )
-            if "counterparty" in refresh_diff.changed_fields:
-                # This column describes the stored name, so it must follow it.
-                existing.counterparty_source = str(
-                    txn_data.get("counterparty_source") or "bank"
-                )
+            # This column describes the stored name, so it must follow it. An
+            # equal name changes no field, and still settles the source.
+            sync_counterparty_source(existing, txn_data)
             if refresh_diff.changed_fields:
                 enrichment_diff = refresh_diff
             existing.account_id = None

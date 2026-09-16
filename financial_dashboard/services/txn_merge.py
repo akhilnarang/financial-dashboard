@@ -214,6 +214,22 @@ def _bank_name_replaces_alias(existing: Transaction, incoming: dict) -> bool:
     )
 
 
+def sync_counterparty_source(txn: Transaction, incoming: dict) -> None:
+    """Make the stored source follow the stored name.
+
+    Call this after a write of the name, and also when a write was refused
+    because the incoming name equals the stored one. A bank that states the
+    same text as a stored label still proves the text is a bank name, so the
+    column must stop claiming the label. If it keeps the claim, the next
+    label overwrites a name the bank has confirmed.
+    """
+    incoming_name = incoming.get("counterparty")
+    if not incoming_name or incoming_name != txn.counterparty:
+        # The stored name came from somewhere else. Say nothing about it.
+        return
+    txn.counterparty_source = str(incoming.get("counterparty_source") or "bank")
+
+
 def _is_information_downgrade(field: str, old_val: object, new_val: object) -> bool:
     # Only the three string-valued fields below can degrade; every other
     # field short-circuits to False without touching old_val/new_val, so the
@@ -1252,9 +1268,9 @@ async def apply_transaction_enrichment(
             txn_data.get("transaction_time_is_received_time")
         )
 
-    # The column describes the stored name, so it must follow it.
-    if "counterparty" in diff.changed_fields:
-        match.counterparty_source = str(txn_data.get("counterparty_source") or "bank")
+    # The column describes the stored name, so it must follow it. An equal
+    # name changes no field, and still settles the source.
+    sync_counterparty_source(match, txn_data)
 
     if match.source != channel and match.source is not None:
         match.source = "sms+email"

@@ -224,6 +224,24 @@ async def test_a_statement_name_replaces_a_saved_label(maker):
     assert stored.counterparty_source == "bank"
 
 
+async def test_a_statement_that_states_the_saved_label_clears_the_claim(maker):
+    """The statement can carry the same text the user saved as a label.
+
+    The name does not change, so nothing is written. The bank still stated
+    the text, so the source must stop calling it a label. If it does not, a
+    later label replaces a name the statement confirmed.
+    """
+    row_id = await _store(
+        maker, counterparty="RAISESEC URITIES", counterparty_source="user_alias"
+    )
+
+    await _enrich(row_id, counterparty="RAISESEC URITIES", narration="MOBILE BANKING")
+
+    stored = await _read(maker, row_id)
+    assert stored.counterparty == "RAISESEC URITIES"
+    assert stored.counterparty_source == "bank"
+
+
 async def test_a_narration_alone_does_not_fill_an_empty_counterparty(maker):
     """An empty field is not a licence to store a channel label.
 

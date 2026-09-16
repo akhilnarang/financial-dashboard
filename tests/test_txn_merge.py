@@ -17,6 +17,7 @@ from financial_dashboard.services.txn_merge import (
     find_match,
     is_duplicate_transaction_error,
     merge_transaction,
+    sync_counterparty_source,
 )
 
 
@@ -1044,6 +1045,28 @@ async def test_merge_transaction_stores_and_replaces_a_user_alias(
     )
     assert replaced.counterparty == "SAMPLE BENEFICIARY"
     assert replaced.counterparty_source == "bank"
+
+
+def test_a_bank_that_states_the_stored_label_clears_the_label_claim() -> None:
+    """A bank can send the same text the user saved as a label.
+
+    The name does not change, so no field changes. The text is still a name
+    the bank states. If the column keeps saying "user_alias", the next label
+    replaces a name the bank confirmed.
+    """
+    txn = _make_txn(counterparty="My Savings Payee", counterparty_source="user_alias")
+    sync_counterparty_source(txn, {"counterparty": "My Savings Payee"})
+    assert txn.counterparty_source == "bank"
+
+
+def test_a_refused_label_does_not_claim_the_stored_name() -> None:
+    """The guard refused the label, so the label owns nothing."""
+    txn = _make_txn(counterparty="SAMPLE BENEFICIARY NAME", counterparty_source="bank")
+    sync_counterparty_source(
+        txn,
+        {"counterparty": "My Savings Payee", "counterparty_source": "user_alias"},
+    )
+    assert txn.counterparty_source == "bank"
 
 
 @pytest.mark.anyio
