@@ -248,6 +248,27 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
     return (txn_date, amount, direction)
 
 
+# How far a settled amount may sit from the amount the card authorised. A fuel
+# surcharge is about 1%, and a foreign charge moves with the settlement-day
+# rate. The band only widens the evidence set, so it must cover the real drift;
+# it never pairs two rows by itself.
+SETTLEMENT_BAND = Decimal("0.012")
+
+
+def _settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
+    """Whether one amount can be the other's settled or authorised twin.
+
+    Read off the larger amount, so the answer does not depend on which side
+    asks.
+    """
+    if settled == authorised:
+        return True
+    larger = max(abs(settled), abs(authorised))
+    if not larger:
+        return False
+    return abs(settled - authorised) <= larger * SETTLEMENT_BAND
+
+
 # cc-parser tags a credit row that is bank-internal bookkeeping, not money
 # that reached the card. HSBC prints one such ``CR`` row before each billed
 # EMI instalment (``emi_installment_transfer``): it moves the instalment off
@@ -590,14 +611,40 @@ def reconcile_statement(
         key: list(rows) for key, rows in db_pool.items()
     }
 
+    # Bucketed by (date, direction) so a banded scan reads only the rows that
+    # share a day with the statement row, not the account's whole history.
+    by_date: dict[tuple[date_type, str], list[tuple[Decimal, list]]] = {}
+    for (key_date, key_amount, key_direction), rows in pool_snapshot.items():
+        by_date.setdefault((key_date, key_direction), []).append((key_amount, rows))
+
     def _reachable(amount: Decimal, direction: str, txn_date: date_type) -> set[int]:
         """The DB rows that could be this statement row's transaction, across
-        the window. Card-blind: see the note above."""
-        found: set[int] = set()
-        for offset in (0, -1, 1):
-            key = _match_key(txn_date + timedelta(days=offset), amount, direction)
-            found.update(db_txn.id for db_txn in pool_snapshot.get(key, []))
-        return found
+        the window. Card-blind: see the note above.
+
+        The amount is a band, not a value. A card states one amount when it
+        authorises and another when it settles: a fuel surcharge lands after
+        the swipe, and a foreign charge is converted on the settlement day at
+        a different rate. The alert carries the authorised amount and the
+        statement carries the settled one, so the same purchase reaches the
+        two sources as two amounts. On an exact amount the stored row is
+        invisible here, the set empties, and the import reads "nothing can
+        already hold this" and stores the purchase a second time.
+
+        Widening only this set cannot pair the two rows or rewrite either
+        amount. It makes the row contended, so it is held back for a person
+        to resolve. A band is not identity: two purchases a surcharge apart
+        are as plausible as one purchase billed twice, and only a person can
+        tell them apart.
+        """
+        return {
+            db_txn.id
+            for offset in (0, -1, 1)
+            for key_amount, rows in by_date.get(
+                (txn_date + timedelta(days=offset), direction), ()
+            )
+            if _settles_within_band(amount, key_amount)
+            for db_txn in rows
+        }
 
     candidate_sets: dict[int, set[int]] = {}
     for stmt_idx, (_stmt_list, direction, txn) in enumerate(stmt_txns):
