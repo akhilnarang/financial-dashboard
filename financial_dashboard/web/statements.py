@@ -60,6 +60,7 @@ from financial_dashboard.services.statements.cc import (
     extract_pdf_from_email,
     group_recon_by_person,
     import_missing_cc_txns,
+    notify_statement_ambiguities,
     load_account_card_masks,
     parse_cc_amount,
     parse_statement,
@@ -333,6 +334,7 @@ async def statement_upload(
     await session.commit()
     upload_id = upload.id
 
+    await notify_statement_ambiguities(upload_id, recon)
     await init_payment_tracking(upload_id)
 
     return RedirectResponse(url=f"/statements/{upload_id}", status_code=303)
@@ -785,6 +787,7 @@ async def statement_reprocess(
     await emit_cc_snapshot(session, upload)
     await session.commit()
 
+    await notify_statement_ambiguities(upload_id, recon)
     await init_payment_tracking(upload_id)
 
     return RedirectResponse(url=f"/statements/{upload_id}", status_code=303)

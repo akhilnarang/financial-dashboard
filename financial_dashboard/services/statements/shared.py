@@ -3,7 +3,6 @@
 import asyncio
 import logging
 from datetime import timedelta
-from decimal import Decimal
 from pathlib import Path
 
 from sqlalchemy import select
@@ -27,6 +26,7 @@ from financial_dashboard.services.statements.bank import (
     reconcile_bank_statement,
 )
 from financial_dashboard.services.statements.cc import (
+    notify_statement_ambiguities,
     enrich_matched_transactions,
     import_missing_cc_txns,
     load_account_card_masks,
@@ -156,59 +156,6 @@ async def retry_cc_statement_upload(
 
     await notify_statement_ambiguities(upload_id, recon)
     return True
-
-
-async def notify_statement_ambiguities(upload_id: int, recon: dict) -> None:
-    """Ask about every statement row the reconciler held back.
-
-    A held-back row has a candidate it could not be safely paired with, and
-    only a person can say whether the two are one purchase billed twice. Best
-    effort: a prompt that fails must not fail the import, because the row is
-    already visible on the statement page.
-    """
-    held = [
-        entry
-        for entry in recon.get("missing", [])
-        if entry.get("ambiguous") and not entry.get("imported")
-    ]
-    if not held:
-        return
-
-    from financial_dashboard.services.settings import get_telegram_chat_id
-    from financial_dashboard.services.telegram import send_statement_ambiguity_prompt
-
-    chat_id = get_telegram_chat_id()
-    if not chat_id:
-        return
-
-    async with async_session() as session:
-        upload = await session.get(StatementUpload, upload_id)
-        if upload is None:
-            return
-        bank = upload.bank
-        for entry in held:
-            candidate_ids = entry.get("candidate_transaction_ids") or []
-            rows = (
-                await session.scalars(
-                    select(Transaction).where(Transaction.id.in_(candidate_ids))
-                )
-            ).all()
-            payload = {
-                "upload_id": upload_id,
-                "stmt_idx": entry["stmt_idx"],
-                "bank": bank,
-                "amount": entry.get("amount"),
-                "narration": entry.get("narration"),
-                "date": entry.get("date"),
-                "candidates": [
-                    {"id": row.id, "amount": f"{Decimal(str(row.amount)):,.2f}"}
-                    for row in rows
-                ],
-            }
-            try:
-                await send_statement_ambiguity_prompt(payload, chat_id)
-            except Exception as exc:
-                logger.warning("Statement ambiguity prompt failed: %s", exc)
 
 
 async def retry_bank_statement_upload(
