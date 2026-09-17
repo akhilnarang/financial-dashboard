@@ -90,7 +90,7 @@ async def _lock_upload(session: AsyncSession, upload_id: int) -> StatementUpload
 
 
 def _row_identity(entry: dict) -> tuple:
-    """What a row states. A reparse can move a row; what it states does not."""
+    """What a row states, for the revision token."""
     return (
         entry.get("date"),
         entry.get("amount"),
@@ -100,33 +100,50 @@ def _row_identity(entry: dict) -> tuple:
     )
 
 
-def _carry_resolved_rows(upload: StatementUpload, recon: dict) -> None:
-    """Copy committed answers onto a reconciliation about to replace them.
+async def _carry_answers(
+    session: AsyncSession,
+    upload: StatementUpload,
+    recon: dict,
+    revision: str,
+) -> None:
+    """Copy this parse's answers onto a reconciliation about to replace them.
 
     A writer computes its reconciliation outside the lock, so a person can
     answer while it runs. Writing it would return the row to unanswered while
     its transaction remains.
 
-    Rows match on what they state, not where they sit: a reparse can move one.
+    The answers come from the decision table, scoped to this revision, so an
+    ordinal means the same row. An answer whose transaction is gone is skipped:
+    the row asks again, which is how a wrong answer is undone.
     """
-    from financial_dashboard.services.statements.cc import reconciliation_from_json
-
-    if not upload.reconciliation_data:
-        return
-
-    stored = reconciliation_from_json(upload.reconciliation_data)
-    answered = {
-        _row_identity(row): row
-        for row in stored.get("missing", [])
-        if row.get("imported") and row.get("imported_txn_id") is not None
-    }
+    answered = (
+        await session.scalars(
+            select(StatementRowDecision).where(
+                StatementRowDecision.statement_upload_id == upload.id,
+                StatementRowDecision.parse_revision == revision,
+                StatementRowDecision.status.in_(("merged", "created")),
+                StatementRowDecision.transaction_id.is_not(None),
+            )
+        )
+    ).all()
     if not answered:
         return
 
+    live = set(
+        (
+            await session.scalars(
+                select(Transaction.id).where(
+                    Transaction.id.in_([d.transaction_id for d in answered])
+                )
+            )
+        ).all()
+    )
+    by_idx = {d.stmt_idx: d for d in answered if d.transaction_id in live}
+
     for entry in recon.get("missing", []):
-        if prior := answered.get(_row_identity(entry)):
+        if prior := by_idx.get(entry.get("stmt_idx")):
             entry["imported"] = True
-            entry["imported_txn_id"] = prior["imported_txn_id"]
+            entry["imported_txn_id"] = prior.transaction_id
             entry["ambiguous"] = False
             entry["import_error"] = None
 
@@ -142,7 +159,7 @@ async def record_pending_decisions(
     is superseded: its ordinal no longer names the same row.
     """
     revision = parse_revision(recon)
-    _carry_resolved_rows(upload, recon)
+    await _carry_answers(session, upload, recon, revision)
 
     stale = (
         await session.scalars(
@@ -209,6 +226,13 @@ async def record_pending_decisions(
         )
         session.add(decision)
         created.append(decision)
+
+    # The caller counted before the carry ran, so count again.
+    upload.missing_count = sum(
+        1 for entry in recon.get("missing", []) if not entry.get("imported")
+    )
+    if upload.missing_count == 0 and upload.status == "partial_import":
+        upload.status = "imported"
 
     await session.flush()
     return created
@@ -404,6 +428,21 @@ async def resolve_settlement(
                 raise SettlementError("Merge target no longer exists")
             if target.account_id != upload.account_id:
                 raise SettlementError("Merge target belongs to another account")
+            if target.statement_upload_id is not None:
+                # The row already states a settled amount, so a near amount is
+                # a second purchase, not its settlement.
+                raise SettlementError("Merge target came from a statement")
+
+            # Defect 1: a claim can live on another upload.
+            rival = await session.scalar(
+                select(StatementRowDecision.id).where(
+                    StatementRowDecision.transaction_id == target.id,
+                    StatementRowDecision.status.in_(("merged", "created")),
+                    StatementRowDecision.id != decision.id,
+                )
+            )
+            if rival is not None:
+                raise SettlementError("Another answer already used this transaction")
 
             txn_id = _apply_merge(decision, target)
             _record_answer_on_upload(upload, decision, txn_id)

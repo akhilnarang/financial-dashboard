@@ -117,7 +117,6 @@ async def retry_cc_statement_upload(
         upload.parsed_txn_count = len(recon["matched"]) + len(recon["missing"])
         upload.matched_count = len(recon["matched"])
         upload.missing_count = len(recon["missing"])
-        upload.reconciliation_data = reconciliation_to_json(recon)
         upload.error = None
 
         imported = len(
@@ -219,7 +218,6 @@ async def retry_bank_statement_upload(
         upload.parsed_txn_count = len(recon["matched"]) + len(recon["missing"])
         upload.matched_count = len(recon["matched"])
         upload.missing_count = len(recon["missing"])
-        upload.reconciliation_data = reconciliation_to_json(recon)
         upload.error = None
 
         account = await session.get(Account, account_id)
