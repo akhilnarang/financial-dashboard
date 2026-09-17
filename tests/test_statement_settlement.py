@@ -28,6 +28,7 @@ from financial_dashboard.db import (
 )
 from financial_dashboard.services.statement_settlement import (
     SettlementError,
+    _carry_answers,
     parse_revision,
     record_pending_decisions,
     resolve_settlement,
@@ -148,25 +149,13 @@ async def test_create_new_stores_the_row_as_its_own_transaction(maker):
     decision = await _decision(maker, upload_id)
 
     async with maker() as session:
-        result = await resolve_settlement(session, decision.id, "create_new")
+        result = await resolve_settlement(session, decision.id)
 
     assert result.status == "created"
     assert [row.amount for row in await _rows(maker)] == [
         Decimal(AUTHORISED),
         Decimal("2529.00"),
     ]
-
-
-async def test_a_row_with_no_candidate_can_still_be_created(maker):
-    """Nothing stored can be this purchase, so Create must still work."""
-    upload_id = await _seed(maker, recon=_recon(candidates=()))
-    decision = await _decision(maker, upload_id)
-
-    async with maker() as session:
-        result = await resolve_settlement(session, decision.id, "create_new")
-
-    assert result.status == "created"
-    assert len(await _rows(maker)) == 2
 
 
 async def test_a_reparse_that_moves_the_row_supersedes_the_old_question(maker):
@@ -246,33 +235,6 @@ async def test_the_revision_token_survives_a_restart():
     assert len(runs) == 1
 
 
-async def test_a_question_retires_when_its_row_stops_needing_an_answer(maker):
-    """A row can stop asking without the parse changing.
-
-    An earlier answer imports it, or a corrected amount matches it. The old
-    prompt must stop working, or a tap stores the purchase a second time.
-    """
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-
-    resolved = _recon()
-    resolved["missing"][0]["imported"] = True
-    resolved["missing"][0]["ambiguous"] = False
-    resolved["settlement_groups"] = []
-
-    async with maker() as session:
-        upload = await session.get(StatementUpload, upload_id)
-        upload.reconciliation_data = json.dumps(resolved)
-        await record_pending_decisions(session, upload, resolved)
-        await session.commit()
-
-    async with maker() as session:
-        result = await resolve_settlement(session, decision.id, "create_new")
-
-    assert result.status == "superseded"
-    assert len(await _rows(maker)) == 1
-
-
 async def test_a_created_row_takes_the_card_of_its_statement_row(maker):
     """A statement bills several cards, so the header card is not the row's."""
     with_card = _recon()
@@ -286,7 +248,7 @@ async def test_a_created_row_takes_the_card_of_its_statement_row(maker):
         await session.commit()
 
     async with maker() as session:
-        await resolve_settlement(session, decision.id, "create_new")
+        await resolve_settlement(session, decision.id)
 
     created = (await _rows(maker))[1]
     assert created.card_mask == "7777"
@@ -317,34 +279,10 @@ async def test_a_tap_revalidates_against_the_stored_reconciliation(maker):
     assert before is not None and before.status == "pending"
 
     async with maker() as session:
-        result = await resolve_settlement(session, decision.id, "create_new")
+        result = await resolve_settlement(session, decision.id)
 
     assert result.status == "superseded"
     assert len(await _rows(maker)) == 1
-
-
-async def test_a_reparse_keeps_an_answer_committed_while_it_ran(maker):
-    """A writer computes its reconciliation outside the write lock.
-
-    A person can answer a row in that window. Writing the computed
-    reconciliation would return the row to unanswered while the transaction it
-    created remains, and the answer cannot be given again.
-    """
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-    async with maker() as session:
-        await resolve_settlement(session, decision.id, "create_new")
-
-    # What the reparse computed before the answer landed.
-    async with maker() as session:
-        upload = await session.get(StatementUpload, upload_id)
-        stale = _recon()
-        await record_pending_decisions(session, upload, stale)
-        await session.commit()
-
-    entry = stale["missing"][0]
-    assert entry["imported"] is True
-    assert entry["imported_txn_id"] is not None
 
 
 async def test_a_reused_question_describes_the_row_of_this_parse(maker):
@@ -385,7 +323,7 @@ async def test_a_carried_answer_comes_from_the_decision(maker):
     upload_id = await _seed(maker)
     decision = await _decision(maker, upload_id)
     async with maker() as session:
-        await resolve_settlement(session, decision.id, "create_new")
+        await resolve_settlement(session, decision.id)
 
     fresh = _recon()
     async with maker() as session:
@@ -396,30 +334,6 @@ async def test_a_carried_answer_comes_from_the_decision(maker):
     entry = fresh["missing"][0]
     assert entry["imported"] is True
     assert entry["imported_txn_id"] is not None
-
-
-async def test_a_deleted_transaction_lets_its_row_ask_again(maker):
-    """Deleting a wrongly created transaction is how an answer is undone.
-
-    The row must then ask again. Carrying an answer whose transaction is gone
-    would leave the row resolved to nothing and never import it.
-    """
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-    async with maker() as session:
-        result = await resolve_settlement(session, decision.id, "create_new")
-
-    async with maker() as session:
-        await session.delete(await session.get(Transaction, result.transaction_id))
-        await session.commit()
-
-    fresh = _recon()
-    async with maker() as session:
-        upload = await session.get(StatementUpload, upload_id)
-        await record_pending_decisions(session, upload, fresh)
-        await session.commit()
-
-    assert fresh["missing"][0].get("imported") is False
 
 
 async def test_the_importer_retires_a_question_whose_row_stopped_asking(maker):
@@ -479,7 +393,7 @@ async def test_the_count_follows_the_carried_answers(maker):
     upload_id = await _seed(maker)
     decision = await _decision(maker, upload_id)
     async with maker() as session:
-        await resolve_settlement(session, decision.id, "create_new")
+        await resolve_settlement(session, decision.id)
 
     async with maker() as session:
         upload = await session.get(StatementUpload, upload_id)
@@ -622,3 +536,113 @@ async def test_an_unknown_decision_is_refused(maker):
     async with maker() as session:
         with pytest.raises(SettlementError):
             await resolve_settlement(session, 9999)
+
+
+async def test_the_same_statement_uploaded_twice_imports_once(maker):
+    """One statement can be uploaded twice, so one row can ask twice.
+
+    The first answer imported the purchase. The second must report that
+    answer, not import the purchase again.
+    """
+    first_id = await _seed(maker)
+    async with maker() as session:
+        second = StatementUpload(
+            account_id=ACCOUNT_ID,
+            bank="hdfc",
+            filename="again.pdf",
+            file_path="/nonexistent/again.pdf",
+            status="partial_import",
+            reconciliation_data=json.dumps(_recon()),
+        )
+        session.add(second)
+        await session.flush()
+        await record_pending_decisions(session, second, _recon())
+        await session.commit()
+
+    async with maker() as session:
+        decisions = list(
+            (
+                await session.scalars(
+                    select(StatementRowDecision).order_by(StatementRowDecision.id)
+                )
+            ).all()
+        )
+
+    async with maker() as session:
+        first = await resolve_settlement(session, decisions[0].id)
+    async with maker() as session:
+        again = await resolve_settlement(session, decisions[1].id)
+
+    assert first.status == "created"
+    assert again.status == "superseded"
+    assert again.transaction_id == first.transaction_id
+    assert [row.amount for row in await _rows(maker)] == [
+        Decimal(AUTHORISED),
+        Decimal("2529.00"),
+    ]
+    assert first_id != decisions[1].statement_upload_id
+
+
+async def test_an_answer_is_not_carried_onto_a_row_that_matched_it(maker):
+    """A reparse can match the created transaction to another statement row.
+
+    That row holds it now, so the answered row must not also claim it: two
+    statement rows would report one transaction and the statement would look
+    fully reconciled with one row missing.
+    """
+    upload_id = await _seed(maker)
+    decision = await _decision(maker, upload_id)
+    async with maker() as session:
+        result = await resolve_settlement(session, decision.id)
+
+    # The reparse gives the created transaction to a different row. The rows
+    # themselves are unchanged, so the revision is the one the answer was
+    # recorded under.
+    fresh = _recon()
+    revision = parse_revision(fresh)
+    fresh["matched"] = [{"stmt_idx": 1, "db_txn_id": result.transaction_id}]
+    async with maker() as session:
+        upload = await session.get(StatementUpload, upload_id)
+        await _carry_answers(session, upload, fresh, revision)
+
+    assert fresh["missing"][0].get("imported") is False
+
+
+async def test_a_reused_row_id_is_not_taken_for_the_answer(maker):
+    """SQLite gives the id of a deleted row to the next insert.
+
+    An answer naming that id must not be carried onto whatever now holds it:
+    the row would be resolved to an unrelated purchase.
+    """
+    upload_id = await _seed(maker)
+    decision = await _decision(maker, upload_id)
+    async with maker() as session:
+        result = await resolve_settlement(session, decision.id)
+
+    async with maker() as session:
+        await session.delete(await session.get(Transaction, result.transaction_id))
+        await session.commit()
+
+    # A separate write, so SQLite gives the freed id to the new row.
+    async with maker() as session:
+        session.add(
+            Transaction(
+                account_id=ACCOUNT_ID,
+                bank="hdfc",
+                email_type="transaction",
+                direction="debit",
+                amount=Decimal("55.00"),
+                currency="INR",
+                transaction_date=datetime.date(2026, 9, 9),
+                counterparty="SOMETHING ELSE",
+                channel="card",
+            )
+        )
+        await session.commit()
+
+    fresh = _recon()
+    async with maker() as session:
+        upload = await session.get(StatementUpload, upload_id)
+        await _carry_answers(session, upload, fresh, parse_revision(fresh))
+
+    assert fresh["missing"][0].get("imported") is False

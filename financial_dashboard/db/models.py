@@ -177,12 +177,11 @@ class StatementRowDecision(Base):
     candidate_txn_ids: Mapped[str | None] = mapped_column(Text)
 
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
-    """One of ``pending``, ``merged``, ``created``, ``superseded``."""
+    """One of ``pending``, ``created``, ``superseded``."""
 
     transaction_id: Mapped[int | None] = mapped_column(
         ForeignKey("transactions.id", ondelete="SET NULL")
     )
-    previous_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
     resulting_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
     reason: Mapped[str | None] = mapped_column(Text)
 

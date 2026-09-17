@@ -43,8 +43,7 @@ from financial_dashboard.services.statements.cc import (
 
 logger = logging.getLogger(__name__)
 
-SettlementAction = Literal["create_new"]
-DecisionStatus = Literal["pending", "merged", "created", "superseded"]
+DecisionStatus = Literal["pending", "created", "superseded"]
 
 
 class SettlementError(Exception):
@@ -116,15 +115,18 @@ async def _carry_answers(
     its transaction remains.
 
     The answers come from the decision table, scoped to this revision, so an
-    ordinal means the same row. An answer whose transaction is gone is skipped:
-    the row asks again, which is how a wrong answer is undone.
+    ordinal means the same row.
+
+    An answer is skipped when its transaction is gone, or when the new
+    reconciliation gives that transaction to another row. The row then asks
+    again, which is how a wrong answer is undone.
     """
     answered = (
         await session.scalars(
             select(StatementRowDecision).where(
                 StatementRowDecision.statement_upload_id == upload.id,
                 StatementRowDecision.parse_revision == revision,
-                StatementRowDecision.status.in_(("merged", "created")),
+                StatementRowDecision.status == "created",
                 StatementRowDecision.transaction_id.is_not(None),
             )
         )
@@ -132,16 +134,32 @@ async def _carry_answers(
     if not answered:
         return
 
+    # The id alone does not prove the row is the one that was created: SQLite
+    # reuses the id of a deleted row, so a later insert can take it. The row
+    # must still be the statement row this upload imported.
     live = set(
         (
             await session.scalars(
                 select(Transaction.id).where(
-                    Transaction.id.in_([d.transaction_id for d in answered])
+                    Transaction.id.in_([d.transaction_id for d in answered]),
+                    Transaction.statement_upload_id == upload.id,
                 )
             )
         ).all()
     )
-    by_idx = {d.stmt_idx: d for d in answered if d.transaction_id in live}
+
+    # A transaction the new reconciliation matched belongs to that row now.
+    matched = {
+        row["db_txn_id"]
+        for row in recon.get("matched", [])
+        if row.get("db_txn_id") is not None
+    }
+
+    by_idx = {
+        d.stmt_idx: d
+        for d in answered
+        if d.transaction_id in live and d.transaction_id not in matched
+    }
 
     for entry in recon.get("missing", []):
         if prior := by_idx.get(entry.get("stmt_idx")):
@@ -272,8 +290,7 @@ def _record_answer_on_upload(
     upload.missing_count = sum(
         1 for entry in recon.get("missing", []) if not entry.get("imported")
     )
-    if decision.status == "created":
-        upload.imported_count = (upload.imported_count or 0) + 1
+    upload.imported_count = (upload.imported_count or 0) + 1
     if upload.missing_count == 0:
         upload.status = "imported"
     elif upload.imported_count:
@@ -281,26 +298,23 @@ def _record_answer_on_upload(
     upload.reconciliation_data = reconciliation_to_json(recon)
 
 
-def _claimed_transaction_ids(
+def _question_is_live(
     upload: StatementUpload,
     decision: StatementRowDecision,
-) -> set[int] | None:
-    """The transactions this statement already claims.
+) -> bool:
+    """Whether the decision still describes a row that asks.
 
-    A transaction answers one statement row, so a claimed one is not offered
-    again.
-
-    ``None`` means the question is dead: the parse changed, or the row is
-    imported or matched now. The caller retires the decision.
+    False when the parse changed, or the row is imported or matched now. The
+    caller retires the decision.
     """
     from financial_dashboard.services.statements.cc import reconciliation_from_json
 
     if not upload.reconciliation_data:
-        return None
+        return False
 
     recon = reconciliation_from_json(upload.reconciliation_data)
     if parse_revision(recon) != decision.parse_revision:
-        return None
+        return False
 
     entry = next(
         (
@@ -310,29 +324,14 @@ def _claimed_transaction_ids(
         ),
         None,
     )
-    if entry is None or entry.get("imported") or not entry.get("ambiguous"):
-        return None
-
-    # A matched row holds the transaction it won, and an answered row holds the
-    # one it was given. Offering either again puts two purchases on one row.
-    claimed = {
-        row["db_txn_id"]
-        for row in recon.get("matched", [])
-        if row.get("db_txn_id") is not None
-    }
-    claimed.update(
-        row["imported_txn_id"]
-        for row in recon.get("missing", [])
-        if row.get("stmt_idx") != decision.stmt_idx
-        and row.get("imported_txn_id") is not None
+    return bool(
+        entry is not None and not entry.get("imported") and entry.get("ambiguous")
     )
-    return claimed
 
 
 async def resolve_settlement(
     session: AsyncSession,
     decision_id: int,
-    action: SettlementAction = "create_new",
 ) -> SettlementResult:
     """Lock, read, revalidate, apply and commit one answer."""
     async with session.begin():
@@ -350,9 +349,7 @@ async def resolve_settlement(
         await session.refresh(decision)
         if decision.status != "pending":
             status: DecisionStatus = (
-                "merged"
-                if decision.status == "merged"
-                else ("created" if decision.status == "created" else "superseded")
+                "created" if decision.status == "created" else "superseded"
             )
             return SettlementResult(status, decision.id, decision.transaction_id)
 
@@ -362,9 +359,34 @@ async def resolve_settlement(
 
         # Read the stored reconciliation again: the row can stop asking while
         # the prompt waits, and answering then stores the purchase twice.
-        if _claimed_transaction_ids(upload, decision) is None:
+        if not _question_is_live(upload, decision):
             decision.status = "superseded"
             return SettlementResult("superseded", decision.id, None)
+
+        # The same statement can be uploaded twice, which asks about one row
+        # twice. An answer already given to that row imported the purchase, and
+        # answering again would import it a second time. The decision table is
+        # the record of those answers, across uploads.
+        twin = await session.scalar(
+            select(StatementRowDecision.transaction_id)
+            .join(
+                StatementUpload,
+                StatementUpload.id == StatementRowDecision.statement_upload_id,
+            )
+            .where(
+                StatementRowDecision.id != decision.id,
+                StatementRowDecision.status == "created",
+                StatementRowDecision.transaction_id.is_not(None),
+                StatementRowDecision.row_date == decision.row_date,
+                StatementRowDecision.row_amount == decision.row_amount,
+                StatementRowDecision.row_direction == decision.row_direction,
+                StatementRowDecision.row_narration == decision.row_narration,
+                StatementUpload.account_id == upload.account_id,
+            )
+        )
+        if twin is not None:
+            decision.status = "superseded"
+            return SettlementResult("superseded", decision.id, twin)
 
         txn_id = await _apply_create_new(session, upload, account, decision)
         _record_answer_on_upload(upload, decision, txn_id)
@@ -460,13 +482,9 @@ async def _send_pending_prompts(upload_id: int) -> None:
             return
 
         for decision in pending:
-            # A claimed transaction is refused at the write.
-            claimed = _claimed_transaction_ids(upload, decision) or set()
-            candidate_ids = [
-                txn_id
-                for txn_id in json.loads(decision.candidate_txn_ids or "[]")
-                if txn_id not in claimed
-            ]
+            # Every candidate is shown. They are evidence to read, not
+            # choices: the only answer imports the row.
+            candidate_ids = json.loads(decision.candidate_txn_ids or "[]")
             rows = (
                 await session.scalars(
                     select(Transaction).where(Transaction.id.in_(candidate_ids))
