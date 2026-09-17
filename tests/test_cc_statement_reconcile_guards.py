@@ -1395,3 +1395,176 @@ async def test_a_row_masked_with_a_deleted_card_is_held_back_not_reimported(
     assert imported == []
     assert "ambiguous" in recon["missing"][0]["import_error"]
     assert [row.id for row in rows] == [addon_txn_id]
+
+
+@pytest.mark.parametrize(
+    ("stored", "statement", "held"),
+    [
+        # A fuel pump authorises the amount on its display. It adds a
+        # surcharge of about 1% at settlement. One fill has two amounts.
+        pytest.param("2500.00", "2,529.00", True, id="fuel-surcharge"),
+        # A foreign charge converts at the settlement-day rate. The two
+        # amounts are therefore different.
+        pytest.param("800.00", "807.00", True, id="foreign-rate-move"),
+        # The difference is too large for one purchase. A hold would lose a
+        # real transaction. The row must therefore import.
+        pytest.param("450.00", "4000.00", False, id="unrelated-amount"),
+        # Outside the band. The import takes this row.
+        pytest.param("1000.00", "1,013.00", False, id="just-outside-band"),
+        # Inside the band.
+        pytest.param("1000.00", "1,012.00", True, id="just-inside-band"),
+    ],
+)
+@pytest.mark.anyio
+async def test_a_settled_amount_does_not_import_over_its_authorisation(
+    session_factory, stored, statement, held
+):
+    """One purchase has two amounts, one for each source.
+
+    The database holds the authorised amount. The statement states the settled
+    amount. With an exact amount the stored row is invisible. The statement
+    row then looks like a new transaction, and the code stores the purchase
+    twice.
+
+    The code holds a banded row back. It does not pair the two rows. The
+    amounts are different, and a pairing must rewrite one of them. A band
+    cannot tell a settled amount from a second purchase of a similar size.
+    """
+    await _seed_account(session_factory)
+    stored_id = await _seed_txn(session_factory, amount=Decimal(stored))
+    parsed = _parsed(
+        [_stmt_txn(date="07/04/2026", amount=statement, narration=NARRATION)]
+    )
+
+    recon = await _reconcile(session_factory, parsed)
+    imported, rows = await _import(session_factory, parsed, recon)
+
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [held]
+    if held:
+        assert imported == []
+        assert [(row.id, row.amount) for row in rows] == [(stored_id, Decimal(stored))]
+    else:
+        assert len(imported) == 1
+        assert len(rows) == 2
+
+
+@pytest.mark.anyio
+async def test_a_banded_rival_never_rewrites_a_stored_amount(session_factory):
+    """Two purchases one surcharge apart are not one purchase billed twice.
+
+    The statement states one amount inside the band of a stored amount, and
+    one amount equal to it. The equal row takes the stored row. The other row
+    is held, because a band cannot say whether it settles that row or is a
+    second purchase. It must not rewrite the stored row either way.
+    """
+    await _seed_account(session_factory)
+    stored_id = await _seed_txn(session_factory, amount=Decimal("1000.00"))
+    parsed = _parsed(
+        [
+            _stmt_txn(date="07/04/2026", amount="1,005.00", narration=NARRATION),
+            _stmt_txn(date="07/04/2026", amount="1,000.00", narration=NARRATION),
+        ]
+    )
+
+    recon = await _reconcile(session_factory, parsed)
+    imported, rows = await _import(session_factory, parsed, recon)
+
+    assert [entry["db_txn_id"] for entry in recon["matched"]] == [stored_id]
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [True]
+    assert imported == []
+    assert [(row.id, row.amount) for row in rows] == [(stored_id, Decimal("1000.00"))]
+
+
+@pytest.mark.anyio
+async def test_a_banded_row_does_not_outrank_an_exact_match_a_day_away(
+    session_factory,
+):
+    """A statement row takes the equal amount, not the nearest amount.
+
+    A row of the same day, one surcharge away, must not take a statement row.
+    The equal amount is stored one day away. A pairing by difference would
+    rewrite the row of the same day and leave the real transaction unpaired.
+    """
+    await _seed_account(session_factory)
+    near_id = await _seed_txn(session_factory, amount=Decimal("995.00"))
+    exact_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("1000.00"),
+        transaction_date=parse_cc_date("06/04/2026"),
+    )
+    parsed = _parsed(
+        [_stmt_txn(date="07/04/2026", amount="1,000.00", narration=NARRATION)]
+    )
+
+    recon = await _reconcile(session_factory, parsed)
+    imported, rows = await _import(session_factory, parsed, recon)
+
+    assert [entry["db_txn_id"] for entry in recon["matched"]] == [exact_id]
+    amounts = {row.id: row.amount for row in rows}
+    assert amounts == {near_id: Decimal("995.00"), exact_id: Decimal("1000.00")}
+    assert imported == []
+
+
+@pytest.mark.anyio
+async def test_two_exact_matches_inside_the_band_both_match(session_factory):
+    """Amounts one surcharge apart are ordinary on a statement.
+
+    A 149.00 and a 150.00 purchase on one day sit inside the settlement band,
+    and each statement row states the amount of its own stored row. Neither is
+    a rival of the other: the amounts already answer the question. Demoting
+    both would ask a person twice about rows that need no question, and an
+    answer of "separate purchase" would then store a duplicate.
+    """
+    await _seed_account(session_factory)
+    low_id = await _seed_txn(
+        session_factory, amount=Decimal("149.00"), counterparty=None
+    )
+    high_id = await _seed_txn(
+        session_factory, amount=Decimal("150.00"), counterparty=None
+    )
+    parsed = _parsed(
+        [
+            _stmt_txn(date="07/04/2026", amount="149.00", narration="SWIGGY BANGALORE"),
+            _stmt_txn(date="07/04/2026", amount="150.00", narration="ZOMATO GURGAON"),
+        ]
+    )
+
+    recon = await _reconcile(session_factory, parsed)
+    imported, rows = await _import(session_factory, parsed, recon)
+
+    assert sorted(entry["db_txn_id"] for entry in recon["matched"]) == [
+        low_id,
+        high_id,
+    ]
+    assert recon["missing"] == []
+    assert imported == []
+    assert {row.id: row.amount for row in rows} == {
+        low_id: Decimal("149.00"),
+        high_id: Decimal("150.00"),
+    }
+
+
+@pytest.mark.anyio
+async def test_a_row_in_another_currency_is_not_a_candidate(session_factory):
+    """A statement states rupees.
+
+    A row in another currency holds a different unit, so its amount and the
+    statement amount are not comparable. Such a row must not be a candidate:
+    it would hold a statement row back for a question nobody can answer, or
+    invite a pairing that states rupees in another unit.
+    """
+    await _seed_account(session_factory)
+    await _seed_txn(
+        session_factory, amount=Decimal("2500.00"), currency="USD", counterparty="SHOP"
+    )
+    parsed = _parsed(
+        [_stmt_txn(date="07/04/2026", amount="2,529.00", narration=NARRATION)]
+    )
+
+    recon = await _reconcile(session_factory, parsed)
+    imported, rows = await _import(session_factory, parsed, recon)
+
+    # The statement row is new, so it imports. The foreign row is untouched.
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [False]
+    assert len(imported) == 1
+    assert {row.currency for row in rows} == {"USD", "INR"}

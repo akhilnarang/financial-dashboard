@@ -248,6 +248,22 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
     return (txn_date, amount, direction)
 
 
+# How far a settled amount can sit from the authorised one. A fuel surcharge is
+# about 1%; a foreign charge moves with the settlement-day rate.
+SETTLEMENT_BAND = Decimal("0.012")
+
+
+def settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
+    """Whether one amount can be the settled or authorised form of the other.
+
+    The function reads the band from the larger amount. The answer is
+    therefore the same for both directions. Two equal amounts give a
+    difference of zero, and zero is inside every band.
+    """
+    gap, larger = abs(settled - authorised), max(abs(settled), abs(authorised))
+    return gap <= larger * SETTLEMENT_BAND
+
+
 # cc-parser tags a credit row that is bank-internal bookkeeping, not money
 # that reached the card. HSBC prints one such ``CR`` row before each billed
 # EMI instalment (``emi_installment_transfer``): it moves the instalment off
@@ -384,6 +400,20 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     return bool(db_narration) and db_narration == narration
 
 
+def _same_amount(txn: "ParsedCcTransaction", db_txn) -> bool:
+    """Whether a statement row and a DB row state the same amount.
+
+    The reachability set holds a band, because a settled amount and an
+    authorised amount are one purchase. A reassignment must not use that band.
+    It moves a row to a candidate by name alone, and two amounts one surcharge
+    apart can be two purchases. Such a pair must stay held back for a person.
+    """
+    try:
+        return parse_cc_amount(txn.amount) == Decimal(str(db_txn.amount))
+    except ValueError, InvalidOperation:
+        return False
+
+
 def _row_names_candidate(stmt_idx: int, cid: int, txn_by_idx, db_by_id) -> bool:
     """Whether a statement row names a DB candidate as its own.
 
@@ -472,7 +502,8 @@ def _resolve_contested_by_counterparty(
             named = [
                 cid
                 for cid in candidate_sets.get(stmt_idx, set())
-                if _row_names_candidate(stmt_idx, cid, txn_by_idx, db_by_id)
+                if _same_amount(txn_by_idx[stmt_idx], db_by_id[cid])
+                and _row_names_candidate(stmt_idx, cid, txn_by_idx, db_by_id)
             ]
             if len(named) != 1 or named[0] not in group_candidate_ids:
                 singled_out = False
@@ -572,6 +603,9 @@ def reconcile_statement(
     # Each key maps to a list of DB transactions (multiple txns can share the same key)
     db_pool: dict[tuple, list] = {}
     for db_txn in db_transactions:
+        # A statement states rupees, so another unit is not comparable.
+        if (db_txn.currency or "INR") != "INR":
+            continue
         if db_txn.transaction_date and db_txn.amount is not None:
             key = _match_key(
                 db_txn.transaction_date, Decimal(str(db_txn.amount)), db_txn.direction
@@ -590,18 +624,62 @@ def reconcile_statement(
         key: list(rows) for key, rows in db_pool.items()
     }
 
+    # Buckets the pool by day and direction. A banded scan then reads the rows
+    # of one day only. It does not read the whole account history.
+    by_day: dict[tuple[date_type, str], list[tuple[Decimal, int]]] = {}
+
+    for (day, amount, direction), rows in pool_snapshot.items():
+        bucket = by_day.setdefault((day, direction), [])
+        bucket.extend((amount, row.id) for row in rows)
+
     def _reachable(amount: Decimal, direction: str, txn_date: date_type) -> set[int]:
         """The DB rows that could be this statement row's transaction, across
-        the window. Card-blind: see the note above."""
-        found: set[int] = set()
-        for offset in (0, -1, 1):
-            key = _match_key(txn_date + timedelta(days=offset), amount, direction)
-            found.update(db_txn.id for db_txn in pool_snapshot.get(key, []))
-        return found
+        the window. Card-blind: see the note above.
+
+        The amount is a band, not a value. A card authorises one amount and
+        settles another: a fuel surcharge, or a foreign rate move. On an exact
+        amount the stored row is invisible, the set empties, and the import
+        stores the purchase again.
+
+        The band only widens this set. It pairs nothing and writes nothing, so
+        the row is held for a person. Two purchases one surcharge apart look
+        the same as one purchase billed twice.
+        """
+        return {
+            txn_id
+            for offset in (0, -1, 1)
+            for row_amount, txn_id in by_day.get(
+                (txn_date + timedelta(days=offset), direction), ()
+            )
+            if settles_within_band(amount, row_amount)
+        }
+
+    def _reachable_exact(
+        amount: Decimal, direction: str, txn_date: date_type
+    ) -> set[int]:
+        """The DB rows that state this row's amount, across the window.
+
+        Contention reads this set, not the banded one. Two rows that each state
+        their own amount are not rivals, and the band would demote both.
+        """
+        return {
+            txn_id
+            for offset in (0, -1, 1)
+            for row_amount, txn_id in by_day.get(
+                (txn_date + timedelta(days=offset), direction), ()
+            )
+            if row_amount == amount
+        }
 
     candidate_sets: dict[int, set[int]] = {}
+    exact_sets: dict[int, set[int]] = {}
     for stmt_idx, (_stmt_list, direction, txn) in enumerate(stmt_txns):
         try:
+            exact_sets[stmt_idx] = _reachable_exact(
+                parse_cc_amount(txn.amount),
+                direction,
+                parse_cc_date(txn.date),
+            )
             candidate_sets[stmt_idx] = _reachable(
                 parse_cc_amount(txn.amount),
                 direction,
@@ -732,9 +810,11 @@ def reconcile_statement(
     db_by_id = {db_txn.id: db_txn for db_txn in db_transactions}
     contested = []
     for entry in matched:
+        # Rivals come from the exact sets. A row that states its own amount is
+        # not a rival of one that states another.
         rivals = [
             stmt_idx
-            for stmt_idx, candidates in candidate_sets.items()
+            for stmt_idx, candidates in exact_sets.items()
             if stmt_idx != entry["stmt_idx"] and entry["db_txn_id"] in candidates
         ]
         if not rivals:
@@ -766,7 +846,7 @@ def reconcile_statement(
     # reassign within the group and keep the matches. Only positive,
     # group-injective evidence resolves — anything short of it stays demoted.
     resolved = _resolve_contested_by_counterparty(
-        contested, candidate_sets, txn_by_idx, db_by_id
+        contested, exact_sets, txn_by_idx, db_by_id
     )
     contested = [entry for entry in contested if id(entry) not in resolved]
 
