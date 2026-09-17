@@ -583,27 +583,18 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
             logger.warning("SMS duplicate account picker failed: %s", exc)
 
 
-def _parse_settlement_callback(
-    data: str,
-) -> tuple[Literal["merge", "create_new"], int, int | None] | None:
+def _parse_settlement_callback(data: str) -> int | None:
+    """The decision a settlement callback names."""
     if len(data.encode()) > 64:
         return None
     parts = data.split(":")
-    if len(parts) == 5 and parts[:3] == ["settle", "v1", "m"]:
-        action: Literal["merge", "create_new"] = "merge"
-    elif len(parts) == 4 and parts[:3] == ["settle", "v1", "n"]:
-        action = "create_new"
-    else:
+    if len(parts) != 4 or parts[:3] != ["settle", "v1", "n"]:
         return None
-
     try:
-        ids = [int(value) for value in parts[3:]]
+        decision_id = int(parts[3])
     except ValueError:
         return None
-    if any(value <= 0 for value in ids):
-        return None
-
-    return action, ids[0], ids[1] if action == "merge" else None
+    return decision_id if decision_id > 0 else None
 
 
 async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
@@ -641,21 +632,15 @@ async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
     buttons = [
         [
             InlineKeyboardButton(
-                f"Merge into #{candidate['id']} (₹{candidate['amount']})",
-                callback_data=f"settle:v1:m:{decision_id}:{candidate['id']}",
-            )
-        ]
-        for candidate in candidates
-    ]
-    buttons.append(
-        [
-            InlineKeyboardButton(
                 "Separate purchase",
                 callback_data=f"settle:v1:n:{decision_id}",
             )
         ]
+    ]
+    lines.append(
+        "A separate purchase imports this row. If it settles one of the rows "
+        "above, correct that row on the statement page."
     )
-    lines.append("Is this one of those purchases, billed at the settled amount?")
 
     # TODO: Persist settlement prompts in a transactional outbox before dispatch.
     await tg_app.bot.send_message(
@@ -678,12 +663,10 @@ async def _handle_settlement_callback(update: Update, context) -> None:
         await query.answer("Unauthorized")
         return
 
-    parsed = _parse_settlement_callback(query.data)
-    if parsed is None:
+    decision_id = _parse_settlement_callback(query.data)
+    if decision_id is None:
         await query.answer("Invalid callback")
         return
-
-    action, decision_id, transaction_id = parsed
 
     from financial_dashboard.services.statement_settlement import (
         SettlementError,
@@ -692,9 +675,7 @@ async def _handle_settlement_callback(update: Update, context) -> None:
 
     try:
         async with async_session() as session:
-            result = await resolve_settlement(
-                session, decision_id, action, transaction_id
-            )
+            result = await resolve_settlement(session, decision_id)
     except SettlementError as exc:
         await query.answer(str(exc))
         return
@@ -705,9 +686,7 @@ async def _handle_settlement_callback(update: Update, context) -> None:
 
     await query.answer()
 
-    if result.status == "merged":
-        text = f"Merged into #{result.transaction_id}"
-    elif result.status == "created":
+    if result.status == "created":
         text = f"Stored as #{result.transaction_id}"
     else:
         text = "This row was already resolved"

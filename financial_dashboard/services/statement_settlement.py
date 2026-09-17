@@ -1,5 +1,10 @@
 """Resolution of a statement row whose amount is near a stored amount.
 
+Only one answer is offered: the row is a separate purchase, so it is imported.
+Answering "this settles that stored row" needs a record of which transaction
+each statement already holds, and one upload's reconciliation is not that
+record. Until there is one, a settlement is corrected on the statement page.
+
 A card states two amounts for one purchase: the amount it authorises at the
 purchase, and the amount it settles days later. A fuel surcharge of about 1% is
 added at settlement, and a foreign purchase converts at the settlement-day
@@ -32,15 +37,13 @@ from financial_dashboard.db import (
     Transaction,
 )
 from financial_dashboard.services.statements.cc import (
-    _confirmed_different_card,
     parse_cc_amount,
     parse_cc_date,
-    settles_within_band,
 )
 
 logger = logging.getLogger(__name__)
 
-SettlementAction = Literal["merge", "create_new"]
+SettlementAction = Literal["create_new"]
 DecisionStatus = Literal["pending", "merged", "created", "superseded"]
 
 
@@ -203,10 +206,12 @@ async def record_pending_decisions(
         if idx not in groups or entry.get("imported"):
             continue
         if (prior := existing.get(idx)) is not None:
-            # A reparse can return to an earlier shape. The row is held now, so
-            # its question is live again; a retired one would never be asked.
-            if prior.status == "superseded":
+            # The row is held and unanswered, so its question is live again. A
+            # resolved decision reaching here means its transaction is gone,
+            # which is how a wrong answer is undone.
+            if prior.status != "pending":
                 prior.status = "pending"
+                prior.transaction_id = None
             # Only the candidates can change without changing the token.
             prior.candidate_txn_ids = json.dumps(groups[idx]["txn_ids"])
             created.append(prior)
@@ -236,52 +241,6 @@ async def record_pending_decisions(
 
     await session.flush()
     return created
-
-
-def _apply_merge(
-    decision: StatementRowDecision,
-    target: Transaction,
-) -> int:
-    """Write the settled amount onto the row the person chose."""
-    try:
-        settled = parse_cc_amount(decision.row_amount or "")
-        row_date = parse_cc_date(decision.row_date or "")
-    except ValueError, InvalidOperation:
-        raise SettlementError("Statement row is unreadable") from None
-
-    stored = Decimal(str(target.amount))
-
-    # Read every rule again. A row that changed after the prompt is not the row
-    # the person saw.
-    #
-    # The names are not a rule. A bank abbreviates, so HPCL and HP PETROL PUMP
-    # MUMBAI are one merchant. The prompt states both, and the person answered.
-    if target.direction != decision.row_direction:
-        raise SettlementError("Merge target runs the other way")
-    if (target.currency or "INR") != "INR":
-        raise SettlementError("Merge target is in another currency")
-    if (
-        target.transaction_date is None
-        or abs((target.transaction_date - row_date).days) > 1
-    ):
-        raise SettlementError("Merge target is outside the statement window")
-    if not settles_within_band(settled, stored):
-        raise SettlementError("Amounts are too far apart to be one purchase")
-    # An unknown mask is not a conflict: a statement can print one header mask
-    # on every row.
-    if _confirmed_different_card(decision.row_card_number, target.card_mask):
-        raise SettlementError("Merge target is on another card")
-
-    target.amount = settled
-    target.enriched_at = datetime.datetime.now(datetime.UTC)
-
-    decision.status = "merged"
-    decision.transaction_id = target.id
-    decision.previous_amount = stored
-    decision.resulting_amount = settled
-    decision.reason = "statement settled the stored authorisation"
-    decision.resolved_at = datetime.datetime.now(datetime.UTC)
-    return target.id
 
 
 def _record_answer_on_upload(
@@ -373,8 +332,7 @@ def _claimed_transaction_ids(
 async def resolve_settlement(
     session: AsyncSession,
     decision_id: int,
-    action: SettlementAction,
-    transaction_id: int | None = None,
+    action: SettlementAction = "create_new",
 ) -> SettlementResult:
     """Lock, read, revalidate, apply and commit one answer."""
     async with session.begin():
@@ -404,49 +362,9 @@ async def resolve_settlement(
 
         # Read the stored reconciliation again: the row can stop asking while
         # the prompt waits, and answering then stores the purchase twice.
-        claimed = _claimed_transaction_ids(upload, decision)
-        if claimed is None:
+        if _claimed_transaction_ids(upload, decision) is None:
             decision.status = "superseded"
             return SettlementResult("superseded", decision.id, None)
-
-        offered = set(json.loads(decision.candidate_txn_ids or "[]")) - claimed
-
-        if action == "merge":
-            if transaction_id is None:
-                raise SettlementError("Merge target is required")
-            if transaction_id not in offered:
-                raise SettlementError("Selected transaction is not a candidate")
-
-            target = (
-                await session.scalars(
-                    select(Transaction)
-                    .where(Transaction.id == transaction_id)
-                    .with_for_update()
-                )
-            ).one_or_none()
-            if target is None:
-                raise SettlementError("Merge target no longer exists")
-            if target.account_id != upload.account_id:
-                raise SettlementError("Merge target belongs to another account")
-            if target.statement_upload_id is not None:
-                # The row already states a settled amount, so a near amount is
-                # a second purchase, not its settlement.
-                raise SettlementError("Merge target came from a statement")
-
-            # Defect 1: a claim can live on another upload.
-            rival = await session.scalar(
-                select(StatementRowDecision.id).where(
-                    StatementRowDecision.transaction_id == target.id,
-                    StatementRowDecision.status.in_(("merged", "created")),
-                    StatementRowDecision.id != decision.id,
-                )
-            )
-            if rival is not None:
-                raise SettlementError("Another answer already used this transaction")
-
-            txn_id = _apply_merge(decision, target)
-            _record_answer_on_upload(upload, decision, txn_id)
-            return SettlementResult("merged", decision.id, txn_id)
 
         txn_id = await _apply_create_new(session, upload, account, decision)
         _record_answer_on_upload(upload, decision, txn_id)

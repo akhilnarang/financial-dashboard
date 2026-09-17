@@ -142,27 +142,6 @@ async def test_a_held_row_becomes_a_pending_question(maker):
     assert json.loads(decision.candidate_txn_ids or "[]") == [1]
 
 
-async def test_merge_writes_the_settled_amount_and_records_the_previous_one(maker):
-    """The statement states what the bank billed, and the answer is kept."""
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-
-    async with maker() as session:
-        result = await resolve_settlement(
-            session, decision.id, "merge", transaction_id=1
-        )
-
-    assert result.status == "merged"
-    assert [(row.id, row.amount) for row in await _rows(maker)] == [
-        (1, Decimal("2529.00"))
-    ]
-
-    after = await _decision(maker, upload_id)
-    assert after.previous_amount == Decimal(AUTHORISED)
-    assert after.resulting_amount == Decimal("2529.00")
-    assert after.reason
-
-
 async def test_create_new_stores_the_row_as_its_own_transaction(maker):
     """The two rows are different purchases, so both must be stored."""
     upload_id = await _seed(maker)
@@ -176,109 +155,6 @@ async def test_create_new_stores_the_row_as_its_own_transaction(maker):
         Decimal(AUTHORISED),
         Decimal("2529.00"),
     ]
-
-
-async def test_a_second_tap_returns_the_first_answer(maker):
-    """Telegram sends the prompt again, and a person taps again."""
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-
-    async with maker() as session:
-        first = await resolve_settlement(
-            session, decision.id, "merge", transaction_id=1
-        )
-    async with maker() as session:
-        second = await resolve_settlement(
-            session, decision.id, "merge", transaction_id=1
-        )
-
-    assert first.status == "merged"
-    assert second.status == "merged"
-    assert second.transaction_id == first.transaction_id
-    assert len(await _rows(maker)) == 1
-
-
-async def test_the_other_button_after_an_answer_adds_no_row(maker):
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-
-    async with maker() as session:
-        await resolve_settlement(session, decision.id, "merge", transaction_id=1)
-    async with maker() as session:
-        again = await resolve_settlement(session, decision.id, "create_new")
-
-    assert again.status == "merged"
-    assert len(await _rows(maker)) == 1
-
-
-async def test_a_target_outside_the_offered_candidates_is_refused(maker):
-    """The prompt offered a candidate. Another id is a forged callback."""
-    upload_id = await _seed(maker, stored=(AUTHORISED, "2512.00"))
-    decision = await _decision(maker, upload_id)
-
-    async with maker() as session:
-        with pytest.raises(SettlementError):
-            await resolve_settlement(session, decision.id, "merge", transaction_id=2)
-
-    assert [row.amount for row in await _rows(maker)] == [
-        Decimal(AUTHORISED),
-        Decimal("2512.00"),
-    ]
-
-
-async def test_a_target_that_moved_out_of_the_band_is_refused(maker):
-    """The row changed after the prompt, so it is not the row shown."""
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-    async with maker() as session:
-        row = await session.get(Transaction, 1)
-        row.amount = Decimal("900.00")
-        await session.commit()
-
-    async with maker() as session:
-        with pytest.raises(SettlementError):
-            await resolve_settlement(session, decision.id, "merge", transaction_id=1)
-
-    assert [row.amount for row in await _rows(maker)] == [Decimal("900.00")]
-
-
-async def test_a_target_in_another_currency_is_refused(maker):
-    """A statement states rupees. Another unit is not comparable."""
-    upload_id = await _seed(maker, currency="USD")
-    decision = await _decision(maker, upload_id)
-
-    async with maker() as session:
-        with pytest.raises(SettlementError):
-            await resolve_settlement(session, decision.id, "merge", transaction_id=1)
-
-    row = (await _rows(maker))[0]
-    assert row.amount == Decimal(AUTHORISED)
-    assert row.currency == "USD"
-
-
-async def test_a_bank_that_abbreviates_a_name_does_not_block_the_answer(maker):
-    """A bank writes one merchant two ways.
-
-    An alert says HPCL and a statement says HP PETROL PUMP MUMBAI. No rule here
-    separates that from two merchants, and the prompt states both names, so the
-    person decides and the code applies the answer.
-    """
-    abbreviated = _recon()
-    abbreviated["missing"][0]["narration"] = "HP PETROL PUMP MUMBAI"
-    upload_id = await _seed(maker, recon=abbreviated)
-    decision = await _decision(maker, upload_id)
-    async with maker() as session:
-        row = await session.get(Transaction, 1)
-        row.counterparty = "HPCL"
-        await session.commit()
-
-    async with maker() as session:
-        result = await resolve_settlement(
-            session, decision.id, "merge", transaction_id=1
-        )
-
-    assert result.status == "merged"
-    assert (await _rows(maker))[0].amount == Decimal("2529.00")
 
 
 async def test_a_row_with_no_candidate_can_still_be_created(maker):
@@ -370,32 +246,6 @@ async def test_the_revision_token_survives_a_restart():
     assert len(runs) == 1
 
 
-async def test_an_answer_outlives_the_statement_it_came_from(maker):
-    """Deleting a statement must not erase what a person decided.
-
-    The row was copied into the decision, and the amounts were recorded there,
-    so the answer stays readable. SQLite runs without foreign-key enforcement,
-    so the upload id it holds can dangle; the resolver refuses such a decision
-    rather than reading through it.
-    """
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-    async with maker() as session:
-        await resolve_settlement(session, decision.id, "merge", transaction_id=1)
-
-    async with maker() as session:
-        await session.delete(await session.get(StatementUpload, upload_id))
-        await session.commit()
-
-    async with maker() as session:
-        kept = await session.get(StatementRowDecision, decision.id)
-
-    assert kept is not None
-    assert kept.status == "merged"
-    assert kept.previous_amount == Decimal(AUTHORISED)
-    assert kept.row_narration == NARRATION
-
-
 async def test_a_question_retires_when_its_row_stops_needing_an_answer(maker):
     """A row can stop asking without the parse changing.
 
@@ -423,42 +273,6 @@ async def test_a_question_retires_when_its_row_stops_needing_an_answer(maker):
     assert len(await _rows(maker)) == 1
 
 
-async def test_a_transaction_another_row_matched_is_not_offered(maker):
-    """One transaction answers one statement row.
-
-    A matched row holds its transaction. Offering it to a held row as well
-    would put two purchases on one row and lose one of them.
-    """
-    claimed = _recon()
-    claimed["matched"] = [{"stmt_idx": 1, "db_txn_id": 1}]
-    upload_id = await _seed(maker, recon=claimed)
-    decision = await _decision(maker, upload_id)
-
-    async with maker() as session:
-        with pytest.raises(SettlementError):
-            await resolve_settlement(session, decision.id, "merge", transaction_id=1)
-
-    assert (await _rows(maker))[0].amount == Decimal(AUTHORISED)
-
-
-async def test_an_answer_shows_on_the_statement(maker):
-    """The statement page reads the reconciliation, so an answer must land there."""
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-
-    async with maker() as session:
-        await resolve_settlement(session, decision.id, "merge", transaction_id=1)
-
-    async with maker() as session:
-        upload = await session.get(StatementUpload, upload_id)
-        recon = json.loads(upload.reconciliation_data or "{}")
-
-    entry = recon["missing"][0]
-    assert entry["imported"] is True
-    assert entry["ambiguous"] is False
-    assert upload.missing_count == 0
-
-
 async def test_a_created_row_takes_the_card_of_its_statement_row(maker):
     """A statement bills several cards, so the header card is not the row's."""
     with_card = _recon()
@@ -476,41 +290,6 @@ async def test_a_created_row_takes_the_card_of_its_statement_row(maker):
 
     created = (await _rows(maker))[1]
     assert created.card_mask == "7777"
-
-
-async def test_a_merge_across_cards_is_refused(maker):
-    """A row of one card does not settle a purchase of another."""
-    other_card = _recon()
-    other_card["missing"][0]["card_number"] = "4111XXXXXXXX7777"
-    upload_id = await _seed(maker, recon=other_card)
-    decision = await _decision(maker, upload_id)
-
-    async with maker() as session:
-        with pytest.raises(SettlementError):
-            await resolve_settlement(session, decision.id, "merge", transaction_id=1)
-
-    assert (await _rows(maker))[0].amount == Decimal(AUTHORISED)
-
-
-async def test_a_statement_that_abbreviates_a_name_still_merges(maker):
-    """A statement writes a name its own way, and glues a reference to it.
-
-    Containment either way is agreement, so the real settlement pairs pass.
-    Only two names that share nothing refuse.
-    """
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-    async with maker() as session:
-        row = await session.get(Transaction, 1)
-        row.counterparty = "SAMPLE FUEL STATION"
-        await session.commit()
-
-    async with maker() as session:
-        result = await resolve_settlement(
-            session, decision.id, "merge", transaction_id=1
-        )
-
-    assert result.status == "merged"
 
 
 async def test_a_tap_revalidates_against_the_stored_reconciliation(maker):
@@ -542,44 +321,6 @@ async def test_a_tap_revalidates_against_the_stored_reconciliation(maker):
 
     assert result.status == "superseded"
     assert len(await _rows(maker)) == 1
-
-
-async def test_one_transaction_cannot_answer_two_statement_rows(maker):
-    """Two held rows can share a candidate, and both prompts arrive together.
-
-    The first answer gives that transaction to its row. The second must not be
-    given the same one: a merge would rewrite the amount again and the first
-    purchase would be gone, with the statement reporting itself reconciled.
-    """
-    two_rows = _recon()
-    second = dict(two_rows["missing"][0], stmt_idx=1, amount="2,520.00")
-    two_rows["missing"].append(second)
-    two_rows["settlement_groups"] = [
-        {"stmt_idxs": [0, 1], "txn_ids": [1], "held_idxs": [0, 1]}
-    ]
-    await _seed(maker, recon=two_rows)
-
-    async with maker() as session:
-        decisions = list(
-            (
-                await session.scalars(
-                    select(StatementRowDecision).order_by(StatementRowDecision.id)
-                )
-            ).all()
-        )
-
-    async with maker() as session:
-        await resolve_settlement(session, decisions[0].id, "merge", transaction_id=1)
-
-    async with maker() as session:
-        with pytest.raises(SettlementError):
-            await resolve_settlement(
-                session, decisions[1].id, "merge", transaction_id=1
-            )
-
-    assert [(row.id, row.amount) for row in await _rows(maker)] == [
-        (1, Decimal("2529.00"))
-    ]
 
 
 async def test_a_reparse_keeps_an_answer_committed_while_it_ran(maker):
@@ -730,63 +471,6 @@ async def test_a_card_change_retires_the_question_of_the_old_card(maker):
     assert statuses == ["pending", "superseded"]
 
 
-async def test_a_statement_row_is_not_a_settlement_target(maker):
-    """A transaction that came from a statement states a settled amount.
-
-    A near amount beside it is a second purchase, not its settlement, so
-    merging would overwrite a billed amount.
-    """
-    upload_id = await _seed(maker)
-    decision = await _decision(maker, upload_id)
-    async with maker() as session:
-        row = await session.get(Transaction, 1)
-        row.statement_upload_id = upload_id
-        await session.commit()
-
-    async with maker() as session:
-        with pytest.raises(SettlementError):
-            await resolve_settlement(session, decision.id, "merge", transaction_id=1)
-
-    assert (await _rows(maker))[0].amount == Decimal(AUTHORISED)
-
-
-async def test_another_upload_cannot_reuse_an_answered_transaction(maker):
-    """Two statements can cover one day, and both can reach one transaction.
-
-    The first answer owns it. The second must be refused, or the first
-    purchase is overwritten and both statements report themselves reconciled.
-    """
-    upload_id = await _seed(maker)
-    first = await _decision(maker, upload_id)
-    async with maker() as session:
-        await resolve_settlement(session, first.id, "merge", transaction_id=1)
-
-    # A second statement, reaching the same transaction.
-    async with maker() as session:
-        other = StatementUpload(
-            account_id=ACCOUNT_ID,
-            bank="hdfc",
-            filename="second.pdf",
-            file_path="/nonexistent/second.pdf",
-            status="partial_import",
-            reconciliation_data=json.dumps(_recon(amount="2,520.00")),
-        )
-        session.add(other)
-        await session.flush()
-        await record_pending_decisions(session, other, _recon(amount="2,520.00"))
-        await session.commit()
-        other_id = other.id
-
-    second = await _decision(maker, other_id)
-    async with maker() as session:
-        with pytest.raises(SettlementError):
-            await resolve_settlement(session, second.id, "merge", transaction_id=1)
-
-    assert [(row.id, row.amount) for row in await _rows(maker)] == [
-        (1, Decimal("2529.00"))
-    ]
-
-
 async def test_the_count_follows_the_carried_answers(maker):
     """A writer counts before the carry runs, so the count is recomputed.
 
@@ -830,3 +514,111 @@ async def test_an_answer_naming_a_gone_transaction_is_not_carried(maker):
         await session.commit()
 
     assert fresh["missing"][0].get("imported") is False
+
+
+async def test_a_second_tap_returns_the_first_answer(maker):
+    """Telegram sends the prompt again, and a person taps again."""
+    upload_id = await _seed(maker)
+    decision = await _decision(maker, upload_id)
+
+    async with maker() as session:
+        first = await resolve_settlement(session, decision.id)
+    async with maker() as session:
+        second = await resolve_settlement(session, decision.id)
+
+    assert first.status == "created"
+    assert second.transaction_id == first.transaction_id
+    assert len(await _rows(maker)) == 2
+
+
+async def test_an_answer_shows_on_the_statement(maker):
+    """The statement page reads the reconciliation, so an answer must land there."""
+    upload_id = await _seed(maker)
+    decision = await _decision(maker, upload_id)
+
+    async with maker() as session:
+        await resolve_settlement(session, decision.id)
+
+    async with maker() as session:
+        upload = await session.get(StatementUpload, upload_id)
+        recon = json.loads(upload.reconciliation_data or "{}")
+
+    assert recon["missing"][0]["imported"] is True
+    assert upload is not None and upload.missing_count == 0
+
+
+async def test_an_answer_outlives_the_statement_it_came_from(maker):
+    """Deleting a statement must not erase what a person decided."""
+    upload_id = await _seed(maker)
+    decision = await _decision(maker, upload_id)
+    async with maker() as session:
+        await resolve_settlement(session, decision.id)
+
+    async with maker() as session:
+        await session.delete(await session.get(StatementUpload, upload_id))
+        await session.commit()
+
+    async with maker() as session:
+        kept = await session.get(StatementRowDecision, decision.id)
+
+    assert kept is not None
+    assert kept.status == "created"
+    assert kept.row_narration == NARRATION
+
+
+async def test_a_deleted_answer_lets_its_row_ask_again(maker):
+    """Deleting the created transaction is how a wrong answer is undone.
+
+    The row must then have a live question, not merely stop being marked
+    imported: a retired decision asks nobody.
+    """
+    upload_id = await _seed(maker)
+    decision = await _decision(maker, upload_id)
+    async with maker() as session:
+        result = await resolve_settlement(session, decision.id)
+
+    async with maker() as session:
+        await session.delete(await session.get(Transaction, result.transaction_id))
+        await session.commit()
+
+    fresh = _recon()
+    async with maker() as session:
+        upload = await session.get(StatementUpload, upload_id)
+        await record_pending_decisions(session, upload, fresh)
+        await session.commit()
+
+    async with maker() as session:
+        again = await session.get(StatementRowDecision, decision.id)
+
+    assert fresh["missing"][0].get("imported") is False
+    assert again is not None
+    assert again.status == "pending"
+    assert again.transaction_id is None
+
+
+async def test_an_unreadable_row_is_refused(maker):
+    """A decision copies what the row stated, and that can be unparseable.
+
+    Importing it would store a row with no amount or no date.
+    """
+    upload_id = await _seed(maker)
+    decision = await _decision(maker, upload_id)
+    async with maker() as session:
+        stored = await session.get(StatementRowDecision, decision.id)
+        stored.row_amount = "not an amount"
+        await session.commit()
+
+    async with maker() as session:
+        with pytest.raises(SettlementError):
+            await resolve_settlement(session, decision.id)
+
+    assert len(await _rows(maker)) == 1
+
+
+async def test_an_unknown_decision_is_refused(maker):
+    """A callback can name a decision that is not there."""
+    await _seed(maker)
+
+    async with maker() as session:
+        with pytest.raises(SettlementError):
+            await resolve_settlement(session, 9999)
