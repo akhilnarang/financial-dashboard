@@ -285,20 +285,22 @@ async def test_a_tap_revalidates_against_the_stored_reconciliation(maker):
     assert len(await _rows(maker)) == 1
 
 
-async def test_a_reused_question_describes_the_row_of_this_parse(maker):
-    """A reparse can change a row while its question waits.
+async def test_a_reused_question_takes_the_candidates_of_this_parse(maker):
+    """A parse that yields the same rows reuses their questions.
 
-    The question is reused when the parse returns to a shape it held before, so
-    it must take the values of the current row, not the ones it was written
-    from.
+    Everything a decision copies is in the revision token, so a changed row
+    makes a new question instead. The candidates are not in the token: the
+    same rows can reach different stored rows after a new transaction lands.
     """
     upload_id = await _seed(maker)
 
-    moved = _recon()
-    moved["missing"][0]["card_number"] = "4111XXXXXXXX7777"
+    wider = _recon()
+    wider["settlement_groups"] = [
+        {"stmt_idxs": [0], "txn_ids": [1, 7], "held_idxs": [0]}
+    ]
     async with maker() as session:
         upload = await session.get(StatementUpload, upload_id)
-        await record_pending_decisions(session, upload, moved)
+        await record_pending_decisions(session, upload, wider)
         await session.commit()
 
     async with maker() as session:
@@ -310,7 +312,7 @@ async def test_a_reused_question_describes_the_row_of_this_parse(maker):
             )
         ).one()
 
-    assert live.row_card_number == "4111XXXXXXXX7777"
+    assert json.loads(live.candidate_txn_ids or "[]") == [1, 7]
 
 
 async def test_a_carried_answer_comes_from_the_decision(maker):
@@ -646,3 +648,235 @@ async def test_a_reused_row_id_is_not_taken_for_the_answer(maker):
         await _carry_answers(session, upload, fresh, parse_revision(fresh))
 
     assert fresh["missing"][0].get("imported") is False
+
+
+async def test_a_statement_that_bills_one_amount_twice_imports_twice(maker):
+    """A statement can print the same line twice, and mean it.
+
+    Two purchases at one merchant on one day for one amount are two rows that
+    match in everything a decision records. Both are real, so both import. The
+    re-upload guard must not read them as one row asked about twice.
+    """
+    two_rows = _recon()
+    two_rows["missing"].append(dict(two_rows["missing"][0], stmt_idx=1))
+    two_rows["settlement_groups"] = [
+        {"stmt_idxs": [0, 1], "txn_ids": [1], "held_idxs": [0, 1]}
+    ]
+    await _seed(maker, recon=two_rows)
+
+    async with maker() as session:
+        decisions = list(
+            (
+                await session.scalars(
+                    select(StatementRowDecision).order_by(StatementRowDecision.stmt_idx)
+                )
+            ).all()
+        )
+
+    for decision in decisions:
+        async with maker() as session:
+            result = await resolve_settlement(session, decision.id)
+            assert result.status == "created"
+
+    assert [row.amount for row in await _rows(maker)] == [
+        Decimal(AUTHORISED),
+        Decimal("2529.00"),
+        Decimal("2529.00"),
+    ]
+
+
+async def test_an_answer_is_not_carried_onto_an_id_this_upload_reused(maker):
+    """The upload's own import can take the id of a deleted answer.
+
+    Checking the row belongs to this upload is then not enough: the row is a
+    different statement row of the same upload. An answer must not bind to it,
+    or the purchase it named is lost.
+    """
+    two_rows = _recon()
+    two_rows["missing"].append(
+        dict(two_rows["missing"][0], stmt_idx=1, amount="55.00", narration="ROW 1")
+    )
+    two_rows["settlement_groups"] = [
+        {"stmt_idxs": [0, 1], "txn_ids": [1], "held_idxs": [0, 1]}
+    ]
+    upload_id = await _seed(maker, recon=two_rows)
+
+    async with maker() as session:
+        first = (
+            await session.scalars(
+                select(StatementRowDecision).where(StatementRowDecision.stmt_idx == 0)
+            )
+        ).one()
+    async with maker() as session:
+        result = await resolve_settlement(session, first.id)
+
+    async with maker() as session:
+        await session.delete(await session.get(Transaction, result.transaction_id))
+        await session.commit()
+
+    # The importer stores the other row, which takes the freed id.
+    async with maker() as session:
+        session.add(
+            Transaction(
+                account_id=ACCOUNT_ID,
+                bank="hdfc",
+                email_type="cc_statement",
+                direction="debit",
+                amount=Decimal("55.00"),
+                currency="INR",
+                transaction_date=datetime.date(2026, 4, 7),
+                counterparty="ROW 1",
+                channel="cc_statement",
+                statement_upload_id=upload_id,
+            )
+        )
+        await session.commit()
+
+    fresh = _recon()
+    fresh["missing"].append(
+        dict(
+            two_rows["missing"][1],
+            imported=True,
+            imported_txn_id=result.transaction_id,
+            ambiguous=False,
+        )
+    )
+    async with maker() as session:
+        upload = await session.get(StatementUpload, upload_id)
+        await _carry_answers(session, upload, fresh, parse_revision(fresh))
+
+    assert fresh["missing"][0].get("imported") is False
+
+
+async def test_an_undone_answer_does_not_block_the_other_upload(maker):
+    """A twin answer whose transaction is gone answers nothing.
+
+    Deleting the created transaction is the undo. The other upload's prompt
+    must then import, not report a transaction that is not there.
+    """
+    await _seed(maker)
+    async with maker() as session:
+        second = StatementUpload(
+            account_id=ACCOUNT_ID,
+            bank="hdfc",
+            filename="again.pdf",
+            file_path="/nonexistent/again.pdf",
+            status="partial_import",
+            reconciliation_data=json.dumps(_recon()),
+        )
+        session.add(second)
+        await session.flush()
+        await record_pending_decisions(session, second, _recon())
+        await session.commit()
+
+    async with maker() as session:
+        decisions = list(
+            (
+                await session.scalars(
+                    select(StatementRowDecision).order_by(StatementRowDecision.id)
+                )
+            ).all()
+        )
+
+    async with maker() as session:
+        first = await resolve_settlement(session, decisions[0].id)
+    async with maker() as session:
+        await session.delete(await session.get(Transaction, first.transaction_id))
+        await session.commit()
+
+    async with maker() as session:
+        again = await resolve_settlement(session, decisions[1].id)
+
+    assert again.status == "created"
+    assert [row.amount for row in await _rows(maker)] == [
+        Decimal(AUTHORISED),
+        Decimal("2529.00"),
+    ]
+
+
+async def test_a_differently_printed_amount_is_the_same_twin(maker):
+    """Two parses can print one amount two ways.
+
+    The strings differ and the money does not, so a re-upload whose parser
+    formats the amount differently must still be read as the same row.
+    """
+    await _seed(maker)
+    unformatted = _recon()
+    unformatted["missing"][0]["amount"] = "2529.00"
+    async with maker() as session:
+        second = StatementUpload(
+            account_id=ACCOUNT_ID,
+            bank="hdfc",
+            filename="again.pdf",
+            file_path="/nonexistent/again.pdf",
+            status="partial_import",
+            reconciliation_data=json.dumps(unformatted),
+        )
+        session.add(second)
+        await session.flush()
+        await record_pending_decisions(session, second, unformatted)
+        await session.commit()
+
+    async with maker() as session:
+        decisions = list(
+            (
+                await session.scalars(
+                    select(StatementRowDecision).order_by(StatementRowDecision.id)
+                )
+            ).all()
+        )
+
+    async with maker() as session:
+        first = await resolve_settlement(session, decisions[0].id)
+    async with maker() as session:
+        again = await resolve_settlement(session, decisions[1].id)
+
+    assert again.status == "superseded"
+    assert again.transaction_id == first.transaction_id
+    assert len(await _rows(maker)) == 2
+
+
+async def test_a_superseded_twin_records_the_transaction_it_found(maker):
+    """A retired question must still say what answered it.
+
+    Without the record a repeat tap reports nothing, and the statement keeps
+    showing the row as unanswered.
+    """
+    await _seed(maker)
+    async with maker() as session:
+        second = StatementUpload(
+            account_id=ACCOUNT_ID,
+            bank="hdfc",
+            filename="again.pdf",
+            file_path="/nonexistent/again.pdf",
+            status="partial_import",
+            reconciliation_data=json.dumps(_recon()),
+        )
+        session.add(second)
+        await session.flush()
+        await record_pending_decisions(session, second, _recon())
+        await session.commit()
+        second_id = second.id
+
+    async with maker() as session:
+        decisions = list(
+            (
+                await session.scalars(
+                    select(StatementRowDecision).order_by(StatementRowDecision.id)
+                )
+            ).all()
+        )
+
+    async with maker() as session:
+        first = await resolve_settlement(session, decisions[0].id)
+    async with maker() as session:
+        await resolve_settlement(session, decisions[1].id)
+
+    async with maker() as session:
+        retired = await session.get(StatementRowDecision, decisions[1].id)
+        upload = await session.get(StatementUpload, second_id)
+        recon = json.loads(upload.reconciliation_data or "{}")
+
+    assert retired is not None
+    assert retired.transaction_id == first.transaction_id
+    assert recon["missing"][0]["imported"] is True

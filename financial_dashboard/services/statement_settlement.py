@@ -148,17 +148,24 @@ async def _carry_answers(
         ).all()
     )
 
-    # A transaction the new reconciliation matched belongs to that row now.
-    matched = {
+    # A transaction the new reconciliation gave to another row belongs to that
+    # row now, whether it matched or was imported. An import of this upload can
+    # take the id of the deleted answer, so the id alone proves nothing.
+    taken = {
         row["db_txn_id"]
         for row in recon.get("matched", [])
         if row.get("db_txn_id") is not None
     }
+    taken.update(
+        row["imported_txn_id"]
+        for row in recon.get("missing", [])
+        if row.get("imported_txn_id") is not None
+    )
 
     by_idx = {
         d.stmt_idx: d
         for d in answered
-        if d.transaction_id in live and d.transaction_id not in matched
+        if d.transaction_id in live and d.transaction_id not in taken
     }
 
     for entry in recon.get("missing", []):
@@ -259,6 +266,18 @@ async def record_pending_decisions(
 
     await session.flush()
     return created
+
+
+def _same_money(raw: str | None, amount: Decimal) -> bool:
+    """Whether a recorded row amount is this amount.
+
+    Two parses can print one amount two ways, so the strings are read as money
+    rather than compared.
+    """
+    try:
+        return parse_cc_amount(raw or "") == amount
+    except ValueError, InvalidOperation:
+        return False
 
 
 def _record_answer_on_upload(
@@ -365,27 +384,60 @@ async def resolve_settlement(
 
         # The same statement can be uploaded twice, which asks about one row
         # twice. An answer already given to that row imported the purchase, and
-        # answering again would import it a second time. The decision table is
-        # the record of those answers, across uploads.
-        twin = await session.scalar(
-            select(StatementRowDecision.transaction_id)
+        # answering again would import it a second time.
+        #
+        # Only another upload counts. A statement that prints one row twice
+        # billed two purchases, and both answers must import: those rows are
+        # equal in everything this compares.
+        twins = await session.scalars(
+            select(StatementRowDecision)
             .join(
                 StatementUpload,
                 StatementUpload.id == StatementRowDecision.statement_upload_id,
             )
+            .join(
+                Transaction,
+                (Transaction.id == StatementRowDecision.transaction_id)
+                & (
+                    Transaction.statement_upload_id
+                    == StatementRowDecision.statement_upload_id
+                ),
+            )
             .where(
-                StatementRowDecision.id != decision.id,
+                StatementRowDecision.statement_upload_id != upload.id,
                 StatementRowDecision.status == "created",
                 StatementRowDecision.transaction_id.is_not(None),
                 StatementRowDecision.row_date == decision.row_date,
-                StatementRowDecision.row_amount == decision.row_amount,
                 StatementRowDecision.row_direction == decision.row_direction,
                 StatementRowDecision.row_narration == decision.row_narration,
+                StatementRowDecision.row_card_number.is_not_distinct_from(
+                    decision.row_card_number
+                ),
                 StatementUpload.account_id == upload.account_id,
             )
         )
+        # The amount is compared as money. Two parses can print one amount two
+        # ways, and the strings would then never match.
+        try:
+            mine = parse_cc_amount(decision.row_amount or "")
+        except ValueError, InvalidOperation:
+            raise SettlementError("Statement row is unreadable") from None
+
+        twin = next(
+            (
+                other.transaction_id
+                for other in twins
+                if _same_money(other.row_amount, mine)
+            ),
+            None,
+        )
+
         if twin is not None:
+            # Record the transaction the twin answer made, so a repeat tap
+            # reports it and the statement stops showing the row as missing.
             decision.status = "superseded"
+            decision.transaction_id = twin
+            _record_answer_on_upload(upload, decision, twin)
             return SettlementResult("superseded", decision.id, twin)
 
         txn_id = await _apply_create_new(session, upload, account, decision)
