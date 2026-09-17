@@ -1454,7 +1454,8 @@ async def test_a_banded_rival_never_rewrites_a_stored_amount(session_factory):
 
     The statement states one amount inside the band of a stored amount, and
     one amount equal to it. The equal row takes the stored row. The other row
-    must import as a new transaction. It must not rewrite the stored row.
+    is held, because a band cannot say whether it settles that row or is a
+    second purchase. It must not rewrite the stored row either way.
     """
     await _seed_account(session_factory)
     stored_id = await _seed_txn(session_factory, amount=Decimal("1000.00"))
@@ -1469,8 +1470,9 @@ async def test_a_banded_rival_never_rewrites_a_stored_amount(session_factory):
     imported, rows = await _import(session_factory, parsed, recon)
 
     assert [entry["db_txn_id"] for entry in recon["matched"]] == [stored_id]
-    stored_row = next(row for row in rows if row.id == stored_id)
-    assert stored_row.amount == Decimal("1000.00")
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [True]
+    assert imported == []
+    assert [(row.id, row.amount) for row in rows] == [(stored_id, Decimal("1000.00"))]
 
 
 @pytest.mark.anyio
