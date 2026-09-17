@@ -34,6 +34,7 @@ from financial_dashboard.db.models import (
     Setting,
     SmsMessage,
     SnapshotHolding,
+    StatementRowDecision,
     StatementUpload,
     Transaction,
 )
@@ -112,6 +113,7 @@ __all__ = [
     "SnapshotHolding",
     "SnapshotKind",
     "SnapshotSource",
+    "StatementRowDecision",
     "StatementUpload",
     "Transaction",
     "async_session",

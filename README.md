@@ -346,6 +346,7 @@ scripts/
 | `Account` | `accounts` | Bank account, savings account, or credit card |
 | `Card` | `cards` | Physical payment card linked to an account (supports addon cards) |
 | `StatementUpload` | `statement_uploads` | CC statement PDF upload with reconciliation results stored as JSON |
+| `StatementRowDecision` | `statement_row_decisions` | What a person answered about a held statement row: one purchase settled, or two purchases |
 | `BankStatementUpload` | `bank_statement_uploads` | Bank statement PDF upload with reconciliation results stored as JSON |
 | `CasUpload` | `cas_uploads` | Imported depository CAS portfolio statement and reconciliation metadata |
 | `BalanceSnapshot` | `balance_snapshots` | Point-in-time asset/liability value emitted by bank, CC, CAS, or manual sources |
@@ -448,6 +449,25 @@ erDiagram
         datetime payment_last_reminded_at
         decimal payment_paid_amount
         datetime payment_paid_at
+    }
+
+    STATEMENT_ROW_DECISIONS {
+        int id PK
+        int statement_upload_id FK
+        string parse_revision
+        int stmt_idx
+        string row_date
+        string row_amount
+        string row_direction
+        text row_narration
+        text candidate_txn_ids
+        string status
+        int transaction_id FK
+        decimal previous_amount
+        decimal resulting_amount
+        text reason
+        datetime created_at
+        datetime resolved_at
     }
 
     BANK_STATEMENT_UPLOADS {
@@ -648,6 +668,8 @@ erDiagram
     EMAIL_SOURCES ||--o{ EMAILS : fetched_from
     FETCH_RULES ||--o{ EMAILS : matched_by
     ACCOUNTS ||--o{ STATEMENT_UPLOADS : owns
+    STATEMENT_UPLOADS ||--o{ STATEMENT_ROW_DECISIONS : asks
+    TRANSACTIONS ||--o{ STATEMENT_ROW_DECISIONS : answered_with
     EMAILS ||--o{ STATEMENT_UPLOADS : originates
     ACCOUNTS ||--o{ BANK_STATEMENT_UPLOADS : owns
     EMAILS ||--o{ BANK_STATEMENT_UPLOADS : originates
@@ -680,6 +702,7 @@ Relationship notes:
 - `(source_id, remote_id)` is unique on `emails` (provider-scoped deduplication).
 - `transactions` has a partial unique index on `(bank, reference_number, direction)` where `reference_number IS NOT NULL` (deduplicates transactions with known UTR/UPI reference numbers; direction is included so a debit and credit sharing a ref don't collide).
 - `transactions` also has a partial lookup index on `reference_number` where it is non-null; ingest uses it to find an opposite-direction leg on a different linked or masked account and mark both transactions as `self_transfer`.
+- `statement_row_decisions` holds what a person answered about a statement row whose amount is near a stored amount: one purchase that settled, or two purchases. The answer outlives its evidence, because a reparse replaces `statement_uploads.reconciliation_data` and deleting an upload removes it while the transactions it changed remain. `stmt_idx` is a position within one parse, so `parse_revision` scopes it: a parse that yields the same rows in the same order keeps its pending questions, and any other parse supersedes them. The row is never cascaded away: SQLite runs without foreign-key enforcement here, so a decision outlives the deletion of its statement, and the copied row plus the recorded amounts stay readable. A reader must therefore treat `statement_upload_id` and `transaction_id` as possibly dangling.
 - `transactions.counterparty_source` is non-null and defaults to `bank`. It says where `counterparty` came from. A parser sets `user_alias` when the bank prints a label the user chose, such as an HDFC payee nickname. A label does not replace a name a bank states, and a bank name replaces a stored label. The column follows the name: a writer that changes one changes the other.
 - `transactions` has a composite lookup index on `(category, transaction_date)`. Category first because a category filter with no date bounds — a drill-through from a category link, say — would otherwise scan the table, both for the rows and for the `count()` the pager needs; `transaction_date` second so a filter carrying both a category and a date range satisfies them from the one index instead of narrowing on dates and re-checking the category per row.
 - `(account_id, card_mask)` is unique on `cards`.

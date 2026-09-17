@@ -300,6 +300,9 @@ async def _handle_callback(update: Update, context) -> None:
     if query.data.startswith("smsdup:v1:"):
         await _handle_sms_duplicate_callback(update, context)
         return
+    if query.data.startswith("settle:v1:"):
+        await _handle_settlement_callback(update, context)
+        return
     if query.data.startswith("cc_pay_pick:"):
         await _handle_cc_pay_pick_callback(update, context)
         return
@@ -578,6 +581,141 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
             )
         except Exception as exc:
             logger.warning("SMS duplicate account picker failed: %s", exc)
+
+
+def _parse_settlement_callback(
+    data: str,
+) -> tuple[Literal["merge", "create_new"], int, int | None] | None:
+    if len(data.encode()) > 64:
+        return None
+    parts = data.split(":")
+    if len(parts) == 5 and parts[:3] == ["settle", "v1", "m"]:
+        action: Literal["merge", "create_new"] = "merge"
+    elif len(parts) == 4 and parts[:3] == ["settle", "v1", "n"]:
+        action = "create_new"
+    else:
+        return None
+
+    try:
+        ids = [int(value) for value in parts[3:]]
+    except ValueError:
+        return None
+    if any(value <= 0 for value in ids):
+        return None
+
+    return action, ids[0], ids[1] if action == "merge" else None
+
+
+async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
+    """Ask whether a statement row settles a stored purchase.
+
+    A card authorises one amount and settles a different one. The statement row
+    can be that settlement, or a second purchase of a similar size. Only a
+    person can say which.
+    """
+    if not tg_app:
+        return
+
+    decision_id = int(payload["decision_id"])
+    candidates = payload.get("candidates") or []
+
+    bank = html.escape(str(payload.get("bank", "")).upper())
+    amount = html.escape(str(payload.get("amount") or ""))
+    narration = html.escape(str(payload.get("narration") or ""))
+    row_date = html.escape(str(payload.get("date") or ""))
+
+    lines = [f"⚠️ <b>{bank}</b> statement row", f"₹{amount}"]
+    if narration:
+        lines[-1] += f" · {narration}"
+    if row_date:
+        lines.append(row_date)
+    # The candidate is described in the text, not only on the button: a person
+    # cannot answer from an id and an amount alone.
+    for candidate in candidates:
+        described = f"#{candidate['id']} · ₹{candidate['amount']}"
+        for field in ("counterparty", "date", "card_mask"):
+            if value := candidate.get(field):
+                described += f" · {html.escape(str(value))}"
+        lines.append(described)
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"Merge into #{candidate['id']} (₹{candidate['amount']})",
+                callback_data=f"settle:v1:m:{decision_id}:{candidate['id']}",
+            )
+        ]
+        for candidate in candidates
+    ]
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "Separate purchase",
+                callback_data=f"settle:v1:n:{decision_id}",
+            )
+        ]
+    )
+    lines.append("Is this one of those purchases, billed at the settled amount?")
+
+    # TODO: Persist settlement prompts in a transactional outbox before dispatch.
+    await tg_app.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML",
+    )
+
+
+async def _handle_settlement_callback(update: Update, context) -> None:
+    """Apply an authorized settlement answer."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    if not query.message:
+        await query.answer("Message no longer available")
+        return
+    if query.message.chat.id != get_telegram_chat_id():
+        await query.answer("Unauthorized")
+        return
+
+    parsed = _parse_settlement_callback(query.data)
+    if parsed is None:
+        await query.answer("Invalid callback")
+        return
+
+    action, decision_id, transaction_id = parsed
+
+    from financial_dashboard.services.statement_settlement import (
+        SettlementError,
+        resolve_settlement,
+    )
+
+    try:
+        async with async_session() as session:
+            result = await resolve_settlement(
+                session, decision_id, action, transaction_id
+            )
+    except SettlementError as exc:
+        await query.answer(str(exc))
+        return
+    except OperationalError:
+        # A rival writer holds the upload write lock past the busy timeout.
+        await query.answer("Busy, try again")
+        return
+
+    await query.answer()
+
+    if result.status == "merged":
+        text = f"Merged into #{result.transaction_id}"
+    elif result.status == "created":
+        text = f"Stored as #{result.transaction_id}"
+    else:
+        text = "This row was already resolved"
+
+    try:
+        await query.edit_message_text(text)
+    except Exception as exc:
+        logger.warning("Settlement callback edit failed: %s", exc)
 
 
 async def send_disambiguation_prompt(payload: dict, chat_id: int) -> None:

@@ -566,6 +566,67 @@ _CC_RECONCILIATION_GATES = (
 )
 
 
+def settlement_groups(
+    candidate_sets: dict[int, set[int]],
+    entries: list[dict],
+) -> list[dict]:
+    """Group the statement rows and stored rows that contend with each other.
+
+    A group is a connected component: a statement row joins every stored row it
+    reaches, and two statement rows join when they reach one stored row. A pair
+    is not the unit — rows two days apart can both reach the row between them,
+    and a matched row holds a claim, so a held row beside it is not alone.
+
+    Takes the full candidate sets. ``candidate_evidence`` stops at a limit, and
+    a group built from it would drop the rows past it.
+    """
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for entry in entries:
+        stmt_key = f"s{entry['stmt_idx']}"
+        find(stmt_key)
+        for txn_id in candidate_sets.get(entry["stmt_idx"], ()):
+            union(stmt_key, f"t{txn_id}")
+        # A matched row also claims the row it won, even when the claim is not
+        # in its candidate set.
+        if (won := entry.get("db_txn_id")) is not None:
+            union(stmt_key, f"t{won}")
+
+    groups: dict[str, dict] = {}
+    for entry in entries:
+        root = find(f"s{entry['stmt_idx']}")
+        group = groups.setdefault(
+            root, {"stmt_idxs": [], "txn_ids": set(), "held_idxs": []}
+        )
+        group["stmt_idxs"].append(entry["stmt_idx"])
+        group["txn_ids"].update(candidate_sets.get(entry["stmt_idx"], ()))
+        if (won := entry.get("db_txn_id")) is not None:
+            group["txn_ids"].add(won)
+        if entry.get("ambiguous") and not entry.get("imported"):
+            group["held_idxs"].append(entry["stmt_idx"])
+
+    return [
+        {
+            "stmt_idxs": sorted(g["stmt_idxs"]),
+            "txn_ids": sorted(g["txn_ids"]),
+            "held_idxs": sorted(g["held_idxs"]),
+        }
+        for g in groups.values()
+        if g["held_idxs"]
+    ]
+
+
 def reconcile_statement(
     parsed,
     db_transactions: list,
@@ -879,6 +940,7 @@ def reconcile_statement(
     return {
         "matched": matched,
         "missing": missing,
+        "settlement_groups": settlement_groups(candidate_sets, [*matched, *missing]),
         "card_summaries": [
             {
                 "card_number": cs.card_number,
@@ -1982,6 +2044,12 @@ async def process_statement_email(
 
         upload.imported_count = len(imported_rows)
         upload.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
+        # function-local: statement_settlement imports this module
+        from financial_dashboard.services.statement_settlement import (
+            record_pending_decisions,
+        )
+
+        await record_pending_decisions(session, upload, recon)
         upload.reconciliation_data = reconciliation_to_json(recon)
         if upload.missing_count == 0:
             upload.status = "imported"  # all matched or all imported
@@ -2007,6 +2075,12 @@ async def process_statement_email(
                     source="cc_statement",
                     txns=imported_txns,
                 )
+
+        from financial_dashboard.services.statement_settlement import (
+            notify_pending_decisions,
+        )
+
+        await notify_pending_decisions(upload.id)
 
         enriched = await enrich_matched_transactions(recon)
 

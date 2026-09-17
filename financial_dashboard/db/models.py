@@ -140,6 +140,67 @@ class Email(Base):
     )
 
 
+class StatementRowDecision(Base):
+    """What a person answered about one held statement row.
+
+    A statement row whose amount is near a stored amount can be one purchase
+    that settled, or two purchases. Only a person can say which. This table
+    holds that answer.
+
+    The answer outlives its evidence. A reparse replaces
+    ``StatementUpload.reconciliation_data``, and deleting an upload removes the
+    row entirely while the transactions it changed remain. So the answer lives
+    here, with enough of the statement row copied in to read it later.
+
+    ``parse_revision`` scopes ``stmt_idx``. That ordinal is the position of a
+    row within one parse, and a reparse can move it. A decision therefore
+    applies to one revision only, and a new revision supersedes the pending
+    decisions of the old one.
+    """
+
+    __tablename__ = "statement_row_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    statement_upload_id: Mapped[int | None] = mapped_column(
+        ForeignKey("statement_uploads.id", ondelete="SET NULL"), index=True
+    )
+    parse_revision: Mapped[str] = mapped_column(String, nullable=False)
+    stmt_idx: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # The statement row as it was shown, so the answer stays readable after a
+    # reparse or a delete.
+    row_date: Mapped[str | None] = mapped_column(String)
+    row_amount: Mapped[str | None] = mapped_column(String)
+    row_direction: Mapped[str | None] = mapped_column(String)
+    row_narration: Mapped[str | None] = mapped_column(Text)
+    row_card_number: Mapped[str | None] = mapped_column(String)
+    candidate_txn_ids: Mapped[str | None] = mapped_column(Text)
+
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    """One of ``pending``, ``merged``, ``created``, ``superseded``."""
+
+    transaction_id: Mapped[int | None] = mapped_column(
+        ForeignKey("transactions.id", ondelete="SET NULL")
+    )
+    previous_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    resulting_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    reason: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, default=lambda: datetime.datetime.now(datetime.UTC)
+    )
+    resolved_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "statement_upload_id",
+            "parse_revision",
+            "stmt_idx",
+            name="uq_statement_row_decision",
+        ),
+    )
+
+
 class StatementUpload(Base):
     __tablename__ = "statement_uploads"
 

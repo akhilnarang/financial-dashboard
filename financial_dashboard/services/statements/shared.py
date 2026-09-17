@@ -25,6 +25,10 @@ from financial_dashboard.services.statements.bank import (
     parse_bank_statement,
     reconcile_bank_statement,
 )
+from financial_dashboard.services.statement_settlement import (
+    notify_pending_decisions,
+    record_pending_decisions,
+)
 from financial_dashboard.services.statements.cc import (
     enrich_matched_transactions,
     import_missing_cc_txns,
@@ -124,6 +128,7 @@ async def retry_cc_statement_upload(
         upload.missing_count = sum(
             1 for entry in recon["missing"] if not entry.get("imported")
         )
+        await record_pending_decisions(session, upload, recon)
         upload.reconciliation_data = reconciliation_to_json(recon)
         if upload.missing_count == 0:
             upload.status = "imported"
@@ -133,6 +138,8 @@ async def retry_cc_statement_upload(
         upload.error = skip_error  # None clears a prior error when nothing skipped
         await emit_cc_snapshot(session, upload)
         await session.commit()
+
+    await notify_pending_decisions(upload_id)
 
     # function-local: breaks cycle with services.reminders (reminders imports services.statements at top)
     from financial_dashboard.services.reminders import (

@@ -54,6 +54,10 @@ from financial_dashboard.services.settings import get_telegram_chat_id
 from financial_dashboard.services.statement_payments import build_payments_view
 from financial_dashboard.services.snapshots import emit_cc_snapshot
 from financial_dashboard.services.statements.bank import process_bank_statement_email
+from financial_dashboard.services.statement_settlement import (
+    notify_pending_decisions,
+    record_pending_decisions,
+)
 from financial_dashboard.services.statements.cc import (
     _parse_pdf_bytes_sync,
     enrich_matched_transactions,
@@ -321,6 +325,7 @@ async def statement_upload(
 
     upload.imported_count = imported
     upload.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
+    await record_pending_decisions(session, upload, recon)
     upload.reconciliation_data = reconciliation_to_json(recon)
     if upload.missing_count == 0:
         upload.status = "imported"
@@ -332,6 +337,8 @@ async def statement_upload(
     await emit_cc_snapshot(session, upload)
     await session.commit()
     upload_id = upload.id
+
+    await notify_pending_decisions(upload_id)
 
     await init_payment_tracking(upload_id)
 
@@ -774,6 +781,7 @@ async def statement_reprocess(
     upload.matched_count = len(recon["matched"])
     upload.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
     upload.imported_count = (upload.imported_count or 0) + newly_imported
+    await record_pending_decisions(session, upload, recon)
     upload.reconciliation_data = reconciliation_to_json(recon)
     if upload.missing_count == 0:
         upload.status = "imported"
@@ -785,6 +793,7 @@ async def statement_reprocess(
     await emit_cc_snapshot(session, upload)
     await session.commit()
 
+    await notify_pending_decisions(upload_id)
     await init_payment_tracking(upload_id)
 
     return RedirectResponse(url=f"/statements/{upload_id}", status_code=303)
