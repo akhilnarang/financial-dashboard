@@ -182,8 +182,6 @@ class StatementRowDecision(Base):
     transaction_id: Mapped[int | None] = mapped_column(
         ForeignKey("transactions.id", ondelete="SET NULL")
     )
-    resulting_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
-    reason: Mapped[str | None] = mapped_column(Text)
 
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime, default=lambda: datetime.datetime.now(datetime.UTC)

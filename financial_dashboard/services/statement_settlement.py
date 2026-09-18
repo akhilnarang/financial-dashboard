@@ -488,8 +488,6 @@ async def _apply_create_new(
 
     decision.status = "created"
     decision.transaction_id = txn.id
-    decision.resulting_amount = amount
-    decision.reason = "a separate purchase, not a settlement"
     decision.resolved_at = datetime.datetime.now(datetime.UTC)
     return txn.id
 

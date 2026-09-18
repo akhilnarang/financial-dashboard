@@ -464,8 +464,6 @@ erDiagram
         text candidate_txn_ids
         string status
         int transaction_id FK
-        decimal resulting_amount
-        text reason
         datetime created_at
         datetime resolved_at
     }
