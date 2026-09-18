@@ -300,6 +300,9 @@ async def _handle_callback(update: Update, context) -> None:
     if query.data.startswith("smsdup:v1:"):
         await _handle_sms_duplicate_callback(update, context)
         return
+    if query.data.startswith("st:"):
+        await _handle_settlement_callback(update, context)
+        return
     if query.data.startswith("cc_pay_pick:"):
         await _handle_cc_pay_pick_callback(update, context)
         return
@@ -578,6 +581,154 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
             )
         except Exception as exc:
             logger.warning("SMS duplicate account picker failed: %s", exc)
+
+
+def _parse_settlement_callback(
+    data: str,
+) -> tuple[Literal["merge", "skip"], int, int, str, int | None] | None:
+    """Read a settlement callback: the action, the row, and the row's digest.
+
+    The callback names everything the answer is about. Nothing is looked up
+    from a stored question.
+    """
+    if len(data.encode()) > 64:
+        return None
+    parts = data.split(":")
+    if len(parts) == 6 and parts[:2] == ["st", "m"]:
+        action: Literal["merge", "skip"] = "merge"
+    elif len(parts) == 5 and parts[:2] == ["st", "s"]:
+        action = "skip"
+    else:
+        return None
+
+    try:
+        upload_id, stmt_idx = int(parts[2]), int(parts[3])
+        target = int(parts[5]) if action == "merge" else None
+    except ValueError:
+        return None
+
+    digest = parts[4]
+    if upload_id <= 0 or stmt_idx < 0 or not digest:
+        return None
+    if target is not None and target <= 0:
+        return None
+    return action, upload_id, stmt_idx, digest, target
+
+
+async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
+    """Ask whether a held statement row settles a stored purchase.
+
+    Both rows are described, because the names and dates are what tell a
+    settlement from a second purchase. Neither answer is preselected.
+    """
+    if not tg_app:
+        return
+
+    upload_id = int(payload["upload_id"])
+    stmt_idx = int(payload["stmt_idx"])
+    digest = str(payload["digest"])
+    bank = html.escape(str(payload.get("bank", "")).upper())
+
+    lines = [
+        f"⚠️ <b>{bank}</b> statement",
+        f"₹{html.escape(str(payload.get('amount') or ''))}"
+        f" · {html.escape(str(payload.get('narration') or ''))}"
+        f" · {html.escape(str(payload.get('date') or ''))}",
+        "",
+        "Stored:",
+    ]
+
+    buttons = []
+    for candidate in payload.get("candidates") or []:
+        described = " · ".join(
+            html.escape(str(value))
+            for value in (
+                f"#{candidate['id']}",
+                f"₹{candidate['amount']}",
+                candidate.get("counterparty"),
+                candidate.get("date"),
+                candidate.get("card_mask"),
+            )
+            if value
+        )
+        lines.append(described)
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"Merge into #{candidate['id']}",
+                    callback_data=(
+                        f"st:m:{upload_id}:{stmt_idx}:{digest}:{candidate['id']}"
+                    ),
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "Separate purchase",
+                callback_data=f"st:s:{upload_id}:{stmt_idx}:{digest}",
+            )
+        ]
+    )
+    lines.append("")
+    lines.append("Merge writes the statement amount onto the stored row.")
+
+    await tg_app.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML",
+    )
+
+
+async def _handle_settlement_callback(update: Update, context) -> None:
+    """Apply an authorized settlement answer."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    if not query.message:
+        await query.answer("Message no longer available")
+        return
+    if query.message.chat.id != get_telegram_chat_id():
+        await query.answer("Unauthorized")
+        return
+
+    parsed = _parse_settlement_callback(query.data)
+    if parsed is None:
+        await query.answer("Invalid callback")
+        return
+
+    action, upload_id, stmt_idx, digest, target = parsed
+
+    from financial_dashboard.services.statement_settlement import (
+        SettlementError,
+        answer,
+    )
+
+    try:
+        async with async_session() as session:
+            result = await answer(session, upload_id, stmt_idx, digest, action, target)
+    except SettlementError as exc:
+        await query.answer(str(exc))
+        return
+    except OperationalError:
+        await query.answer("Busy, try again")
+        return
+
+    await query.answer()
+
+    if result.outcome == "merged":
+        text = f"Merged into #{result.transaction_id}"
+    elif result.outcome == "skipped":
+        text = "Left as a separate purchase"
+    else:
+        text = "This row was already answered"
+
+    try:
+        await query.edit_message_text(text)
+    except Exception as exc:
+        logger.warning("Settlement callback edit failed: %s", exc)
 
 
 async def send_disambiguation_prompt(payload: dict, chat_id: int) -> None:

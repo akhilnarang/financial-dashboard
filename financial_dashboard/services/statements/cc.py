@@ -2008,6 +2008,12 @@ async def process_statement_email(
                     txns=imported_txns,
                 )
 
+        from financial_dashboard.services.statement_settlement import (
+            ask_about_held_rows,
+        )
+
+        await ask_about_held_rows(upload.id)
+
         enriched = await enrich_matched_transactions(recon)
 
         # function-local: breaks cycle with services.reminders (reminders imports services.statements at top)
