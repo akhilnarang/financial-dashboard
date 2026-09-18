@@ -1397,6 +1397,57 @@ async def test_a_row_masked_with_a_deleted_card_is_held_back_not_reimported(
     assert [row.id for row in rows] == [addon_txn_id] + [row.id for row in imported]
 
 
+@pytest.mark.anyio
+async def test_a_reprocess_does_not_record_a_held_row_twice(session_factory):
+    """A reprocess must leave the ledger the size it found it.
+
+    Two purchases of one amount whose narrations overlap cannot be told apart
+    by name. They import on the first pass. On the next pass each one can
+    reach the other's row, so both are held. Recording them again would add
+    two rows per reprocess, without end.
+    """
+    await _seed_account(session_factory)
+    parsed = _parsed(
+        [
+            _stmt_txn(date="07/04/2026", amount="100.00", narration="SHOP"),
+            _stmt_txn(date="07/04/2026", amount="100.00", narration="SHOP BRANCH"),
+        ]
+    )
+
+    sizes = []
+    for _ in range(4):
+        recon = await _reconcile(session_factory, parsed)
+        _imported, rows = await _import(session_factory, parsed, recon)
+        sizes.append(len(rows))
+
+    assert sizes == [2, 2, 2, 2]
+
+
+@pytest.mark.anyio
+async def test_a_reprocess_records_a_held_row_once(session_factory):
+    """A held row still enters the ledger, and only once.
+
+    The statement states the purchase, so holding it out would lose it. The
+    stored alert stays beside it until a person folds the two.
+    """
+    await _seed_account(session_factory)
+    await _seed_txn(session_factory, amount=Decimal("90.00"), counterparty="MERCHANT A")
+    parsed = _parsed(
+        [
+            _stmt_txn(date="07/04/2026", amount="90.00", narration="CGST ON FEE"),
+            _stmt_txn(date="07/04/2026", amount="90.00", narration="SGST ON FEE"),
+        ]
+    )
+
+    sizes = []
+    for _ in range(4):
+        recon = await _reconcile(session_factory, parsed)
+        _imported, rows = await _import(session_factory, parsed, recon)
+        sizes.append(len(rows))
+
+    assert sizes == [3, 3, 3, 3]
+
+
 @pytest.mark.parametrize(
     ("stored", "statement", "held"),
     [

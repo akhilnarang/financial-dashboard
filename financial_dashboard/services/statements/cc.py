@@ -1030,6 +1030,21 @@ async def resolve_cc_card_mask(
     return last4_from_card(account.account_number)
 
 
+async def _rows_a_statement_recorded(session, upload) -> set[int]:
+    """The rows any statement of this account put in the ledger.
+
+    A reprocess writes a new upload row, and a second upload of one statement
+    writes another, so the id of this upload names too little.
+    """
+    result = await session.scalars(
+        select(Transaction.id).where(
+            Transaction.account_id == upload.account_id,
+            Transaction.statement_upload_id.is_not(None),
+        )
+    )
+    return set(result.all())
+
+
 async def import_missing_cc_txns(
     session,
     upload: "StatementUpload",
@@ -1077,9 +1092,17 @@ async def import_missing_cc_txns(
         need the count can take ``len()`` of the result.
     """
     link_ctx = await build_link_context(session)
+    recorded = await _rows_a_statement_recorded(session, upload)
     imported: list[Transaction] = []
     for entry in recon["missing"]:
         if entry.get("imported"):
+            continue
+        # A held row that can reach a row this statement already recorded was
+        # recorded on an earlier pass. Contention keeps it out of ``matched``,
+        # so only this check stops it importing again on every reprocess.
+        if entry.get("ambiguous") and recorded.intersection(
+            entry.get("candidate_transaction_ids") or []
+        ):
             continue
         try:
             amount = parse_cc_amount(entry["amount"])
