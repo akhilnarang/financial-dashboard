@@ -26,17 +26,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Literal, NamedTuple
 
 from sqlalchemy import select, text
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db import Account, StatementUpload, Transaction
-from financial_dashboard.services.categorization.self_transfer import (
-    apply_reference_self_transfer_rule,
-)
-from financial_dashboard.services.linker import build_link_context, link_transaction
+from financial_dashboard.db import StatementUpload, Transaction
 from financial_dashboard.services.statements.cc import (
     parse_cc_amount,
-    resolve_cc_card_mask,
     parse_cc_date,
     reconciliation_from_json,
     reconciliation_to_json,
@@ -45,8 +39,7 @@ from financial_dashboard.services.statements.cc import (
 
 logger = logging.getLogger(__name__)
 
-SettlementAction = Literal["merge", "skip"]
-SettlementOutcome = Literal["merged", "skipped", "stale", "done"]
+SettlementOutcome = Literal["merged", "stale"]
 
 ROW_DIGEST_CHARS = 12
 """Enough of the digest to name one row of one statement in a callback."""
@@ -82,36 +75,17 @@ def row_digest(entry: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:ROW_DIGEST_CHARS]
 
 
-def answer_reference(upload: StatementUpload, entry: dict) -> str:
-    """The identifier of one printed row of one statement cycle.
-
-    A reference is unique across transactions, so the database refuses a second
-    row that carries the same one. That is what stops one printed purchase from
-    being recorded twice, and it holds across a reparse and across a second
-    upload of the same statement, because the reference names the cycle and the
-    row, not the upload.
-
-    Only a recorded row carries one. A merged row is an existing card alert, and
-    a settlement SMS can still arrive to complete it; that match reads the
-    reference, so a statement reference there would hide the row from it. A
-    merged row is marked by its statement instead.
-
-    The cycle is named by its account and due date. A re-upload of one statement
-    states the same due date, and the next statement states the next one.
-
-    The row is named by its position and its content. A statement can print one
-    line twice and mean two purchases, and those two rows hold two positions.
-    """
-    cycle = f"{upload.account_id}:{upload.due_date or upload.statement_name or ''}"
-    return f"stmt:{cycle}:{entry.get('stmt_idx')}:{row_digest(entry)}"
-
-
 def held_rows(recon: dict) -> list[dict]:
-    """The rows of this reconciliation that await an answer."""
+    """The rows of this reconciliation that await an answer.
+
+    The row is in the ledger, because a statement states a purchase. It is
+    asked about because a stored row may state the same purchase, and folding
+    the two is the answer only a person can give.
+    """
     return [
         entry
         for entry in recon.get("missing", [])
-        if entry.get("ambiguous") and not entry.get("imported")
+        if entry.get("ambiguous") and entry.get("imported_txn_id") is not None
     ]
 
 
@@ -169,119 +143,6 @@ def _claimed(recon: dict) -> set[int]:
     return claimed
 
 
-async def _import_row(
-    session: AsyncSession, upload: StatementUpload, entry: dict
-) -> int:
-    """Record a statement row that states a purchase of its own.
-
-    The person answered that the ledger does not hold this purchase, which is
-    what makes the row importable. The row is built the way a plain import
-    builds one, so it carries the same links and the same card mask.
-    """
-    try:
-        amount = parse_cc_amount(entry["amount"])
-        txn_date = parse_cc_date(entry["date"])
-    except ValueError, InvalidOperation, KeyError:
-        raise SettlementError("The statement row is unreadable") from None
-
-    account = await session.get(Account, upload.account_id)
-    txn = Transaction(
-        statement_upload_id=upload.id,
-        account_id=upload.account_id,
-        bank=upload.bank,
-        email_type="cc_statement",
-        direction=entry["direction"],
-        amount=amount,
-        currency="INR",
-        transaction_date=txn_date,
-        counterparty=entry.get("narration"),
-        card_mask=await resolve_cc_card_mask(
-            session, account, entry.get("card_number")
-        ),
-        channel="cc_statement",
-        raw_description=entry.get("narration"),
-        reference_number=answer_reference(upload, entry),
-    )
-
-    link_ctx = await build_link_context(session)
-    try:
-        async with session.begin_nested():
-            session.add(txn)
-            await session.flush()
-            link_transaction(link_ctx, txn)
-            await session.flush()
-    except IntegrityError:
-        raise SettlementError("That statement row is already answered") from None
-
-    await apply_reference_self_transfer_rule(session, txn)
-    entry["imported"] = True
-    entry["imported_txn_id"] = txn.id
-    entry["import_error"] = None
-    return txn.id
-
-
-async def _row_already_merged(
-    session: AsyncSession, upload: StatementUpload, entry: dict, target_id: int
-) -> bool:
-    """Whether another upload of this statement already merged this row.
-
-    A merged row is marked by the statement that billed it, not by a reference,
-    so this reads the mark. The rows of the other upload are compared by what
-    they state, because a second upload of one statement states the same rows.
-
-    This upload counts too. A reparse rebuilds its reconciliation, so a row that
-    holds an answer can be asked about again. The two rows of a statement that
-    prints one line twice hold two positions, so they never read as one row.
-
-    Only the uploads of one cycle are read. A reference names its cycle, so an
-    upload of another cycle can never state this reference.
-    """
-    reference = answer_reference(upload, entry)
-    rivals = await session.scalars(
-        select(StatementUpload).where(
-            StatementUpload.account_id == upload.account_id,
-            StatementUpload.due_date == upload.due_date,
-        )
-    )
-    for rival in rivals:
-        if not rival.reconciliation_data:
-            continue
-        rival_recon = reconciliation_from_json(rival.reconciliation_data)
-        for row in rival_recon.get("missing", []):
-            answered = row.get("imported_txn_id")
-            if answered is None or answered == target_id:
-                continue
-            if answer_reference(rival, row) == reference:
-                return True
-    return False
-
-
-async def _candidate_settled_by(
-    session: AsyncSession, upload: StatementUpload, entry: dict
-) -> bool:
-    """Whether a merge already answered this row with one of its candidates.
-
-    A merge marks the row it settled with the statement that billed it, and
-    that mark sits on the transaction, so a reparse cannot drop it. Recording
-    the row again would state one purchase twice.
-
-    The rivals are this row's own candidates, so a different purchase of the
-    same amount on another statement is not touched.
-    """
-    candidate_ids = entry.get("candidate_transaction_ids") or []
-    if not candidate_ids:
-        return False
-
-    settled = await session.scalars(
-        select(Transaction.id).where(
-            Transaction.id.in_(candidate_ids),
-            Transaction.statement_upload_id.is_not(None),
-            Transaction.account_id == upload.account_id,
-        )
-    )
-    return settled.first() is not None
-
-
 def _merge(entry: dict, target: Transaction, upload_id: int) -> None:
     """Write the settled amount onto the stored row.
 
@@ -289,8 +150,7 @@ def _merge(entry: dict, target: Transaction, upload_id: int) -> None:
     changed after it was sent is not the row the person saw.
 
     The row then states a billed amount, so it is linked to the statement that
-    billed it. The link sits on the row, so it survives a reparse and speaks
-    for every upload of the statement.
+    billed it.
     """
     try:
         settled = parse_cc_amount(entry["amount"])
@@ -324,13 +184,16 @@ async def answer(
     upload_id: int,
     stmt_idx: int,
     digest: str,
-    action: SettlementAction,
-    transaction_id: int | None = None,
+    transaction_id: int,
 ) -> SettlementResult:
-    """Apply one answer, under the write lock.
+    """Fold a recorded statement row into the stored alert it settles.
 
-    Returns ``stale`` when the row no longer asks, so a second tap of an old
-    prompt reports that rather than writing again.
+    The statement row is already in the ledger. This states that it and the
+    stored row are one purchase, so the stored row takes the billed amount and
+    the statement row goes.
+
+    Returns ``stale`` when the row was folded already, so a second tap of an
+    old prompt reports that rather than folding again.
     """
     async with session.begin():
         upload = await _lock_upload(session, upload_id)
@@ -343,25 +206,20 @@ async def answer(
         except SettlementError:
             return SettlementResult("stale", None)
 
-        if action == "skip":
-            if await _candidate_settled_by(session, upload, entry):
-                raise SettlementError("That statement row is already answered")
-            imported = await _import_row(session, upload, entry)
-            entry["ambiguous"] = False
-            upload.missing_count = sum(
-                1 for row in recon.get("missing", []) if not row.get("imported")
-            )
-            if upload.missing_count == 0:
-                upload.status = "imported"
-            upload.reconciliation_data = reconciliation_to_json(recon)
-            return SettlementResult("skipped", imported)
+        recorded_id = entry.get("imported_txn_id")
+        if recorded_id is None:
+            return SettlementResult("stale", None)
 
-        if transaction_id is None:
-            raise SettlementError("No row was chosen")
+        if transaction_id == recorded_id:
+            raise SettlementError("That is the statement row itself")
         if transaction_id in _claimed(recon):
             raise SettlementError("Another row already uses that transaction")
         if transaction_id not in (entry.get("candidate_transaction_ids") or []):
             raise SettlementError("That row was not offered")
+
+        recorded = await session.get(Transaction, recorded_id)
+        if recorded is None:
+            return SettlementResult("stale", None)
 
         target = (
             await session.scalars(
@@ -374,20 +232,12 @@ async def answer(
             raise SettlementError("That row is gone")
         if target.account_id != upload.account_id:
             raise SettlementError("That row belongs to another account")
-        if await _row_already_merged(session, upload, entry, target.id):
-            raise SettlementError("That statement row is already answered")
 
         _merge(entry, target, upload.id)
 
-        entry["imported"] = True
+        await session.delete(recorded)
         entry["imported_txn_id"] = target.id
         entry["ambiguous"] = False
-        entry["import_error"] = None
-        upload.missing_count = sum(
-            1 for row in recon.get("missing", []) if not row.get("imported")
-        )
-        if upload.missing_count == 0:
-            upload.status = "imported"
         upload.reconciliation_data = reconciliation_to_json(recon)
 
         if target.direction == "credit":

@@ -219,11 +219,15 @@ async def test_db_card_mask_decides_pairing_or_holdback(
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert imported == []
-    assert [row.id for row in rows] == [txn_id]
-    if not matches:
-        assert "ambiguous" in recon["missing"][0]["import_error"]
-        assert rows[0].counterparty == "MERCHANT A"
+    if matches:
+        assert imported == []
+        assert [row.id for row in rows] == [txn_id]
+    else:
+        assert len(imported) == 1
+        assert txn_id in [row.id for row in rows]
+        assert next(row for row in rows if row.id == txn_id).counterparty == (
+            "MERCHANT A"
+        )
 
 
 @pytest.mark.anyio
@@ -302,8 +306,7 @@ async def test_a_card_on_another_account_is_still_not_this_accounts_card(
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert imported == []
-    assert [row.id for row in rows] == [other_id]
+    assert len(imported) == 1
     other = next(row for row in rows if row.id == other_id)
     assert other.counterparty == "MERCHANT ON OTHER ACCOUNT"
 
@@ -409,11 +412,10 @@ async def test_statement_side_collision_is_not_imported_as_a_duplicate(
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert imported == []
+    assert len(imported) == len(recon["missing"])
     for entry in recon["missing"]:
-        assert entry["imported"] is False
-        assert "ambiguous" in entry["import_error"]
-    assert [row.id for row in rows] == [a_id]
+        assert entry["imported"] is True
+    assert [row.id for row in rows] == [a_id] + [row.id for row in imported]
 
 
 @pytest.mark.anyio
@@ -446,8 +448,8 @@ async def test_statement_rows_two_days_apart_still_contend_for_the_row_between_t
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert imported == []
-    assert [row.id for row in rows] == [a_id]
+    assert len(imported) == 2
+    assert [row.id for row in rows] == [a_id] + [row.id for row in imported]
 
 
 @pytest.mark.anyio
@@ -847,9 +849,8 @@ async def test_interchangeable_rivals_leave_the_winners_match_alone(session_fact
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert imported == []
-    assert "ambiguous" in recon["missing"][0]["import_error"]
-    assert [row.id for row in rows] == [a_id]
+    assert len(imported) == 1
+    assert [row.id for row in rows] == [a_id] + [row.id for row in imported]
 
 
 @pytest.mark.anyio
@@ -878,8 +879,8 @@ async def test_rivals_with_differing_narrations_still_demote_the_winner(
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert imported == []
-    assert [row.id for row in rows] == [a_id]
+    assert len(imported) == 2
+    assert [row.id for row in rows] == [a_id] + [row.id for row in imported]
 
 
 @pytest.mark.anyio
@@ -1392,9 +1393,8 @@ async def test_a_row_masked_with_a_deleted_card_is_held_back_not_reimported(
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert imported == []
-    assert "ambiguous" in recon["missing"][0]["import_error"]
-    assert [row.id for row in rows] == [addon_txn_id]
+    assert len(imported) == 1
+    assert [row.id for row in rows] == [addon_txn_id] + [row.id for row in imported]
 
 
 @pytest.mark.parametrize(
@@ -1429,6 +1429,10 @@ async def test_a_settled_amount_does_not_import_over_its_authorisation(
     The code holds a banded row back. It does not pair the two rows. The
     amounts are different, and a pairing must rewrite one of them. A band
     cannot tell a settled amount from a second purchase of a similar size.
+
+    A held row is imported, because a statement states a purchase. The hold
+    marks it for a person, who folds it into the stored row when the two state
+    one purchase.
     """
     await _seed_account(session_factory)
     stored_id = await _seed_txn(session_factory, amount=Decimal(stored))
@@ -1440,12 +1444,9 @@ async def test_a_settled_amount_does_not_import_over_its_authorisation(
     imported, rows = await _import(session_factory, parsed, recon)
 
     assert [entry["ambiguous"] for entry in recon["missing"]] == [held]
-    if held:
-        assert imported == []
-        assert [(row.id, row.amount) for row in rows] == [(stored_id, Decimal(stored))]
-    else:
-        assert len(imported) == 1
-        assert len(rows) == 2
+    assert len(imported) == 1
+    assert len(rows) == 2
+    assert (stored_id, Decimal(stored)) in [(row.id, row.amount) for row in rows]
 
 
 @pytest.mark.anyio
@@ -1471,8 +1472,8 @@ async def test_a_banded_rival_never_rewrites_a_stored_amount(session_factory):
 
     assert [entry["db_txn_id"] for entry in recon["matched"]] == [stored_id]
     assert [entry["ambiguous"] for entry in recon["missing"]] == [True]
-    assert imported == []
-    assert [(row.id, row.amount) for row in rows] == [(stored_id, Decimal("1000.00"))]
+    assert len(imported) == 1
+    assert (stored_id, Decimal("1000.00")) in [(row.id, row.amount) for row in rows]
 
 
 @pytest.mark.anyio

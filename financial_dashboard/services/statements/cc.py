@@ -1081,12 +1081,6 @@ async def import_missing_cc_txns(
     for entry in recon["missing"]:
         if entry.get("imported"):
             continue
-        if entry.get("ambiguous"):
-            entry["import_error"] = (
-                "ambiguous match — the DB may already hold this transaction under a "
-                "row it could not be safely paired with; resolve manually"
-            )
-            continue
         try:
             amount = parse_cc_amount(entry["amount"])
             txn_date = parse_cc_date(entry["date"])

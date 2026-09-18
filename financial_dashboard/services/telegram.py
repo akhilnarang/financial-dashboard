@@ -583,10 +583,8 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
             logger.warning("SMS duplicate account picker failed: %s", exc)
 
 
-def _parse_settlement_callback(
-    data: str,
-) -> tuple[Literal["merge", "skip"], int, int, str, int | None] | None:
-    """Read a settlement callback: the action, the row, and the row's digest.
+def _parse_settlement_callback(data: str) -> tuple[int, int, str, int] | None:
+    """Read a settlement callback: the row, its digest, and the row to fold into.
 
     The callback names everything the answer is about. Nothing is looked up
     from a stored question.
@@ -594,25 +592,18 @@ def _parse_settlement_callback(
     if len(data.encode()) > 64:
         return None
     parts = data.split(":")
-    if len(parts) == 6 and parts[:2] == ["st", "m"]:
-        action: Literal["merge", "skip"] = "merge"
-    elif len(parts) == 5 and parts[:2] == ["st", "s"]:
-        action = "skip"
-    else:
+    if len(parts) != 6 or parts[:2] != ["st", "m"]:
         return None
 
     try:
-        upload_id, stmt_idx = int(parts[2]), int(parts[3])
-        target = int(parts[5]) if action == "merge" else None
+        upload_id, stmt_idx, target = int(parts[2]), int(parts[3]), int(parts[5])
     except ValueError:
         return None
 
     digest = parts[4]
-    if upload_id <= 0 or stmt_idx < 0 or not digest:
+    if upload_id <= 0 or stmt_idx < 0 or target <= 0 or not digest:
         return None
-    if target is not None and target <= 0:
-        return None
-    return action, upload_id, stmt_idx, digest, target
+    return upload_id, stmt_idx, digest, target
 
 
 async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
@@ -663,17 +654,9 @@ async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
             ]
         )
 
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                "Separate purchase",
-                callback_data=f"st:s:{upload_id}:{stmt_idx}:{digest}",
-            )
-        ]
-    )
     lines.append("")
-    lines.append("Merge writes the statement amount onto the stored row.")
-    lines.append("Separate purchase adds the statement row as its own purchase.")
+    lines.append("The statement row is in the ledger as its own purchase.")
+    lines.append("Merge folds it into the stored row, which takes the billed amount.")
 
     await tg_app.bot.send_message(
         chat_id=chat_id,
@@ -700,7 +683,7 @@ async def _handle_settlement_callback(update: Update, context) -> None:
         await query.answer("Invalid callback")
         return
 
-    action, upload_id, stmt_idx, digest, target = parsed
+    upload_id, stmt_idx, digest, target = parsed
 
     from financial_dashboard.services.statement_settlement import (
         SettlementError,
@@ -709,7 +692,7 @@ async def _handle_settlement_callback(update: Update, context) -> None:
 
     try:
         async with async_session() as session:
-            result = await answer(session, upload_id, stmt_idx, digest, action, target)
+            result = await answer(session, upload_id, stmt_idx, digest, target)
     except SettlementError as exc:
         await query.answer(str(exc))
         return
@@ -720,15 +703,9 @@ async def _handle_settlement_callback(update: Update, context) -> None:
     await query.answer()
 
     if result.outcome == "merged":
-        text = f"Merged into #{result.transaction_id}"
-    elif result.outcome == "skipped":
-        text = (
-            f"Added as #{result.transaction_id}"
-            if result.transaction_id
-            else "Recorded as a separate purchase"
-        )
+        text = f"Folded into #{result.transaction_id}"
     else:
-        text = "This row was already answered"
+        text = "This row was answered already"
 
     try:
         await query.edit_message_text(text)
