@@ -10,7 +10,8 @@ The reconciler holds such a row back. This module asks about it, and applies
 the answer:
 
 - **Merge** writes the settled amount onto the stored row.
-- **Skip** leaves both rows alone. The statement row stays held.
+- **Skip** records the statement row as a purchase of its own. Both amounts
+  then stand, because they are two purchases.
 
 The question needs no stored state. The callback carries what it is about, and
 a digest of the row as it was shown, so a row that changed since is refused.
@@ -24,12 +25,18 @@ import logging
 from decimal import Decimal, InvalidOperation
 from typing import Literal, NamedTuple
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, true
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db import StatementUpload, Transaction
+from financial_dashboard.db import Account, StatementUpload, Transaction
+from financial_dashboard.services.categorization.self_transfer import (
+    apply_reference_self_transfer_rule,
+)
+from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.statements.cc import (
     parse_cc_amount,
+    resolve_cc_card_mask,
     parse_cc_date,
     reconciliation_from_json,
     reconciliation_to_json,
@@ -134,11 +141,107 @@ def _claimed(recon: dict) -> set[int]:
     return claimed
 
 
-def _merge(entry: dict, target: Transaction) -> None:
+async def _import_row(
+    session: AsyncSession, upload: StatementUpload, entry: dict
+) -> int | None:
+    """Record a statement row that states a purchase of its own.
+
+    The person answered that the ledger does not hold this purchase, which is
+    what makes the row importable. The row is built the way a plain import
+    builds one, so it carries the same links and the same card mask.
+    """
+    try:
+        amount = parse_cc_amount(entry["amount"])
+        txn_date = parse_cc_date(entry["date"])
+    except ValueError, InvalidOperation, KeyError:
+        entry["import_error"] = "could not parse amount/date"
+        return None
+
+    account = await session.get(Account, upload.account_id)
+    txn = Transaction(
+        statement_upload_id=upload.id,
+        account_id=upload.account_id,
+        bank=upload.bank,
+        email_type="cc_statement",
+        direction=entry["direction"],
+        amount=amount,
+        currency="INR",
+        transaction_date=txn_date,
+        counterparty=entry.get("narration"),
+        card_mask=await resolve_cc_card_mask(
+            session, account, entry.get("card_number")
+        ),
+        channel="cc_statement",
+        raw_description=entry.get("narration"),
+    )
+
+    link_ctx = await build_link_context(session)
+    try:
+        async with session.begin_nested():
+            session.add(txn)
+            await session.flush()
+            link_transaction(link_ctx, txn)
+            await session.flush()
+    except IntegrityError:
+        entry["duplicate"] = True
+        entry["import_error"] = "duplicate transaction"
+        return None
+
+    await apply_reference_self_transfer_rule(session, txn)
+    entry["imported"] = True
+    entry["imported_txn_id"] = txn.id
+    entry["import_error"] = None
+    return txn.id
+
+
+async def _already_settled(
+    session: AsyncSession,
+    entry: dict,
+    account_id: int,
+    upload_id: int,
+    target_id: int | None,
+) -> bool:
+    """Whether another upload of this statement already answered this row.
+
+    The same statement can be uploaded twice, and each upload asks its own
+    question. The two reconciliations do not see each other, so the check reads
+    the ledger instead: a settled row states the statement amount on the
+    statement date and names a statement.
+
+    The rival must name a different upload. A statement can print one line
+    twice and mean two purchases, and those two answers both name this upload.
+    """
+    try:
+        settled = parse_cc_amount(entry["amount"])
+        row_date = parse_cc_date(entry["date"])
+    except ValueError, InvalidOperation, KeyError:
+        return False
+
+    rival = await session.scalars(
+        select(Transaction.id)
+        .where(
+            Transaction.account_id == account_id,
+            Transaction.id != target_id if target_id is not None else true(),
+            Transaction.statement_upload_id.is_not(None),
+            Transaction.statement_upload_id != upload_id,
+            Transaction.amount == settled,
+            Transaction.transaction_date == row_date,
+            Transaction.direction == entry.get("direction"),
+        )
+        .limit(1)
+    )
+    return rival.first() is not None
+
+
+def _merge(entry: dict, target: Transaction, upload_id: int) -> None:
     """Write the settled amount onto the stored row.
 
     Every rule is read again here. The prompt is a question, and a row that
     changed after it was sent is not the row the person saw.
+
+    The row then states a billed amount, so it is linked to the statement that
+    billed it. The link sits on the row, so it survives a reparse and speaks
+    for every upload of the statement.
     """
     try:
         settled = parse_cc_amount(entry["amount"])
@@ -163,6 +266,7 @@ def _merge(entry: dict, target: Transaction) -> None:
         raise SettlementError("The amounts are too far apart")
 
     target.amount = settled
+    target.statement_upload_id = upload_id
     target.enriched_at = datetime.datetime.now(datetime.UTC)
 
 
@@ -191,10 +295,21 @@ async def answer(
             return SettlementResult("stale", None)
 
         if action == "skip":
+            if await _already_settled(
+                session, entry, upload.account_id, upload.id, None
+            ):
+                raise SettlementError("That statement row is already answered")
+            imported = await _import_row(session, upload, entry)
             entry["ambiguous"] = False
-            entry["import_error"] = "a separate purchase, left alone"
+            upload.missing_count = sum(
+                1 for row in recon.get("missing", []) if not row.get("imported")
+            )
+            if upload.missing_count == 0:
+                upload.status = "imported"
             upload.reconciliation_data = reconciliation_to_json(recon)
-            return SettlementResult("skipped", None)
+            if entry.get("direction") == "credit":
+                await _resync_payment_state(session, upload)
+            return SettlementResult("skipped", imported)
 
         if transaction_id is None:
             raise SettlementError("No row was chosen")
@@ -214,8 +329,12 @@ async def answer(
             raise SettlementError("That row is gone")
         if target.account_id != upload.account_id:
             raise SettlementError("That row belongs to another account")
+        if await _already_settled(
+            session, entry, upload.account_id, upload.id, target.id
+        ):
+            raise SettlementError("That statement row is already answered")
 
-        _merge(entry, target)
+        _merge(entry, target, upload.id)
 
         entry["imported"] = True
         entry["imported_txn_id"] = target.id
@@ -228,7 +347,25 @@ async def answer(
             upload.status = "imported"
         upload.reconciliation_data = reconciliation_to_json(recon)
 
+        if target.direction == "credit":
+            await _resync_payment_state(session, upload)
+
         return SettlementResult("merged", target.id)
+
+
+async def _resync_payment_state(session: AsyncSession, upload: StatementUpload) -> None:
+    """Re-derive the paid state after an answer changed a credit.
+
+    A statement is asked about right after it is read, and answered later. The
+    read has therefore already re-derived the paid state, and an answer that
+    adds or rewrites a credit changes what it derived from.
+    """
+    from financial_dashboard.services.reminders import resync_tracked_cc_payment_state
+
+    try:
+        await resync_tracked_cc_payment_state(session, upload)
+    except Exception as exc:
+        logger.warning("Settlement payment resync failed: %s", exc)
 
 
 async def ask_about_held_rows(upload_id: int) -> None:
@@ -258,8 +395,13 @@ async def _send_prompts(upload_id: int) -> None:
             return
 
         recon = reconciliation_from_json(upload.reconciliation_data)
+        claimed = _claimed(recon)
         for entry in held_rows(recon):
-            candidate_ids = entry.get("candidate_transaction_ids") or []
+            candidate_ids = [
+                txn_id
+                for txn_id in entry.get("candidate_transaction_ids") or []
+                if txn_id not in claimed
+            ]
             rows = (
                 await session.scalars(
                     select(Transaction).where(Transaction.id.in_(candidate_ids))

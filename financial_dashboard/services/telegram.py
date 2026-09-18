@@ -673,6 +673,7 @@ async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
     )
     lines.append("")
     lines.append("Merge writes the statement amount onto the stored row.")
+    lines.append("Separate purchase adds the statement row as its own purchase.")
 
     await tg_app.bot.send_message(
         chat_id=chat_id,
@@ -721,7 +722,11 @@ async def _handle_settlement_callback(update: Update, context) -> None:
     if result.outcome == "merged":
         text = f"Merged into #{result.transaction_id}"
     elif result.outcome == "skipped":
-        text = "Left as a separate purchase"
+        text = (
+            f"Added as #{result.transaction_id}"
+            if result.transaction_id
+            else "Recorded as a separate purchase"
+        )
     else:
         text = "This row was already answered"
 

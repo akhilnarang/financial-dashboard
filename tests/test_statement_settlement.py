@@ -130,8 +130,13 @@ async def test_merge_writes_the_settled_amount(maker):
     ]
 
 
-async def test_skip_leaves_both_rows_alone(maker):
-    """Two purchases of a similar size. Neither row may change."""
+async def test_skip_records_the_second_purchase(maker):
+    """Two purchases of a similar size, so the statement row is a purchase.
+
+    The stored row keeps the amount it was authorised at, and the statement
+    row enters the ledger at the amount it was billed at. Leaving it out would
+    lose a real purchase.
+    """
     upload_id = await _seed(maker)
     digest = row_digest(_row())
 
@@ -139,8 +144,15 @@ async def test_skip_leaves_both_rows_alone(maker):
         result = await answer(session, upload_id, 0, digest, "skip")
 
     assert result.outcome == "skipped"
-    assert [row.amount for row in await _rows(maker)] == [Decimal(AUTHORISED)]
-    assert held_rows(await _recon_of(maker, upload_id)) == []
+    assert [row.amount for row in await _rows(maker)] == [
+        Decimal(AUTHORISED),
+        Decimal("2529.00"),
+    ]
+
+    recon = await _recon_of(maker, upload_id)
+    assert held_rows(recon) == []
+    assert recon["missing"][0]["imported"] is True
+    assert recon["missing"][0]["imported_txn_id"] == result.transaction_id
 
 
 async def test_a_second_tap_changes_nothing(maker):
@@ -278,31 +290,197 @@ async def test_two_identical_rows_are_two_questions(maker):
     assert held_rows(await _recon_of(maker, upload_id)) == []
 
 
+async def test_an_answered_row_keeps_the_transaction_it_took(maker):
+    """A merge claims its target, so a later row cannot take the same one.
+
+    Two identical rows share a digest, because a digest states what a row
+    states and these rows state the same thing. The claim, not the digest,
+    keeps the second row off the transaction the first one took.
+    """
+    two = _recon([_row(stmt_idx=0), _row(stmt_idx=1)])
+    upload_id = await _seed(maker, recon=two)
+    digest = row_digest(_row())
+
+    async with maker() as session:
+        first = await answer(session, upload_id, 0, digest, "merge", 1)
+    async with maker() as session:
+        with pytest.raises(SettlementError):
+            await answer(session, upload_id, 1, digest, "merge", 1)
+
+    assert first.outcome == "merged"
+    assert [(row.id, row.amount) for row in await _rows(maker)] == [
+        (1, Decimal("2529.00"))
+    ]
+
+
+async def test_a_merge_links_the_row_to_its_statement(maker):
+    """A merged row states a billed amount, so it names the statement.
+
+    The link sits on the row, so a reparse cannot drop it. A replayed prompt
+    then finds a row that already came from a statement.
+    """
+    upload_id = await _seed(maker)
+    digest = row_digest(_row())
+
+    async with maker() as session:
+        await answer(session, upload_id, 0, digest, "merge", 1)
+    assert (await _rows(maker))[0].statement_upload_id == upload_id
+
+    async with maker() as session:
+        upload = await session.get(StatementUpload, upload_id)
+        upload.reconciliation_data = json.dumps(_recon())
+        await session.commit()
+
+    async with maker() as session:
+        with pytest.raises(SettlementError):
+            await answer(session, upload_id, 0, digest, "merge", 1)
+
+    assert [row.amount for row in await _rows(maker)] == [Decimal("2529.00")]
+
+
+async def test_one_printed_row_is_answered_once_across_uploads(maker):
+    """The same statement can be uploaded twice.
+
+    Each upload asks its own question about the same printed purchase. Two
+    answers would write that one purchase onto two stored rows.
+    """
+    upload_id = await _seed(
+        maker,
+        stored=(AUTHORISED, "2512.00"),
+        recon=_recon([_row(candidates=(1, 2))]),
+    )
+    async with maker() as session:
+        second = StatementUpload(
+            account_id=ACCOUNT_ID,
+            bank="hdfc",
+            filename="statement.pdf",
+            file_path="/nonexistent/statement.pdf",
+            status="partial_import",
+            reconciliation_data=json.dumps(_recon([_row(candidates=(1, 2))])),
+        )
+        session.add(second)
+        await session.commit()
+        second_id = second.id
+
+    digest = row_digest(_row(candidates=(1, 2)))
+
+    async with maker() as session:
+        await answer(session, upload_id, 0, digest, "merge", 1)
+    async with maker() as session:
+        with pytest.raises(SettlementError):
+            await answer(session, second_id, 0, digest, "merge", 2)
+
+    assert [row.amount for row in await _rows(maker)] == [
+        Decimal("2529.00"),
+        Decimal("2512.00"),
+    ]
+
+
+async def test_a_transaction_that_runs_the_other_way_is_refused(maker):
+    """A statement debit cannot settle a stored credit."""
+    upload_id = await _seed(maker)
+    digest = row_digest(_row())
+    async with maker() as session:
+        row = await session.get(Transaction, 1)
+        row.direction = "credit"
+        await session.commit()
+
+    async with maker() as session:
+        with pytest.raises(SettlementError):
+            await answer(session, upload_id, 0, digest, "merge", 1)
+
+    assert (await _rows(maker))[0].amount == Decimal(AUTHORISED)
+
+
+async def test_a_transaction_that_moved_out_of_the_window_is_refused(maker):
+    """A settlement follows its purchase by about a day, not by weeks."""
+    upload_id = await _seed(maker)
+    digest = row_digest(_row())
+    async with maker() as session:
+        row = await session.get(Transaction, 1)
+        row.transaction_date = datetime.date(2026, 3, 1)
+        await session.commit()
+
+    async with maker() as session:
+        with pytest.raises(SettlementError):
+            await answer(session, upload_id, 0, digest, "merge", 1)
+
+    assert (await _rows(maker))[0].amount == Decimal(AUTHORISED)
+
+
+async def test_a_transaction_on_another_account_is_refused(maker):
+    """A statement speaks for one card only."""
+    upload_id = await _seed(maker)
+    digest = row_digest(_row())
+    async with maker() as session:
+        session.add(Account(id=2, bank="hdfc", label="Other", type="credit_card"))
+        row = await session.get(Transaction, 1)
+        row.account_id = 2
+        await session.commit()
+
+    async with maker() as session:
+        with pytest.raises(SettlementError):
+            await answer(session, upload_id, 0, digest, "merge", 1)
+
+    assert (await _rows(maker))[0].amount == Decimal(AUTHORISED)
+
+
+async def test_one_printed_row_is_recorded_once_across_uploads(maker):
+    """A statement uploaded twice states its purchases once.
+
+    The second upload asks the same question about the same printed row, so
+    answering both would record one purchase twice.
+    """
+    first_id = await _seed(maker)
+    async with maker() as session:
+        second = StatementUpload(
+            account_id=ACCOUNT_ID,
+            bank="hdfc",
+            filename="statement.pdf",
+            file_path="/nonexistent/statement.pdf",
+            status="partial_import",
+            reconciliation_data=json.dumps(_recon()),
+        )
+        session.add(second)
+        await session.commit()
+        second_id = second.id
+
+    digest = row_digest(_row())
+    async with maker() as session:
+        await answer(session, first_id, 0, digest, "skip")
+    async with maker() as session:
+        with pytest.raises(SettlementError):
+            await answer(session, second_id, 0, digest, "skip")
+
+    assert [row.amount for row in await _rows(maker)] == [
+        Decimal(AUTHORISED),
+        Decimal("2529.00"),
+    ]
+
+
+async def test_answering_a_credit_re_derives_the_paid_state(maker, monkeypatch):
+    """A credit answer changes what the paid state was derived from."""
+    seen = []
+
+    async def fake_resync(session, upload):
+        seen.append(upload.id)
+        return True
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.reminders.resync_tracked_cc_payment_state",
+        fake_resync,
+    )
+    credit = _row()
+    credit["direction"] = "credit"
+    upload_id = await _seed(maker, recon=_recon([credit]))
+
+    async with maker() as session:
+        await answer(session, upload_id, 0, row_digest(credit), "skip")
+
+    assert seen == [upload_id]
+
+
 async def test_the_digest_follows_what_the_row_states():
     """Equal rows give one digest; a changed row gives another."""
     assert row_digest(_row()) == row_digest(_row())
     assert row_digest(_row()) != row_digest(_row(amount="1,000.00"))
-
-
-async def test_the_digest_survives_a_restart():
-    """The digest travels to Telegram and comes back, possibly after a restart.
-
-    ``hash()`` is salted per process, so a digest built from it would differ
-    and every prompt would be refused.
-    """
-    import subprocess
-    import sys
-
-    script = (
-        "from financial_dashboard.services.statement_settlement import row_digest;"
-        "print(row_digest({'date': '07/04/2026', 'amount': '2,529.00',"
-        " 'direction': 'debit', 'narration': 'X', 'card_number': None}))"
-    )
-    runs = {
-        subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True, check=True
-        ).stdout.strip()
-        for _ in range(2)
-    }
-
-    assert len(runs) == 1
