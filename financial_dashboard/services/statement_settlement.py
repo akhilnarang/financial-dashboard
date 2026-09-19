@@ -149,8 +149,12 @@ def _merge(entry: dict, target: Transaction, upload_id: int) -> None:
     Every rule is read again here. The prompt is a question, and a row that
     changed after it was sent is not the row the person saw.
 
-    The row then states a billed amount, so it is linked to the statement that
-    billed it.
+    The row then states what the statement billed: the amount, the date and the
+    merchant. The alert states what the card authorised, which can be a day
+    earlier and a shorter name, and the row is a statement row now.
+
+    A name the user chose stands. The bank did not state it, so a statement
+    does not answer for it.
     """
     try:
         settled = parse_cc_amount(entry["amount"])
@@ -174,7 +178,12 @@ def _merge(entry: dict, target: Transaction, upload_id: int) -> None:
     if not settles_within_band(settled, stored):
         raise SettlementError("The amounts are too far apart")
 
+    narration = entry.get("narration")
+    if narration and target.counterparty_source != "user_alias":
+        target.counterparty = narration
+
     target.amount = settled
+    target.transaction_date = row_date
     target.statement_upload_id = upload_id
     target.enriched_at = datetime.datetime.now(datetime.UTC)
 

@@ -40,6 +40,7 @@ import json
 import logging
 import tempfile
 import unicodedata
+from difflib import SequenceMatcher
 from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -70,6 +71,7 @@ from financial_dashboard.core.masks import (
     normalize_mask,
     trailing_visible_digits,
 )
+from cc_parser.parsers.narration import normalize_merchant_name
 from bank_email_parser.models import Money, ParsedEmail
 
 from financial_dashboard.integrations.parsers import parse_cc_statement_pdf
@@ -378,6 +380,35 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
             return True
         start = index + 1
     return False
+
+
+MERCHANT_SIMILARITY = 0.5
+"""How much of the shorter merchant name must appear in the longer one.
+
+A card alert and a statement spell one merchant differently. The alert
+truncates and the statement adds a city and a country, or the other way
+round. The longest run they share, as a fraction of the shorter name, tells
+them apart from two different merchants: a pair of spellings of one merchant
+scores about 0.5 or more, and two merchants score about 0.25 or less.
+"""
+
+
+def _same_merchant(row_narration: str | None, db_txn) -> bool:
+    """Whether a statement row and a stored row name one merchant.
+
+    The names are stripped of references, terminals and processor wrappers
+    first, so what is compared is the merchant and its location.
+    """
+    narration = normalize_merchant_name(row_narration or "")
+    stored = normalize_merchant_name(db_txn.counterparty or "")
+    if not narration or not stored:
+        return False
+
+    short, long = sorted((narration, stored), key=len)
+    run = SequenceMatcher(None, short, long).find_longest_match(
+        0, len(short), 0, len(long)
+    )
+    return run.size / len(short) >= MERCHANT_SIMILARITY
 
 
 def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
@@ -697,7 +728,7 @@ def reconcile_statement(
                 txn_id
                 for txn_id in banded
                 if txn_id in exact_sets[stmt_idx]
-                or _counterparty_singles_out(txn.narration, rows_by_id[txn_id])
+                or _same_merchant(txn.narration, rows_by_id[txn_id])
             }
         except ValueError, InvalidOperation:
             continue

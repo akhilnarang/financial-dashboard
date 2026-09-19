@@ -299,6 +299,47 @@ async def test_a_transaction_that_moved_out_of_the_window_is_refused(maker):
     assert (await _rows(maker))[0].amount == Decimal(AUTHORISED)
 
 
+async def test_a_fold_states_what_the_statement_states(maker):
+    """A folded row is a statement row, so it states the statement's facts.
+
+    The alert states what the card authorised: an amount, a date that can be a
+    day earlier, and a shorter name. The statement states what the bank
+    billed. A row that keeps the alert's date or name no longer answers to the
+    statement, so the next reprocess records the purchase again.
+    """
+    upload_id = await _seed(maker)
+    async with maker() as session:
+        row = await session.get(Transaction, 1)
+        row.transaction_date = datetime.date(2026, 4, 6)
+        await session.commit()
+
+    async with maker() as session:
+        await answer(session, upload_id, 0, row_digest(_row()), 1)
+
+    folded = (await _rows(maker))[0]
+    assert folded.amount == Decimal("2529.00")
+    assert folded.transaction_date == datetime.date(2026, 4, 7)
+    assert folded.counterparty == NARRATION
+
+
+async def test_a_fold_keeps_a_name_the_user_chose(maker):
+    """A bank did not state a user's own label, so a statement does not
+    answer for it."""
+    upload_id = await _seed(maker)
+    async with maker() as session:
+        row = await session.get(Transaction, 1)
+        row.counterparty = "My fuel card"
+        row.counterparty_source = "user_alias"
+        await session.commit()
+
+    async with maker() as session:
+        await answer(session, upload_id, 0, row_digest(_row()), 1)
+
+    folded = (await _rows(maker))[0]
+    assert folded.amount == Decimal("2529.00")
+    assert folded.counterparty == "My fuel card"
+
+
 async def test_a_fold_keeps_a_one_day_offset_row(maker):
     """A settlement follows its purchase by a day, and that is still one."""
     upload_id = await _seed(maker)
