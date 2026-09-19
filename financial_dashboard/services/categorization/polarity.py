@@ -62,9 +62,7 @@ CREDIT_DEFAULT = REPAYMENT_SLUG
 # is therefore impossible on a card and must never survive as the answer; the
 # unexplained card credit defaults to a bill payment instead.
 CC_CREDIT_DEFAULT = CREDIT_CARD_PAYMENT_SLUG
-CC_IMPOSSIBLE_CREDIT_SLUGS: frozenset = frozenset(
-    {REPAYMENT_SLUG, "salary", "other_income", "interest"}
-)
+CC_IMPOSSIBLE_CREDIT_SLUGS: frozenset = INCOME_SLUGS - {"refund", "cashback_rewards"}
 
 
 class DirectionResult(NamedTuple):

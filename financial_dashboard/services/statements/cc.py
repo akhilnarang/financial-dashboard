@@ -73,6 +73,7 @@ from financial_dashboard.core.masks import (
 from bank_email_parser.models import Money, ParsedEmail
 
 from financial_dashboard.integrations.parsers import parse_cc_statement_pdf
+from financial_dashboard.services.categorization.engine import requeue_after_enrichment
 from financial_dashboard.services.categorization.self_transfer import (
     apply_reference_self_transfer_rule,
 )
@@ -886,6 +887,7 @@ async def enrich_matched_transactions(recon: dict) -> int:
 
             txn.counterparty = narration
             txn.counterparty_source = "bank"
+            await requeue_after_enrichment(session, txn)
             enriched += 1
             entry["enriched"] = True
 

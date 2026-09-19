@@ -8,6 +8,9 @@ _NON_ALNUM_SPACE = re.compile(r"[^a-z0-9 ]+")
 # 7+ consecutive digits (card/account/long refs) or phone-like numbers.
 _LONG_DIGITS = re.compile(r"\d{7,}")
 _PHONE = re.compile(r"(?<!\d)(?:\+?\d[\s-]?){10,13}(?!\d)")
+# Conventional grouped 16-digit card numbers can use separators that are not
+# covered by _PHONE (for example ``1234/5678/9012/3456``).
+_GROUPED_CARD = re.compile(r"(?<!\d)(?:\d{4}[\s/-]){3}\d{4}(?!\d)")
 
 
 def normalize_text(s: str | None) -> str:
@@ -48,7 +51,8 @@ def redact_pii(s: str | None) -> str:
     """
     if not s:
         return ""
-    redacted = _PHONE.sub("[redacted-phone]", s)
+    redacted = _GROUPED_CARD.sub("[redacted-num]", s)
+    redacted = _PHONE.sub("[redacted-phone]", redacted)
     redacted = _LONG_DIGITS.sub("[redacted-num]", redacted)
     return redacted
 

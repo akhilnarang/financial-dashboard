@@ -11,8 +11,11 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 
 from financial_dashboard.config import Settings
-from financial_dashboard.core.deps import verify_credentials
+from financial_dashboard.core.deps import get_session, verify_credentials
 from financial_dashboard.core.security import check_credentials
+from financial_dashboard.db import Transaction
+from financial_dashboard.api import router as api_router
+from financial_dashboard.config import settings as app_settings
 
 
 # ---------------------------------------------------------------------------
@@ -232,3 +235,42 @@ class TestAuthIntegration:
                     "/", headers=_basic_auth_header("admin", "p:a:s:s")
                 )
                 assert r.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_transaction_attachment_route_uses_global_auth(
+    session, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(app_settings, "transaction_attachment_root", str(tmp_path))
+    (tmp_path / "receipt.pdf").write_bytes(b"%PDF-1.7\nreceipt")
+    transaction = Transaction(
+        bank="hdfc",
+        email_type="purchase",
+        direction="debit",
+        amount="12.00",
+        attachment_path="receipt.pdf",
+    )
+    session.add(transaction)
+    await session.commit()
+
+    app = FastAPI(dependencies=[Depends(verify_credentials)])
+
+    async def _override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.include_router(api_router)
+    auth_settings = _make_settings("admin", "pass")
+    with patch("financial_dashboard.core.security.settings", auth_settings):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            denied = await client.get(f"/api/transactions/{transaction.id}/attachment")
+            allowed = await client.get(
+                f"/api/transactions/{transaction.id}/attachment",
+                headers=_basic_auth_header("admin", "pass"),
+            )
+
+    assert denied.status_code == 401
+    assert allowed.status_code == 200
+    assert allowed.content.startswith(b"%PDF-")

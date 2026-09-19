@@ -1,16 +1,26 @@
 """Orchestrates rule + LLM categorization for a single transaction, and the
 selection query used by the sweep."""
 
-from sqlalchemy import select
+import json
+
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import Account, Transaction, utc_now
+from financial_dashboard.db.models import (
+    Account,
+    AuditAction,
+    AuditInteraction,
+    Transaction,
+    Setting,
+    utc_now,
+)
 from financial_dashboard.services.categorization import gemini, openai_provider
 from financial_dashboard.services.categorization.fewshot import get_similar_examples
 from financial_dashboard.services.categorization.llm import NEEDS_REVIEW, LlmResult
 from financial_dashboard.services.categorization.hashing import (
     build_input_payload,
     compute_input_hash,
+    compute_transaction_confirmation_hash,
 )
 from financial_dashboard.services.categorization.rules import (
     RULESET_VERSION,
@@ -18,6 +28,13 @@ from financial_dashboard.services.categorization.rules import (
     match_rules,
 )
 from financial_dashboard.services.categorization.polarity import resolve_direction
+from financial_dashboard.services.categorization.review_decisions import (
+    candidates_from_result,
+    create_or_reuse_decision,
+)
+from financial_dashboard.services.categorization.decision_lifecycle import (
+    supersede_active_decisions,
+)
 from financial_dashboard.services.categorization.self_transfer import (
     apply_reference_self_transfer_rule,
 )
@@ -37,8 +54,26 @@ from financial_dashboard.services.settings import (
 async def resolve_account_type(session: AsyncSession, txn: Transaction) -> str | None:
     if txn.account_id is None:
         return None
-    account = await session.get(Account, txn.account_id)
+    account = await session.get(Account, txn.account_id, populate_existing=True)
     return account.type if account else None
+
+
+async def requeue_after_enrichment(session: AsyncSession, txn: Transaction) -> None:
+    """Retry unresolved model results only when classifier inputs changed."""
+    if txn.category_method != "llm" or (
+        txn.category != "unknown" and txn.review_status not in ("pending", "notified")
+    ):
+        return
+    account_type = await resolve_account_type(session, txn)
+    if (
+        compute_input_hash(build_input_payload(txn, account_type))
+        == txn.category_input_hash
+    ):
+        return
+    txn.category_method = "pending_llm"
+    txn.review_status = None
+    txn.review_reason = None
+    await supersede_active_decisions(session, txn.id)
 
 
 def _active_model_name() -> str:
@@ -63,6 +98,7 @@ async def _llm_classify(*, fields, examples, active_slugs) -> LlmResult:
             base_url=get_openai_base_url(),
             reasoning_effort=get_setting("openai.reasoning_effort") or "",
             name_tokens=name_tokens,
+            confidence_threshold=_confidence_threshold(),
         )
     return await gemini.classify(
         fields=fields,
@@ -79,6 +115,91 @@ def _confidence_threshold() -> float:
         return float(get_setting("categorization.confidence_threshold") or "0.6")
     except ValueError, TypeError:
         return 0.6
+
+
+async def _record_merchant_lookup(
+    session: AsyncSession,
+    txn: Transaction,
+    result: LlmResult,
+    *,
+    before: dict[str, object],
+    input_hash: str,
+    gate_reason: str | None,
+    stale: bool = False,
+) -> None:
+    if result.merchant_search is None:
+        return
+    evidence = result.merchant_search
+    if not stale and txn.review_status == "pending":
+        txn.review_reason = (txn.review_reason or result.reason) + (
+            "\nMerchant lookup: "
+            + evidence["status"]
+            + "".join("\nSource: " + source["url"] for source in evidence["sources"])
+        )
+    audit = AuditInteraction(
+        # Background lookup has no inbound Telegram event or delivery.
+        inbound_chat_id=0,
+        trigger="merchant_lookup",
+        transaction_id=txn.id,
+        status="completed",
+        outcome="stale"
+        if stale
+        else "needs_review"
+        if txn.review_status == "pending"
+        else "classified",
+        error_code="transaction_changed" if stale else evidence.get("error_code"),
+        provider="openai",
+        model=evidence.get("model", _active_model_name()),
+        prompt_version="merchant-lookup-v1",
+        output_mode="web_search",
+        model_input_json=json.dumps(
+            {
+                "merchant": evidence["merchant"],
+                "city": evidence["city"],
+                "category_input_hash": input_hash,
+            }
+        ),
+        model_output_json=json.dumps(
+            {
+                "merchant_search": evidence,
+                "before": before,
+                "result": {
+                    "category": result.slug,
+                    "confidence": result.confidence,
+                    "reason": result.reason,
+                },
+                "applied_category": None if stale else txn.category,
+                "current_category": txn.category,
+                "review_status": txn.review_status,
+                "gate_reason": gate_reason,
+            }
+        ),
+        model_explanation=result.reason,
+        completed_at=utc_now(),
+    )
+    session.add(audit)
+    if stale:
+        return
+    await session.flush()
+    session.add(
+        AuditAction(
+            interaction_id=audit.id,
+            transaction_id=txn.id,
+            action_type="categorize_transaction",
+            target_type="transaction",
+            target_id=txn.id,
+            arguments_json=json.dumps({"category": result.slug}),
+            before_json=json.dumps(before),
+            after_json=json.dumps(
+                {
+                    "category": txn.category,
+                    "confidence": txn.category_confidence,
+                    "method": txn.category_method,
+                }
+            ),
+            status="applied",
+        )
+    )
 
 
 async def categorize_one(
@@ -115,6 +236,7 @@ async def categorize_one(
         txn.category_vocab_version = get_vocab_version()
         txn.categorized_at = utc_now()
         txn.review_status = None
+        await supersede_active_decisions(session, txn.id)
         return "rule"
 
     if not use_llm:
@@ -148,12 +270,43 @@ async def categorize_one(
     examples = await get_similar_examples(
         session, counterparty=txn.counterparty, direction=txn.direction, limit=5
     )
+    before: dict[str, object] = {
+        "category": txn.category,
+        "confidence": txn.category_confidence,
+        "method": txn.category_method,
+    }
+    expected_state = compute_transaction_confirmation_hash(txn, account_type)
     result = await _llm_classify(
         fields=fields,
         examples=examples,
         active_slugs=active_slugs,
     )
-
+    # SQLite's legacy SELECT does not start a transaction. Take a write lock on
+    # a non-projection setting before reloading and applying the model result.
+    await session.execute(
+        update(Setting)
+        .where(Setting.key == "category_vocab_version")
+        .values(value=Setting.value)
+    )
+    current = await session.get(Transaction, txn.id, populate_existing=True)
+    if current is None:
+        return "skip"
+    account_type = await resolve_account_type(session, current)
+    if (
+        current.category_method != before["method"]
+        or compute_transaction_confirmation_hash(current, account_type)
+        != expected_state
+    ):
+        await _record_merchant_lookup(
+            session,
+            current,
+            result,
+            before=before,
+            input_hash=input_hash,
+            gate_reason="transaction changed during categorization",
+            stale=True,
+        )
+        return "skip"
     txn.category_method = "llm"
     txn.category_model = _active_model_name()
     txn.category_confidence = result.confidence
@@ -161,13 +314,30 @@ async def categorize_one(
     txn.category_vocab_version = get_vocab_version()
     txn.categorized_at = utc_now()
 
-    if result.slug == NEEDS_REVIEW or result.confidence < _confidence_threshold():
+    proposed_slug: str | None = None
+    gate_reason: str | None = None
+    threshold = _confidence_threshold()
+    if result.slug == NEEDS_REVIEW or result.confidence < threshold:
         resolved, _ = resolve_direction("unknown", txn.direction, account_type)
+        if result.slug != NEEDS_REVIEW:
+            proposed, proposal_changed = resolve_direction(
+                result.slug, txn.direction, account_type
+            )
+            proposed_slug = None if proposal_changed else proposed
         txn.category = resolved
         txn.review_status = "pending"
         txn.review_reason = result.reason
+        gate_reason = (
+            result.reason
+            if result.slug == NEEDS_REVIEW
+            and result.reason.startswith("invalid model category slug:")
+            else "model abstained"
+            if result.slug == NEEDS_REVIEW
+            else f"confidence {result.confidence:.2f} below {threshold:.2f}"
+        )
     else:
         resolved, changed = resolve_direction(result.slug, txn.direction, account_type)
+        proposed_slug = resolved
         txn.category = resolved
         if changed:
             # The model gave a directionally-impossible slug — it was confused,
@@ -176,8 +346,40 @@ async def categorize_one(
             txn.review_reason = f"direction fallback: model said {result.slug}"
             txn.category_confidence = min(result.confidence, 0.4)
             txn.review_status = "pending"
+            gate_reason = f"{result.slug} is incompatible with {txn.direction}"
         else:
             txn.review_status = None
+            await supersede_active_decisions(session, txn.id)
+    await _record_merchant_lookup(
+        session,
+        txn,
+        result,
+        before=before,
+        input_hash=input_hash,
+        gate_reason=gate_reason,
+    )
+    if txn.review_status == "pending":
+        # A new model attempt needs a fresh review and delivery, even if its
+        # candidates match an earlier, already-notified decision.
+        await supersede_active_decisions(session, txn.id)
+        txn.notify_attempts = 0
+        compatible_candidates = [
+            candidate
+            for candidate in candidates_from_result(result)
+            if resolve_direction(
+                str(candidate["category"]), txn.direction, account_type
+            ).slug
+            == candidate["category"]
+        ]
+        await create_or_reuse_decision(
+            session,
+            txn,
+            candidates=compatible_candidates,
+            gate_reason=gate_reason,
+            proposed_slug=proposed_slug,
+            confidence=result.confidence,
+            threshold=threshold,
+        )
     return "llm"
 
 
@@ -191,7 +393,8 @@ def select_needs_work_stmt(*, llm: bool, limit: int):
 
     llm=False: rule pass — rows never evaluated (method IS NULL).
     llm=True: LLM pass — 'pending_llm' rows, brand-new NULL rows, OR a prior LLM
-    'unknown' whose vocabulary is now stale (a new slug may now fit).
+    'unknown' or unresolved review whose vocabulary is now stale (a new slug
+    may now fit). Review rows already have direction-default categories.
     """
     current_vocab = get_vocab_version()
     if not llm:
@@ -208,7 +411,10 @@ def select_needs_work_stmt(*, llm: bool, limit: int):
             Transaction.category_method.is_(None)
             | (Transaction.category_method == "pending_llm")
             | (
-                (Transaction.category == "unknown")
+                (
+                    (Transaction.category == "unknown")
+                    | Transaction.review_status.in_(("pending", "notified"))
+                )
                 & (Transaction.category_method == "llm")
                 & (
                     Transaction.category_vocab_version.is_(None)

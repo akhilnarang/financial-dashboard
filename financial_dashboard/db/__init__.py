@@ -18,6 +18,8 @@ from financial_dashboard.db.enums import (
 from financial_dashboard.db.init_db import init_db as _init_db
 from financial_dashboard.db.models import (
     Account,
+    AuditAction,
+    AuditInteraction,
     BankStatementUpload,
     Base,
     BalanceSnapshot,
@@ -31,10 +33,14 @@ from financial_dashboard.db.models import (
     InvestmentLot,
     ManualItem,
     MerchantRule,
+    CategoryReviewDecision,
     Setting,
     SmsMessage,
     SnapshotHolding,
     StatementUpload,
+    TelegramConversation,
+    TelegramMessageContext,
+    TelegramOutboundDelivery,
     Transaction,
 )
 
@@ -87,6 +93,8 @@ async def init_db() -> None:
 
 __all__ = [
     "Account",
+    "AuditAction",
+    "AuditInteraction",
     "AsyncSession",
     "BankStatementUpload",
     "Base",
@@ -105,6 +113,7 @@ __all__ = [
     "ManualItem",
     "ManualKind",
     "MerchantRule",
+    "CategoryReviewDecision",
     "PaymentStatus",
     "Setting",
     "SmsMessage",
@@ -113,6 +122,9 @@ __all__ = [
     "SnapshotKind",
     "SnapshotSource",
     "StatementUpload",
+    "TelegramConversation",
+    "TelegramMessageContext",
+    "TelegramOutboundDelivery",
     "Transaction",
     "async_session",
     "engine",
