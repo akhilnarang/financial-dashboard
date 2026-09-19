@@ -673,6 +673,7 @@ def reconcile_statement(
 
     candidate_sets: dict[int, set[int]] = {}
     exact_sets: dict[int, set[int]] = {}
+    rows_by_id = {db_txn.id: db_txn for db_txn in db_transactions}
     for stmt_idx, (_stmt_list, direction, txn) in enumerate(stmt_txns):
         try:
             exact_sets[stmt_idx] = _reachable_exact(
@@ -680,11 +681,24 @@ def reconcile_statement(
                 direction,
                 parse_cc_date(txn.date),
             )
-            candidate_sets[stmt_idx] = _reachable(
+            banded = _reachable(
                 parse_cc_amount(txn.amount),
                 direction,
                 parse_cc_date(txn.date),
             )
+            # A settled amount sits a surcharge or a rate move from the
+            # amount the card authorised, so the band alone puts every row of
+            # a similar size in reach. One purchase states one merchant, so a
+            # row that names another merchant is another purchase.
+            #
+            # An exact amount needs no name. Two rows that state one amount
+            # state one purchase, whatever the statement calls the merchant.
+            candidate_sets[stmt_idx] = {
+                txn_id
+                for txn_id in banded
+                if txn_id in exact_sets[stmt_idx]
+                or _counterparty_singles_out(txn.narration, rows_by_id[txn_id])
+            }
         except ValueError, InvalidOperation:
             continue
 
@@ -1033,25 +1047,36 @@ async def resolve_cc_card_mask(
 async def _recorded_by_a_statement(session, upload) -> dict[tuple, list[int]]:
     """The rows a statement recorded, by what they state.
 
-    A statement row states an amount on a date. Its recorded copy states the
-    same, because the copy is built from the row. So the two find each other
-    on those, and a purchase on another day or at another amount cannot stand
-    in for it.
+    A statement row states an amount, a date, a direction and a merchant. Its
+    recorded copy states the same four, because the copy is built from the
+    row. So the two find each other, and no other purchase can stand in for
+    it: not one at another amount or on another day, not a refund of the same
+    size, and not another merchant.
 
     The list holds every copy of one key, so a statement that prints one line
     twice gives each line its own copy.
     """
     result = await session.execute(
         select(
-            Transaction.id, Transaction.amount, Transaction.transaction_date
+            Transaction.id,
+            Transaction.amount,
+            Transaction.transaction_date,
+            Transaction.direction,
+            Transaction.counterparty,
         ).where(
             Transaction.account_id == upload.account_id,
             Transaction.statement_upload_id.is_not(None),
         )
     )
     by_key: dict[tuple, list[int]] = {}
-    for txn_id, amount, txn_date in result:
-        by_key.setdefault((Decimal(str(amount)), txn_date), []).append(txn_id)
+    for txn_id, amount, txn_date, direction, counterparty in result:
+        key = (
+            Decimal(str(amount)),
+            txn_date,
+            direction,
+            _normalize_narration(counterparty),
+        )
+        by_key.setdefault(key, []).append(txn_id)
     for ids in by_key.values():
         ids.sort()
     return by_key
@@ -1122,15 +1147,16 @@ async def import_missing_cc_txns(
         # open and a person must still be able to fold it.
         if entry.get("ambiguous"):
             try:
-                key = (parse_cc_amount(entry["amount"]), parse_cc_date(entry["date"]))
+                key = (
+                    parse_cc_amount(entry["amount"]),
+                    parse_cc_date(entry["date"]),
+                    entry["direction"],
+                    _normalize_narration(entry.get("narration")),
+                )
             except ValueError, InvalidOperation, KeyError:
                 key = None
             copy = next(
-                (
-                    txn_id
-                    for txn_id in recorded.get(key, ())
-                    if txn_id not in claimed
-                ),
+                (txn_id for txn_id in recorded.get(key, ()) if txn_id not in claimed),
                 None,
             )
             if copy is not None:

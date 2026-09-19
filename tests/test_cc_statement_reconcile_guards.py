@@ -1483,8 +1483,11 @@ async def test_a_reprocess_keeps_the_question_open(session_factory):
         )
 
     held = held_rows(recon)
+    recorded = [row.id for row in rows if row.statement_upload_id is not None]
+
     assert len(rows) == 3
-    assert [entry["imported_txn_id"] for entry in held] == [2, 3]
+    assert len(held) == 2
+    assert sorted(entry["imported_txn_id"] for entry in held) == sorted(recorded)
 
 
 @pytest.mark.anyio
@@ -1518,6 +1521,98 @@ async def test_a_purchase_beside_last_cycles_purchase_is_recorded(
 
     assert sizes == [2, 2, 2]
     assert sorted(row.counterparty for row in rows) == ["GROCERIES", "PHARMACY"]
+
+
+@pytest.mark.anyio
+async def test_a_refund_never_answers_for_a_purchase(session_factory):
+    """A refund and a purchase of one size are not one row.
+
+    Both state the same amount on the same day. Only the direction tells them
+    apart, so a key without it lets a held refund name a purchase. A fold then
+    deletes the purchase.
+    """
+    await _seed_account(session_factory)
+    parsed = _parsed(
+        [_stmt_txn(date="07/04/2026", amount="100.00", narration=NARRATION)]
+    )
+    parsed.payments_refunds = [
+        _stmt_txn(date="07/04/2026", amount="100.00", narration=NARRATION)
+    ]
+
+    for _ in range(3):
+        recon = await _reconcile(session_factory, parsed)
+        _imported, rows = await _import(session_factory, parsed, recon)
+
+    assert sorted(row.direction for row in rows) == ["credit", "debit"]
+    recorded = {row.direction: row.id for row in rows}
+    for entry in recon["missing"]:
+        answered = entry.get("imported_txn_id")
+        if answered is not None:
+            assert answered == recorded[entry["direction"]]
+
+
+@pytest.mark.anyio
+async def test_another_merchant_is_a_second_purchase(session_factory):
+    """A band reaches a row of a similar size. A merchant says whose it is.
+
+    One purchase states one merchant. A stored row that names another merchant
+    is another purchase, so the statement row states a purchase of its own and
+    imports without a question.
+    """
+    await _seed_account(session_factory)
+    stored_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("2500.00"),
+        counterparty="SAMPLE PHARMACY",
+        raw_description="SAMPLE PHARMACY",
+    )
+    parsed = _parsed(
+        [_stmt_txn(date="07/04/2026", amount="2,529.00", narration=NARRATION)]
+    )
+
+    recon = await _reconcile(session_factory, parsed)
+    imported, rows = await _import(session_factory, parsed, recon)
+
+    assert recon["missing"][0]["ambiguous"] is False
+    assert recon["missing"][0]["candidate_transaction_ids"] == []
+    assert len(imported) == 1
+    assert sorted(row.amount for row in rows) == [
+        Decimal("2500.00"),
+        Decimal("2529.00"),
+    ]
+    assert stored_id in [row.id for row in rows]
+
+
+@pytest.mark.anyio
+async def test_an_exact_amount_needs_no_merchant(session_factory):
+    """Two rows that state one amount state one purchase.
+
+    A bank writes a merchant one way in an alert and another way on the
+    statement. The amount is the same, so the rows pair whatever it is called.
+    """
+    await _seed_account(session_factory)
+    stored_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("450.00"),
+        counterparty="AMZN",
+        raw_description="AMZN",
+    )
+    parsed = _parsed(
+        [
+            _stmt_txn(
+                date="07/04/2026",
+                amount="450.00",
+                narration="AMAZON PAY INDIA PRI",
+            )
+        ]
+    )
+
+    recon = await _reconcile(session_factory, parsed)
+    imported, rows = await _import(session_factory, parsed, recon)
+
+    assert [entry["db_txn_id"] for entry in recon["matched"]] == [stored_id]
+    assert imported == []
+    assert len(rows) == 1
 
 
 @pytest.mark.parametrize(
@@ -1556,9 +1651,17 @@ async def test_a_settled_amount_does_not_import_over_its_authorisation(
     A held row is imported, because a statement states a purchase. The hold
     marks it for a person, who folds it into the stored row when the two state
     one purchase.
+
+    The stored row names the merchant the statement names. One purchase states
+    one merchant, so a band alone does not pair two rows.
     """
     await _seed_account(session_factory)
-    stored_id = await _seed_txn(session_factory, amount=Decimal(stored))
+    stored_id = await _seed_txn(
+        session_factory,
+        amount=Decimal(stored),
+        counterparty="SWIGGY LIMITED",
+        raw_description="SWIGGY LIMITED",
+    )
     parsed = _parsed(
         [_stmt_txn(date="07/04/2026", amount=statement, narration=NARRATION)]
     )
@@ -1580,9 +1683,16 @@ async def test_a_banded_rival_never_rewrites_a_stored_amount(session_factory):
     one amount equal to it. The equal row takes the stored row. The other row
     is held, because a band cannot say whether it settles that row or is a
     second purchase. It must not rewrite the stored row either way.
+
+    The stored row names the merchant both rows name, so the band reaches it.
     """
     await _seed_account(session_factory)
-    stored_id = await _seed_txn(session_factory, amount=Decimal("1000.00"))
+    stored_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("1000.00"),
+        counterparty="SWIGGY LIMITED",
+        raw_description="SWIGGY LIMITED",
+    )
     parsed = _parsed(
         [
             _stmt_txn(date="07/04/2026", amount="1,005.00", narration=NARRATION),
