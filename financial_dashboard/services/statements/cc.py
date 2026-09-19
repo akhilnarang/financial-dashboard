@@ -1030,16 +1030,25 @@ async def resolve_cc_card_mask(
     return last4_from_card(account.account_number)
 
 
-async def _rows_a_statement_recorded(session, upload) -> set[int]:
-    """The rows any statement of this account put in the ledger.
+async def _rows_this_cycle_recorded(session, upload) -> set[int]:
+    """The rows this statement cycle put in the ledger.
 
     A reprocess writes a new upload row, and a second upload of one statement
-    writes another, so the id of this upload names too little.
+    writes another, so the id of this upload names too little. The cycle is
+    named by its due date, which every upload of one statement states.
+
+    Only this cycle counts. A purchase on the statement before can sit a day
+    and a fraction of a percent from a purchase on this one, and reading the
+    whole account would take that neighbour for this row and never record it.
     """
+    uploads = select(StatementUpload.id).where(
+        StatementUpload.account_id == upload.account_id,
+        StatementUpload.due_date == upload.due_date,
+    )
     result = await session.scalars(
         select(Transaction.id).where(
             Transaction.account_id == upload.account_id,
-            Transaction.statement_upload_id.is_not(None),
+            Transaction.statement_upload_id.in_(uploads),
         )
     )
     return set(result.all())
@@ -1092,17 +1101,32 @@ async def import_missing_cc_txns(
         need the count can take ``len()`` of the result.
     """
     link_ctx = await build_link_context(session)
-    recorded = await _rows_a_statement_recorded(session, upload)
+    recorded = await _rows_this_cycle_recorded(session, upload)
+    claimed = {
+        row["imported_txn_id"]
+        for row in recon["missing"]
+        if row.get("imported_txn_id") is not None
+    }
     imported: list[Transaction] = []
     for entry in recon["missing"]:
         if entry.get("imported"):
             continue
-        # A held row that can reach a row this statement already recorded was
+        # A held row that can reach a row this cycle already recorded was
         # recorded on an earlier pass. Contention keeps it out of ``matched``,
         # so only this check stops it importing again on every reprocess.
-        if entry.get("ambiguous") and recorded.intersection(
-            entry.get("candidate_transaction_ids") or []
-        ):
+        #
+        # The entry names that row. It is the copy this row states, and the
+        # question about it is still open, so the person must still be able to
+        # fold it.
+        already = sorted(
+            recorded.intersection(entry.get("candidate_transaction_ids") or [])
+            - claimed
+        )
+        if entry.get("ambiguous") and already:
+            entry["imported"] = True
+            entry["imported_txn_id"] = already[0]
+            entry["import_error"] = None
+            claimed.add(already[0])
             continue
         try:
             amount = parse_cc_amount(entry["amount"])

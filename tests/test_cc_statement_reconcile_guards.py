@@ -34,6 +34,7 @@ from financial_dashboard.db import (
     Transaction,
 )
 from financial_dashboard.services.statements import cc as cc_module
+from financial_dashboard.services.statement_settlement import held_rows
 from financial_dashboard.services.statements.cc import (
     import_missing_cc_txns,
     load_account_card_masks,
@@ -149,9 +150,13 @@ async def _reconcile(maker, parsed) -> dict:
     return reconcile_statement(parsed, db_txns, ACCOUNT_ID, card_masks)
 
 
-async def _import(maker, parsed, recon) -> tuple[list, list]:
+async def _import(maker, parsed, recon, due_date=None) -> tuple[list, list]:
     """Drive the real ``import_missing_cc_txns`` and return
-    (imported transactions, every DB row afterwards)."""
+    (imported transactions, every DB row afterwards).
+
+    ``due_date`` names the statement cycle. Every upload of one statement
+    states the same one, and the next statement states the next one.
+    """
     async with maker() as session:
         upload = StatementUpload(
             account_id=ACCOUNT_ID,
@@ -159,6 +164,7 @@ async def _import(maker, parsed, recon) -> tuple[list, list]:
             filename="statement.pdf",
             file_path="/nonexistent/statement.pdf",
             status="parsed",
+            due_date=due_date,
         )
         session.add(upload)
         await session.flush()
@@ -1417,7 +1423,9 @@ async def test_a_reprocess_does_not_record_a_held_row_twice(session_factory):
     sizes = []
     for _ in range(4):
         recon = await _reconcile(session_factory, parsed)
-        _imported, rows = await _import(session_factory, parsed, recon)
+        _imported, rows = await _import(
+            session_factory, parsed, recon, due_date="20/05/2026"
+        )
         sizes.append(len(rows))
 
     assert sizes == [2, 2, 2, 2]
@@ -1442,10 +1450,74 @@ async def test_a_reprocess_records_a_held_row_once(session_factory):
     sizes = []
     for _ in range(4):
         recon = await _reconcile(session_factory, parsed)
-        _imported, rows = await _import(session_factory, parsed, recon)
+        _imported, rows = await _import(
+            session_factory, parsed, recon, due_date="20/05/2026"
+        )
         sizes.append(len(rows))
 
     assert sizes == [3, 3, 3, 3]
+
+
+@pytest.mark.anyio
+async def test_a_reprocess_keeps_the_question_open(session_factory):
+    """A reprocess must not answer a held row by itself.
+
+    The row is recorded, and a person is asked whether a stored row states the
+    same purchase. A reprocess rebuilds the reconciliation, so it must name the
+    row it recorded. Without that name the question disappears and the two
+    rows stand for ever.
+    """
+    await _seed_account(session_factory)
+    await _seed_txn(session_factory, amount=Decimal("90.00"), counterparty="MERCHANT A")
+    parsed = _parsed(
+        [
+            _stmt_txn(date="07/04/2026", amount="90.00", narration="MERCHANT A"),
+            _stmt_txn(date="07/04/2026", amount="90.00", narration="MERCHANT A BRANCH"),
+        ]
+    )
+
+    for _ in range(3):
+        recon = await _reconcile(session_factory, parsed)
+        _imported, rows = await _import(
+            session_factory, parsed, recon, due_date="20/05/2026"
+        )
+
+    held = held_rows(recon)
+    assert len(rows) == 3
+    assert [entry["imported_txn_id"] for entry in held] == [2, 3]
+
+
+@pytest.mark.anyio
+async def test_a_purchase_beside_last_cycles_purchase_is_recorded(
+    session_factory,
+):
+    """A statement must not suppress the next statement's purchases.
+
+    A purchase at the end of one cycle can sit a day and a fraction of a
+    percent from a purchase at the start of the next. Reading every statement
+    of the account would take the first for the second and never record it.
+    """
+    await _seed_account(session_factory)
+    april = _parsed(
+        [_stmt_txn(date="30/04/2026", amount="1000.00", narration="GROCERIES")]
+    )
+    may = _parsed(
+        [_stmt_txn(date="01/05/2026", amount="1005.00", narration="PHARMACY")]
+    )
+
+    recon = await _reconcile(session_factory, april)
+    await _import(session_factory, april, recon, due_date="20/05/2026")
+
+    sizes = []
+    for _ in range(3):
+        recon = await _reconcile(session_factory, may)
+        _imported, rows = await _import(
+            session_factory, may, recon, due_date="20/06/2026"
+        )
+        sizes.append(len(rows))
+
+    assert sizes == [2, 2, 2]
+    assert sorted(row.counterparty for row in rows) == ["GROCERIES", "PHARMACY"]
 
 
 @pytest.mark.parametrize(
