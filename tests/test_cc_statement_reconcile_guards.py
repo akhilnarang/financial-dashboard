@@ -1524,6 +1524,38 @@ async def test_a_purchase_beside_last_cycles_purchase_is_recorded(
 
 
 @pytest.mark.anyio
+async def test_a_line_a_parser_missed_before_is_recorded(session_factory):
+    """A parser fix reads a line an earlier parse missed.
+
+    The rows it read before hold their own copies. The new line is a purchase
+    of its own, so it must enter the ledger and not take a copy another line
+    already holds.
+    """
+    await _seed_account(session_factory)
+    before = _parsed(
+        [_stmt_txn(date="07/04/2026", amount="90.00", narration=NARRATION)]
+    )
+    after = _parsed(
+        [
+            _stmt_txn(date="07/04/2026", amount="90.00", narration=NARRATION),
+            _stmt_txn(date="07/04/2026", amount="90.00", narration=NARRATION),
+            _stmt_txn(date="07/04/2026", amount="90.00", narration=NARRATION),
+        ]
+    )
+
+    recon = await _reconcile(session_factory, before)
+    await _import(session_factory, before, recon)
+
+    sizes = []
+    for _ in range(3):
+        recon = await _reconcile(session_factory, after)
+        _imported, rows = await _import(session_factory, after, recon)
+        sizes.append(len(rows))
+
+    assert sizes == [3, 3, 3]
+
+
+@pytest.mark.anyio
 async def test_a_refund_never_answers_for_a_purchase(session_factory):
     """A refund and a purchase of one size are not one row.
 

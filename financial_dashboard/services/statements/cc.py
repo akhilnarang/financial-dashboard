@@ -1130,11 +1130,20 @@ async def import_missing_cc_txns(
     """
     link_ctx = await build_link_context(session)
     recorded = await _recorded_by_a_statement(session, upload)
+    # A row speaks for one statement row. A matched row holds the one it won,
+    # so a held row must not take it too: a parser that reads a line it missed
+    # before would otherwise be handed a copy another line already holds, and
+    # the purchase would never enter the ledger.
     claimed = {
+        row["db_txn_id"]
+        for row in recon.get("matched", [])
+        if row.get("db_txn_id") is not None
+    }
+    claimed.update(
         row["imported_txn_id"]
         for row in recon["missing"]
         if row.get("imported_txn_id") is not None
-    }
+    )
     imported: list[Transaction] = []
     for entry in recon["missing"]:
         if entry.get("imported"):
