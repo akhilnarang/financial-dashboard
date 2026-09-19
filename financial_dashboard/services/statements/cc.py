@@ -1030,28 +1030,31 @@ async def resolve_cc_card_mask(
     return last4_from_card(account.account_number)
 
 
-async def _rows_this_cycle_recorded(session, upload) -> set[int]:
-    """The rows this statement cycle put in the ledger.
+async def _recorded_by_a_statement(session, upload) -> dict[tuple, list[int]]:
+    """The rows a statement recorded, by what they state.
 
-    A reprocess writes a new upload row, and a second upload of one statement
-    writes another, so the id of this upload names too little. The cycle is
-    named by its due date, which every upload of one statement states.
+    A statement row states an amount on a date. Its recorded copy states the
+    same, because the copy is built from the row. So the two find each other
+    on those, and a purchase on another day or at another amount cannot stand
+    in for it.
 
-    Only this cycle counts. A purchase on the statement before can sit a day
-    and a fraction of a percent from a purchase on this one, and reading the
-    whole account would take that neighbour for this row and never record it.
+    The list holds every copy of one key, so a statement that prints one line
+    twice gives each line its own copy.
     """
-    uploads = select(StatementUpload.id).where(
-        StatementUpload.account_id == upload.account_id,
-        StatementUpload.due_date == upload.due_date,
-    )
-    result = await session.scalars(
-        select(Transaction.id).where(
+    result = await session.execute(
+        select(
+            Transaction.id, Transaction.amount, Transaction.transaction_date
+        ).where(
             Transaction.account_id == upload.account_id,
-            Transaction.statement_upload_id.in_(uploads),
+            Transaction.statement_upload_id.is_not(None),
         )
     )
-    return set(result.all())
+    by_key: dict[tuple, list[int]] = {}
+    for txn_id, amount, txn_date in result:
+        by_key.setdefault((Decimal(str(amount)), txn_date), []).append(txn_id)
+    for ids in by_key.values():
+        ids.sort()
+    return by_key
 
 
 async def import_missing_cc_txns(
@@ -1101,7 +1104,7 @@ async def import_missing_cc_txns(
         need the count can take ``len()`` of the result.
     """
     link_ctx = await build_link_context(session)
-    recorded = await _rows_this_cycle_recorded(session, upload)
+    recorded = await _recorded_by_a_statement(session, upload)
     claimed = {
         row["imported_txn_id"]
         for row in recon["missing"]
@@ -1111,23 +1114,31 @@ async def import_missing_cc_txns(
     for entry in recon["missing"]:
         if entry.get("imported"):
             continue
-        # A held row that can reach a row this cycle already recorded was
-        # recorded on an earlier pass. Contention keeps it out of ``matched``,
-        # so only this check stops it importing again on every reprocess.
+        # A held row a statement already recorded must not be recorded again.
+        # Contention keeps such a row out of ``matched``, so only this check
+        # stops it importing on every reprocess.
         #
-        # The entry names that row. It is the copy this row states, and the
-        # question about it is still open, so the person must still be able to
-        # fold it.
-        already = sorted(
-            recorded.intersection(entry.get("candidate_transaction_ids") or [])
-            - claimed
-        )
-        if entry.get("ambiguous") and already:
-            entry["imported"] = True
-            entry["imported_txn_id"] = already[0]
-            entry["import_error"] = None
-            claimed.add(already[0])
-            continue
+        # The entry names the copy, because the question about it is still
+        # open and a person must still be able to fold it.
+        if entry.get("ambiguous"):
+            try:
+                key = (parse_cc_amount(entry["amount"]), parse_cc_date(entry["date"]))
+            except ValueError, InvalidOperation, KeyError:
+                key = None
+            copy = next(
+                (
+                    txn_id
+                    for txn_id in recorded.get(key, ())
+                    if txn_id not in claimed
+                ),
+                None,
+            )
+            if copy is not None:
+                entry["imported"] = True
+                entry["imported_txn_id"] = copy
+                entry["import_error"] = None
+                claimed.add(copy)
+                continue
         try:
             amount = parse_cc_amount(entry["amount"])
             txn_date = parse_cc_date(entry["date"])
