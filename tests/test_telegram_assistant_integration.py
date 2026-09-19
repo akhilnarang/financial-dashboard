@@ -1050,6 +1050,8 @@ async def test_tool_round_renews_lease_after_pending_confirmation_dismissal(
             started_by="reply",
             status="active",
             pending_confirmation_kind="merchant_rule",
+            expires_at=datetime.datetime.now(datetime.UTC)
+            + datetime.timedelta(hours=1),
             pending_confirmation_json='{"action":{"kind":"merchant_rule"}}',
         )
         interaction = AuditInteraction(
