@@ -27,6 +27,7 @@ from financial_dashboard.services.assistant.contracts import (
 )
 from financial_dashboard.services.assistant.orchestrator import (
     _process_attachment_interaction,
+    _process_callback_interaction,
     _process_text_interaction,
     _queue_result,
     current_confirmation_state_hash,
@@ -37,7 +38,6 @@ from financial_dashboard.services.assistant.orchestrator import (
 from financial_dashboard.services.assistant.provider import StructuredResult
 from financial_dashboard.services.assistant.mutations import (
     apply_transaction_changes,
-    undo_merchant_rule,
 )
 from financial_dashboard.services.assistant.contracts import ApplyTransactionChanges
 
@@ -575,9 +575,15 @@ async def test_pending_confirmation_expiry_is_rejected(session):
 
 
 @pytest.mark.anyio
-async def test_merchant_rule_replacement_undo_restores_previous_rule(session):
+async def test_merchant_rule_replacement_undo_restores_previous_rule(
+    session, monkeypatch
+):
     session.add_all(
-        [Category(slug="groceries", active=True), Category(slug="dining", active=True)]
+        [
+            Category(slug="groceries", active=True),
+            Category(slug="dining", active=True),
+            Setting(key="telegram.chat_id", value="7"),
+        ]
     )
     transaction = Transaction(
         bank="hdfc",
@@ -589,7 +595,22 @@ async def test_merchant_rule_replacement_undo_restores_previous_rule(session):
     existing = MerchantRule(
         pattern="fresh basket", category="dining", active=True, priority=25
     )
-    session.add_all([transaction, existing])
+    conversation = TelegramConversation(
+        chat_id=7,
+        started_by="reply",
+        status="active",
+        expires_at=datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1),
+    )
+    session.add_all([transaction, existing, conversation])
+    await session.flush()
+    source = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="reply",
+        conversation_id=conversation.id,
+        transaction_id=transaction.id,
+        status="delivered",
+    )
+    session.add(source)
     await session.flush()
     request = ApplyTransactionChanges(
         name="apply_transaction_changes",
@@ -604,14 +625,50 @@ async def test_merchant_rule_replacement_undo_restores_previous_rule(session):
         session,
         request,
         current_user_message="always use groceries",
+        interaction_id=source.id,
     )
-
     await session.refresh(existing)
     assert existing.category == "groceries"
-    assert await undo_merchant_rule(session, result.action_ids[-1])
-    await session.refresh(existing)
-    assert existing.category == "dining"
-    assert existing.priority == 25
+    callback = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="undo",
+        status="processing",
+        worker_token="undo-worker",
+    )
+    session.add(callback)
+    await session.commit()
+    maker = async_sessionmaker(
+        session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    monkeypatch.setattr(db_package, "async_session", maker)
+
+    async def fake_dispatch(delivery_id: int) -> bool:
+        return True
+
+    monkeypatch.setattr(telegram, "dispatch_saved_delivery", fake_dispatch)
+
+    await _process_callback_interaction(
+        interaction_id=callback.id,
+        worker_token="undo-worker",
+        trigger="undo",
+        callback_data=f"undo:v1:{result.action_ids[-1]}",
+        recipient_chat_id=7,
+        physical_message_id=None,
+    )
+
+    async with maker() as verification:
+        saved_rule = await verification.get(MerchantRule, existing.id)
+        saved_callback = await verification.get(AuditInteraction, callback.id)
+        output = await verification.scalar(
+            select(TelegramOutboundDelivery).where(
+                TelegramOutboundDelivery.interaction_id == callback.id
+            )
+        )
+    assert saved_rule.category == "dining"
+    assert saved_rule.priority == 25
+    assert saved_callback.conversation_id == conversation.id
+    assert saved_callback.transaction_id == transaction.id
+    assert output.transaction_id == transaction.id
 
 
 @pytest.mark.anyio

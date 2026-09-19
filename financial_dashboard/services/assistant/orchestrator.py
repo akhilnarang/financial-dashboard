@@ -17,11 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import (
     Account,
+    AuditAction,
     AuditInteraction,
     CategoryReviewDecision,
     Setting,
     TelegramMessageContext,
-    TelegramOutboundDelivery,
     TelegramConversation,
     Transaction,
     as_utc,
@@ -1786,6 +1786,17 @@ async def _process_callback_interaction(
                         transaction_id=decision.transaction_id,
                         **owner_kwargs,
                     ) and await settle_delivery_from_callback(session, delivery_id)
+                    source_interaction = None
+                    if delivery_proven:
+                        interaction.transaction_id = decision.transaction_id
+                        if decision.source_interaction_id is not None:
+                            source_interaction = await session.get(
+                                AuditInteraction, decision.source_interaction_id
+                            )
+                            if source_interaction is not None:
+                                interaction.conversation_id = (
+                                    source_interaction.conversation_id
+                                )
                     action = (
                         await consume_decision(
                             session,
@@ -1807,7 +1818,6 @@ async def _process_callback_interaction(
                         )
                     )
                 else:
-                    interaction.transaction_id = action.target_id
                     if physical_message_id is not None and (
                         await resolve_reply(
                             session,
@@ -1816,31 +1826,22 @@ async def _process_callback_interaction(
                         )
                         is None
                     ):
-                        source_delivery = await session.get(
-                            TelegramOutboundDelivery, delivery_id
-                        )
-                        source_conversation_id = None
-                        source_interaction_id = None
-                        if (
-                            source_delivery is not None
-                            and source_delivery.interaction_id is not None
-                        ):
-                            source_interaction = await session.get(
-                                AuditInteraction, source_delivery.interaction_id
-                            )
-                            if source_interaction is not None:
-                                source_conversation_id = (
-                                    source_interaction.conversation_id
-                                )
-                                source_interaction_id = source_interaction.id
                         await record_physical_message(
                             session,
                             chat_id=recipient_chat_id,
                             message_id=physical_message_id,
                             context_kind="category_review",
-                            conversation_id=source_conversation_id,
+                            conversation_id=(
+                                source_interaction.conversation_id
+                                if source_interaction is not None
+                                else None
+                            ),
                             transaction_id=action.target_id,
-                            interaction_id=source_interaction_id,
+                            interaction_id=(
+                                source_interaction.id
+                                if source_interaction is not None
+                                else None
+                            ),
                             outbound_delivery_id=delivery_id,
                         )
                     result = OrchestrationResult(
@@ -1852,8 +1853,22 @@ async def _process_callback_interaction(
             else:
                 try:
                     _, _, raw_action = callback_data.split(":")
+                    action_id = int(raw_action)
+                    source_action = await session.get(AuditAction, action_id)
+                    source_interaction = (
+                        await session.get(
+                            AuditInteraction, source_action.interaction_id
+                        )
+                        if source_action is not None
+                        and source_action.action_type == "merchant_rule"
+                        and source_action.interaction_id is not None
+                        else None
+                    )
+                    if source_interaction is not None:
+                        interaction.conversation_id = source_interaction.conversation_id
+                        interaction.transaction_id = source_interaction.transaction_id
                     undone = await undo_merchant_rule(
-                        session, int(raw_action), interaction_id=interaction.id
+                        session, action_id, interaction_id=interaction.id
                     )
                 except ValueError:
                     undone = False

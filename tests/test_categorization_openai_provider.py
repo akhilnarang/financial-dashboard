@@ -265,7 +265,10 @@ async def test_uncertain_merchant_uses_public_search_then_reconsiders(monkeypatc
                 "category": "needs_review",
                 "confidence": 0.2,
                 "reason": "unfamiliar merchant",
-                "merchant_lookup": {"name": "Café 24", "city": "Montréal 1234567890"},
+                "merchant_lookup": {
+                    "name": "Café 24 1234/5678/9012/3456",
+                    "city": "Montréal 1234567890",
+                },
             }
         )
     )
