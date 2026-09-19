@@ -1,3 +1,4 @@
+import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -197,11 +198,14 @@ def test_custom_bot_api_derives_matching_file_endpoint():
 
 
 @pytest.mark.anyio
-async def test_claimed_turn_resumes_once_after_restart(session, monkeypatch):
+@pytest.mark.parametrize("expired", [False, True])
+async def test_claimed_turn_resumes_once_after_restart(session, monkeypatch, expired):
     conversation = TelegramConversation(
         chat_id=77,
         started_by="ask",
         status="active",
+        expires_at=datetime.datetime.now(datetime.UTC)
+        + datetime.timedelta(hours=-1 if expired else 1),
     )
     session.add(conversation)
     await session.flush()
@@ -237,5 +241,10 @@ async def test_claimed_turn_resumes_once_after_restart(session, monkeypatch):
     async with maker() as verification:
         saved = await verification.get(AuditInteraction, interaction.id)
     assert saved.status == "ready_to_send"
+    if expired:
+        assert saved.outcome == "error"
+        assert saved.error_code == "conversation_expired"
+        assert "/ask" in saved.assistant_text
+        return
     assert saved.outcome == "answer"
     assert "ambiguous" in saved.assistant_text

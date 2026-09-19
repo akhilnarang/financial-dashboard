@@ -1156,7 +1156,11 @@ async def _process_text_interaction(
                         code="conversation_expired",
                     )
                 )
-                if conversation.status != "active"
+                if (
+                    conversation.status != "active"
+                    or conversation.expires_at is None
+                    or as_utc(conversation.expires_at) <= utc_now()
+                )
                 else None
             )
             if result is None and (
