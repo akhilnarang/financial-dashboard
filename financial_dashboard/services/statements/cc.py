@@ -40,6 +40,7 @@ import json
 import logging
 import tempfile
 import unicodedata
+from difflib import SequenceMatcher
 from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -70,6 +71,7 @@ from financial_dashboard.core.masks import (
     normalize_mask,
     trailing_visible_digits,
 )
+from cc_parser.parsers.narration import normalize_merchant_name
 from bank_email_parser.models import Money, ParsedEmail
 
 from financial_dashboard.integrations.parsers import parse_cc_statement_pdf
@@ -380,6 +382,35 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
     return False
 
 
+MERCHANT_SIMILARITY = 0.5
+"""How much of the shorter merchant name must appear in the longer one.
+
+A card alert and a statement spell one merchant differently. The alert
+truncates and the statement adds a city and a country, or the other way
+round. The longest run they share, as a fraction of the shorter name, tells
+them apart from two different merchants: a pair of spellings of one merchant
+scores about 0.5 or more, and two merchants score about 0.25 or less.
+"""
+
+
+def _same_merchant(row_narration: str | None, db_txn) -> bool:
+    """Whether a statement row and a stored row name one merchant.
+
+    The names are stripped of references, terminals and processor wrappers
+    first, so what is compared is the merchant and its location.
+    """
+    narration = normalize_merchant_name(row_narration or "")
+    stored = normalize_merchant_name(db_txn.counterparty or "")
+    if not narration or not stored:
+        return False
+
+    short, long = sorted((narration, stored), key=len)
+    run = SequenceMatcher(None, short, long).find_longest_match(
+        0, len(short), 0, len(long)
+    )
+    return run.size / len(short) >= MERCHANT_SIMILARITY
+
+
 def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     """Whether a statement row specifically names one DB candidate.
 
@@ -673,6 +704,7 @@ def reconcile_statement(
 
     candidate_sets: dict[int, set[int]] = {}
     exact_sets: dict[int, set[int]] = {}
+    rows_by_id = {db_txn.id: db_txn for db_txn in db_transactions}
     for stmt_idx, (_stmt_list, direction, txn) in enumerate(stmt_txns):
         try:
             exact_sets[stmt_idx] = _reachable_exact(
@@ -680,11 +712,24 @@ def reconcile_statement(
                 direction,
                 parse_cc_date(txn.date),
             )
-            candidate_sets[stmt_idx] = _reachable(
+            banded = _reachable(
                 parse_cc_amount(txn.amount),
                 direction,
                 parse_cc_date(txn.date),
             )
+            # A settled amount sits a surcharge or a rate move from the
+            # amount the card authorised, so the band alone puts every row of
+            # a similar size in reach. One purchase states one merchant, so a
+            # row that names another merchant is another purchase.
+            #
+            # An exact amount needs no name. Two rows that state one amount
+            # state one purchase, whatever the statement calls the merchant.
+            candidate_sets[stmt_idx] = {
+                txn_id
+                for txn_id in banded
+                if txn_id in exact_sets[stmt_idx]
+                or _same_merchant(txn.narration, rows_by_id[txn_id])
+            }
         except ValueError, InvalidOperation:
             continue
 
@@ -1030,6 +1075,44 @@ async def resolve_cc_card_mask(
     return last4_from_card(account.account_number)
 
 
+async def _recorded_by_a_statement(session, upload) -> dict[tuple, list[int]]:
+    """The rows a statement recorded, by what they state.
+
+    A statement row states an amount, a date, a direction and a merchant. Its
+    recorded copy states the same four, because the copy is built from the
+    row. So the two find each other, and no other purchase can stand in for
+    it: not one at another amount or on another day, not a refund of the same
+    size, and not another merchant.
+
+    The list holds every copy of one key, so a statement that prints one line
+    twice gives each line its own copy.
+    """
+    result = await session.execute(
+        select(
+            Transaction.id,
+            Transaction.amount,
+            Transaction.transaction_date,
+            Transaction.direction,
+            Transaction.counterparty,
+        ).where(
+            Transaction.account_id == upload.account_id,
+            Transaction.statement_upload_id.is_not(None),
+        )
+    )
+    by_key: dict[tuple, list[int]] = {}
+    for txn_id, amount, txn_date, direction, counterparty in result:
+        key = (
+            Decimal(str(amount)),
+            txn_date,
+            direction,
+            _normalize_narration(counterparty),
+        )
+        by_key.setdefault(key, []).append(txn_id)
+    for ids in by_key.values():
+        ids.sort()
+    return by_key
+
+
 async def import_missing_cc_txns(
     session,
     upload: "StatementUpload",
@@ -1077,16 +1160,51 @@ async def import_missing_cc_txns(
         need the count can take ``len()`` of the result.
     """
     link_ctx = await build_link_context(session)
+    recorded = await _recorded_by_a_statement(session, upload)
+    # A row speaks for one statement row. A matched row holds the one it won,
+    # so a held row must not take it too: a parser that reads a line it missed
+    # before would otherwise be handed a copy another line already holds, and
+    # the purchase would never enter the ledger.
+    claimed = {
+        row["db_txn_id"]
+        for row in recon.get("matched", [])
+        if row.get("db_txn_id") is not None
+    }
+    claimed.update(
+        row["imported_txn_id"]
+        for row in recon["missing"]
+        if row.get("imported_txn_id") is not None
+    )
     imported: list[Transaction] = []
     for entry in recon["missing"]:
         if entry.get("imported"):
             continue
+        # A held row a statement already recorded must not be recorded again.
+        # Contention keeps such a row out of ``matched``, so only this check
+        # stops it importing on every reprocess.
+        #
+        # The entry names the copy, because the question about it is still
+        # open and a person must still be able to fold it.
         if entry.get("ambiguous"):
-            entry["import_error"] = (
-                "ambiguous match — the DB may already hold this transaction under a "
-                "row it could not be safely paired with; resolve manually"
+            try:
+                key = (
+                    parse_cc_amount(entry["amount"]),
+                    parse_cc_date(entry["date"]),
+                    entry["direction"],
+                    _normalize_narration(entry.get("narration")),
+                )
+            except ValueError, InvalidOperation, KeyError:
+                key = None
+            copy = next(
+                (txn_id for txn_id in recorded.get(key, ()) if txn_id not in claimed),
+                None,
             )
-            continue
+            if copy is not None:
+                entry["imported"] = True
+                entry["imported_txn_id"] = copy
+                entry["import_error"] = None
+                claimed.add(copy)
+                continue
         try:
             amount = parse_cc_amount(entry["amount"])
             txn_date = parse_cc_date(entry["date"])
@@ -2007,6 +2125,12 @@ async def process_statement_email(
                     source="cc_statement",
                     txns=imported_txns,
                 )
+
+        from financial_dashboard.services.statement_settlement import (
+            ask_about_held_rows,
+        )
+
+        await ask_about_held_rows(upload.id)
 
         enriched = await enrich_matched_transactions(recon)
 
