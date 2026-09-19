@@ -1,7 +1,12 @@
 import pytest
 from sqlalchemy import text
 
-from financial_dashboard.db.models import Category, ExtensionSyncState, Transaction
+from financial_dashboard.db.models import (
+    Account,
+    Category,
+    ExtensionSyncState,
+    Transaction,
+)
 from financial_dashboard.services.assistant.contracts import ApplyTransactionChanges
 from financial_dashboard.services.assistant.mutations import (
     MutationRejected,
@@ -16,7 +21,12 @@ def _txn():
 
 @pytest.mark.anyio
 async def test_patch_omission_and_strict_direction(session):
+    account = Account(bank="test", label="Card", type="credit_card")
+    session.add_all([account, Category(slug="tax_refund", active=True)])
+    await session.flush()
     txn = _txn()
+    txn.direction = "credit"
+    txn.account_id = account.id
     session.add(txn)
     await session.flush()
     request = ApplyTransactionChanges(
@@ -33,10 +43,15 @@ async def test_patch_omission_and_strict_direction(session):
     bad = ApplyTransactionChanges(
         name="apply_transaction_changes",
         transaction_id=txn.id,
-        changes={"category": {"op": "set", "value": "salary"}},
+        changes={"category": {"op": "set", "value": "tax_refund"}},
     )
-    with pytest.raises(MutationRejected):
-        await apply_transaction_changes(session, bad, current_user_message="salary")
+    with pytest.raises(MutationRejected, match="transaction direction"):
+        await apply_transaction_changes(
+            session, bad, current_user_message="This was money from the government"
+        )
+    await session.refresh(txn)
+    assert txn.category is None
+    assert txn.note == "context"
 
 
 @pytest.mark.anyio

@@ -11,6 +11,7 @@ from financial_dashboard.db import (
     AuditInteraction,
     CategoryReviewDecision,
     Setting,
+    TelegramConversation,
     TelegramMessageContext,
     TelegramOutboundDelivery,
     Transaction,
@@ -238,12 +239,28 @@ async def test_callback_repairs_delivery_and_physical_message_context(
         counterparty="PUREBERRYSMUMBAI",
         review_status="pending",
     )
-    session.add(transaction)
+    conversation = TelegramConversation(
+        chat_id=7,
+        started_by="reply",
+        status="active",
+        expires_at=datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1),
+    )
+    session.add_all([transaction, conversation])
+    await session.flush()
+    source = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="reply",
+        conversation_id=conversation.id,
+        transaction_id=transaction.id,
+        status="delivery_partial",
+    )
+    session.add(source)
     await session.flush()
     input_hash = compute_input_hash(build_input_payload(transaction, None))
     transaction.category_input_hash = input_hash
     decision = CategoryReviewDecision(
         transaction_id=transaction.id,
+        source_interaction_id=source.id,
         category_input_hash=input_hash,
         candidates_json=json.dumps([{"category": "groceries", "confidence": 0.55}]),
         gate_reason="low confidence",
@@ -263,7 +280,7 @@ async def test_callback_repairs_delivery_and_physical_message_context(
         recipient_chat_id=7,
         text="choose",
         ordinal=0,
-        category_review_decision_id=decision.id,
+        interaction_id=source.id,
         transaction_id=transaction.id,
     )
     delivery.status = "delivering"
@@ -291,6 +308,12 @@ async def test_callback_repairs_delivery_and_physical_message_context(
 
     async with maker() as verification:
         saved_delivery = await verification.get(TelegramOutboundDelivery, delivery.id)
+        saved_callback = await verification.get(AuditInteraction, callback.id)
+        result_delivery = await verification.scalar(
+            select(TelegramOutboundDelivery).where(
+                TelegramOutboundDelivery.interaction_id == callback.id
+            )
+        )
         physical = await verification.scalar(
             select(TelegramMessageContext).where(
                 TelegramMessageContext.chat_id == 7,
@@ -299,7 +322,10 @@ async def test_callback_repairs_delivery_and_physical_message_context(
         )
     assert saved_delivery.status == "delivered"
     assert saved_delivery.worker_token is None
+    assert saved_callback.conversation_id == conversation.id
+    assert result_delivery.transaction_id == transaction.id
     assert physical.transaction_id == transaction.id
+    assert physical.conversation_id == conversation.id
     assert physical.outbound_delivery_id == delivery.id
     assert physical.context_kind == "category_review"
 
