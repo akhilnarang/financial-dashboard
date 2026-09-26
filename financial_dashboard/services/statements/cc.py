@@ -36,22 +36,20 @@ import asyncio
 import datetime
 import email as email_lib
 from collections import Counter
+from collections.abc import Mapping
 import json
 import logging
 import tempfile
 import unicodedata
+from difflib import SequenceMatcher
 from datetime import date as date_type, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-if TYPE_CHECKING:
-    # Aliased: the statement parser's row model shares the name Transaction
-    # with the DB model imported below.
-    from cc_parser.parsers.models import Transaction as ParsedCcTransaction
 from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.db import (
     Account,
@@ -70,6 +68,10 @@ from financial_dashboard.core.masks import (
     normalize_mask,
     trailing_visible_digits,
 )
+
+# Aliased: the statement parser's row model shares its name with the DB model.
+from cc_parser.parsers.models import Transaction as ParsedCcTransaction
+from cc_parser.parsers.narration import normalize_merchant_name
 from bank_email_parser.models import Money, ParsedEmail
 
 from financial_dashboard.integrations.parsers import parse_cc_statement_pdf
@@ -94,6 +96,47 @@ from financial_dashboard.services.telegram import (
     send_bulk_summary,
     send_transaction_notification,
 )
+
+
+class MatchKey(NamedTuple):
+    """What a statement row and a stored row must share to pair."""
+
+    day: date_type
+    amount: Decimal
+    direction: str
+
+
+class TwinKey(NamedTuple):
+    """What a debit and its ledger twin both state."""
+
+    card_number: str | None
+    date: str
+    amount: str
+    narration: str
+
+
+class DayKey(NamedTuple):
+    """One day of stored rows that run one way."""
+
+    day: date_type
+    direction: str
+
+
+class StoredAmount(NamedTuple):
+    """The amount a stored row states, and its id."""
+
+    amount: Decimal
+    txn_id: int
+
+
+class CopyKey(NamedTuple):
+    """What a statement row states, and so what its recorded copy states."""
+
+    amount: Decimal
+    day: date_type
+    direction: str
+    merchant: str
+
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +276,7 @@ def _confirmed_different_card(stmt_card: str | None, db_card_mask: str | None) -
     return bool(stmt_mask) and bool(db_mask) and not mask_matches(stmt_mask, db_mask)
 
 
-def _refresh_identity(txn: "ParsedCcTransaction") -> str:
+def _refresh_identity(txn: ParsedCcTransaction) -> str:
     """Everything a refresh would write onto the DB row a statement row wins.
 
     Two statement rows with equal identities are interchangeable as *winners*:
@@ -244,8 +287,21 @@ def _refresh_identity(txn: "ParsedCcTransaction") -> str:
     return (txn.narration or "").strip()
 
 
-def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
-    return (txn_date, amount, direction)
+def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> MatchKey:
+    return MatchKey(txn_date, amount, direction)
+
+
+# A fuel surcharge adds about 1% at settlement.
+SETTLEMENT_BAND = Decimal("0.012")
+
+
+def settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
+    """Returns whether the difference between two amounts is within the settlement band.
+
+    Calculates the tolerance from the larger amount to make comparisons symmetric.
+    """
+    gap, larger = abs(settled - authorised), max(abs(settled), abs(authorised))
+    return gap <= larger * SETTLEMENT_BAND
 
 
 # cc-parser tags a credit row that is bank-internal bookkeeping, not money
@@ -256,15 +312,12 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
 INTERNAL_TRANSFER_CREDIT_REASONS = frozenset({"emi_installment_transfer"})
 
 
-TwinKey = tuple[str | None, str, str, str]
-
-
-def _ledger_twin_key(txn: "ParsedCcTransaction") -> TwinKey:
-    return (txn.card_number, txn.date, txn.amount, txn.narration.upper())
+def _ledger_twin_key(txn: ParsedCcTransaction) -> TwinKey:
+    return TwinKey(txn.card_number, txn.date, txn.amount, txn.narration.upper())
 
 
 def internal_transfer_debit_twins(
-    debits: list["ParsedCcTransaction"],
+    debits: list[ParsedCcTransaction],
 ) -> Counter[TwinKey]:
     """Count the debit rows a tagged credit may claim as its ledger twin.
 
@@ -281,7 +334,7 @@ def internal_transfer_debit_twins(
 
 
 def claim_internal_transfer_twin(
-    txn: "ParsedCcTransaction",
+    txn: ParsedCcTransaction,
     twins: Counter[TwinKey],
 ) -> bool:
     """Claim a debit twin for a tagged credit row.
@@ -362,6 +415,27 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
             return True
         start = index + 1
     return False
+
+
+# The similarity two merchant names need when neither contains the other.
+MERCHANT_SIMILARITY = 0.8
+
+
+def _same_merchant(row_narration: str | None, db_txn: Transaction) -> bool:
+    """Returns whether a statement description and a stored transaction match the same
+    merchant.
+
+    Compares normalized names using substring checks and similarity ratios.
+    """
+    narration = normalize_merchant_name(row_narration or "")
+    stored = normalize_merchant_name(db_txn.counterparty or "")
+    if not narration or not stored:
+        return False
+
+    short, long = sorted((narration, stored), key=len)
+    if short in long:
+        return True
+    return SequenceMatcher(None, narration, stored).ratio() >= MERCHANT_SIMILARITY
 
 
 def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
@@ -570,8 +644,11 @@ def reconcile_statement(
 
     # Build DB candidate pool indexed by (date, amount, direction) for fast lookup
     # Each key maps to a list of DB transactions (multiple txns can share the same key)
-    db_pool: dict[tuple, list] = {}
+    db_pool: dict[MatchKey, list] = {}
     for db_txn in db_transactions:
+        # Only a rupee row can match a statement row.
+        if (db_txn.currency or "INR") != "INR":
+            continue
         if db_txn.transaction_date and db_txn.amount is not None:
             key = _match_key(
                 db_txn.transaction_date, Decimal(str(db_txn.amount)), db_txn.direction
@@ -586,27 +663,45 @@ def reconcile_statement(
     # or one deleted after its transactions were stored), so a card conflict
     # must surface as ambiguity — the picker declines the pairing and the row
     # is held back — rather than empty the set and read as "import it".
-    pool_snapshot: dict[tuple, list] = {
+    pool_snapshot: dict[MatchKey, list] = {
         key: list(rows) for key, rows in db_pool.items()
     }
 
-    def _reachable(amount: Decimal, direction: str, txn_date: date_type) -> set[int]:
-        """The DB rows that could be this statement row's transaction, across
-        the window. Card-blind: see the note above."""
-        found: set[int] = set()
-        for offset in (0, -1, 1):
-            key = _match_key(txn_date + timedelta(days=offset), amount, direction)
-            found.update(db_txn.id for db_txn in pool_snapshot.get(key, []))
-        return found
+    # Group by day and direction, so a band check reads three days, not the whole pool.
+    by_day: dict[DayKey, list[StoredAmount]] = {}
+
+    for (day, amount, direction), rows in pool_snapshot.items():
+        bucket = by_day.setdefault(DayKey(day, direction), [])
+        bucket.extend(StoredAmount(amount, row.id) for row in rows)
+
+    def _reachable(
+        amount: Decimal, direction: str, txn_date: date_type
+    ) -> list[StoredAmount]:
+        """Returns the stored rows within one day and inside the settlement band."""
+        return [
+            stored
+            for offset in (0, -1, 1)
+            for stored in by_day.get(
+                DayKey(txn_date + timedelta(days=offset), direction), []
+            )
+            if settles_within_band(amount, stored.amount)
+        ]
 
     candidate_sets: dict[int, set[int]] = {}
+    exact_sets: dict[int, set[int]] = {}
+    rows_by_id = {db_txn.id: db_txn for db_txn in db_transactions}
     for stmt_idx, (_stmt_list, direction, txn) in enumerate(stmt_txns):
         try:
-            candidate_sets[stmt_idx] = _reachable(
-                parse_cc_amount(txn.amount),
-                direction,
-                parse_cc_date(txn.date),
-            )
+            amount = parse_cc_amount(txn.amount)
+            banded = _reachable(amount, direction, parse_cc_date(txn.date))
+            exact_sets[stmt_idx] = {s.txn_id for s in banded if s.amount == amount}
+            # A banded row must name the same merchant. An exact amount need not.
+            candidate_sets[stmt_idx] = {
+                s.txn_id
+                for s in banded
+                if s.amount == amount
+                or _same_merchant(txn.narration, rows_by_id[s.txn_id])
+            }
         except ValueError, InvalidOperation:
             continue
 
@@ -732,9 +827,10 @@ def reconcile_statement(
     db_by_id = {db_txn.id: db_txn for db_txn in db_transactions}
     contested = []
     for entry in matched:
+        # Rivals come from exact amounts only.
         rivals = [
             stmt_idx
-            for stmt_idx, candidates in candidate_sets.items()
+            for stmt_idx, candidates in exact_sets.items()
             if stmt_idx != entry["stmt_idx"] and entry["db_txn_id"] in candidates
         ]
         if not rivals:
@@ -766,7 +862,7 @@ def reconcile_statement(
     # reassign within the group and keep the matches. Only positive,
     # group-injective evidence resolves — anything short of it stays demoted.
     resolved = _resolve_contested_by_counterparty(
-        contested, candidate_sets, txn_by_idx, db_by_id
+        contested, exact_sets, txn_by_idx, db_by_id
     )
     contested = [entry for entry in contested if id(entry) not in resolved]
 
@@ -897,7 +993,7 @@ async def enrich_matched_transactions(recon: dict) -> int:
 
 async def resolve_cc_card_mask(
     session,
-    account: "Account | None",
+    account: Account | None,
     raw: str | None,
 ) -> str | None:
     """Resolve a statement's card-number string to a canonical last-4 mask.
@@ -950,13 +1046,48 @@ async def resolve_cc_card_mask(
     return last4_from_card(account.account_number)
 
 
+async def _recorded_by_a_statement(
+    session: AsyncSession, upload: StatementUpload
+) -> dict[CopyKey, list[int]]:
+    """Maps (amount, date, direction, merchant) to the IDs of the rows a statement recorded.
+
+    Filters by ``cc_statement`` to prevent reusing merged card alerts as statement
+    copies.
+    """
+    result = await session.execute(
+        select(
+            Transaction.id,
+            Transaction.amount,
+            Transaction.transaction_date,
+            Transaction.direction,
+            Transaction.counterparty,
+        )
+        .where(
+            Transaction.account_id == upload.account_id,
+            Transaction.statement_upload_id.is_not(None),
+            Transaction.email_type == "cc_statement",
+        )
+        .order_by(Transaction.id)
+    )
+    by_key: dict[CopyKey, list[int]] = {}
+    for txn_id, amount, txn_date, direction, counterparty in result:
+        key = CopyKey(
+            Decimal(str(amount)),
+            txn_date,
+            direction,
+            _normalize_narration(counterparty),
+        )
+        by_key.setdefault(key, []).append(txn_id)
+    return by_key
+
+
 async def import_missing_cc_txns(
     session,
-    upload: "StatementUpload",
+    upload: StatementUpload,
     parsed,
-    account: "Account | None",
+    account: Account | None,
     recon: dict,
-) -> list["Transaction"]:
+) -> list[Transaction]:
     """Import ``recon["missing"]`` entries as CC-statement ``Transaction`` rows.
 
     Used by every code path that processes a CC statement — initial upload,
@@ -997,16 +1128,38 @@ async def import_missing_cc_txns(
         need the count can take ``len()`` of the result.
     """
     link_ctx = await build_link_context(session)
+    recorded = await _recorded_by_a_statement(session, upload)
+    # A held row must not take a row that a matched row holds.
+    claimed = {
+        row["db_txn_id"]
+        for row in recon.get("matched", [])
+        if row.get("db_txn_id") is not None
+    }
     imported: list[Transaction] = []
     for entry in recon["missing"]:
         if entry.get("imported"):
             continue
+        # A held row that a statement recorded before names that copy, and is not
+        # imported again.
         if entry.get("ambiguous"):
-            entry["import_error"] = (
-                "ambiguous match — the DB may already hold this transaction under a "
-                "row it could not be safely paired with; resolve manually"
-            )
-            continue
+            try:
+                key = CopyKey(
+                    parse_cc_amount(entry["amount"]),
+                    parse_cc_date(entry["date"]),
+                    entry["direction"],
+                    _normalize_narration(entry.get("narration")),
+                )
+            except ValueError, InvalidOperation, KeyError:
+                copies = []
+            else:
+                copies = recorded.get(key, [])
+            copy = next((txn_id for txn_id in copies if txn_id not in claimed), None)
+            if copy is not None:
+                entry["imported"] = True
+                entry["imported_txn_id"] = copy
+                entry["import_error"] = None
+                claimed.add(copy)
+                continue
         try:
             amount = parse_cc_amount(entry["amount"])
             txn_date = parse_cc_date(entry["date"])
@@ -1066,7 +1219,7 @@ async def import_missing_cc_txns(
     return imported
 
 
-def reconciliation_to_json(data: dict) -> str:
+def reconciliation_to_json(data: Mapping[str, object]) -> str:
     """Serialize reconciliation data to JSON."""
     return json.dumps(data)
 
@@ -1547,7 +1700,7 @@ def _parse_pdf_bytes_sync(
         tmp_path.unlink(missing_ok=True)
 
 
-async def _find_account(bank: str, parsed) -> "Account | None":
+async def _find_account(bank: str, parsed) -> Account | None:
     """Find an existing credit_card account matching the statement's card.
 
     Returns None if nothing matches — statements must not auto-create accounts.
@@ -1927,6 +2080,12 @@ async def process_statement_email(
                     source="cc_statement",
                     txns=imported_txns,
                 )
+
+        from financial_dashboard.services.statement_settlement import (
+            ask_about_held_rows,
+        )
+
+        await ask_about_held_rows(upload.id)
 
         enriched = await enrich_matched_transactions(recon)
 

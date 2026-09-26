@@ -10,18 +10,57 @@ import html
 import logging
 import re
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, NamedTuple, TypedDict
 
 from datetime import timedelta
 from typing import cast
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, RetryAfter
-from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from sqlalchemy.exc import OperationalError
 
 from financial_dashboard.db import Transaction, async_session
 from financial_dashboard.services.settings import get_telegram_chat_id
+
+
+class SettlementCallback(NamedTuple):
+    """What a settlement button names: the row, as the prompt showed it, and the target."""
+
+    upload_id: int
+    stmt_idx: int
+    digest: str
+    target: int
+
+
+class PromptCandidate(TypedDict):
+    """A stored row that a settlement prompt offers to fold into."""
+
+    id: int
+    amount: str
+    counterparty: str | None
+    date: str | None
+    card_mask: str | None
+
+
+class SettlementPrompt(TypedDict):
+    """The held statement row that a settlement prompt asks about."""
+
+    upload_id: int
+    stmt_idx: int
+    digest: str
+    bank: str
+    amount: str
+    narration: str | None
+    date: str
+    candidates: list[PromptCandidate]
+
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +338,9 @@ async def _handle_callback(update: Update, context) -> None:
         return
     if query.data.startswith("smsdup:v1:"):
         await _handle_sms_duplicate_callback(update, context)
+        return
+    if query.data.startswith("st:"):
+        await _handle_settlement_callback(update, context)
         return
     if query.data.startswith("cc_pay_pick:"):
         await _handle_cc_pay_pick_callback(update, context)
@@ -578,6 +620,133 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
             )
         except Exception as exc:
             logger.warning("SMS duplicate account picker failed: %s", exc)
+
+
+def _parse_settlement_callback(data: str) -> SettlementCallback | None:
+    """Parses settlement callback data into upload ID, row index, digest, and target ID.
+
+    Returns ``None`` if the callback format is invalid.
+    """
+    parts = data.split(":")
+    if len(parts) != 6 or parts[:2] != ["st", "m"]:
+        return None
+
+    try:
+        upload_id, stmt_idx, target = int(parts[2]), int(parts[3]), int(parts[5])
+    except ValueError:
+        return None
+    return SettlementCallback(upload_id, stmt_idx, parts[4], target)
+
+
+async def send_settlement_prompt(payload: SettlementPrompt, chat_id: int) -> None:
+    """Sends a Telegram prompt asking the user to resolve a held statement row.
+
+    Includes row details and inline buttons for each candidate stored transaction.
+    """
+    if not tg_app:
+        return
+
+    upload_id = payload["upload_id"]
+    stmt_idx = payload["stmt_idx"]
+    digest = payload["digest"]
+    bank = html.escape(payload["bank"].upper())
+
+    lines = [
+        f"⚠️ <b>{bank}</b> statement",
+        f"₹{html.escape(payload['amount'])}"
+        f" · {html.escape(payload['narration'] or '')}"
+        f" · {html.escape(payload['date'])}",
+        "",
+        "Stored:",
+    ]
+
+    buttons = []
+    for candidate in payload["candidates"]:
+        described = " · ".join(
+            html.escape(str(value))
+            for value in (
+                f"#{candidate['id']}",
+                f"₹{candidate['amount']}",
+                candidate.get("counterparty"),
+                candidate.get("date"),
+                candidate.get("card_mask"),
+            )
+            if value
+        )
+        lines.append(described)
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"Merge into #{candidate['id']}",
+                    callback_data=(
+                        f"st:m:{upload_id}:{stmt_idx}:{digest}:{candidate['id']}"
+                    ),
+                )
+            ]
+        )
+
+    lines.append("")
+    lines.append("The statement row is in the ledger as its own purchase.")
+    lines.append("Merge folds it into the stored row, which takes the billed amount.")
+
+    await tg_app.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML",
+    )
+
+
+async def _handle_settlement_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Applies a user settlement choice from a Telegram callback query.
+
+    Verifies authorization, merges the transaction, and edits the message text.
+    """
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    if not query.message:
+        await query.answer("Message no longer available")
+        return
+    if query.message.chat.id != get_telegram_chat_id():
+        await query.answer("Unauthorized")
+        return
+
+    parsed = _parse_settlement_callback(query.data)
+    if parsed is None:
+        await query.answer("Invalid callback")
+        return
+
+    upload_id, stmt_idx, digest, target = parsed
+
+    from financial_dashboard.services.statement_settlement import (
+        SettlementError,
+        answer,
+    )
+
+    try:
+        async with async_session() as session:
+            result = await answer(session, upload_id, stmt_idx, digest, target)
+    except SettlementError as exc:
+        await query.answer(str(exc))
+        return
+    except OperationalError:
+        await query.answer("Busy, try again")
+        return
+
+    await query.answer()
+
+    if result.outcome == "merged":
+        text = f"Folded into #{result.transaction_id}"
+    else:
+        text = "This row was answered already"
+
+    try:
+        await query.edit_message_text(text)
+    except Exception as exc:
+        logger.warning("Settlement callback edit failed: %s", exc)
 
 
 async def send_disambiguation_prompt(payload: dict, chat_id: int) -> None:

@@ -29,6 +29,7 @@ class _DbTxn(NamedTuple):
     id: int
     transaction_date: datetime.date | None
     amount: Decimal
+    currency: str | None
     direction: str
     counterparty: str | None
     reference_number: str | None
@@ -50,6 +51,7 @@ def _db_standins(scenario_txns: Sequence, *, account_pk: int) -> list[_DbTxn]:
                 id=i,
                 transaction_date=t.transaction_date,
                 amount=t.amount,
+                currency=t.currency,
                 direction=t.direction,
                 counterparty=t.counterparty,
                 reference_number=t.reference_number,

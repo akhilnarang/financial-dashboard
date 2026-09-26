@@ -25,6 +25,9 @@ from financial_dashboard.services.statements.bank import (
     parse_bank_statement,
     reconcile_bank_statement,
 )
+from financial_dashboard.services.statement_settlement import (
+    ask_about_held_rows,
+)
 from financial_dashboard.services.statements.cc import (
     enrich_matched_transactions,
     import_missing_cc_txns,
@@ -133,6 +136,8 @@ async def retry_cc_statement_upload(
         upload.error = skip_error  # None clears a prior error when nothing skipped
         await emit_cc_snapshot(session, upload)
         await session.commit()
+
+    await ask_about_held_rows(upload_id)
 
     # function-local: breaks cycle with services.reminders (reminders imports services.statements at top)
     from financial_dashboard.services.reminders import (
