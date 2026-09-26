@@ -10,7 +10,7 @@ import html
 import logging
 import re
 from decimal import Decimal
-from typing import Literal, TypedDict
+from typing import Literal, NamedTuple, TypedDict
 
 from datetime import timedelta
 from typing import cast
@@ -583,7 +583,16 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
             logger.warning("SMS duplicate account picker failed: %s", exc)
 
 
-def _parse_settlement_callback(data: str) -> tuple[int, int, str, int] | None:
+class SettlementCallback(NamedTuple):
+    """What a settlement button names: the row, as the prompt showed it, and the target."""
+
+    upload_id: int
+    stmt_idx: int
+    digest: str
+    target: int
+
+
+def _parse_settlement_callback(data: str) -> SettlementCallback | None:
     """Parses settlement callback data into upload ID, row index, digest, and target ID.
 
     Returns ``None`` if the callback format or values are invalid.
@@ -602,7 +611,7 @@ def _parse_settlement_callback(data: str) -> tuple[int, int, str, int] | None:
     digest = parts[4]
     if upload_id <= 0 or stmt_idx < 0 or target <= 0 or not digest:
         return None
-    return upload_id, stmt_idx, digest, target
+    return SettlementCallback(upload_id, stmt_idx, digest, target)
 
 
 class PromptCandidate(TypedDict):

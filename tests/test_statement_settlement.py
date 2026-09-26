@@ -14,6 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from financial_dashboard.db import Account, Base, StatementUpload, Transaction
 from financial_dashboard.services.statement_settlement import (
+    HeldRow,
+    MatchedRow,
+    Reconciliation,
     SettlementError,
     answer,
     row_digest,
@@ -41,7 +44,13 @@ async def maker():
     await engine.dispose()
 
 
-def _row(*, stmt_idx=0, amount=SETTLED, candidates=(1,), recorded=2) -> dict:
+def _row(
+    *,
+    stmt_idx: int = 0,
+    amount: str = SETTLED,
+    candidates: tuple[int, ...] = (1,),
+    recorded: int = 2,
+) -> HeldRow:
     """Returns a test dictionary for an ambiguous imported statement row."""
     return {
         "stmt_idx": stmt_idx,
@@ -57,11 +66,18 @@ def _row(*, stmt_idx=0, amount=SETTLED, candidates=(1,), recorded=2) -> dict:
     }
 
 
-def _recon(rows=None, matched=()) -> dict:
-    return {"matched": list(matched), "missing": list(rows or [_row()])}
+def _recon(
+    rows: list[HeldRow] | None = None, matched: list[MatchedRow] | None = None
+) -> Reconciliation:
+    return {"matched": matched or [], "missing": rows or [_row()]}
 
 
-async def _seed(maker, *, stored=(AUTHORISED,), recon=None) -> int:
+async def _seed(
+    maker,
+    *,
+    stored: tuple[str, ...] = (AUTHORISED,),
+    recon: Reconciliation | None = None,
+) -> int:
     """Populates the test database with an account, statement upload, and transactions.
 
     Returns the generated statement upload ID.

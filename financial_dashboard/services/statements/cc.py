@@ -279,7 +279,13 @@ def settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
 INTERNAL_TRANSFER_CREDIT_REASONS = frozenset({"emi_installment_transfer"})
 
 
-TwinKey = tuple[str | None, str, str, str]
+class TwinKey(NamedTuple):
+    """What a debit and its ledger twin both state."""
+
+    card_number: str | None
+    date: str
+    amount: str
+    narration: str
 
 
 class DayKey(NamedTuple):
@@ -306,7 +312,7 @@ class CopyKey(NamedTuple):
 
 
 def _ledger_twin_key(txn: ParsedCcTransaction) -> TwinKey:
-    return (txn.card_number, txn.date, txn.amount, txn.narration.upper())
+    return TwinKey(txn.card_number, txn.date, txn.amount, txn.narration.upper())
 
 
 def internal_transfer_debit_twins(

@@ -19,7 +19,7 @@ both directions.
 
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
 from cc_parser.parsers.models import Transaction as CcTransaction
@@ -35,6 +35,7 @@ from financial_dashboard.db import (
 )
 from financial_dashboard.services.statements import cc as cc_module
 from financial_dashboard.services.statement_settlement import (
+    Reconciliation,
     answer,
     held_rows,
     row_digest,
@@ -1428,12 +1429,13 @@ async def test_a_reprocess_keeps_the_question_open(session_factory):
             session_factory, parsed, recon, due_date="20/05/2026"
         )
 
-    held = held_rows(recon)
+    held = held_rows(cast(Reconciliation, recon))
     recorded = [row.id for row in rows if row.statement_upload_id is not None]
 
     assert len(rows) == 3
     assert len(held) == 2
-    assert sorted(entry["imported_txn_id"] for entry in held) == sorted(recorded)
+    held_ids = [i for entry in held if (i := entry["imported_txn_id"]) is not None]
+    assert sorted(held_ids) == sorted(recorded)
 
 
 @pytest.mark.anyio
@@ -1587,7 +1589,7 @@ async def test_a_folded_alert_is_never_handed_out_as_a_copy(session_factory):
         await session.commit()
         upload_id = upload.id
 
-    [entry] = held_rows(recon)
+    [entry] = held_rows(cast(Reconciliation, recon))
     async with session_factory() as session:
         folded = await answer(
             session, upload_id, entry["stmt_idx"], row_digest(entry), alert_id

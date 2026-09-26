@@ -40,6 +40,7 @@ class HeldRow(TypedDict):
     direction: str
     narration: str | None
     card_number: str | None
+    imported: bool
     imported_txn_id: int | None
     ambiguous: NotRequired[bool]
     candidate_transaction_ids: NotRequired[list[int]]
@@ -49,7 +50,7 @@ class MatchedRow(TypedDict):
     """A statement row that the reconciler paired with a stored row."""
 
     stmt_idx: int
-    db_txn_id: int | None
+    db_txn_id: int
 
 
 class Reconciliation(TypedDict):
