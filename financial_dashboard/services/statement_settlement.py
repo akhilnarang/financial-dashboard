@@ -76,11 +76,11 @@ def row_digest(entry: HeldRow) -> str:
     """
     payload = json.dumps(
         [
-            entry.get("date"),
-            entry.get("amount"),
-            entry.get("direction"),
-            entry.get("narration") or "",
-            entry.get("card_number") or "",
+            entry["date"],
+            entry["amount"],
+            entry["direction"],
+            entry["narration"] or "",
+            entry["card_number"] or "",
         ],
         default=str,
     )
@@ -102,7 +102,7 @@ def _find_row(recon: Reconciliation, stmt_idx: int, digest: str) -> HeldRow:
     Raises ``SettlementError`` if the row is missing or the digest changed.
     """
     for entry in held_rows(recon):
-        if entry.get("stmt_idx") == stmt_idx:
+        if entry["stmt_idx"] == stmt_idx:
             if row_digest(entry) != digest:
                 raise SettlementError("The statement row changed")
             return entry
@@ -158,7 +158,7 @@ def _merge(entry: HeldRow, target: Transaction, upload_id: int) -> None:
 
     stored = Decimal(str(target.amount))
 
-    if target.direction != entry.get("direction"):
+    if target.direction != entry["direction"]:
         raise SettlementError("That row runs the other way")
     if (target.currency or "INR") != "INR":
         raise SettlementError("That row is in another currency")
@@ -172,7 +172,7 @@ def _merge(entry: HeldRow, target: Transaction, upload_id: int) -> None:
     if not settles_within_band(settled, stored):
         raise SettlementError("The amounts are too far apart")
 
-    narration = entry.get("narration")
+    narration = entry["narration"]
     if narration and target.counterparty_source != "user_alias":
         target.counterparty = narration
 
@@ -207,7 +207,7 @@ async def answer(
         except SettlementError:
             return SettlementResult("stale", None)
 
-        recorded_id = entry.get("imported_txn_id")
+        recorded_id = entry["imported_txn_id"]
         if recorded_id is None:
             return SettlementResult("stale", None)
 

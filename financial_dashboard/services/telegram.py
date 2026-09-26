@@ -17,11 +17,50 @@ from typing import cast
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, RetryAfter
-from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from sqlalchemy.exc import OperationalError
 
 from financial_dashboard.db import Transaction, async_session
 from financial_dashboard.services.settings import get_telegram_chat_id
+
+
+class SettlementCallback(NamedTuple):
+    """What a settlement button names: the row, as the prompt showed it, and the target."""
+
+    upload_id: int
+    stmt_idx: int
+    digest: str
+    target: int
+
+
+class PromptCandidate(TypedDict):
+    """A stored row that a settlement prompt offers to fold into."""
+
+    id: int
+    amount: str
+    counterparty: str | None
+    date: str | None
+    card_mask: str | None
+
+
+class SettlementPrompt(TypedDict):
+    """The held statement row that a settlement prompt asks about."""
+
+    upload_id: int
+    stmt_idx: int
+    digest: str
+    bank: str
+    amount: str
+    narration: str | None
+    date: str
+    candidates: list[PromptCandidate]
+
 
 logger = logging.getLogger(__name__)
 
@@ -583,15 +622,6 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
             logger.warning("SMS duplicate account picker failed: %s", exc)
 
 
-class SettlementCallback(NamedTuple):
-    """What a settlement button names: the row, as the prompt showed it, and the target."""
-
-    upload_id: int
-    stmt_idx: int
-    digest: str
-    target: int
-
-
 def _parse_settlement_callback(data: str) -> SettlementCallback | None:
     """Parses settlement callback data into upload ID, row index, digest, and target ID.
 
@@ -612,29 +642,6 @@ def _parse_settlement_callback(data: str) -> SettlementCallback | None:
     if upload_id <= 0 or stmt_idx < 0 or target <= 0 or not digest:
         return None
     return SettlementCallback(upload_id, stmt_idx, digest, target)
-
-
-class PromptCandidate(TypedDict):
-    """A stored row that a settlement prompt offers to fold into."""
-
-    id: int
-    amount: str
-    counterparty: str | None
-    date: str | None
-    card_mask: str | None
-
-
-class SettlementPrompt(TypedDict):
-    """The held statement row that a settlement prompt asks about."""
-
-    upload_id: int
-    stmt_idx: int
-    digest: str
-    bank: str
-    amount: str
-    narration: str | None
-    date: str
-    candidates: list[PromptCandidate]
 
 
 async def send_settlement_prompt(payload: SettlementPrompt, chat_id: int) -> None:
@@ -696,7 +703,9 @@ async def send_settlement_prompt(payload: SettlementPrompt, chat_id: int) -> Non
     )
 
 
-async def _handle_settlement_callback(update: Update, context) -> None:
+async def _handle_settlement_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """Applies a user settlement choice from a Telegram callback query.
 
     Verifies authorization, merges the transaction, and edits the message text.

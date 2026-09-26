@@ -97,6 +97,47 @@ from financial_dashboard.services.telegram import (
     send_transaction_notification,
 )
 
+
+class MatchKey(NamedTuple):
+    """What a statement row and a stored row must share to pair."""
+
+    day: date_type
+    amount: Decimal
+    direction: str
+
+
+class TwinKey(NamedTuple):
+    """What a debit and its ledger twin both state."""
+
+    card_number: str | None
+    date: str
+    amount: str
+    narration: str
+
+
+class DayKey(NamedTuple):
+    """One day of stored rows that run one way."""
+
+    day: date_type
+    direction: str
+
+
+class StoredAmount(NamedTuple):
+    """The amount a stored row states, and its id."""
+
+    amount: Decimal
+    txn_id: int
+
+
+class CopyKey(NamedTuple):
+    """What a statement row states, and so what its recorded copy states."""
+
+    amount: Decimal
+    day: date_type
+    direction: str
+    merchant: str
+
+
 logger = logging.getLogger(__name__)
 
 STATEMENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "statements"
@@ -246,14 +287,6 @@ def _refresh_identity(txn: ParsedCcTransaction) -> str:
     return (txn.narration or "").strip()
 
 
-class MatchKey(NamedTuple):
-    """What a statement row and a stored row must share to pair."""
-
-    day: date_type
-    amount: Decimal
-    direction: str
-
-
 def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> MatchKey:
     return MatchKey(txn_date, amount, direction)
 
@@ -277,38 +310,6 @@ def settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
 # the loan ledger, the debit twin bills it, and the payable amount does not
 # change. Such a row is not a card transaction, so it must not become one.
 INTERNAL_TRANSFER_CREDIT_REASONS = frozenset({"emi_installment_transfer"})
-
-
-class TwinKey(NamedTuple):
-    """What a debit and its ledger twin both state."""
-
-    card_number: str | None
-    date: str
-    amount: str
-    narration: str
-
-
-class DayKey(NamedTuple):
-    """One day of stored rows that run one way."""
-
-    day: date_type
-    direction: str
-
-
-class StoredAmount(NamedTuple):
-    """The amount a stored row states, and its id."""
-
-    amount: Decimal
-    txn_id: int
-
-
-class CopyKey(NamedTuple):
-    """What a statement row states, and so what its recorded copy states."""
-
-    amount: Decimal
-    day: date_type
-    direction: str
-    merchant: str
 
 
 def _ledger_twin_key(txn: ParsedCcTransaction) -> TwinKey:
@@ -420,7 +421,7 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
 MERCHANT_SIMILARITY = 0.8
 
 
-def _same_merchant(row_narration: str | None, db_txn) -> bool:
+def _same_merchant(row_narration: str | None, db_txn: Transaction) -> bool:
     """Returns whether a statement description and a stored transaction match the same
     merchant.
 
@@ -457,7 +458,7 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     return bool(db_narration) and db_narration == narration
 
 
-def _same_amount(txn: ParsedCcTransaction, db_txn) -> bool:
+def _same_amount(txn: ParsedCcTransaction, db_txn: Transaction) -> bool:
     """Returns whether a statement row and a database transaction have the exact same
     amount.
 
