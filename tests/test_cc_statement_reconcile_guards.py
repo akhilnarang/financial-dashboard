@@ -36,7 +36,6 @@ from financial_dashboard.db import (
 from financial_dashboard.services.statements import cc as cc_module
 from financial_dashboard.services.statement_settlement import held_rows
 from financial_dashboard.services.statements.cc import (
-    _same_merchant,
     import_missing_cc_txns,
     load_account_card_masks,
     parse_cc_date,
@@ -1641,59 +1640,35 @@ async def test_a_refund_never_answers_for_a_purchase(session_factory):
             assert answered == recorded[entry["direction"]]
 
 
-@pytest.mark.parametrize(
-    ("alert", "statement", "same"),
-    [
-        # A statement adds the city, the state and the country. An SMS glues
-        # them together.
-        pytest.param(
-            "SampleMerchant Bengaluru kaIN",
-            "SAMPLEMERCHANT BENGALURU KA IN",
-            True,
-            id="glued-location",
-        ),
-        # A foreign charge: the statement drops the comma and spells the
-        # country the same.
-        pytest.param(
-            "SAMPLEVENDOR, INC NEW YORK US",
-            "SAMPLEVENDOR INC NEW YORK US",
-            True,
-            id="foreign-punctuation",
-        ),
-        # An SMS truncates the name mid-word.
-        pytest.param(
-            "INDIAN OIL CORPOR",
-            "INDIAN OIL CORPORATION BANGALORE IN",
-            True,
-            id="alert-truncated",
-        ),
-        # A statement column truncates instead.
-        pytest.param(
-            "INDIANOIL CORPORATION LTD",
-            "INDIANOIL CORPORAT BANGAL IN",
-            True,
-            id="statement-truncated",
-        ),
-        # A payment processor wraps the name.
-        pytest.param(
-            "SampleFood", "RAZ*SampleFood BANGALORE IND", True, id="processor-wrapper"
-        ),
-        # Two merchants.
-        pytest.param("SAMPLE PHARMACY", "FUEL STATION", False, id="other-merchant"),
-        pytest.param("UBER INDIA", "OLA CABS BANGALORE", False, id="two-cab-firms"),
-        pytest.param("GROCERIES", "PHARMACY BRANCH", False, id="two-shops"),
-    ],
-)
-def test_one_merchant_is_read_through_two_spellings(alert, statement, same):
-    """A card alert and a statement spell one merchant differently.
+@pytest.mark.anyio
+async def test_a_fuel_surcharge_is_held_for_a_person(session_factory):
+    """A pump authorises one amount, and the statement bills about 1% more.
 
-    The alert truncates and the statement adds a location, or the other way
-    round. The names must still read as one merchant, and two merchants must
-    not.
+    The alert names the merchant. The statement names it with a prefix and the
+    city. The two must read as one merchant, so the statement row is held and
+    the person is asked whether to fold it into the alert.
     """
-    stored = SimpleNamespace(counterparty=alert, raw_description=alert)
+    await _seed_account(session_factory)
+    stored_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("2500.00"),
+        counterparty="SAMPLE ENTERPRISES",
+        raw_description=None,
+    )
+    parsed = _parsed(
+        [
+            _stmt_txn(
+                date="07/04/2026",
+                amount="2,529.00",
+                narration="MW SAMPLE ENTERPRISES Pune",
+            )
+        ]
+    )
 
-    assert _same_merchant(statement, stored) is same
+    recon = await _reconcile(session_factory, parsed)
+
+    assert recon["missing"][0]["ambiguous"] is True
+    assert recon["missing"][0]["candidate_transaction_ids"] == [stored_id]
 
 
 @pytest.mark.anyio

@@ -382,14 +382,14 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
     return False
 
 
-MERCHANT_SIMILARITY = 0.5
-"""How much of the shorter merchant name must appear in the longer one.
+MERCHANT_SIMILARITY = 0.8
+"""How alike two spellings of one merchant are, when neither contains the
+other.
 
-A card alert and a statement spell one merchant differently. The alert
-truncates and the statement adds a city and a country, or the other way
-round. The longest run they share, as a fraction of the shorter name, tells
-them apart from two different merchants: a pair of spellings of one merchant
-scores about 0.5 or more, and two merchants score about 0.25 or less.
+A statement states the merchant a card alert states, and adds the city and the
+country. So one name usually sits inside the other. When it does not, the two
+names must still read as one merchant, and this states how much of them must
+agree.
 """
 
 
@@ -405,10 +405,9 @@ def _same_merchant(row_narration: str | None, db_txn) -> bool:
         return False
 
     short, long = sorted((narration, stored), key=len)
-    run = SequenceMatcher(None, short, long).find_longest_match(
-        0, len(short), 0, len(long)
-    )
-    return run.size / len(short) >= MERCHANT_SIMILARITY
+    if short in long:
+        return True
+    return SequenceMatcher(None, narration, stored).ratio() >= MERCHANT_SIMILARITY
 
 
 def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
@@ -1086,6 +1085,10 @@ async def _recorded_by_a_statement(session, upload) -> dict[tuple, list[int]]:
 
     The list holds every copy of one key, so a statement that prints one line
     twice gives each line its own copy.
+
+    Only a row a statement wrote counts. A folded card alert also names a
+    statement, and states the same four things, but it is the purchase itself.
+    An answer must never hand it out as a copy to discard.
     """
     result = await session.execute(
         select(
@@ -1097,6 +1100,7 @@ async def _recorded_by_a_statement(session, upload) -> dict[tuple, list[int]]:
         ).where(
             Transaction.account_id == upload.account_id,
             Transaction.statement_upload_id.is_not(None),
+            Transaction.email_type == "cc_statement",
         )
     )
     by_key: dict[tuple, list[int]] = {}
