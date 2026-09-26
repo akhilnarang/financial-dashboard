@@ -37,7 +37,7 @@ class SettlementResult(NamedTuple):
 
 
 class SettlementError(Exception):
-    """Signals an invalid settlement request or an unresolvable statement row."""
+    """Raised when an answer names no row it can act on."""
 
 
 def row_digest(entry: dict) -> str:
@@ -117,7 +117,8 @@ def _claimed(recon: dict) -> set[int]:
 def _merge(entry: dict, target: Transaction, upload_id: int) -> None:
     """Updates a stored transaction with settled statement values after verifying rules.
 
-    Raises ``SettlementError`` if direction, currency, date, or amount violates rules.
+    Raises ``SettlementError`` when the row is unreadable, or when the target fails a
+    direction, currency, origin, date or amount check.
     Preserves user aliases when updating the counterparty name.
     """
     try:

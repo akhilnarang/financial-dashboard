@@ -645,7 +645,7 @@ def reconcile_statement(
         key: list(rows) for key, rows in db_pool.items()
     }
 
-    # Group by day and direction, so a band check reads one day only.
+    # Group by day and direction, so a band check reads three days, not the whole pool.
     by_day: dict[tuple[date_type, str], list[tuple[Decimal, int]]] = {}
 
     for (day, amount, direction), rows in pool_snapshot.items():
@@ -1052,7 +1052,7 @@ async def resolve_cc_card_mask(
 
 
 async def _recorded_by_a_statement(session, upload) -> dict[tuple, list[int]]:
-    """Maps transaction attributes to lists of stored statement transaction IDs.
+    """Maps (amount, date, direction, merchant) to the IDs of the rows a statement recorded.
 
     Filters by ``cc_statement`` to prevent reusing merged card alerts as statement
     copies.

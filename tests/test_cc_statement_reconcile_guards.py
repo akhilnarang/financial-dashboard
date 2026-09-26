@@ -1525,7 +1525,7 @@ async def test_a_fuel_surcharge_is_held_for_a_person(session_factory):
     """Verifies that the reconciler holds surcharged transactions for user review when
     merchants match.
 
-    Without this check, surcharged purchases import as unlinked duplicates.
+    Without this check, the row imports as a plain purchase and nobody is asked.
     """
     await _seed_account(session_factory)
     stored_id = await _seed_txn(
