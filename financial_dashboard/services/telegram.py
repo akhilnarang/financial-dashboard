@@ -584,10 +584,9 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
 
 
 def _parse_settlement_callback(data: str) -> tuple[int, int, str, int] | None:
-    """Read a settlement callback: the row, its digest, and the row to fold into.
+    """Parses settlement callback data into upload ID, row index, digest, and target ID.
 
-    The callback names everything the answer is about. Nothing is looked up
-    from a stored question.
+    Returns ``None`` if the callback format or values are invalid.
     """
     if len(data.encode()) > 64:
         return None
@@ -607,10 +606,9 @@ def _parse_settlement_callback(data: str) -> tuple[int, int, str, int] | None:
 
 
 async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
-    """Ask whether a held statement row settles a stored purchase.
+    """Sends a Telegram prompt asking the user to resolve a held statement row.
 
-    Both rows are described, because the names and dates are what tell a
-    settlement from a second purchase. Neither answer is preselected.
+    Includes row details and inline buttons for each candidate stored transaction.
     """
     if not tg_app:
         return
@@ -667,7 +665,10 @@ async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
 
 
 async def _handle_settlement_callback(update: Update, context) -> None:
-    """Apply an authorized settlement answer."""
+    """Applies a user settlement choice from a Telegram callback query.
+
+    Verifies authorization, merges the transaction, and edits the message text.
+    """
     query = update.callback_query
     if not query or not query.data:
         return

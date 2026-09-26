@@ -1,7 +1,7 @@
-"""Folding a recorded statement row into the stored alert for one purchase.
+"""Tests settlement logic for credit card statement rows.
 
-A pump authorises 2,500.00 and the statement bills 2,529.00 for one fill. The
-statement row is recorded, and a person folds it into the alert.
+Verifies merging statement rows into stored alert transactions. Covers stale responses
+and validation errors.
 """
 
 import datetime
@@ -42,7 +42,7 @@ async def maker():
 
 
 def _row(*, stmt_idx=0, amount=SETTLED, candidates=(1,), recorded=2) -> dict:
-    """A held row, as it stands after the statement was imported."""
+    """Returns a test dictionary for an ambiguous imported statement row."""
     return {
         "stmt_idx": stmt_idx,
         "date": "07/04/2026",
@@ -62,10 +62,9 @@ def _recon(rows=None, matched=()) -> dict:
 
 
 async def _seed(maker, *, stored=(AUTHORISED,), recon=None) -> int:
-    """One account, one imported statement, and one stored row per amount.
+    """Populates the test database with an account, statement upload, and transactions.
 
-    The statement row is in the ledger, because the reconciler imports a held
-    row like any other. The stored rows are the card alerts it may state.
+    Returns the generated statement upload ID.
     """
     payload = recon or _recon()
     async with maker() as session:
@@ -125,9 +124,10 @@ async def _rows(maker) -> list[Transaction]:
 
 
 async def test_a_fold_states_what_the_statement_states(maker):
-    """One row stays, at the billed amount, date and merchant.
+    """Verifies that merging overwrites stored transaction fields with statement data.
 
-    The alert can be a day earlier and name the merchant more briefly.
+    Without this merge, stored records retain outdated amounts, dates, and merchant
+    descriptions.
     """
     upload_id = await _seed(maker)
     async with maker() as session:
@@ -149,7 +149,10 @@ async def test_a_fold_states_what_the_statement_states(maker):
 
 
 async def test_only_the_row_the_prompt_showed_is_folded_once(maker):
-    """A changed row is refused, and a second tap changes nothing."""
+    """Verifies that a fold applies only to the row the prompt showed, and only once.
+
+    Without this check, a tap can fold a changed row, or fold one row twice.
+    """
     upload_id = await _seed(maker)
 
     async with maker() as session:
@@ -170,7 +173,11 @@ async def test_only_the_row_the_prompt_showed_is_folded_once(maker):
 
 
 async def test_a_row_another_statement_row_holds_is_refused(maker):
-    """Folding onto it would put two purchases on one row."""
+    """Verifies that settlement rejects transactions already claimed by other statement
+    rows.
+
+    Without this check, two distinct purchases collapse into one record.
+    """
     claimed = _recon(matched=[{"stmt_idx": 1, "db_txn_id": 1}])
     upload_id = await _seed(maker, recon=claimed)
 
@@ -185,7 +192,11 @@ async def test_a_row_another_statement_row_holds_is_refused(maker):
 
 
 async def test_a_row_the_prompt_did_not_offer_is_refused(maker):
-    """The prompt named its candidates. Any other id is a forged callback."""
+    """Verifies that settlement rejects target transactions not offered as candidates.
+
+    Without this guard, forged or invalid callback requests can corrupt transaction
+    history.
+    """
     upload_id = await _seed(
         maker, stored=(AUTHORISED, "2512.00"), recon=_recon([_row(recorded=3)])
     )

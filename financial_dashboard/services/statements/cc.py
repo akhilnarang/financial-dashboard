@@ -250,17 +250,14 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
     return (txn_date, amount, direction)
 
 
-# How far a settled amount can sit from the authorised one. A fuel surcharge is
-# about 1%; a foreign charge moves with the settlement-day rate.
+# A fuel surcharge adds about 1% at settlement.
 SETTLEMENT_BAND = Decimal("0.012")
 
 
 def settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
-    """Whether one amount can be the settled or authorised form of the other.
+    """Returns whether the difference between two amounts is within the settlement band.
 
-    The function reads the band from the larger amount. The answer is
-    therefore the same for both directions. Two equal amounts give a
-    difference of zero, and zero is inside every band.
+    Calculates the tolerance from the larger amount to make comparisons symmetric.
     """
     gap, larger = abs(settled - authorised), max(abs(settled), abs(authorised))
     return gap <= larger * SETTLEMENT_BAND
@@ -383,21 +380,17 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
 
 
 MERCHANT_SIMILARITY = 0.8
-"""How alike two spellings of one merchant are, when neither contains the
-other.
+"""Defines the minimum similarity score required to match two merchant names.
 
-A statement states the merchant a card alert states, and adds the city and the
-country. So one name usually sits inside the other. When it does not, the two
-names must still read as one merchant, and this states how much of them must
-agree.
+The matcher applies this threshold when neither name contains the other.
 """
 
 
 def _same_merchant(row_narration: str | None, db_txn) -> bool:
-    """Whether a statement row and a stored row name one merchant.
+    """Returns whether a statement description and a stored transaction match the same
+    merchant.
 
-    The names are stripped of references, terminals and processor wrappers
-    first, so what is compared is the merchant and its location.
+    Compares normalized names using substring checks and similarity ratios.
     """
     narration = normalize_merchant_name(row_narration or "")
     stored = normalize_merchant_name(db_txn.counterparty or "")
@@ -431,12 +424,10 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
 
 
 def _same_amount(txn: "ParsedCcTransaction", db_txn) -> bool:
-    """Whether a statement row and a DB row state the same amount.
+    """Returns whether a statement row and a database transaction have the exact same
+    amount.
 
-    The reachability set holds a band, because a settled amount and an
-    authorised amount are one purchase. A reassignment must not use that band.
-    It moves a row to a candidate by name alone, and two amounts one surcharge
-    apart can be two purchases. Such a pair must stay held back for a person.
+    This comparison ignores the settlement band to prevent false matches.
     """
     try:
         return parse_cc_amount(txn.amount) == Decimal(str(db_txn.amount))
@@ -633,7 +624,7 @@ def reconcile_statement(
     # Each key maps to a list of DB transactions (multiple txns can share the same key)
     db_pool: dict[tuple, list] = {}
     for db_txn in db_transactions:
-        # A statement states rupees, so another unit is not comparable.
+        # Only a rupee row can match a statement row.
         if (db_txn.currency or "INR") != "INR":
             continue
         if db_txn.transaction_date and db_txn.amount is not None:
@@ -654,8 +645,7 @@ def reconcile_statement(
         key: list(rows) for key, rows in db_pool.items()
     }
 
-    # Buckets the pool by day and direction. A banded scan then reads the rows
-    # of one day only. It does not read the whole account history.
+    # Group by day and direction, so a band check reads one day only.
     by_day: dict[tuple[date_type, str], list[tuple[Decimal, int]]] = {}
 
     for (day, amount, direction), rows in pool_snapshot.items():
@@ -663,17 +653,10 @@ def reconcile_statement(
         bucket.extend((amount, row.id) for row in rows)
 
     def _reachable(amount: Decimal, direction: str, txn_date: date_type) -> set[int]:
-        """The DB rows that could be this statement row's transaction, across
-        the window. Card-blind: see the note above.
+        """Returns stored transaction IDs that match the date window, direction, and
+        settlement band.
 
-        The amount is a band, not a value. A card authorises one amount and
-        settles another: a fuel surcharge, or a foreign rate move. On an exact
-        amount the stored row is invisible, the set empties, and the import
-        stores the purchase again.
-
-        The band only widens this set. It pairs nothing and writes nothing, so
-        the row is held for a person. Two purchases one surcharge apart look
-        the same as one purchase billed twice.
+        The settlement band accounts for surcharges and currency exchange differences.
         """
         return {
             txn_id
@@ -687,10 +670,11 @@ def reconcile_statement(
     def _reachable_exact(
         amount: Decimal, direction: str, txn_date: date_type
     ) -> set[int]:
-        """The DB rows that state this row's amount, across the window.
+        """Returns stored transaction IDs that match the date window, direction, and
+        exact amount.
 
-        Contention reads this set, not the banded one. Two rows that each state
-        their own amount are not rivals, and the band would demote both.
+        Contention checks use this exact set to prevent false rivalry between distinct
+        rows.
         """
         return {
             txn_id
@@ -716,13 +700,7 @@ def reconcile_statement(
                 direction,
                 parse_cc_date(txn.date),
             )
-            # A settled amount sits a surcharge or a rate move from the
-            # amount the card authorised, so the band alone puts every row of
-            # a similar size in reach. One purchase states one merchant, so a
-            # row that names another merchant is another purchase.
-            #
-            # An exact amount needs no name. Two rows that state one amount
-            # state one purchase, whatever the statement calls the merchant.
+            # A banded row must name the same merchant. An exact amount need not.
             candidate_sets[stmt_idx] = {
                 txn_id
                 for txn_id in banded
@@ -854,8 +832,7 @@ def reconcile_statement(
     db_by_id = {db_txn.id: db_txn for db_txn in db_transactions}
     contested = []
     for entry in matched:
-        # Rivals come from the exact sets. A row that states its own amount is
-        # not a rival of one that states another.
+        # Rivals come from exact amounts only.
         rivals = [
             stmt_idx
             for stmt_idx, candidates in exact_sets.items()
@@ -1075,20 +1052,10 @@ async def resolve_cc_card_mask(
 
 
 async def _recorded_by_a_statement(session, upload) -> dict[tuple, list[int]]:
-    """The rows a statement recorded, by what they state.
+    """Maps transaction attributes to lists of stored statement transaction IDs.
 
-    A statement row states an amount, a date, a direction and a merchant. Its
-    recorded copy states the same four, because the copy is built from the
-    row. So the two find each other, and no other purchase can stand in for
-    it: not one at another amount or on another day, not a refund of the same
-    size, and not another merchant.
-
-    The list holds every copy of one key, so a statement that prints one line
-    twice gives each line its own copy.
-
-    Only a row a statement wrote counts. A folded card alert also names a
-    statement, and states the same four things, but it is the purchase itself.
-    An answer must never hand it out as a copy to discard.
+    Filters by ``cc_statement`` to prevent reusing merged card alerts as statement
+    copies.
     """
     result = await session.execute(
         select(
@@ -1165,10 +1132,7 @@ async def import_missing_cc_txns(
     """
     link_ctx = await build_link_context(session)
     recorded = await _recorded_by_a_statement(session, upload)
-    # A row speaks for one statement row. A matched row holds the one it won,
-    # so a held row must not take it too: a parser that reads a line it missed
-    # before would otherwise be handed a copy another line already holds, and
-    # the purchase would never enter the ledger.
+    # A held row must not take a row that a matched row holds.
     claimed = {
         row["db_txn_id"]
         for row in recon.get("matched", [])
@@ -1183,12 +1147,8 @@ async def import_missing_cc_txns(
     for entry in recon["missing"]:
         if entry.get("imported"):
             continue
-        # A held row a statement already recorded must not be recorded again.
-        # Contention keeps such a row out of ``matched``, so only this check
-        # stops it importing on every reprocess.
-        #
-        # The entry names the copy, because the question about it is still
-        # open and a person must still be able to fold it.
+        # A held row that a statement recorded before names that copy, and is not
+        # imported again.
         if entry.get("ambiguous"):
             try:
                 key = (

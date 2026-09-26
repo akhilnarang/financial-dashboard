@@ -1,21 +1,7 @@
-"""Answer a statement row whose amount is near a stored amount.
+"""This module resolves statement rows that are near stored transaction amounts.
 
-A card states two amounts for one purchase: the amount it authorises at the
-swipe, and the amount it settles days later. A fuel surcharge is added at
-settlement, and a foreign charge converts at the settlement-day rate. So a
-statement row near a stored amount is one purchase billed once, or two
-purchases of a similar size. Nothing in the rows tells them apart.
-
-The reconciler holds such a row back. This module asks about it, and applies
-the answer:
-
-- **Merge** writes the settled amount onto the stored row.
-- **Skip** records the statement row as a purchase of its own. Both amounts
-  then stand, because they are two purchases.
-
-The question needs no stored state. The callback carries what it is about, and
-a digest of the row as it was shown, so a row that changed since is refused.
-Everything else is read again at the write.
+It asks users whether to merge the row into a stored purchase. It then updates the
+database records with the chosen action.
 """
 
 import datetime
@@ -42,7 +28,7 @@ logger = logging.getLogger(__name__)
 SettlementOutcome = Literal["merged", "stale"]
 
 ROW_DIGEST_CHARS = 12
-"""Enough of the digest to name one row of one statement in a callback."""
+"""Defines the digest length that identifies a statement row in a callback."""
 
 
 class SettlementResult(NamedTuple):
@@ -51,16 +37,13 @@ class SettlementResult(NamedTuple):
 
 
 class SettlementError(Exception):
-    """A request that names no answerable row."""
+    """Signals an invalid settlement request or an unresolvable statement row."""
 
 
 def row_digest(entry: dict) -> str:
-    """A short digest of what a statement row states.
+    """Returns a stable hash of key statement row fields.
 
-    The callback carries this, so a row that changed after the prompt is
-    refused rather than answered. sha256, not ``hash()``: the digest travels to
-    Telegram and comes back after a restart, and ``hash()`` is salted per
-    process.
+    Callbacks carry this value to detect changes to the row.
     """
     payload = json.dumps(
         [
@@ -76,12 +59,7 @@ def row_digest(entry: dict) -> str:
 
 
 def held_rows(recon: dict) -> list[dict]:
-    """The rows of this reconciliation that await an answer.
-
-    The row is in the ledger, because a statement states a purchase. It is
-    asked about because a stored row may state the same purchase, and folding
-    the two is the answer only a person can give.
-    """
+    """Returns the recorded statement rows that still wait for an answer."""
     return [
         entry
         for entry in recon.get("missing", [])
@@ -90,10 +68,9 @@ def held_rows(recon: dict) -> list[dict]:
 
 
 def _find_row(recon: dict, stmt_idx: int, digest: str) -> dict:
-    """The held row this answer is about, or raise.
+    """Finds the held statement row with the specified index and digest.
 
-    The digest must match: a reparse can move a row to this position, and that
-    row is not the one the prompt showed.
+    Raises ``SettlementError`` if the row is missing or the digest changed.
     """
     for entry in held_rows(recon):
         if entry.get("stmt_idx") == stmt_idx:
@@ -104,10 +81,9 @@ def _find_row(recon: dict, stmt_idx: int, digest: str) -> dict:
 
 
 async def _lock_upload(session: AsyncSession, upload_id: int) -> StatementUpload | None:
-    """Take the write lock before reading what the answer depends on.
+    """Locks the statement upload record for update.
 
-    A reparse and an answer can run at once, so a read outside the lock can
-    return state the other writer has replaced.
+    This lock prevents concurrent tasks from modifying reconciliation data.
     """
     if session.get_bind().dialect.name == "sqlite":
         await session.execute(text("BEGIN IMMEDIATE"))
@@ -121,14 +97,9 @@ async def _lock_upload(session: AsyncSession, upload_id: int) -> StatementUpload
 
 
 def _claimed(recon: dict) -> set[int]:
-    """The transactions this statement already speaks for.
+    """Returns the set of transaction IDs already used in this reconciliation.
 
-    A transaction answers one statement row. A matched row holds the one it
-    won, and an answered row holds the one it took.
-
-    The answered rows are also refused by the reference, which the database
-    keeps unique. This set reads them so the person gets the reason, not a
-    constraint error.
+    Settlement checks this set to prevent assigning the same transaction twice.
     """
     claimed = {
         row["db_txn_id"]
@@ -144,17 +115,10 @@ def _claimed(recon: dict) -> set[int]:
 
 
 def _merge(entry: dict, target: Transaction, upload_id: int) -> None:
-    """Write the settled amount onto the stored row.
+    """Updates a stored transaction with settled statement values after verifying rules.
 
-    Every rule is read again here. The prompt is a question, and a row that
-    changed after it was sent is not the row the person saw.
-
-    The row then states what the statement billed: the amount, the date and the
-    merchant. The alert states what the card authorised, which can be a day
-    earlier and a shorter name, and the row is a statement row now.
-
-    A name the user chose stands. The bank did not state it, so a statement
-    does not answer for it.
+    Raises ``SettlementError`` if direction, currency, date, or amount violates rules.
+    Preserves user aliases when updating the counterparty name.
     """
     try:
         settled = parse_cc_amount(entry["amount"])
@@ -195,14 +159,10 @@ async def answer(
     digest: str,
     transaction_id: int,
 ) -> SettlementResult:
-    """Fold a recorded statement row into the stored alert it settles.
+    """Folds a held statement row into the stored transaction the person chose.
 
-    The statement row is already in the ledger. This states that it and the
-    stored row are one purchase, so the stored row takes the billed amount and
-    the statement row goes.
-
-    Returns ``stale`` when the row was folded already, so a second tap of an
-    old prompt reports that rather than folding again.
+    Deletes the statement's recorded copy of the row. Returns ``stale`` when the row
+    changed or has an answer already.
     """
     async with session.begin():
         upload = await _lock_upload(session, upload_id)
@@ -256,14 +216,9 @@ async def answer(
 
 
 async def _resync_payment_state(session: AsyncSession, upload: StatementUpload) -> None:
-    """Re-derive the paid state after a merge rewrote a payment credit.
+    """Updates the credit card payment state after a merge changes a credit amount.
 
-    A statement is asked about right after it is read, and answered later. The
-    read has therefore already re-derived the paid state, and a merge that
-    rewrites the amount of a credit changes what it derived from.
-
-    Only a merge reaches this. A recorded row is a ``cc_statement`` credit, and
-    the payment classifier does not count one as a bill payment.
+    Catches and logs any errors to avoid failing the settlement.
     """
     from financial_dashboard.services.reminders import resync_tracked_cc_payment_state
 
@@ -274,10 +229,9 @@ async def _resync_payment_state(session: AsyncSession, upload: StatementUpload) 
 
 
 async def ask_about_held_rows(upload_id: int) -> None:
-    """Send one prompt for each row of this statement that awaits an answer.
+    """Sends resolution prompts for all held statement rows in an upload.
 
-    Best effort: the import is already committed and the rows are on the
-    statement page, so a prompt that fails must not fail the import.
+    Suppresses prompt errors because the statement import is already committed.
     """
     try:
         await _send_prompts(upload_id)

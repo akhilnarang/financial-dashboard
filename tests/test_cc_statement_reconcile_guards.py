@@ -156,11 +156,9 @@ async def _reconcile(maker, parsed) -> dict:
 
 
 async def _import(maker, parsed, recon, due_date=None) -> tuple[list, list]:
-    """Drive the real ``import_missing_cc_txns`` and return
-    (imported transactions, every DB row afterwards).
+    """Runs ``import_missing_cc_txns`` for a test upload.
 
-    ``due_date`` names the statement cycle. Every upload of one statement
-    states the same one, and the next statement states the next one.
+    Returns the imported transactions and all database rows.
     """
     async with maker() as session:
         upload = StatementUpload(
@@ -1410,12 +1408,10 @@ async def test_a_row_masked_with_a_deleted_card_is_held_back_not_reimported(
 
 @pytest.mark.anyio
 async def test_a_reprocess_keeps_the_question_open(session_factory):
-    """A reprocess must not answer a held row by itself.
+    """Verifies that reprocessing a statement keeps held rows open for user resolution.
 
-    The row is recorded, and a person is asked whether a stored row states the
-    same purchase. A reprocess rebuilds the reconciliation, so it must name the
-    row it recorded. Without that name the question disappears and the two
-    rows stand for ever.
+    Without this check, repeated processing drops unresolved rows and leaves duplicate
+    records.
     """
     await _seed_account(session_factory)
     await _seed_txn(session_factory, amount=Decimal("90.00"), counterparty="MERCHANT A")
@@ -1442,11 +1438,10 @@ async def test_a_reprocess_keeps_the_question_open(session_factory):
 
 @pytest.mark.anyio
 async def test_a_line_a_parser_missed_before_is_recorded(session_factory):
-    """A parser fix reads a line an earlier parse missed.
+    """Verifies that newly discovered statement lines import as distinct transactions.
 
-    The rows it read before hold their own copies. The new line is a purchase
-    of its own, so it must enter the ledger and not take a copy another line
-    already holds.
+    Without this protection, new lines reuse existing copies and miss legitimate
+    purchases.
     """
     await _seed_account(session_factory)
     before = _parsed(
@@ -1474,13 +1469,9 @@ async def test_a_line_a_parser_missed_before_is_recorded(session_factory):
 
 @pytest.mark.anyio
 async def test_a_held_row_takes_its_own_copy_not_a_neighbours(session_factory):
-    """A held row states an amount, a date, a direction and a merchant.
+    """Verifies that a held row matches only its own recorded copy.
 
-    Its copy states the same four. A row of that size on that day that states
-    another merchant, or runs the other way, is a different row and must not
-    answer for this one. The copy that another statement recorded first has
-    the lower id, so a key that reads fewer of the four hands this row that
-    one, and a fold then rewrites a purchase that is not this one.
+    Without this check, the row binds to an unrelated transaction with a lower ID.
     """
     await _seed_account(session_factory)
 
@@ -1531,11 +1522,10 @@ async def test_a_held_row_takes_its_own_copy_not_a_neighbours(session_factory):
 
 @pytest.mark.anyio
 async def test_a_fuel_surcharge_is_held_for_a_person(session_factory):
-    """A pump authorises one amount, and the statement bills about 1% more.
+    """Verifies that the reconciler holds surcharged transactions for user review when
+    merchants match.
 
-    The alert names the merchant. The statement names it with a prefix and the
-    city. The two must read as one merchant, so the statement row is held and
-    the person is asked whether to fold it into the alert.
+    Without this check, surcharged purchases import as unlinked duplicates.
     """
     await _seed_account(session_factory)
     stored_id = await _seed_txn(
@@ -1562,15 +1552,9 @@ async def test_a_fuel_surcharge_is_held_for_a_person(session_factory):
 
 @pytest.mark.anyio
 async def test_a_folded_alert_is_never_handed_out_as_a_copy(session_factory):
-    """A fold keeps the card alert and deletes the statement's copy.
+    """Verifies that a folded card alert never counts as a statement's recorded copy.
 
-    The alert then states what the statement states and names the statement,
-    but it is the purchase itself. When a reprocess holds the row again, the
-    alert must not be named as the row's copy, because a second fold would
-    delete it.
-
-    The alert's card is not one the account lists, so a reprocess cannot pair
-    the two rows and holds the statement row again.
+    Without this rule, a later fold can delete the purchase itself.
     """
     await _seed_account(session_factory)
     alert_id = await _seed_txn(
@@ -1618,11 +1602,11 @@ async def test_a_folded_alert_is_never_handed_out_as_a_copy(session_factory):
 
 @pytest.mark.anyio
 async def test_another_merchant_is_a_second_purchase(session_factory):
-    """A band reaches a row of a similar size. A merchant says whose it is.
+    """Verifies that statement rows for different merchants import as distinct
+    purchases.
 
-    One purchase states one merchant. A stored row that names another merchant
-    is another purchase, so the statement row states a purchase of its own and
-    imports without a question.
+    Without this check, unrelated purchases with similar amounts prompt unnecessary
+    merges.
     """
     await _seed_account(session_factory)
     stored_id = await _seed_txn(
@@ -1652,11 +1636,11 @@ async def test_another_merchant_is_a_second_purchase(session_factory):
 async def test_a_banded_row_does_not_outrank_an_exact_match_a_day_away(
     session_factory,
 ):
-    """A statement row takes the equal amount, not the nearest amount.
+    """Verifies that exact amount matches take priority over nearby amounts from the
+    same day.
 
-    A row of the same day, one surcharge away, must not take a statement row.
-    The equal amount is stored one day away. A pairing by difference would
-    rewrite the row of the same day and leave the real transaction unpaired.
+    Without this rule, a nearby surcharge steals the match and leaves the real purchase
+    unlinked.
     """
     await _seed_account(session_factory)
     near_id = await _seed_txn(session_factory, amount=Decimal("995.00"))
@@ -1680,13 +1664,10 @@ async def test_a_banded_row_does_not_outrank_an_exact_match_a_day_away(
 
 @pytest.mark.anyio
 async def test_two_exact_matches_inside_the_band_both_match(session_factory):
-    """Amounts one surcharge apart are ordinary on a statement.
+    """Verifies that distinct transactions with exact matches pair directly when their
+    amounts sit inside the band.
 
-    A 149.00 and a 150.00 purchase on one day sit inside the settlement band,
-    and each statement row states the amount of its own stored row. Neither is
-    a rival of the other: the amounts already answer the question. Demoting
-    both would ask a person twice about rows that need no question, and an
-    answer of "separate purchase" would then store a duplicate.
+    Without this rule, contention demotes valid matches to ambiguous prompts.
     """
     await _seed_account(session_factory)
     low_id = await _seed_txn(
@@ -1721,12 +1702,10 @@ async def test_two_exact_matches_inside_the_band_both_match(session_factory):
 
 @pytest.mark.anyio
 async def test_a_row_in_another_currency_is_not_a_candidate(session_factory):
-    """A statement states rupees.
+    """Verifies that foreign currency transactions are not candidates for domestic
+    statement rows.
 
-    A row in another currency holds a different unit, so its amount and the
-    statement amount are not comparable. Such a row must not be a candidate:
-    it would hold a statement row back for a question nobody can answer, or
-    invite a pairing that states rupees in another unit.
+    Without this guard, mismatched currencies trigger invalid settlement prompts.
     """
     await _seed_account(session_factory)
     await _seed_txn(
