@@ -34,8 +34,13 @@ from financial_dashboard.db import (
     Transaction,
 )
 from financial_dashboard.services.statements import cc as cc_module
-from financial_dashboard.services.statement_settlement import held_rows
+from financial_dashboard.services.statement_settlement import (
+    answer,
+    held_rows,
+    row_digest,
+)
 from financial_dashboard.services.statements.cc import (
+    reconciliation_to_json,
     import_missing_cc_txns,
     load_account_card_masks,
     parse_cc_date,
@@ -1669,6 +1674,62 @@ async def test_a_fuel_surcharge_is_held_for_a_person(session_factory):
 
     assert recon["missing"][0]["ambiguous"] is True
     assert recon["missing"][0]["candidate_transaction_ids"] == [stored_id]
+
+
+@pytest.mark.anyio
+async def test_a_folded_alert_is_never_handed_out_as_a_copy(session_factory):
+    """A fold keeps the card alert and deletes the statement's copy.
+
+    The alert then states what the statement states and names the statement,
+    but it is the purchase itself. When a reprocess holds the row again, the
+    alert must not be named as the row's copy, because a second fold would
+    delete it.
+
+    The alert's card is not one the account lists, so a reprocess cannot pair
+    the two rows and holds the statement row again.
+    """
+    await _seed_account(session_factory)
+    alert_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("2500.00"),
+        counterparty="SAMPLE ENTERPRISES",
+        raw_description=None,
+        card_mask="1111",
+    )
+    parsed = _parsed(
+        [
+            _stmt_txn(
+                date="07/04/2026",
+                amount="2,529.00",
+                narration="MW SAMPLE ENTERPRISES Pune",
+            )
+        ]
+    )
+
+    recon = await _reconcile(session_factory, parsed)
+    await _import(session_factory, parsed, recon)
+    async with session_factory() as session:
+        upload = (
+            await session.scalars(
+                select(StatementUpload).order_by(StatementUpload.id.desc())
+            )
+        ).first()
+        upload.reconciliation_data = reconciliation_to_json(recon)
+        await session.commit()
+        upload_id = upload.id
+
+    [entry] = held_rows(recon)
+    async with session_factory() as session:
+        folded = await answer(
+            session, upload_id, entry["stmt_idx"], row_digest(entry), alert_id
+        )
+    assert folded.outcome == "merged"
+
+    recon = await _reconcile(session_factory, parsed)
+    _imported, rows = await _import(session_factory, parsed, recon)
+
+    assert alert_id in [row.id for row in rows]
+    assert alert_id not in [entry.get("imported_txn_id") for entry in recon["missing"]]
 
 
 @pytest.mark.anyio
