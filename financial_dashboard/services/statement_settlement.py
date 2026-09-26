@@ -9,7 +9,7 @@ import hashlib
 import json
 import logging
 from decimal import Decimal, InvalidOperation
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,8 +27,36 @@ logger = logging.getLogger(__name__)
 
 SettlementOutcome = Literal["merged", "stale"]
 
+# The digest length that identifies a statement row in a callback.
 ROW_DIGEST_CHARS = 12
-"""Defines the digest length that identifies a statement row in a callback."""
+
+
+class HeldRow(TypedDict):
+    """A statement row in a reconciliation, as the settlement reads it."""
+
+    stmt_idx: int
+    date: str
+    amount: str
+    direction: str
+    narration: str | None
+    card_number: str | None
+    imported_txn_id: int | None
+    ambiguous: NotRequired[bool]
+    candidate_transaction_ids: NotRequired[list[int]]
+
+
+class MatchedRow(TypedDict):
+    """A statement row that the reconciler paired with a stored row."""
+
+    stmt_idx: int
+    db_txn_id: int | None
+
+
+class Reconciliation(TypedDict):
+    """The stored result of one statement's reconciliation."""
+
+    matched: list[MatchedRow]
+    missing: list[HeldRow]
 
 
 class SettlementResult(NamedTuple):
@@ -40,7 +68,7 @@ class SettlementError(Exception):
     """Raised when an answer names no row it can act on."""
 
 
-def row_digest(entry: dict) -> str:
+def row_digest(entry: HeldRow) -> str:
     """Returns a stable hash of key statement row fields.
 
     Callbacks carry this value to detect changes to the row.
@@ -58,7 +86,7 @@ def row_digest(entry: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:ROW_DIGEST_CHARS]
 
 
-def held_rows(recon: dict) -> list[dict]:
+def held_rows(recon: Reconciliation) -> list[HeldRow]:
     """Returns the recorded statement rows that still wait for an answer."""
     return [
         entry
@@ -67,7 +95,7 @@ def held_rows(recon: dict) -> list[dict]:
     ]
 
 
-def _find_row(recon: dict, stmt_idx: int, digest: str) -> dict:
+def _find_row(recon: Reconciliation, stmt_idx: int, digest: str) -> HeldRow:
     """Finds the held statement row with the specified index and digest.
 
     Raises ``SettlementError`` if the row is missing or the digest changed.
@@ -96,25 +124,25 @@ async def _lock_upload(session: AsyncSession, upload_id: int) -> StatementUpload
     ).one_or_none()
 
 
-def _claimed(recon: dict) -> set[int]:
+def _claimed(recon: Reconciliation) -> set[int]:
     """Returns the set of transaction IDs already used in this reconciliation.
 
     Settlement checks this set to prevent assigning the same transaction twice.
     """
     claimed = {
-        row["db_txn_id"]
+        txn_id
         for row in recon.get("matched", [])
-        if row.get("db_txn_id") is not None
+        if (txn_id := row.get("db_txn_id")) is not None
     }
     claimed.update(
-        row["imported_txn_id"]
+        txn_id
         for row in recon.get("missing", [])
-        if row.get("imported_txn_id") is not None
+        if (txn_id := row.get("imported_txn_id")) is not None
     )
     return claimed
 
 
-def _merge(entry: dict, target: Transaction, upload_id: int) -> None:
+def _merge(entry: HeldRow, target: Transaction, upload_id: int) -> None:
     """Updates a stored transaction with settled statement values after verifying rules.
 
     Raises ``SettlementError`` when the row is unreadable, or when the target fails a
@@ -170,7 +198,9 @@ async def answer(
         if upload is None or not upload.reconciliation_data:
             raise SettlementError("That statement is gone")
 
-        recon = reconciliation_from_json(upload.reconciliation_data)
+        recon = cast(
+            Reconciliation, reconciliation_from_json(upload.reconciliation_data)
+        )
         try:
             entry = _find_row(recon, stmt_idx, digest)
         except SettlementError:
@@ -254,7 +284,9 @@ async def _send_prompts(upload_id: int) -> None:
         if upload is None or not upload.reconciliation_data:
             return
 
-        recon = reconciliation_from_json(upload.reconciliation_data)
+        recon = cast(
+            Reconciliation, reconciliation_from_json(upload.reconciliation_data)
+        )
         claimed = _claimed(recon)
         for entry in held_rows(recon):
             candidate_ids = [
@@ -274,9 +306,9 @@ async def _send_prompts(upload_id: int) -> None:
                     "stmt_idx": entry["stmt_idx"],
                     "digest": row_digest(entry),
                     "bank": upload.bank,
-                    "amount": entry.get("amount"),
-                    "narration": entry.get("narration"),
-                    "date": entry.get("date"),
+                    "amount": entry["amount"],
+                    "narration": entry["narration"],
+                    "date": entry["date"],
                     "candidates": [
                         {
                             "id": row.id,

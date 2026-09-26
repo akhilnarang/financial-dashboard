@@ -10,7 +10,7 @@ import html
 import logging
 import re
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, TypedDict
 
 from datetime import timedelta
 from typing import cast
@@ -605,7 +605,30 @@ def _parse_settlement_callback(data: str) -> tuple[int, int, str, int] | None:
     return upload_id, stmt_idx, digest, target
 
 
-async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
+class PromptCandidate(TypedDict):
+    """A stored row that a settlement prompt offers to fold into."""
+
+    id: int
+    amount: str
+    counterparty: str | None
+    date: str | None
+    card_mask: str | None
+
+
+class SettlementPrompt(TypedDict):
+    """The held statement row that a settlement prompt asks about."""
+
+    upload_id: int
+    stmt_idx: int
+    digest: str
+    bank: str
+    amount: str
+    narration: str | None
+    date: str
+    candidates: list[PromptCandidate]
+
+
+async def send_settlement_prompt(payload: SettlementPrompt, chat_id: int) -> None:
     """Sends a Telegram prompt asking the user to resolve a held statement row.
 
     Includes row details and inline buttons for each candidate stored transaction.
@@ -613,22 +636,22 @@ async def send_settlement_prompt(payload: dict, chat_id: int) -> None:
     if not tg_app:
         return
 
-    upload_id = int(payload["upload_id"])
-    stmt_idx = int(payload["stmt_idx"])
-    digest = str(payload["digest"])
-    bank = html.escape(str(payload.get("bank", "")).upper())
+    upload_id = payload["upload_id"]
+    stmt_idx = payload["stmt_idx"]
+    digest = payload["digest"]
+    bank = html.escape(payload["bank"].upper())
 
     lines = [
         f"⚠️ <b>{bank}</b> statement",
-        f"₹{html.escape(str(payload.get('amount') or ''))}"
-        f" · {html.escape(str(payload.get('narration') or ''))}"
-        f" · {html.escape(str(payload.get('date') or ''))}",
+        f"₹{html.escape(payload['amount'])}"
+        f" · {html.escape(payload['narration'] or '')}"
+        f" · {html.escape(payload['date'])}",
         "",
         "Stored:",
     ]
 
     buttons = []
-    for candidate in payload.get("candidates") or []:
+    for candidate in payload["candidates"]:
         described = " · ".join(
             html.escape(str(value))
             for value in (
