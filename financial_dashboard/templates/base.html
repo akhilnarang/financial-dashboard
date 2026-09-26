@@ -539,6 +539,7 @@
             detailContent.innerHTML = await resp.text();
             detailContent.querySelectorAll('script').forEach(old => {
                 const s = document.createElement('script');
+                for (const a of old.attributes) s.setAttribute(a.name, a.value);
                 s.textContent = old.textContent;
                 old.replaceWith(s);
             });
