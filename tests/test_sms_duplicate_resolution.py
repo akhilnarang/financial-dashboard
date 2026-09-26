@@ -121,6 +121,9 @@ async def test_resolver_creates_new_transaction(session, monkeypatch):
     assert created.sms_message_id == sms_id
     rows = (await session.scalars(select(Transaction))).all()
     assert len(rows) == 2
+    # The new row gets its own notification, so its note and category can be set.
+    assert result.notification is not None
+    assert result.notification["amount"] == created.amount
 
 
 @pytest.mark.anyio
