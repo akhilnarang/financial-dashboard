@@ -458,18 +458,6 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     return bool(db_narration) and db_narration == narration
 
 
-def _same_amount(txn: ParsedCcTransaction, db_txn: Transaction) -> bool:
-    """Returns whether a statement row and a database transaction have the exact same
-    amount.
-
-    This comparison ignores the settlement band to prevent false matches.
-    """
-    try:
-        return parse_cc_amount(txn.amount) == Decimal(str(db_txn.amount))
-    except ValueError, InvalidOperation:
-        return False
-
-
 def _row_names_candidate(stmt_idx: int, cid: int, txn_by_idx, db_by_id) -> bool:
     """Whether a statement row names a DB candidate as its own.
 
@@ -558,8 +546,7 @@ def _resolve_contested_by_counterparty(
             named = [
                 cid
                 for cid in candidate_sets.get(stmt_idx, set())
-                if _same_amount(txn_by_idx[stmt_idx], db_by_id[cid])
-                and _row_names_candidate(stmt_idx, cid, txn_by_idx, db_by_id)
+                if _row_names_candidate(stmt_idx, cid, txn_by_idx, db_by_id)
             ]
             if len(named) != 1 or named[0] not in group_candidate_ids:
                 singled_out = False
@@ -687,60 +674,33 @@ def reconcile_statement(
         bucket = by_day.setdefault(DayKey(day, direction), [])
         bucket.extend(StoredAmount(amount, row.id) for row in rows)
 
-    def _reachable(amount: Decimal, direction: str, txn_date: date_type) -> set[int]:
-        """Returns stored transaction IDs that match the date window, direction, and
-        settlement band.
-
-        The settlement band accounts for surcharges and currency exchange differences.
-        """
-        return {
-            stored.txn_id
+    def _reachable(
+        amount: Decimal, direction: str, txn_date: date_type
+    ) -> list[StoredAmount]:
+        """Returns the stored rows within one day and inside the settlement band."""
+        return [
+            stored
             for offset in (0, -1, 1)
             for stored in by_day.get(
                 DayKey(txn_date + timedelta(days=offset), direction), []
             )
             if settles_within_band(amount, stored.amount)
-        }
-
-    def _reachable_exact(
-        amount: Decimal, direction: str, txn_date: date_type
-    ) -> set[int]:
-        """Returns stored transaction IDs that match the date window, direction, and
-        exact amount.
-
-        Contention checks use this exact set to prevent false rivalry between distinct
-        rows.
-        """
-        return {
-            stored.txn_id
-            for offset in (0, -1, 1)
-            for stored in by_day.get(
-                DayKey(txn_date + timedelta(days=offset), direction), []
-            )
-            if stored.amount == amount
-        }
+        ]
 
     candidate_sets: dict[int, set[int]] = {}
     exact_sets: dict[int, set[int]] = {}
     rows_by_id = {db_txn.id: db_txn for db_txn in db_transactions}
     for stmt_idx, (_stmt_list, direction, txn) in enumerate(stmt_txns):
         try:
-            exact_sets[stmt_idx] = _reachable_exact(
-                parse_cc_amount(txn.amount),
-                direction,
-                parse_cc_date(txn.date),
-            )
-            banded = _reachable(
-                parse_cc_amount(txn.amount),
-                direction,
-                parse_cc_date(txn.date),
-            )
+            amount = parse_cc_amount(txn.amount)
+            banded = _reachable(amount, direction, parse_cc_date(txn.date))
+            exact_sets[stmt_idx] = {s.txn_id for s in banded if s.amount == amount}
             # A banded row must name the same merchant. An exact amount need not.
             candidate_sets[stmt_idx] = {
-                txn_id
-                for txn_id in banded
-                if txn_id in exact_sets[stmt_idx]
-                or _same_merchant(txn.narration, rows_by_id[txn_id])
+                s.txn_id
+                for s in banded
+                if s.amount == amount
+                or _same_merchant(txn.narration, rows_by_id[s.txn_id])
             }
         except ValueError, InvalidOperation:
             continue
@@ -1101,11 +1061,13 @@ async def _recorded_by_a_statement(
             Transaction.transaction_date,
             Transaction.direction,
             Transaction.counterparty,
-        ).where(
+        )
+        .where(
             Transaction.account_id == upload.account_id,
             Transaction.statement_upload_id.is_not(None),
             Transaction.email_type == "cc_statement",
         )
+        .order_by(Transaction.id)
     )
     by_key: dict[CopyKey, list[int]] = {}
     for txn_id, amount, txn_date, direction, counterparty in result:
@@ -1116,8 +1078,6 @@ async def _recorded_by_a_statement(
             _normalize_narration(counterparty),
         )
         by_key.setdefault(key, []).append(txn_id)
-    for ids in by_key.values():
-        ids.sort()
     return by_key
 
 
@@ -1175,11 +1135,6 @@ async def import_missing_cc_txns(
         for row in recon.get("matched", [])
         if row.get("db_txn_id") is not None
     }
-    claimed.update(
-        row["imported_txn_id"]
-        for row in recon["missing"]
-        if row.get("imported_txn_id") is not None
-    )
     imported: list[Transaction] = []
     for entry in recon["missing"]:
         if entry.get("imported"):

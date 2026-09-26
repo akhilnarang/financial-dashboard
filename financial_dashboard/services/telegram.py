@@ -625,10 +625,8 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
 def _parse_settlement_callback(data: str) -> SettlementCallback | None:
     """Parses settlement callback data into upload ID, row index, digest, and target ID.
 
-    Returns ``None`` if the callback format or values are invalid.
+    Returns ``None`` if the callback format is invalid.
     """
-    if len(data.encode()) > 64:
-        return None
     parts = data.split(":")
     if len(parts) != 6 or parts[:2] != ["st", "m"]:
         return None
@@ -637,11 +635,7 @@ def _parse_settlement_callback(data: str) -> SettlementCallback | None:
         upload_id, stmt_idx, target = int(parts[2]), int(parts[3]), int(parts[5])
     except ValueError:
         return None
-
-    digest = parts[4]
-    if upload_id <= 0 or stmt_idx < 0 or target <= 0 or not digest:
-        return None
-    return SettlementCallback(upload_id, stmt_idx, digest, target)
+    return SettlementCallback(upload_id, stmt_idx, parts[4], target)
 
 
 async def send_settlement_prompt(payload: SettlementPrompt, chat_id: int) -> None:

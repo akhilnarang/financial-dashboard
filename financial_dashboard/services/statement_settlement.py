@@ -4,7 +4,6 @@ It asks users whether to merge the row into a stored purchase. It then updates t
 database records with the chosen action.
 """
 
-import datetime
 import hashlib
 import json
 import logging
@@ -20,15 +19,9 @@ from financial_dashboard.services.statements.cc import (
     parse_cc_date,
     reconciliation_from_json,
     reconciliation_to_json,
-    settles_within_band,
 )
 
 logger = logging.getLogger(__name__)
-
-SettlementOutcome = Literal["merged", "stale"]
-
-# The digest length that identifies a statement row in a callback.
-ROW_DIGEST_CHARS = 12
 
 
 class HeldRow(TypedDict):
@@ -61,7 +54,7 @@ class Reconciliation(TypedDict):
 
 
 class SettlementResult(NamedTuple):
-    outcome: SettlementOutcome
+    outcome: Literal["merged", "stale"]
     transaction_id: int | None
 
 
@@ -81,10 +74,9 @@ def row_digest(entry: HeldRow) -> str:
             entry["direction"],
             entry["narration"] or "",
             entry["card_number"] or "",
-        ],
-        default=str,
+        ]
     )
-    return hashlib.sha256(payload.encode()).hexdigest()[:ROW_DIGEST_CHARS]
+    return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
 def held_rows(recon: Reconciliation) -> list[HeldRow]:
@@ -144,42 +136,22 @@ def _claimed(recon: Reconciliation) -> set[int]:
 
 
 def _merge(entry: HeldRow, target: Transaction, upload_id: int) -> None:
-    """Updates a stored transaction with settled statement values after verifying rules.
+    """Writes the statement's amount, date and merchant onto the stored row.
 
-    Raises ``SettlementError`` when the row is unreadable, or when the target fails a
-    direction, currency, origin, date or amount check.
-    Preserves user aliases when updating the counterparty name.
+    The reconciler applied every pairing rule when it offered this row, so the
+    fold does not check them again.
+
+    Raises ``SettlementError`` when the statement row is unreadable.
     """
     try:
-        settled = parse_cc_amount(entry["amount"])
-        row_date = parse_cc_date(entry["date"])
-    except ValueError, InvalidOperation, KeyError:
+        target.amount = parse_cc_amount(entry["amount"])
+        target.transaction_date = parse_cc_date(entry["date"])
+    except ValueError, InvalidOperation:
         raise SettlementError("The statement row is unreadable") from None
 
-    stored = Decimal(str(target.amount))
-
-    if target.direction != entry["direction"]:
-        raise SettlementError("That row runs the other way")
-    if (target.currency or "INR") != "INR":
-        raise SettlementError("That row is in another currency")
-    if target.statement_upload_id is not None:
-        raise SettlementError("That row already came from a statement")
-    if (
-        target.transaction_date is None
-        or abs((target.transaction_date - row_date).days) > 1
-    ):
-        raise SettlementError("That row is outside the statement window")
-    if not settles_within_band(settled, stored):
-        raise SettlementError("The amounts are too far apart")
-
-    narration = entry["narration"]
-    if narration and target.counterparty_source != "user_alias":
-        target.counterparty = narration
-
-    target.amount = settled
-    target.transaction_date = row_date
+    if entry["narration"]:
+        target.counterparty = entry["narration"]
     target.statement_upload_id = upload_id
-    target.enriched_at = datetime.datetime.now(datetime.UTC)
 
 
 async def answer(
@@ -207,32 +179,15 @@ async def answer(
         except SettlementError:
             return SettlementResult("stale", None)
 
-        recorded_id = entry["imported_txn_id"]
-        if recorded_id is None:
-            return SettlementResult("stale", None)
-
-        if transaction_id == recorded_id:
-            raise SettlementError("That is the statement row itself")
         if transaction_id in _claimed(recon):
             raise SettlementError("Another row already uses that transaction")
         if transaction_id not in (entry.get("candidate_transaction_ids") or []):
             raise SettlementError("That row was not offered")
 
-        recorded = await session.get(Transaction, recorded_id)
-        if recorded is None:
+        recorded = await session.get(Transaction, entry["imported_txn_id"])
+        target = await session.get(Transaction, transaction_id)
+        if recorded is None or target is None:
             return SettlementResult("stale", None)
-
-        target = (
-            await session.scalars(
-                select(Transaction)
-                .where(Transaction.id == transaction_id)
-                .with_for_update()
-            )
-        ).one_or_none()
-        if target is None:
-            raise SettlementError("That row is gone")
-        if target.account_id != upload.account_id:
-            raise SettlementError("That row belongs to another account")
 
         _merge(entry, target, upload.id)
 
@@ -240,38 +195,14 @@ async def answer(
         entry["imported_txn_id"] = target.id
         entry["ambiguous"] = False
         upload.reconciliation_data = reconciliation_to_json(recon)
-
-        if target.direction == "credit":
-            await _resync_payment_state(session, upload)
-
         return SettlementResult("merged", target.id)
 
 
-async def _resync_payment_state(session: AsyncSession, upload: StatementUpload) -> None:
-    """Updates the credit card payment state after a merge changes a credit amount.
-
-    Catches and logs any errors to avoid failing the settlement.
-    """
-    from financial_dashboard.services.reminders import resync_tracked_cc_payment_state
-
-    try:
-        await resync_tracked_cc_payment_state(session, upload)
-    except Exception as exc:
-        logger.warning("Settlement payment resync failed: %s", exc)
-
-
 async def ask_about_held_rows(upload_id: int) -> None:
-    """Sends resolution prompts for all held statement rows in an upload.
+    """Sends one Telegram prompt for each held statement row in an upload.
 
-    Suppresses prompt errors because the statement import is already committed.
+    The import is already committed, so a failed prompt is logged, not raised.
     """
-    try:
-        await _send_prompts(upload_id)
-    except Exception as exc:
-        logger.warning("Settlement prompt failed: %s", exc)
-
-
-async def _send_prompts(upload_id: int) -> None:
     from financial_dashboard.db import async_session
     from financial_dashboard.services.settings import get_telegram_chat_id
     from financial_dashboard.services.telegram import send_settlement_prompt
@@ -280,50 +211,50 @@ async def _send_prompts(upload_id: int) -> None:
     if not chat_id:
         return
 
-    async with async_session() as session:
-        upload = await session.get(StatementUpload, upload_id)
-        if upload is None or not upload.reconciliation_data:
-            return
+    try:
+        async with async_session() as session:
+            upload = await session.get(StatementUpload, upload_id)
+            if upload is None or not upload.reconciliation_data:
+                return
 
-        recon = cast(
-            Reconciliation, reconciliation_from_json(upload.reconciliation_data)
-        )
-        claimed = _claimed(recon)
-        for entry in held_rows(recon):
-            candidate_ids = [
-                txn_id
-                for txn_id in entry.get("candidate_transaction_ids") or []
-                if txn_id not in claimed
-            ]
-            rows = (
-                await session.scalars(
-                    select(Transaction).where(Transaction.id.in_(candidate_ids))
-                )
-            ).all()
-
-            await send_settlement_prompt(
-                {
-                    "upload_id": upload_id,
-                    "stmt_idx": entry["stmt_idx"],
-                    "digest": row_digest(entry),
-                    "bank": upload.bank,
-                    "amount": entry["amount"],
-                    "narration": entry["narration"],
-                    "date": entry["date"],
-                    "candidates": [
-                        {
-                            "id": row.id,
-                            "amount": f"{Decimal(str(row.amount)):,.2f}",
-                            "counterparty": row.counterparty,
-                            "date": (
-                                row.transaction_date.strftime("%d/%m/%Y")
-                                if row.transaction_date
-                                else None
-                            ),
-                            "card_mask": row.card_mask,
-                        }
-                        for row in rows
-                    ],
-                },
-                chat_id,
+            recon = cast(
+                Reconciliation, reconciliation_from_json(upload.reconciliation_data)
             )
+            for entry in held_rows(recon):
+                rows = (
+                    await session.scalars(
+                        select(Transaction).where(
+                            Transaction.id.in_(
+                                entry.get("candidate_transaction_ids") or []
+                            )
+                        )
+                    )
+                ).all()
+                await send_settlement_prompt(
+                    {
+                        "upload_id": upload_id,
+                        "stmt_idx": entry["stmt_idx"],
+                        "digest": row_digest(entry),
+                        "bank": upload.bank,
+                        "amount": entry["amount"],
+                        "narration": entry["narration"],
+                        "date": entry["date"],
+                        "candidates": [
+                            {
+                                "id": row.id,
+                                "amount": f"{Decimal(str(row.amount)):,.2f}",
+                                "counterparty": row.counterparty,
+                                "date": (
+                                    row.transaction_date.strftime("%d/%m/%Y")
+                                    if row.transaction_date
+                                    else None
+                                ),
+                                "card_mask": row.card_mask,
+                            }
+                            for row in rows
+                        ],
+                    },
+                    chat_id,
+                )
+    except Exception as exc:
+        logger.warning("Settlement prompt failed: %s", exc)
