@@ -27,7 +27,10 @@ from telegram.ext import (
 from sqlalchemy.exc import OperationalError
 
 from financial_dashboard.db import Transaction, async_session
-from financial_dashboard.services.settings import get_telegram_chat_id
+from financial_dashboard.services.settings import (
+    get_telegram_chat_id,
+    should_notify_transactions,
+)
 
 
 class SettlementCallback(NamedTuple):
@@ -605,6 +608,19 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
         await query.edit_message_text(text)
     except Exception as exc:
         logger.warning("SMS duplicate callback edit failed: %s", exc)
+
+    # A new row gets the notification a new SMS gets, so its note and
+    # category can be set.
+    if result.notification is not None and should_notify_transactions():
+        try:
+            await send_transaction_notification(
+                result.transaction_id,
+                result.notification,
+                get_telegram_chat_id(),
+                source="sms",
+            )
+        except Exception as exc:
+            logger.warning("SMS duplicate notification failed: %s", exc)
 
     if result.pending_payment_check is not None:
         from financial_dashboard.services.reminders import check_payment_received

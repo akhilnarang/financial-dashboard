@@ -36,6 +36,7 @@ class SmsDuplicateResolutionResult(NamedTuple):
     transaction_id: int
     pending_payment_check: tuple[int, int, Decimal] | None = None
     pending_disambiguation: dict | None = None
+    notification: dict | None = None
 
 
 async def _lock_sms(session: AsyncSession, sms_id: int) -> SmsMessage | None:
@@ -179,6 +180,7 @@ async def _resolve_create_new(
         outcome.transaction_id,
         outcome.pending_payment_check,
         outcome.pending_disambiguation,
+        outcome.primary_notification,
     )
 
 
