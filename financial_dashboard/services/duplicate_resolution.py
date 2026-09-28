@@ -431,6 +431,7 @@ async def resolve_email_duplicate(
                         "bank": evaluation.target.bank,
                         "direction": evaluation.target.direction,
                         "amount": evaluation.target.amount,
+                        "currency": evaluation.target.currency,
                         "counterparty": evaluation.target.counterparty,
                         "transaction_date": evaluation.target.transaction_date,
                         "transaction_time": evaluation.target.transaction_time,

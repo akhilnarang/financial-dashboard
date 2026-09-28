@@ -328,6 +328,7 @@ async def test_apply_enriches_existing_row_atomically_without_payment_or_duplica
                 "bank": "testbank",
                 "direction": "debit",
                 "amount": Decimal("42.15"),
+                "currency": "INR",
                 "counterparty": "Synthetic Shop",
                 "transaction_date": datetime.date(2030, 1, 2),
                 "transaction_time": datetime.time(10, 4),

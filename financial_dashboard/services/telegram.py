@@ -309,15 +309,20 @@ async def send_bulk_summary(
             lines.append(" \u00b7 ".join(detail_parts))
 
         if txns:
-            debits = [t for _, t in txns if t.get("direction") == "debit"]
-            credits = [t for _, t in txns if t.get("direction") == "credit"]
             parts = []
-            if debits:
-                total = sum(float(t.get("amount", 0)) for t in debits)
-                parts.append(f"{len(debits)} debits (\u20b9{total:,.2f})")
-            if credits:
-                total = sum(float(t.get("amount", 0)) for t in credits)
-                parts.append(f"{len(credits)} credits (\u20b9{total:,.2f})")
+            for direction in ("debit", "credit"):
+                rows = [t for _, t in txns if t.get("direction") == direction]
+                if not rows:
+                    continue
+                # Each currency gets its own total. A sum across currencies has no meaning.
+                totals: dict[str, Decimal] = {}
+                for t in rows:
+                    code = (t.get("currency") or "INR").strip().upper()
+                    totals[code] = totals.get(code, Decimal(0)) + Decimal(
+                        str(t.get("amount", 0))
+                    )
+                money = " + ".join(format_money(v, k) for k, v in totals.items())
+                parts.append(f"{len(rows)} {direction}s ({money})")
             if parts:
                 lines.append(" \u00b7 ".join(parts))
 
@@ -519,12 +524,14 @@ async def send_sms_duplicate_disambiguation_prompt(payload: dict, chat_id: int) 
     ]
     bank = html.escape(str(payload.get("bank", "")).upper())
     direction = html.escape(str(payload.get("direction", "")).upper())
-    amount = html.escape(f"{Decimal(str(payload.get('amount', 0))):,.2f}")
+    money = format_money(
+        Decimal(str(payload.get("amount", 0))), payload.get("currency")
+    )
     counterparty = html.escape(str(payload.get("counterparty") or ""))
     transaction_date = html.escape(str(payload.get("transaction_date") or ""))
     lines = [
         f"⚠️ <b>{bank}</b> {direction} SMS #{sms_id}",
-        f"₹{amount}" + (f" · {counterparty}" if counterparty else ""),
+        money + (f" · {counterparty}" if counterparty else ""),
     ]
     if transaction_date:
         lines.append(transaction_date)

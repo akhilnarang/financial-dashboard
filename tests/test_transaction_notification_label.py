@@ -132,3 +132,23 @@ async def test_notification_label_handles_unlinked_transaction(session):
     assert account_obj is None
     assert card_obj is None
     assert build_account_label(account_obj, card_obj) == ""
+
+
+@pytest.mark.anyio
+async def test_notification_payload_keeps_a_foreign_currency(session):
+    from financial_dashboard.services.sms_pipeline import _notification_payload
+    from financial_dashboard.services.telegram import format_money
+
+    txn = Transaction(
+        bank="hsbc",
+        email_type="hsbc_cc_transaction_alert",
+        direction="debit",
+        amount=Decimal("100.00"),
+        currency="EUR",
+    )
+    session.add(txn)
+    await session.flush()
+
+    payload = await _notification_payload(txn, session)
+
+    assert format_money(payload["amount"], payload["currency"]) == "EUR 100.00"

@@ -307,6 +307,29 @@ async def test_foreign_currency_amount_is_not_shown_in_rupees():
     assert "₹" not in captured["text"]
 
 
+@pytest.mark.anyio
+async def test_bulk_summary_totals_each_currency_apart():
+    from financial_dashboard.services.telegram import send_bulk_summary
+
+    captured = {}
+
+    async def fake_send(app, *, chat_id, text):
+        captured["text"] = text
+
+    txns = [
+        (1, {"direction": "debit", "amount": Decimal("100.00"), "currency": "INR"}),
+        (2, {"direction": "debit", "amount": Decimal("50.00"), "currency": None}),
+        (3, {"direction": "debit", "amount": Decimal("12.34"), "currency": "USD"}),
+    ]
+    with patch("financial_dashboard.services.telegram.tg_app", new=object()):
+        with patch(
+            "financial_dashboard.services.telegram._send_with_retry",
+            new=AsyncMock(side_effect=fake_send),
+        ):
+            await send_bulk_summary(3, 12345, source="email", txns=txns)
+    assert "3 debits (₹150.00 + USD 12.34)" in captured["text"]
+
+
 def test_format_money_defaults_to_rupees():
     from financial_dashboard.services.telegram import format_money
 
