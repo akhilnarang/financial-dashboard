@@ -152,7 +152,8 @@ class CategoryProposal(StrictModel):
     outcome: Literal["category_proposal"]
     transaction_id: StrictInt = Field(gt=0)
     explanation: StrictStr = Field(min_length=1, max_length=500)
-    candidates: list[CategoryCandidate] = Field(min_length=2, max_length=3)
+    # The application offers one guessed category after a shorthand note.
+    candidates: list[CategoryCandidate] = Field(min_length=1, max_length=3)
 
     @field_validator("candidates")
     @classmethod

@@ -234,7 +234,14 @@ async def test_nonfinite_amount_filter_becomes_deliverable_error(session):
 
 
 @pytest.mark.anyio
-async def test_confirmation_text_is_rendered_from_validated_action(session):
+async def test_confirmation_text_is_rendered_from_validated_action(
+    session, monkeypatch
+):
+    # The model sees a redacted name. The question must show the stored pattern
+    # that the rule writes.
+    monkeypatch.setitem(
+        settings_service._cache, "categorization.hidden_identifiers", "Basket"
+    )
     session.add(Category(slug="groceries", active=True))
     transaction = Transaction(
         bank="hdfc",

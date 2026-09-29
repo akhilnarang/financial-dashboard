@@ -4,8 +4,10 @@ This module deliberately knows nothing about Telegram update objects.  The
 transport resolves the trusted reply target and passes it here.
 """
 
+import asyncio
 import json
 import datetime
+import logging
 import re
 from decimal import Decimal, InvalidOperation
 from collections.abc import Awaitable, Callable, Sequence
@@ -37,6 +39,7 @@ from financial_dashboard.services.assistant.contracts import (
     Answer,
     ApplyTransactionChanges,
     AssistantResponse,
+    CategoryCandidate,
     CategoryProposal,
     Clarification,
     Error,
@@ -61,6 +64,7 @@ from financial_dashboard.services.assistant.mutations import (
     MutationRejected,
     MutationResult,
     apply_transaction_changes,
+    unnamed_shorthand_category,
 )
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.provider import (
@@ -84,6 +88,14 @@ from financial_dashboard.services.categorization.decision_lifecycle import (
     supersede_active_decisions,
 )
 from financial_dashboard.services.categorization.normalize import normalize_text
+
+logger = logging.getLogger(__name__)
+
+# A turn must end inside the processing lease, so another worker does not
+# take it over while it runs.
+TURN_TIMEOUT_SECONDS = 180
+MAX_TURN_ATTEMPTS = 3
+
 
 _UNSUPPORTED_AGGREGATE = re.compile(
     r"\b(?:total|sum|average|breakdown)\b"
@@ -188,11 +200,15 @@ async def _lock_authorized_chat(
 
 def _confirmation_question(
     pending: MerchantRuleConfirmation,
-    target: AssistantTransaction,
+    counterparty: str | None,
 ) -> str:
-    """Render confirmations from validated application state, never model prose."""
+    """Render confirmations from validated application state, never model prose.
+
+    The pattern comes from the stored counterparty, so the user sees the rule
+    that the apply step writes.
+    """
     try:
-        pattern = derive_merchant_pattern(target.counterparty)
+        pattern = derive_merchant_pattern(counterparty)
     except ValueError as exc:
         raise MutationRejected(str(exc)) from exc
     return (
@@ -474,8 +490,14 @@ async def run_turn(
                     try:
                         if target is None:
                             raise MutationRejected("confirmation target is not trusted")
+                        stored = await session.get(Transaction, pending.transaction_id)
                         response = response.model_copy(
-                            update={"question": _confirmation_question(pending, target)}
+                            update={
+                                "question": _confirmation_question(
+                                    pending,
+                                    stored.counterparty if stored else None,
+                                )
+                            }
                         )
                         await _persist_pending(
                             session,
@@ -560,18 +582,47 @@ async def run_turn(
                     )
                 if mutation_calls:
                     call = mutation_calls[0]
-                    try:
-                        mutation = await apply_transaction_changes(
-                            session,
-                            call,
-                            current_user_message=user_message,
-                            interaction_id=interaction_id,
-                            direction_policy=_request_direction_policy(
-                                call, user_message, direction_policy
-                            ),
+                    guessed = await unnamed_shorthand_category(
+                        session, call, user_message
+                    )
+                    if guessed is not None:
+                        call = call.model_copy(
+                            update={
+                                "changes": call.changes.model_copy(
+                                    update={"category": None}
+                                )
+                            }
                         )
-                    except MutationRejected:
-                        raise
+                    mutation = await apply_transaction_changes(
+                        session,
+                        call,
+                        current_user_message=user_message,
+                        interaction_id=interaction_id,
+                        direction_policy=_request_direction_policy(
+                            call, user_message, direction_policy
+                        ),
+                    )
+                    if guessed is not None:
+                        proposal = CategoryProposal(
+                            outcome="category_proposal",
+                            transaction_id=call.transaction_id,
+                            explanation=f"Is '{guessed}' the right category?",
+                            candidates=[
+                                CategoryCandidate(
+                                    slug=guessed,
+                                    reason="Guessed from the note.",
+                                    confidence=0.5,
+                                )
+                            ],
+                        )
+                        try:
+                            decision_id = await _save_proposal(
+                                session, proposal, target, interaction_id
+                            )
+                        except MutationRejected:
+                            # The note is saved. An unsafe guess gets no button.
+                            return completed(response, mutation)
+                        return completed(proposal, mutation, decision_id)
             except MutationRejected:
                 return completed(
                     Error(
@@ -859,6 +910,8 @@ def _response_text(result: OrchestrationResult, transaction_id: int | None) -> s
         ]
         label = ", ".join(changed) or "transaction"
         text = f"Saved {label} for #{result.mutation.transaction_id}."
+        if isinstance(response, CategoryProposal):
+            text += f" {response.explanation}"
         if result.mutation.merchant_rule_pattern:
             text += (
                 f" Merchant rule '{result.mutation.merchant_rule_pattern}' uses "
@@ -1306,6 +1359,20 @@ async def resume_claimed_interactions(*, bot=None, limit: int = 50) -> int:
                 await mark_authorization_changed(session, interaction.id)
                 await session.commit()
                 continue
+            if interaction.attempts > MAX_TURN_ATTEMPTS:
+                logger.warning(
+                    "Assistant turn %s failed after %s attempts",
+                    interaction_id,
+                    MAX_TURN_ATTEMPTS,
+                )
+                interaction.status = "failed"
+                interaction.outcome = "error"
+                interaction.error_code = "too_many_attempts"
+                interaction.worker_token = None
+                interaction.processing_lease_until = None
+                await session.commit()
+                continue
+            attempt = interaction.attempts
             trigger = interaction.trigger
             conversation_id = interaction.conversation_id
             if conversation_id is None and trigger in {"ask", "reply", "attachment"}:
@@ -1347,38 +1414,47 @@ async def resume_claimed_interactions(*, bot=None, limit: int = 50) -> int:
                     await session.commit()
                     continue
             await session.commit()
-        if trigger == "attachment":
-            assert bot is not None and attachment_payload is not None
-            await _process_attachment_interaction(
-                bot=bot,
-                interaction_id=interaction_id,
-                worker_token=worker_token,
-                transaction_id=transaction_id,
-                recipient_chat_id=recipient_chat_id,
-                file_id=attachment_payload["file_id"],
-                declared_size=attachment_payload.get("declared_size"),
-                caption=caption,
+        try:
+            async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+                if trigger == "attachment":
+                    assert bot is not None and attachment_payload is not None
+                    await _process_attachment_interaction(
+                        bot=bot,
+                        interaction_id=interaction_id,
+                        worker_token=worker_token,
+                        transaction_id=transaction_id,
+                        recipient_chat_id=recipient_chat_id,
+                        file_id=attachment_payload["file_id"],
+                        declared_size=attachment_payload.get("declared_size"),
+                        caption=caption,
+                    )
+                elif trigger in {"category_button", "undo"}:
+                    await _process_callback_interaction(
+                        interaction_id=interaction_id,
+                        worker_token=worker_token,
+                        trigger=trigger,
+                        callback_data=user_text,
+                        recipient_chat_id=recipient_chat_id,
+                        physical_message_id=interaction.inbound_message_id,
+                    )
+                else:
+                    assert conversation_id is not None
+                    await _process_text_interaction(
+                        interaction_id=interaction_id,
+                        worker_token=worker_token,
+                        conversation_id=conversation_id,
+                        transaction_id=transaction_id,
+                        user_text=user_text,
+                        replied_to_interaction_id=replied_to_interaction_id,
+                        recipient_chat_id=recipient_chat_id,
+                    )
+        except Exception:
+            # The lease expires and a later cycle retries the turn. One bad
+            # turn must not stop the turns and deliveries after it.
+            logger.exception(
+                "Assistant turn %s failed on attempt %s", interaction_id, attempt
             )
-        elif trigger in {"category_button", "undo"}:
-            await _process_callback_interaction(
-                interaction_id=interaction_id,
-                worker_token=worker_token,
-                trigger=trigger,
-                callback_data=user_text,
-                recipient_chat_id=recipient_chat_id,
-                physical_message_id=interaction.inbound_message_id,
-            )
-        else:
-            assert conversation_id is not None
-            await _process_text_interaction(
-                interaction_id=interaction_id,
-                worker_token=worker_token,
-                conversation_id=conversation_id,
-                transaction_id=transaction_id,
-                user_text=user_text,
-                replied_to_interaction_id=replied_to_interaction_id,
-                recipient_chat_id=recipient_chat_id,
-            )
+            continue
         resumed += 1
     return resumed
 
@@ -1499,30 +1575,32 @@ async def handle_telegram_update(update, context, *, trigger: str) -> None:
             return
         await session.commit()
 
-    if trigger == "attachment":
-        await _process_attachment_interaction(
-            bot=context.bot,
+    async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+        if trigger == "attachment":
+            await _process_attachment_interaction(
+                bot=context.bot,
+                interaction_id=interaction.id,
+                worker_token=worker_token,
+                transaction_id=transaction_id,
+                recipient_chat_id=message.chat.id,
+                file_id=media.file_id,
+                declared_size=media.file_size,
+                caption=message.caption,
+            )
+            return
+
+    async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+        await _process_text_interaction(
             interaction_id=interaction.id,
             worker_token=worker_token,
+            conversation_id=conversation.id,
             transaction_id=transaction_id,
+            user_text=user_text,
+            replied_to_interaction_id=(
+                mapped.interaction_id if mapped is not None else None
+            ),
             recipient_chat_id=message.chat.id,
-            file_id=media.file_id,
-            declared_size=media.file_size,
-            caption=message.caption,
         )
-        return
-
-    await _process_text_interaction(
-        interaction_id=interaction.id,
-        worker_token=worker_token,
-        conversation_id=conversation.id,
-        transaction_id=transaction_id,
-        user_text=user_text,
-        replied_to_interaction_id=(
-            mapped.interaction_id if mapped is not None else None
-        ),
-        recipient_chat_id=message.chat.id,
-    )
 
 
 async def _process_attachment_interaction(
@@ -1955,12 +2033,13 @@ async def _handle_assistant_callback(update, context, *, trigger: str) -> None:
         assert interaction is not None
         interaction_id = interaction.id
         await session.commit()
-    await _process_callback_interaction(
-        interaction_id=interaction_id,
-        worker_token=worker_token,
-        trigger=trigger,
-        callback_data=query.data,
-        recipient_chat_id=message.chat.id,
-        physical_message_id=message.message_id,
-    )
+    async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+        await _process_callback_interaction(
+            interaction_id=interaction_id,
+            worker_token=worker_token,
+            trigger=trigger,
+            callback_data=query.data,
+            recipient_chat_id=message.chat.id,
+            physical_message_id=message.message_id,
+        )
     await query.answer()

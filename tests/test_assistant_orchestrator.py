@@ -8,6 +8,7 @@ from financial_dashboard.db.models import (
 )
 from financial_dashboard.services.assistant.contracts import (
     Answer,
+    CategoryProposal,
     Error,
     ToolCalls,
 )
@@ -17,6 +18,7 @@ from financial_dashboard.services.assistant.orchestrator import (
     run_turn,
 )
 from financial_dashboard.services.assistant.provider import StructuredResult
+from financial_dashboard.services.categorization.vocabulary import ensure_category
 
 
 class FakeProvider:
@@ -69,6 +71,45 @@ async def test_orchestrator_refuses_unsupported_aggregate_questions(session):
     assert result.response.outcome == "error"
     assert result.response.code == "unsupported_aggregate"
     assert provider.calls == 0
+
+
+@pytest.mark.anyio
+async def test_shorthand_note_offers_an_unnamed_category_as_a_button(session):
+    await ensure_category(session, "food")
+    txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
+    session.add(txn)
+    await session.flush()
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": txn.id,
+                        "changes": {
+                            "note": {"op": "set", "value": "lunch with a friend"},
+                            "category": {"op": "set", "value": "food"},
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    result = await run_turn(
+        session,
+        provider,
+        user_message="This was lunch with a friend",
+        transaction_id=txn.id,
+    )
+
+    assert result.mutation is not None
+    assert result.mutation.after["note"] == "lunch with a friend"
+    assert result.mutation.after["category"] is None
+    assert isinstance(result.response, CategoryProposal)
+    assert [c.slug for c in result.response.candidates] == ["food"]
+    assert result.decision_id is not None
 
 
 @pytest.mark.anyio

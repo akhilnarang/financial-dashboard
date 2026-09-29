@@ -110,10 +110,11 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(memdb, monkeypa
     async with memdb() as s:
         row = (await s.scalars(select(Transaction))).one()
         assert row.category == "expense"
-        assert row.review_status == "pending"
+        # The same candidates reuse the sent prompt instead of sending it again.
+        assert row.review_status == "notified"
         assert row.category_vocab_version == 2
         decisions = (await s.scalars(select(CategoryReviewDecision))).all()
-        assert [decision.status for decision in decisions] == ["superseded", "active"]
+        assert [decision.status for decision in decisions] == ["active"]
         row.category_method = "manual"
         row.category_vocab_version = 1
         row.review_status = "notified"

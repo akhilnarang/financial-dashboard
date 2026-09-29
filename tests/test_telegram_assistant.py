@@ -198,8 +198,9 @@ def test_custom_bot_api_derives_matching_file_endpoint():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("expired", [False, True])
-async def test_claimed_turn_resumes_once_after_restart(session, monkeypatch, expired):
+@pytest.mark.parametrize("state", ["fresh", "expired", "worn_out"])
+async def test_claimed_turn_resumes_once_after_restart(session, monkeypatch, state):
+    expired = state == "expired"
     conversation = TelegramConversation(
         chat_id=77,
         started_by="ask",
@@ -217,6 +218,7 @@ async def test_claimed_turn_resumes_once_after_restart(session, monkeypatch, exp
         conversation_id=conversation.id,
         user_text="why was the last transaction held?",
         status="claimed",
+        attempts=3 if state == "worn_out" else 0,
     )
     session.add(interaction)
     await session.commit()
@@ -235,11 +237,15 @@ async def test_claimed_turn_resumes_once_after_restart(session, monkeypatch, exp
         resume_claimed_interactions,
     )
 
-    assert await resume_claimed_interactions() == 1
+    assert await resume_claimed_interactions() == (0 if state == "worn_out" else 1)
     assert await resume_claimed_interactions() == 0
 
     async with maker() as verification:
         saved = await verification.get(AuditInteraction, interaction.id)
+    if state == "worn_out":
+        # A turn that keeps failing must stop. It must not retry forever.
+        assert (saved.status, saved.error_code) == ("failed", "too_many_attempts")
+        return
     assert saved.status == "ready_to_send"
     if expired:
         assert saved.outcome == "error"

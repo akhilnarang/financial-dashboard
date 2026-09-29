@@ -10,6 +10,7 @@ from financial_dashboard.db.models import (
     Account,
     AuditAction,
     AuditInteraction,
+    CategoryReviewDecision,
     Transaction,
     Setting,
     utc_now,
@@ -310,6 +311,13 @@ async def categorize_one(
             stale=True,
         )
         return "skip"
+    was_notified = txn.review_status == "notified"
+    active_decision_id = await session.scalar(
+        select(CategoryReviewDecision.id).where(
+            CategoryReviewDecision.transaction_id == txn.id,
+            CategoryReviewDecision.status == "active",
+        )
+    )
     txn.category_method = "llm"
     txn.category_model = _active_model_name()
     txn.category_confidence = result.confidence
@@ -362,10 +370,6 @@ async def categorize_one(
         gate_reason=gate_reason,
     )
     if txn.review_status == "pending":
-        # A new model attempt needs a fresh review and delivery, even if its
-        # candidates match an earlier, already-notified decision.
-        await supersede_active_decisions(session, txn.id)
-        txn.notify_attempts = 0
         compatible_candidates = [
             candidate
             for candidate in candidates_from_result(result)
@@ -374,7 +378,7 @@ async def categorize_one(
             ).slug
             == candidate["category"]
         ]
-        await create_or_reuse_decision(
+        decision = await create_or_reuse_decision(
             session,
             txn,
             candidates=compatible_candidates,
@@ -383,6 +387,12 @@ async def categorize_one(
             confidence=result.confidence,
             threshold=threshold,
         )
+        if was_notified and active_decision_id in (None, decision.id):
+            # The user already has a prompt with the same candidates. A row
+            # notified before decisions existed also keeps its old prompt.
+            txn.review_status = "notified"
+        else:
+            txn.notify_attempts = 0
     return "llm"
 
 

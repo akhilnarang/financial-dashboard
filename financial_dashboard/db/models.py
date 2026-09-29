@@ -815,6 +815,9 @@ class AuditInteraction(Base):
         String, nullable=False, default="claimed", server_default="claimed", index=True
     )
     outcome: Mapped[str | None] = mapped_column(String)
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     worker_token: Mapped[str | None] = mapped_column(String)
     processing_lease_until: Mapped[datetime.datetime | None] = mapped_column(DateTime)
     assistant_text: Mapped[str | None] = mapped_column(Text)

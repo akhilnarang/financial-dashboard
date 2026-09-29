@@ -124,6 +124,7 @@ async def claim_processing(
                 worker_token=token,
                 processing_lease_until=until,
                 processing_at=now,
+                attempts=AuditInteraction.attempts + 1,
             )
             .execution_options(synchronize_session="fetch")
         ),

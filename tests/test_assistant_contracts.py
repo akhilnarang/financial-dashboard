@@ -31,13 +31,14 @@ def test_extra_fields_and_unknown_tools_fail_closed():
         )
 
 
-def test_category_proposal_requires_two_or_three_unique_candidates():
+def test_category_proposal_requires_unique_candidates():
+    candidate = {"slug": "groceries", "reason": "a", "confidence": 0.5}
     with pytest.raises(ValidationError):
         parse_response(
             {
                 "outcome": "category_proposal",
                 "transaction_id": 1,
                 "explanation": "uncertain",
-                "candidates": [{"slug": "groceries", "reason": "a", "confidence": 0.5}],
+                "candidates": [candidate, candidate],
             }
         )

@@ -2,12 +2,13 @@
 
 import re
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import (
     AuditInteraction,
     CategoryReviewDecision,
+    TelegramConversation,
     TelegramMessageContext,
     TelegramOutboundDelivery,
 )
@@ -132,3 +133,28 @@ async def record_physical_message(
     session.add(row)
     await session.flush()
     return row
+
+
+async def move_transaction_references(
+    session: AsyncSession, old_id: int, new_id: int
+) -> None:
+    """Point reply mappings at the row that survives a fold.
+
+    SQLite can give a deleted transaction id to a new row. A reply to an old
+    message must not reach that new row.
+
+    Args:
+        session: The session that deletes the old row.
+        old_id: The id of the transaction to delete.
+        new_id: The id of the transaction that keeps the data.
+    """
+    for model in (
+        TelegramConversation,
+        TelegramMessageContext,
+        TelegramOutboundDelivery,
+    ):
+        await session.execute(
+            update(model)
+            .where(model.transaction_id == old_id)
+            .values(transaction_id=new_id)
+        )

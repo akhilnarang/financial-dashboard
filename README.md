@@ -755,6 +755,7 @@ erDiagram
         string provider
         string model
         string prompt_version
+        int attempts
         string output_mode
         text assistant_text
         int input_tokens

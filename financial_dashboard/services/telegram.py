@@ -15,8 +15,8 @@ from typing import Literal, NamedTuple, TypedDict
 from datetime import timedelta
 from typing import cast
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import NetworkError, RetryAfter
+from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -900,6 +900,18 @@ async def send_sms_duplicate_disambiguation_prompt(payload: dict, chat_id: int) 
     )
 
 
+async def _answer_after_commit(query: CallbackQuery) -> None:
+    """Answer a tap whose work is already committed.
+
+    Telegram rejects an answer to an old tap, for example one replayed after a
+    restart. The follow-up work must still run, so log the error and continue.
+    """
+    try:
+        await query.answer()
+    except TelegramError as exc:
+        logger.info("Late callback answer failed: %s", exc)
+
+
 async def _handle_sms_duplicate_callback(update: Update, context) -> None:
     """Resolve an authorized deferred SMS duplicate callback."""
     query = update.callback_query
@@ -936,7 +948,7 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
         await query.answer("Busy, try again")
         return
 
-    await query.answer()
+    await _answer_after_commit(query)
     if result.status == "already_resolved":
         text = f"Already resolved as #{result.transaction_id}"
     elif result.status == "merged":
@@ -1091,7 +1103,7 @@ async def _handle_settlement_callback(
         await query.answer("Busy, try again")
         return
 
-    await query.answer()
+    await _answer_after_commit(query)
 
     if result.outcome == "merged":
         text = f"Folded into #{result.transaction_id}"

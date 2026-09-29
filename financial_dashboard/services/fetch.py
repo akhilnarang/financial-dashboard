@@ -55,11 +55,15 @@ async def run_categorization_cycle() -> None:
             is_telegram_assistant_enabled,
         )
 
-        if is_telegram_assistant_enabled():
-            await resume_claimed_interactions(
-                bot=telegram.tg_app.bot if telegram.tg_app is not None else None
-            )
-            await telegram.dispatch_pending_deliveries()
+        if not is_telegram_assistant_enabled():
+            return
+        await resume_claimed_interactions(
+            bot=telegram.tg_app.bot if telegram.tg_app is not None else None
+        )
+    except Exception:
+        logger.exception("Assistant turn recovery failed")
+    try:
+        await telegram.dispatch_pending_deliveries()
     except Exception:
         logger.exception("Assistant delivery recovery failed")
 

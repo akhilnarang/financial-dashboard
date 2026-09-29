@@ -88,35 +88,28 @@ def _category_assignment_is_negated(text: str) -> bool:
 
 
 def _cashflow_polarity_is_explicit(text: str, excluded: bool) -> bool:
+    flow = r"(?:\s+\w+){0,4}?\s+(?:cash\s?)?flow\b"
     negative_exclude = bool(
-        re.search(
-            rf"\b{_NEGATION}\b"
-            r"(?:\s+\w+){0,5}\s+exclude(?:d)?\b",
-            text,
-        )
+        re.search(rf"\b{_NEGATION}\b(?:\s+\w+){{0,5}}\s+exclude(?:d)?\b", text)
     )
     negative_include = bool(
-        re.search(
-            rf"\b{_NEGATION}\b"
-            r"(?:\s+\w+){0,5}\s+include(?:d)?\b",
-            text,
-        )
+        re.search(rf"\b{_NEGATION}\b(?:\s+\w+){{0,5}}\s+include(?:d)?\b", text)
     )
     if excluded:
         if negative_exclude:
             return False
         return bool(
-            re.search(r"\bexclude(?:d)?\b", text)
-            or re.search(r"\bremove\b.{0,32}\bcash ?flow\b", text)
-            or negative_include
+            re.search(rf"\b(?:exclude(?:d)?|remove)\b{flow}", text)
+            or re.search(
+                rf"\b{_NEGATION}\b(?:\s+\w+){{0,5}}\s+include(?:d)?\b{flow}", text
+            )
             or re.search(r"\bcash ?flow exclusion\b.{0,16}\b(?:on|true|yes)\b", text)
         )
     if negative_include:
         return False
     return bool(
-        re.search(r"\binclude(?:d)?\b", text)
-        or re.search(r"\b(?:add|restore|count)\b.{0,32}\bcash ?flow\b", text)
-        or negative_exclude
+        re.search(rf"\b(?:include(?:d)?|add|restore|count)\b{flow}", text)
+        or re.search(rf"\b{_NEGATION}\b(?:\s+\w+){{0,5}}\s+exclude(?:d)?\b{flow}", text)
         or re.search(r"\bcash ?flow exclusion\b.{0,16}\b(?:off|false|no)\b", text)
     )
 
@@ -135,6 +128,37 @@ async def _category_evidence(
         if resolved == category:
             return spelling
     return category
+
+
+async def unnamed_shorthand_category(
+    session: AsyncSession,
+    request: ApplyTransactionChanges,
+    current_user_message: str,
+) -> str | None:
+    """Return a category that a shorthand note implies but does not name.
+
+    The caller must offer this category as a button. It must not write it.
+
+    Args:
+        session: The session of the current turn.
+        request: The patch that the model returned.
+        current_user_message: The text of the current turn.
+
+    Returns:
+        The implied category slug, or None when the message names it or the
+        turn is not a shorthand note.
+    """
+    patch = request.changes.category
+    if patch is None or patch.op != "set" or not patch.value:
+        return None
+    instruction = parse_instruction(current_user_message.strip())
+    if not instruction.note_shorthand:
+        return None
+    evidence = await _category_evidence(session, instruction.text, patch.value)
+    value = normalize_text(evidence).replace("_", " ")
+    if mentions_category(normalize_text(current_user_message), value):
+        return None
+    return patch.value
 
 
 async def _validate_ordinary_intent(
@@ -202,9 +226,12 @@ async def _validate_ordinary_intent(
                 raise MutationRejected(
                     "negated instructions cannot change transaction data"
                 )
-            if not instruction.note_shorthand and not mentions_category(
-                normalized, value
-            ):
+            # A shorthand note moves text out of the instruction. The category
+            # must still appear somewhere in the message.
+            evidence_text = (
+                normalize_text(raw) if instruction.note_shorthand else normalized
+            )
+            if not mentions_category(evidence_text, value):
                 raise MutationRejected(
                     "category value must be supported by the current message"
                 )

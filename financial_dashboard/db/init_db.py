@@ -213,6 +213,15 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                 text("ALTER TABLE audit_interactions ADD COLUMN output_mode TEXT")
             )
         try:
+            await conn.execute(text("SELECT attempts FROM audit_interactions LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE audit_interactions "
+                    "ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            )
+        try:
             await conn.execute(
                 text("SELECT exclude_from_cashflow FROM transactions LIMIT 0")
             )

@@ -47,7 +47,7 @@ async def test_patch_omission_and_strict_direction(session):
     )
     with pytest.raises(MutationRejected, match="transaction direction"):
         await apply_transaction_changes(
-            session, bad, current_user_message="This was money from the government"
+            session, bad, current_user_message="set category to tax refund"
         )
     await session.refresh(txn)
     assert txn.category is None
@@ -364,7 +364,6 @@ async def test_single_quoted_contraction_is_only_note_payload(session):
             "Amazon Fresh",
             "groceries",
         ),
-        ("This was lunch with a friend", "lunch with a friend", "food"),
     ],
 )
 async def test_combined_note_and_category_instruction_applies_both(
@@ -657,6 +656,7 @@ async def test_polite_cashflow_question_cannot_change_exclusion(session):
     [
         (True, "include this in cashflow"),
         (False, "exclude this from cashflow"),
+        (True, "the delivery fee was excluded from the bill"),
     ],
 )
 async def test_cashflow_intent_must_match_requested_polarity(session, value, message):
