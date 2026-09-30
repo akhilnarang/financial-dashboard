@@ -91,8 +91,8 @@ def _projection(
         category_confidence=row.category_confidence,
         category_model=_bounded(row.category_model),
         review_status=_bounded(row.review_status),
-        review_reason=_redacted(row.review_reason, name_tokens),
-        review_gate_reason=_redacted(review_gate_reason, name_tokens),
+        review_reason=_bounded(row.review_reason),
+        review_gate_reason=_bounded(review_gate_reason),
     )
 
 

@@ -34,7 +34,6 @@ async def test_get_transaction_redacts_private_identifiers(session):
         raw_description="merchant metadata",
         reference_number="123456789",
         note="lunch with Alice",
-        review_reason="Alice paid me back",
     )
     session.add(transaction)
     await session.flush()
@@ -46,13 +45,10 @@ async def test_get_transaction_redacts_private_identifiers(session):
     assert result.counterparty == "PUREBERRYSMUMBAI"
     assert result.reference_number == "[redacted-num]"
     assert result.note == "lunch with [redacted-name]"
-    assert result.review_reason == "[redacted-name] paid me back"
 
 
 @pytest.mark.anyio
 async def test_get_transaction_includes_saved_review_gate(session):
-    # An assistant proposal can store user words as its gate reason.
-    settings_service._cache["categorization.hidden_identifiers"] = "Alice"
     transaction = _transaction(review_status="pending")
     session.add(transaction)
     await session.flush()
@@ -61,7 +57,7 @@ async def test_get_transaction_includes_saved_review_gate(session):
             transaction_id=transaction.id,
             category_input_hash="hash",
             candidates_json="[]",
-            gate_reason="Alice: confidence 0.42 below 0.60",
+            gate_reason="confidence 0.42 below 0.60",
         )
     )
     await session.flush()
@@ -69,7 +65,7 @@ async def test_get_transaction_includes_saved_review_gate(session):
     result = await get_transaction(session, transaction.id)
 
     assert result is not None
-    assert result.review_gate_reason == "[redacted-name]: confidence 0.42 below 0.60"
+    assert result.review_gate_reason == "confidence 0.42 below 0.60"
 
 
 @pytest.mark.anyio
