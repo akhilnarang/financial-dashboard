@@ -11,7 +11,6 @@ import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal, NamedTuple
-from zoneinfo import ZoneInfo
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +18,7 @@ from bank_sms_parser import parse_sms
 from bank_sms_parser.exceptions import ParseError, UnsupportedSmsTypeError
 from bank_sms_parser.models import ParsedSms
 
+from financial_dashboard.core.dates import IST
 from financial_dashboard.db import SmsMessage, Transaction
 from financial_dashboard.services.linker import LinkContext, link_transaction
 from financial_dashboard.services.txn_merge import (
@@ -28,8 +28,6 @@ from financial_dashboard.services.txn_merge import (
 )
 
 logger = logging.getLogger(__name__)
-
-_IST = ZoneInfo("Asia/Kolkata")
 
 
 @dataclass
@@ -78,7 +76,7 @@ def parsed_sms_to_txn_data(parsed: ParsedSms, sms_row: SmsMessage) -> dict | Non
         received_utc = sms_row.received_at
         if received_utc.tzinfo is None:
             received_utc = received_utc.replace(tzinfo=datetime.UTC)
-        ist = received_utc.astimezone(_IST)
+        ist = received_utc.astimezone(IST)
         if transaction_date is None:
             transaction_date = ist.date()
         if transaction_time is None:

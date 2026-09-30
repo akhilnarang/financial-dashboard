@@ -22,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from bank_email_parser.api import parse_email
 from bank_email_parser.exceptions import ParseError, UnsupportedEmailTypeError
 
+from financial_dashboard.core.dates import email_received_at_ist
 from financial_dashboard.db import Base, Email, Transaction, async_session, engine
 from financial_dashboard.services.emails import _disambiguate_am_pm
 from financial_dashboard.services.parser_quirks import (
@@ -148,7 +149,7 @@ def _process_eml(
         return None, None
     transaction_date = txn.transaction_date
     if transaction_date is None and received_at is not None:
-        transaction_date = received_at.date()
+        transaction_date = email_received_at_ist(received_at).date()
     transaction_time = txn.transaction_time
     if (
         transaction_time is not None

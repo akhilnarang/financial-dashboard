@@ -7,9 +7,12 @@ of next month minus a day") wherever a month window is needed.
 """
 
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from dateutil import parser
 from dateutil.relativedelta import relativedelta
+
+IST = ZoneInfo("Asia/Kolkata")
 
 # The trailing window every month-over-month chart on the site defaults to. One
 # name so the service, the route and the widget cannot drift to different
@@ -90,3 +93,21 @@ def format_ddmmyyyy(value: date | datetime | None) -> str:
     if isinstance(value, datetime):
         value = value.date()
     return value.strftime("%d/%m/%Y")
+
+
+def email_received_at_ist(received_at: datetime) -> datetime:
+    """Convert an email Date header to IST.
+
+    An email that arrives immediately after midnight IST has a different IST
+    date than its UTC date. A header with an unknown zone gives no time zone.
+    Such a header is IST.
+
+    Args:
+        received_at: The parsed Date header, aware or naive.
+
+    Returns:
+        The same moment as an aware IST datetime.
+    """
+    if received_at.tzinfo is None:
+        return received_at.replace(tzinfo=IST)
+    return received_at.astimezone(IST)

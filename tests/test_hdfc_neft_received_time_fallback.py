@@ -209,3 +209,24 @@ def test_a_parser_cannot_declare_a_nonsense_time_source():
 
             def parse(self, html):  # pragma: no cover
                 raise NotImplementedError
+
+
+def test_date_fallback_uses_ist_for_every_email_type():
+    """A body with no date gets the arrival date in IST. The slice repayment
+    email arrived at 01:23 IST. Its UTC date is one day earlier. The SMS for
+    the same repayment has the IST date. A UTC date made two rows."""
+    msg = EmailMessage()
+    msg["Subject"] = "Payment received for your slice credit card"
+    msg["From"] = "slice <noreply@slice.bank.in>"
+    # 19:53:15 UTC on the 29th == 01:23:15 IST on the 30th.
+    msg["Date"] = "Tue, 29 Sep 2026 19:53:15 +0000"
+    msg.set_content(
+        "<p>We&rsquo;ve received your repayment of &#8377; 1,234.56 for the "
+        "slice credit card.</p>",
+        subtype="html",
+    )
+    error, txn_data, _hint, _parsed = _process_email_full("slice", msg.as_bytes())
+    assert error is None, error
+    assert txn_data is not None
+    assert txn_data["transaction_date"] == datetime.date(2026, 9, 30)
+    assert txn_data["transaction_time"] is None
