@@ -49,12 +49,9 @@ async def classify(
         active_slugs=active_slugs,
         name_tokens=name_tokens,
     )
-    # Only the explicitly supported official model gets hosted search. Keep
-    # arbitrary OpenAI-compatible endpoints on their existing Chat contract.
-    search_enabled = model == "gpt-5.6-luna" and base_url.rstrip("/") in (
-        "",
-        "https://api.openai.com/v1",
-    )
+    # Only the official OpenAI API has the hosted web_search tool. Keep
+    # OpenAI-compatible endpoints on their existing Chat contract.
+    search_enabled = base_url.rstrip("/") in ("", "https://api.openai.com/v1")
     if search_enabled:
         prompt += (
             "\nIf uncertain specifically because a public merchant business is "

@@ -110,7 +110,7 @@ Unresolved LLM categorizations retry once after a vocabulary change, or when
 source enrichment changes the classifier input. Manual categories remain
 authoritative. These retries do not lower the confidence threshold.
 
-With `gpt-5.6-luna` on the official OpenAI endpoint, an uncertain classifier
+On the official OpenAI endpoint, an uncertain classifier
 can request a merchant-name lookup before asking for review. The lookup receives
 only the model-inferred merchant name and optional city, with the existing
 numeric-PII and configured-name redaction applied before search. The transaction
