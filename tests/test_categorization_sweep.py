@@ -53,14 +53,15 @@ async def test_rule_sweep_categorizes_interest_rows(memdb):
         assert row.category_method == "rule"
 
 
-@pytest.mark.parametrize("prompt", ["sent", "failed", "assistant"])
+@pytest.mark.parametrize("prompt", ["sent", "failed", "assistant", "assistant_failed"])
 async def test_sweeps_retry_review_once_after_vocabulary_changes(
     memdb, monkeypatch, prompt
 ):
-    prompt_failed = prompt == "failed"
+    prompt_failed = prompt in ("failed", "assistant_failed")
     from sqlalchemy import select
 
     from financial_dashboard.db.models import (
+        AuditInteraction,
         Category,
         CategoryReviewDecision,
         TelegramOutboundDelivery,
@@ -120,18 +121,27 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         row.review_status = "notified"
         s.add(Category(slug="groceries", active=True))
         decision = await s.scalar(select(CategoryReviewDecision))
-        if prompt == "assistant":
+        owner = {"category_review_decision_id": decision.id}
+        if prompt.startswith("assistant"):
             # An assistant proposal stores its candidates with "slug" keys.
+            # The interaction that made it owns its delivery.
             decision.candidates_json = json.dumps(
                 [
                     {"slug": "groceries", "reason": "r", "confidence": 0.4},
                     {"slug": "food", "reason": "r", "confidence": 0.2},
                 ]
             )
+            interaction = AuditInteraction(
+                inbound_chat_id=7, trigger="reply", status="delivery_failed"
+            )
+            s.add(interaction)
+            await s.flush()
+            decision.source_interaction_id = interaction.id
+            owner = {"interaction_id": interaction.id}
         if prompt_failed:
             s.add(
                 TelegramOutboundDelivery(
-                    category_review_decision_id=decision.id,
+                    **owner,
                     transaction_id=row.id,
                     recipient_chat_id=7,
                     text="Needs a category",

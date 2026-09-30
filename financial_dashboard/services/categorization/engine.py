@@ -313,16 +313,27 @@ async def categorize_one(
         )
         return "skip"
     was_notified = txn.review_status == "notified"
-    active_decision_id = await session.scalar(
-        select(CategoryReviewDecision.id).where(
-            CategoryReviewDecision.transaction_id == txn.id,
-            CategoryReviewDecision.status == "active",
+    active_decision = (
+        await session.execute(
+            select(
+                CategoryReviewDecision.id, CategoryReviewDecision.source_interaction_id
+            ).where(
+                CategoryReviewDecision.transaction_id == txn.id,
+                CategoryReviewDecision.status == "active",
+            )
         )
-    )
-    if active_decision_id is not None and await session.scalar(
+    ).first()
+    active_decision_id = active_decision.id if active_decision else None
+    # A background prompt owns its delivery. An assistant proposal is sent
+    # by the interaction that made it.
+    if active_decision is not None and await session.scalar(
         select(TelegramOutboundDelivery.id)
         .where(
-            TelegramOutboundDelivery.category_review_decision_id == active_decision_id,
+            (TelegramOutboundDelivery.category_review_decision_id == active_decision.id)
+            | (
+                TelegramOutboundDelivery.interaction_id
+                == active_decision.source_interaction_id
+            ),
             TelegramOutboundDelivery.status.in_(("abandoned", "cancelled")),
         )
         .limit(1)
