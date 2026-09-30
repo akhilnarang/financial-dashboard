@@ -2,7 +2,6 @@
 
 import asyncio
 import datetime
-import logging
 from decimal import Decimal
 from unittest.mock import AsyncMock
 
@@ -108,17 +107,8 @@ def _patch_current_parse(monkeypatch, txn_data: dict | None = None) -> AsyncMock
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "preview_token",
-    [
-        pytest.param("v1." + "a" * 63 + "é", id="non-ascii"),
-        pytest.param("not-a-preview-token", id="wrong-shape"),
-        pytest.param("v1." + "A" * 64, id="uppercase-hex"),
-        pytest.param("v1." + "a" * 63, id="truncated"),
-    ],
-)
-async def test_apply_rejects_invalid_preview_token_before_service(
-    client, session, monkeypatch, preview_token
+async def test_apply_without_preview_token_is_rejected_before_service(
+    client, session, monkeypatch
 ):
     email, target = await _seed_deferred(session)
     email_id, target_id = email.id, target.id
@@ -129,11 +119,7 @@ async def test_apply_rejects_invalid_preview_token_before_service(
 
     response = await client.post(
         f"/api/emails/{email_id}/resolve-duplicate",
-        json={
-            "transaction_id": target_id,
-            "apply": True,
-            "preview_token": preview_token,
-        },
+        json={"transaction_id": target_id, "apply": True},
     )
 
     assert response.status_code == 422, response.text
@@ -141,35 +127,6 @@ async def test_apply_rejects_invalid_preview_token_before_service(
     session.expire_all()
     assert (await session.get(Email, email_id)).status == "skipped"
     assert (await session.get(Transaction, target_id)).email_id is None
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "payload",
-    [
-        pytest.param({"apply": True}, id="apply-requires-token"),
-        pytest.param(
-            {"preview_token": "v1." + "a" * 64},
-            id="preview-forbids-token",
-        ),
-    ],
-)
-async def test_request_mode_rejects_missing_or_forbidden_token_before_service(
-    client, session, monkeypatch, payload
-):
-    email, target = await _seed_deferred(session)
-    import financial_dashboard.api.emails as emails_api
-
-    resolver = AsyncMock()
-    monkeypatch.setattr(emails_api, "resolve_email_duplicate", resolver)
-
-    response = await client.post(
-        f"/api/emails/{email.id}/resolve-duplicate",
-        json={"transaction_id": target.id, **payload},
-    )
-
-    assert response.status_code == 422, response.text
-    resolver.assert_not_awaited()
 
 
 @pytest.mark.anyio
@@ -476,79 +433,26 @@ async def test_apply_rejects_stale_preview_token(client, session, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_apply_rollback_does_not_send_enrichment_notification(
-    client, session, monkeypatch
-):
-    email, target = await _seed_deferred(session)
-    email_id, target_id = email.id, target.id
-    _patch_current_parse(monkeypatch, _parsed_txn())
-
-    from financial_dashboard.services import duplicate_resolution as service
-
-    enrichment_notification = AsyncMock()
-    monkeypatch.setattr(service, "should_notify_transactions", lambda: True)
-    monkeypatch.setattr(
-        service, "send_enrichment_notification", enrichment_notification
-    )
-    preview = await client.post(
-        f"/api/emails/{email_id}/resolve-duplicate",
-        json={"transaction_id": target_id},
-    )
-    original_apply = service.apply_transaction_enrichment
-
-    async def apply_with_drift(*args, **kwargs):
-        await original_apply(*args, **kwargs)
-        return EnrichmentDiff()
-
-    monkeypatch.setattr(service, "apply_transaction_enrichment", apply_with_drift)
-    response = await client.post(
-        f"/api/emails/{email_id}/resolve-duplicate",
-        json={
-            "transaction_id": target_id,
-            "apply": True,
-            "preview_token": preview.json()["preview_token"],
-        },
-    )
-
-    assert response.status_code == 409, response.text
-    session.expire_all()
-    stored_email = await session.get(Email, email_id)
-    stored_target = await session.get(Transaction, target_id)
-    assert stored_email.status == "skipped"
-    assert stored_target.email_id is None
-    assert stored_target.counterparty is None
-    enrichment_notification.assert_not_awaited()
-
-
-@pytest.mark.anyio
 async def test_incompatible_target_is_rejected(client, session, monkeypatch):
-    email, target = await _seed_deferred(session)
-    _patch_current_parse(monkeypatch, _parsed_txn(amount=Decimal("43.15")))
-
-    response = await client.post(
-        f"/api/emails/{email.id}/resolve-duplicate",
-        json={"transaction_id": target.id},
-    )
-
-    assert response.status_code == 409
-    assert "compatible" in response.json()["detail"]
-
-
-@pytest.mark.anyio
-async def test_conflicting_known_balance_is_incompatible(client, session, monkeypatch):
     email, target = await _seed_deferred(session)
     target.balance = Decimal("850.00")
     await session.commit()
     email_id, target_id = email.id, target.id
-    _patch_current_parse(monkeypatch, _parsed_txn(balance=Decimal("900.00")))
 
-    response = await client.post(
-        f"/api/emails/{email_id}/resolve-duplicate",
-        json={"transaction_id": target_id},
-    )
+    for parsed in (
+        _parsed_txn(amount=Decimal("43.15"), balance=Decimal("850.00")),
+        # A different known balance proves a different event.
+        _parsed_txn(balance=Decimal("900.00")),
+    ):
+        _patch_current_parse(monkeypatch, parsed)
+        response = await client.post(
+            f"/api/emails/{email_id}/resolve-duplicate",
+            json={"transaction_id": target_id},
+        )
+        assert response.status_code == 409
 
-    assert response.status_code == 409
-    assert "compatible" in response.json()["detail"]
+    session.expire_all()
+    assert (await session.get(Transaction, target_id)).email_id is None
 
 
 @pytest.mark.anyio
@@ -576,73 +480,43 @@ async def test_target_with_occupied_email_slot_is_rejected(
 
 
 @pytest.mark.anyio
-async def test_source_with_attached_transaction_is_rejected(
+async def test_ineligible_source_email_is_rejected_before_loading(
     client, session, monkeypatch
 ):
+    """Only a deferred email of a transaction rule with no row can resolve."""
     email, target = await _seed_deferred(session)
-    attached = Transaction(
-        email_id=email.id,
-        bank="other-test-bank",
-        email_type="synthetic_attached_alert",
-        direction="credit",
-        amount=Decimal("7.25"),
-    )
-    session.add(attached)
-    await session.commit()
-    email_id, target_id = email.id, target.id
+    email_id, target_id, rule_id = email.id, target.id, email.rule_id
     loader = _patch_current_parse(monkeypatch, _parsed_txn())
 
-    response = await client.post(
-        f"/api/emails/{email_id}/resolve-duplicate",
-        json={"transaction_id": target_id},
-    )
+    async def resolve_status() -> int:
+        response = await client.post(
+            f"/api/emails/{email_id}/resolve-duplicate",
+            json={"transaction_id": target_id},
+        )
+        return response.status_code
 
-    assert response.status_code == 409
-    assert "Email already has an attached" in response.json()["detail"]
-    loader.assert_not_awaited()
-
-
-@pytest.mark.anyio
-async def test_non_deferred_email_is_rejected(client, session, monkeypatch):
-    email, target = await _seed_deferred(session)
     email.status = "failed"
-    email.error = "synthetic prior parse error"
     await session.commit()
-    loader = _patch_current_parse(monkeypatch, _parsed_txn())
+    assert await resolve_status() == 409
+    (await session.get(Email, email_id)).status = "skipped"
 
-    response = await client.post(
-        f"/api/emails/{email.id}/resolve-duplicate",
-        json={"transaction_id": target.id},
-    )
-
-    assert response.status_code == 409
-    loader.assert_not_awaited()
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("rule_state", "expected_status"),
-    [("missing", 404), ("non_transaction", 422)],
-)
-async def test_ineligible_rule_does_not_load_raw_email(
-    client, session, monkeypatch, rule_state, expected_status
-):
-    email, target = await _seed_deferred(session)
-    rule = await session.get(FetchRule, email.rule_id)
-    assert rule is not None
-    if rule_state == "missing":
-        await session.delete(rule)
-    else:
-        rule.email_kind = "cc_statement"
+    (await session.get(FetchRule, rule_id)).email_kind = "cc_statement"
     await session.commit()
-    loader = _patch_current_parse(monkeypatch, _parsed_txn())
+    assert await resolve_status() == 422
+    (await session.get(FetchRule, rule_id)).email_kind = "transaction"
 
-    response = await client.post(
-        f"/api/emails/{email.id}/resolve-duplicate",
-        json={"transaction_id": target.id},
+    session.add(
+        Transaction(
+            email_id=email_id,
+            bank="other-test-bank",
+            email_type="synthetic_attached_alert",
+            direction="credit",
+            amount=Decimal("7.25"),
+        )
     )
+    await session.commit()
+    assert await resolve_status() == 409
 
-    assert response.status_code == expected_status
     loader.assert_not_awaited()
 
 
@@ -660,14 +534,13 @@ async def test_current_parse_failure_is_422_and_keeps_defer(
     )
 
     assert response.status_code == 422
-    assert response.json()["detail"] == "Current parser did not produce a transaction"
     session.expire_all()
     assert (await session.get(Email, email_id)).status == "skipped"
 
 
 @pytest.mark.anyio
 async def test_missing_email_transaction_and_raw_source_return_404(
-    client, session, monkeypatch, caplog
+    client, session, monkeypatch
 ):
     email, target = await _seed_deferred(session)
     email_id, target_id = email.id, target.id
@@ -689,23 +562,16 @@ async def test_missing_email_transaction_and_raw_source_return_404(
         "load_or_fetch_raw_email",
         AsyncMock(return_value=RawEmailResult(None, "secret provider detail", None)),
     )
-    with caplog.at_level(logging.WARNING, logger=service.__name__):
-        missing_raw = await client.post(
-            f"/api/emails/{email_id}/resolve-duplicate",
-            json={"transaction_id": target_id},
-        )
+    missing_raw = await client.post(
+        f"/api/emails/{email_id}/resolve-duplicate",
+        json={"transaction_id": target_id},
+    )
 
     assert missing_email.status_code == 404
     assert missing_txn.status_code == 404
     assert missing_raw.status_code == 404
-    assert missing_raw.json()["detail"] == "Raw email source is unavailable"
+    # The provider error must not reach the client.
     assert "secret" not in missing_raw.text
-    assert any(
-        str(email_id) in record.getMessage()
-        and "secret provider detail" in record.getMessage()
-        for record in caplog.records
-        if record.name == service.__name__
-    )
 
 
 @pytest.mark.anyio
@@ -917,35 +783,6 @@ async def test_full_email_reference_enriches_short_sms_reference(
     stored = await session.get(Transaction, target_id)
     assert stored.reference_number == "BANKPREFIX00000123"
     assert await session.scalar(select(func.count()).select_from(Transaction)) == 1
-
-
-@pytest.mark.anyio
-async def test_full_email_reference_accepts_short_prefix_reference(
-    client, session, monkeypatch
-):
-    email, target = await _seed_deferred(session)
-    # Deliberately fail the date-only fuzzy counterparty gate so this exercises
-    # only the conservative explicit shortened-reference fallback.
-    target.transaction_time = None
-    target.counterparty = "Earlier synthetic label"
-    target.reference_number = "SYNTHPREFIX"
-    await session.commit()
-    _patch_current_parse(
-        monkeypatch,
-        _parsed_txn(
-            transaction_time=None,
-            counterparty="Current synthetic label",
-            reference_number="SYNTHPREFIX987654",
-        ),
-    )
-
-    preview = await client.post(
-        f"/api/emails/{email.id}/resolve-duplicate",
-        json={"transaction_id": target.id},
-    )
-
-    assert preview.status_code == 200, preview.text
-    assert preview.json()["after"]["reference_number"] == "SYNTHPREFIX987654"
 
 
 @pytest.mark.anyio

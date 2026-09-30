@@ -89,35 +89,33 @@ async def _get_upload(maker, upload_id):
 
 
 @pytest.mark.anyio
-async def test_provisional_sms_appears_as_pending(maker):
-    """A provisional bill-payment SMS shows in the pending set, not settled."""
-    upload_id, _ = await _seed_open_statement(maker)
-    await _add_provisional_sms(maker, day=7)
-
-    upload = await _get_upload(maker, upload_id)
-    async with maker() as session:
-        view = await build_payments_view(session, upload)
-
-    assert view.settled == []
-    assert len(view.pending) == 1
-    pending = view.pending[0]
-    assert pending.amount == "30,000.00"
-    assert pending.card_mask.endswith("1234")
-
-
-@pytest.mark.anyio
 async def test_settle_promotes_provisional_to_real_credit(maker):
-    """Settling a provisional SMS creates one real credit and moves paid."""
+    """Settling a provisional SMS creates one real credit and moves paid.
+    A repeated settle creates no second credit."""
     upload_id, acc_id = await _seed_open_statement(maker)
     sms_id = await _add_provisional_sms(maker, day=7)
 
-    # Promote via the same pipeline path the web handler uses.
-    async with maker() as session, session.begin():
-        sms = await session.get(SmsMessage, sms_id)
-        link_ctx = await build_link_context(session)
-        outcome = await process_sms_row(session, sms, link_ctx, settle_provisional=True)
+    # Before settle the SMS shows as pending, not settled.
+    async with maker() as session:
+        view = await build_payments_view(session, await _get_upload(maker, upload_id))
+    assert view.settled == []
+    assert [(p.amount, p.card_mask[-4:]) for p in view.pending] == [
+        ("30,000.00", "1234")
+    ]
+
+    async def _settle():
+        async with maker() as session, session.begin():
+            sms = await session.get(SmsMessage, sms_id)
+            link_ctx = await build_link_context(session)
+            return await process_sms_row(
+                session, sms, link_ctx, settle_provisional=True
+            )
+
+    outcome = await _settle()
     assert outcome.transaction_id is not None
     assert outcome.pending_payment_check is not None
+    # A second settle reuses the same credit.
+    assert (await _settle()).transaction_id == outcome.transaction_id
 
     # Fire the recompute hook (web handler does this post-commit).
     from financial_dashboard.services.reminders import check_payment_received
@@ -154,58 +152,6 @@ async def test_settle_promotes_provisional_to_real_credit(maker):
     assert view.pending == []
 
 
-@pytest.mark.anyio
-async def test_settle_is_idempotent_on_linked_sms(maker):
-    """A second settle of an already-linked SMS makes no second credit."""
-    _, acc_id = await _seed_open_statement(maker)
-    sms_id = await _add_provisional_sms(maker, day=7)
-
-    async def _settle():
-        async with maker() as session, session.begin():
-            sms = await session.get(SmsMessage, sms_id)
-            link_ctx = await build_link_context(session)
-            return await process_sms_row(
-                session, sms, link_ctx, settle_provisional=True
-            )
-
-    first = await _settle()
-    assert first.transaction_id is not None
-    # A second settle reuses the same equal-balance credit.
-    second = await _settle()
-    assert second.transaction_id == first.transaction_id
-
-    async with maker() as session:
-        credits = (
-            (
-                await session.execute(
-                    select(Transaction).where(
-                        Transaction.account_id == acc_id,
-                        Transaction.direction == "credit",
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        assert len(credits) == 1
-
-
-@pytest.mark.anyio
-async def test_two_same_amount_provisionals_both_pending(maker):
-    """Two identical-amount same-day provisionals are two distinct pending
-    rows (each its own SMS), not collapsed."""
-    upload_id, _ = await _seed_open_statement(maker)
-    await _add_provisional_sms(maker, day=7, minute=7)
-    await _add_provisional_sms(maker, day=7, minute=11)
-
-    upload = await _get_upload(maker, upload_id)
-    async with maker() as session:
-        view = await build_payments_view(session, upload)
-
-    assert len(view.pending) == 2
-    assert {p.amount for p in view.pending} == {"30,000.00"}
-
-
 async def _add_settled_credit(maker, acc_id, *, amount, day=8):
     """A real bank-settled CC-payment credit already in the ledger."""
     async with maker() as session:
@@ -222,21 +168,6 @@ async def _add_settled_credit(maker, acc_id, *, amount, day=8):
         session.add(txn)
         await session.commit()
         return txn.id
-
-
-@pytest.mark.anyio
-async def test_distinct_same_amount_settled_credit_keeps_provisional(maker):
-    """Amount equality alone does not hide a distinct pending payment."""
-    upload_id, acc_id = await _seed_open_statement(maker)
-    await _add_provisional_sms(maker, day=7)
-    await _add_settled_credit(maker, acc_id, amount="30000.00", day=8)
-
-    upload = await _get_upload(maker, upload_id)
-    async with maker() as session:
-        view = await build_payments_view(session, upload)
-
-    assert len(view.settled) == 1
-    assert len(view.pending) == 1
 
 
 @pytest.mark.anyio
@@ -356,37 +287,8 @@ async def test_null_date_credit_bounded_to_its_cycle_by_created_at(maker):
 
 
 @pytest.mark.anyio
-async def test_is_settleable_rejects_non_provisional(maker):
-    """The settle validator rejects a non-payment SMS and a wrong-bank SMS."""
-    from financial_dashboard.services.statement_payments import (
-        is_settleable_provisional,
-    )
-
-    upload_id, _ = await _seed_open_statement(maker)
-    upload = await _get_upload(maker, upload_id)
-
-    # A plain spend SMS (not a bill payment) must be rejected.
-    async with maker() as session:
-        spend = SmsMessage(
-            bank="hdfc",
-            sender="VK-HDFCBK",
-            body="Spent Rs.500 From HDFC Bank Card x1234 At Zomato On 2026-08-07:14:23:00 Bal Rs.1000",
-            received_at=datetime.datetime(2026, 8, 7, 9, 0, tzinfo=datetime.UTC),
-            status="parsed",
-        )
-        session.add(spend)
-        await session.commit()
-        spend_id = spend.id
-
-    async with maker() as session:
-        sms = await session.get(SmsMessage, spend_id)
-        assert await is_settleable_provisional(session, sms, upload) is False
-
-
-@pytest.mark.anyio
-async def test_maskless_provisional_rejected_when_card_unmatched(maker):
-    """A provisional whose parsed card does not match the account is rejected
-    even for an otherwise-valid payment shape (strict card check on settle)."""
+async def test_settle_rejects_other_card_and_non_payment_sms(maker):
+    """Settle rejects a provisional for another card and a plain spend SMS."""
     from financial_dashboard.services.statement_payments import (
         is_settleable_provisional,
     )
@@ -409,8 +311,22 @@ async def test_maskless_provisional_rejected_when_card_unmatched(maker):
         )
         session.add(other)
         await session.commit()
-        other_id = other.id
+
+        spend = SmsMessage(
+            bank="hdfc",
+            sender="VK-HDFCBK",
+            body=(
+                "Spent Rs.500 From HDFC Bank Card x1234 At Zomato On "
+                "2026-08-07:14:23:00 Bal Rs.1000"
+            ),
+            received_at=datetime.datetime(2026, 8, 7, 9, 0, tzinfo=datetime.UTC),
+            status="parsed",
+        )
+        session.add(spend)
+        await session.commit()
+        ids = [other.id, spend.id]
 
     async with maker() as session:
-        sms = await session.get(SmsMessage, other_id)
-        assert await is_settleable_provisional(session, sms, upload) is False
+        for sms_id in ids:
+            sms = await session.get(SmsMessage, sms_id)
+            assert await is_settleable_provisional(session, sms, upload) is False

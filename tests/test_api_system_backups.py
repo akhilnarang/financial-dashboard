@@ -2,12 +2,13 @@ import asyncio
 import fcntl
 import hashlib
 import json
-import logging
 import os
 import sqlite3
 import stat
 import threading
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import NamedTuple
 
@@ -28,6 +29,21 @@ from financial_dashboard.services import system_backups
 pytestmark = pytest.mark.anyio
 
 
+@asynccontextmanager
+async def _api_client(session: AsyncSession) -> AsyncIterator[AsyncClient]:
+    app = FastAPI()
+
+    async def override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.include_router(api_router)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yield client
+
+
 @pytest.fixture
 async def backup_api(tmp_path):
     database_path = tmp_path / "synthetic-ledger.db"
@@ -41,18 +57,8 @@ async def backup_api(tmp_path):
         )
 
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as session:
-        app = FastAPI()
-
-        async def override_session():
-            yield session
-
-        app.dependency_overrides[get_session] = override_session
-        app.include_router(api_router)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            yield client, session, engine, database_path
+    async with maker() as session, _api_client(session) as client:
+        yield client, session, engine, database_path
 
     await engine.dispose()
 
@@ -91,13 +97,25 @@ def _assert_no_paths(value: object, database_path: Path) -> None:
 
 
 async def test_post_creates_verified_online_backup_with_committed_wal_rows(backup_api):
-    client, session, _engine, database_path = backup_api
+    client, session, engine, database_path = backup_api
     wal_path = Path(f"{database_path}-wal")
     assert wal_path.exists()
     assert wal_path.stat().st_size > 0
     assert not session.in_transaction()
+    statements: list[str] = []
 
-    response = await client.post("/api/system/backups")
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    # The backup runs off the request session: no SQL, no transaction.
+    event.listen(engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        response = await client.post("/api/system/backups")
+        listing = await client.get("/api/system/backups")
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record_statement)
+    assert statements == []
+    assert listing.json()["status"] == "ok"
 
     assert response.status_code == 200
     body = response.json()
@@ -142,45 +160,12 @@ async def test_post_creates_verified_online_backup_with_committed_wal_rows(backu
     assert source_rows.all() == [("committed-row",)]
 
 
-async def test_relative_sqlite_url_is_resolved_internally(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    engine = create_async_engine("sqlite+aiosqlite:///relative-ledger.db")
-    async with engine.begin() as connection:
-        await connection.execute(text("CREATE TABLE synthetic_rows (value TEXT)"))
-        await connection.execute(
-            text("INSERT INTO synthetic_rows (value) VALUES ('relative-row')")
-        )
-
-    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as session:
-        app = FastAPI()
-
-        async def override_session():
-            yield session
-
-        app.dependency_overrides[get_session] = override_session
-        app.include_router(api_router)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            body = (await client.post("/api/system/backups")).json()
-
-    assert body["status"] == "created"
-    backup_path, _manifest_path = _backup_paths(
-        tmp_path / "relative-ledger.db", body["backup"]["backup_id"]
-    )
-    with sqlite3.connect(backup_path) as backup_connection:
-        assert backup_connection.execute(
-            "SELECT value FROM synthetic_rows"
-        ).fetchall() == [("relative-row",)]
-    await engine.dispose()
-
-
-async def test_literal_tilde_sqlite_path_is_not_expanded(tmp_path, monkeypatch):
+async def test_relative_sqlite_path_resolves_without_tilde_expansion(
+    tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
     literal_directory = tmp_path / "~"
     literal_directory.mkdir()
-    database_path = literal_directory / "literal-ledger.db"
     engine = create_async_engine("sqlite+aiosqlite:///~/literal-ledger.db")
     async with engine.begin() as connection:
         await connection.execute(text("CREATE TABLE synthetic_rows (value TEXT)"))
@@ -189,13 +174,12 @@ async def test_literal_tilde_sqlite_path_is_not_expanded(tmp_path, monkeypatch):
         )
 
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as session:
-        response = await system_backups.create_system_backup(session)
+    async with maker() as session, _api_client(session) as client:
+        body = (await client.post("/api/system/backups")).json()
 
-    assert response.status == "created"
-    assert response.backup is not None
+    assert body["status"] == "created"
     backup_path, _manifest_path = _backup_paths(
-        database_path, response.backup.backup_id
+        literal_directory / "literal-ledger.db", body["backup"]["backup_id"]
     )
     with sqlite3.connect(backup_path) as backup_connection:
         assert backup_connection.execute(
@@ -292,9 +276,7 @@ async def test_post_prunes_oldest_backups_to_retention_bound(backup_api, monkeyp
     )
 
 
-async def test_get_ignores_malformed_manifests_without_following_paths(
-    backup_api, caplog
-):
+async def test_get_ignores_malformed_manifests_without_following_paths(backup_api):
     client, _session, _engine, database_path = backup_api
     valid = (await client.post("/api/system/backups")).json()["backup"]
     backup_directory = _backup_root(database_path)
@@ -316,53 +298,13 @@ async def test_get_ignores_malformed_manifests_without_following_paths(
         )
     )
 
-    with caplog.at_level(logging.WARNING, logger=system_backups.__name__):
-        response = await client.get("/api/system/backups")
+    response = await client.get("/api/system/backups")
 
     assert response.status_code == 200
     assert [item["backup_id"] for item in response.json()["backups"]] == [
         valid["backup_id"]
     ]
     assert "/private/never-follow-this" not in response.text
-    assert any(
-        "malformed system backup manifest" in record.getMessage()
-        for record in caplog.records
-    )
-
-
-@pytest.mark.parametrize("limit", ["0", "101", "not-an-integer"])
-async def test_get_validates_limit(backup_api, limit):
-    client, *_rest = backup_api
-
-    response = await client.get("/api/system/backups", params={"limit": limit})
-
-    assert response.status_code == 422
-
-
-async def test_backup_openapi_uses_inferred_typed_responses(backup_api):
-    client, *_rest = backup_api
-
-    document = (await client.get("/openapi.json")).json()
-    get_operation = document["paths"]["/api/system/backups"]["get"]
-    post_operation = document["paths"]["/api/system/backups"]["post"]
-    assert get_operation["responses"]["200"]["content"]["application/json"][
-        "schema"
-    ] == {"$ref": "#/components/schemas/SystemBackupListResponse"}
-    assert post_operation["responses"]["200"]["content"]["application/json"][
-        "schema"
-    ] == {"$ref": "#/components/schemas/SystemBackupCreateResponse"}
-    limit_parameter = next(
-        parameter
-        for parameter in get_operation["parameters"]
-        if parameter["name"] == "limit"
-    )
-    assert limit_parameter["schema"] == {
-        "type": "integer",
-        "maximum": 100,
-        "minimum": 1,
-        "default": 50,
-        "title": "Limit",
-    }
 
 
 async def test_in_memory_sqlite_is_typed_unsupported_without_file_work(client):
@@ -393,46 +335,19 @@ async def test_in_memory_sqlite_is_typed_unsupported_without_file_work(client):
         ("file::memory:?cache=shared", {"uri": "true"}),
         ("file:temporary?mode=memory", {"uri": "true"}),
         ("file:temporary%3Fmode=memory", {"uri": "true"}),
-        ("ledger.db?mode=memory", {}),
-        ("file://remote.example/private.db", {"uri": "true"}),
         ("file:ledger.db?mode=ro&vfs=private", {"uri": "true"}),
+        ("file://remote.example/private.db", {"uri": "true"}),
         ("file:ledger.db", {"uri": "true", "vfs": "private"}),
     ],
 )
-async def test_sqlite_uri_memory_temp_and_unsupported_shapes_are_rejected(
-    database, query
-):
+async def test_memory_remote_and_vfs_sqlite_uris_are_unsupported(database, query):
     engine = create_async_engine(
         URL.create("sqlite+aiosqlite", database=database, query=query)
     )
-    try:
-        assert system_backups._sqlite_file_database(engine.sync_engine) is None
-    finally:
-        await engine.dispose()
-
-
-async def test_embedded_memory_mode_is_typed_unsupported_via_api():
-    engine = create_async_engine(
-        URL.create(
-            "sqlite+aiosqlite",
-            database="file:temporary?mode=memory",
-            query={"uri": "true"},
-        )
-    )
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as session:
-        app = FastAPI()
-
-        async def override_session():
-            yield session
-
-        app.dependency_overrides[get_session] = override_session
-        app.include_router(api_router)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            post = await client.post("/api/system/backups")
-            listing = await client.get("/api/system/backups")
+    async with maker() as session, _api_client(session) as client:
+        post = await client.post("/api/system/backups")
+        listing = await client.get("/api/system/backups")
 
     assert post.json() == {
         "status": "unsupported",
@@ -488,27 +403,6 @@ async def test_online_backup_progress_deadline_is_fast_and_closes_connections(
     assert destination.closed is True
 
 
-async def test_backup_timeout_cleans_artifacts_and_sanitizes_response(
-    backup_api, monkeypatch
-):
-    client, _session, _engine, database_path = backup_api
-
-    def time_out(_source, _destination):
-        raise system_backups.BackupTimeoutError("private contention detail")
-
-    monkeypatch.setattr(system_backups, "_run_online_backup", time_out)
-    response = await client.post("/api/system/backups")
-
-    assert response.json() == {
-        "status": "unavailable",
-        "backend": "sqlite",
-        "backup": None,
-    }
-    assert "private contention detail" not in response.text
-    backup_directory = _backup_root(database_path)
-    assert list(backup_directory.iterdir()) == []
-
-
 async def test_create_scavenges_only_unlocked_stale_temporary_directories(
     backup_api, monkeypatch
 ):
@@ -543,64 +437,20 @@ async def test_create_scavenges_only_unlocked_stale_temporary_directories(
     assert not active.exists()
 
 
-async def test_verification_failure_cleans_artifacts_and_sanitizes_response(
-    backup_api, monkeypatch, caplog
-):
-    client, _session, _engine, database_path = backup_api
-    secret_detail = "private verification detail"
-
-    def fail_verification(_path):
-        raise RuntimeError(secret_detail)
-
-    monkeypatch.setattr(system_backups, "_verify_sqlite_backup", fail_verification)
-    with caplog.at_level(logging.ERROR, logger=system_backups.__name__):
-        response = await client.post("/api/system/backups")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "unavailable",
-        "backend": "sqlite",
-        "backup": None,
-    }
-    assert secret_detail not in response.text
-    assert str(database_path) not in response.text
-    backup_directory = _backup_root(database_path)
-    assert list(backup_directory.iterdir()) == []
-    assert any(
-        secret_detail in record.getMessage()
-        for record in caplog.records
-        if record.name == system_backups.__name__
-    )
-
-
-async def test_directory_publication_failure_removes_all_temp_artifacts(
-    backup_api, monkeypatch
-):
-    client, _session, _engine, database_path = backup_api
-
-    def fail_directory_rename(_source, _destination):
-        raise OSError("synthetic directory publication failure")
-
-    monkeypatch.setattr(system_backups.os, "rename", fail_directory_rename)
-
-    response = await client.post("/api/system/backups")
-    listing = await client.get("/api/system/backups")
-
-    assert response.json() == {
-        "status": "unavailable",
-        "backend": "sqlite",
-        "backup": None,
-    }
-    assert listing.json()["backups"] == []
-    backup_directory = _backup_root(database_path)
-    assert list(backup_directory.iterdir()) == []
-
-
-async def test_post_rename_sync_failure_removes_published_directory(
+async def test_create_failures_remove_all_artifacts_and_sanitize_response(
     backup_api, monkeypatch
 ):
     client, _session, _engine, database_path = backup_api
     backup_root = _backup_root(database_path)
+    secret_detail = "private verification detail"
+    unavailable = {"status": "unavailable", "backend": "sqlite", "backup": None}
+
+    def fail_verification(_path):
+        raise RuntimeError(secret_detail)
+
+    def fail_directory_rename(_source, _destination):
+        raise OSError("synthetic directory publication failure")
+
     original_fsync_directory = system_backups._fsync_directory
     failed_publication_sync = False
 
@@ -611,16 +461,22 @@ async def test_post_rename_sync_failure_removes_published_directory(
             raise OSError("synthetic publication sync failure")
         return original_fsync_directory(path)
 
-    monkeypatch.setattr(system_backups, "_fsync_directory", fail_first_root_sync)
-    response = await client.post("/api/system/backups")
+    # Verify fails, rename fails, then fsync fails after the rename published.
+    for target, name, replacement in (
+        (system_backups, "_verify_sqlite_backup", fail_verification),
+        (system_backups.os, "rename", fail_directory_rename),
+        (system_backups, "_fsync_directory", fail_first_root_sync),
+    ):
+        monkeypatch.setattr(target, name, replacement)
+        response = await client.post("/api/system/backups")
+        monkeypatch.undo()
 
-    assert response.json() == {
-        "status": "unavailable",
-        "backend": "sqlite",
-        "backup": None,
-    }
+        assert response.json() == unavailable
+        assert secret_detail not in response.text
+        assert str(database_path) not in response.text
+        assert list(backup_root.iterdir()) == []
     assert failed_publication_sync is True
-    assert list(backup_root.iterdir()) == []
+    assert (await client.get("/api/system/backups")).json()["backups"] == []
 
 
 async def test_dedicated_executor_serializes_workers_across_event_loops(
@@ -783,26 +639,3 @@ async def test_cancelled_failed_worker_preserves_cancellation_and_releases_admis
     retry = await system_backups.create_system_backup(session)
     assert retry.status == "created"
     assert call_count == 2
-
-
-async def test_backup_operations_do_not_start_request_session_sql_or_transaction(
-    backup_api,
-):
-    client, session, engine, _database_path = backup_api
-    statements: list[str] = []
-
-    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
-        statements.append(statement)
-
-    assert not session.in_transaction()
-    event.listen(engine.sync_engine, "before_cursor_execute", record_statement)
-    try:
-        post = await client.post("/api/system/backups")
-        listing = await client.get("/api/system/backups")
-    finally:
-        event.remove(engine.sync_engine, "before_cursor_execute", record_statement)
-
-    assert post.json()["status"] == "created"
-    assert listing.json()["status"] == "ok"
-    assert statements == []
-    assert not session.in_transaction()

@@ -329,38 +329,42 @@ Rules:
 
 ## Testing
 
-Tests protect behaviour at the boundaries this repo owns. Keep the suite
-small enough that a failure names a broken contract, not a private
-refactor.
+- Strongly avoid creating new tests. Extend an existing focused test when it can
+  cover the changed behavior; add a case only for an otherwise uncovered contract.
+- Require behavioral contract coverage: assert public response values, observable
+  side effects, and user-visible HTTP behavior. Each case must identify the
+  regression it protects against. Check this with a negative control: break the
+  guard, and the case must fail.
+- Cover the hot path and, at most, one meaningful failure case per contract.
+  Parameterized variations count as cases; retain them only for distinct behavior.
+- A money path is the exception. A duplicate or phantom ledger row is the worst
+  failure in this repo, so a matcher or merge path keeps its zero-candidate,
+  many-candidate, and idempotence cases.
+- Do not test implementation details, private structure, or facts already checked
+  by the typechecker. Stored transaction fields, amounts, categories, and cashflow
+  figures are contracts.
+- Test adapters at project-owned boundaries. Mock external dependencies or service
+  boundaries, and verify meaningful data crosses them. A canned fake answer alone
+  does not prove the integration works.
+- Give a test stub every field the real object carries. An incomplete fake drives
+  defensive `getattr` into production code. Fix the stub, not the caller.
+- Keep UI tests limited to critical user-visible behavior, such as the figures a
+  page shows and rejection of unsafe input. Avoid exact markup or CSS assertions.
+- Prefer product behavior over isolated tests of test helpers.
+- Request changes for excessive, redundant, or non-contract tests. When pruning,
+  preserve distinct behavior rather than optimizing test counts or coverage scores.
 
-- **Strongly avoid new tests.** Extend a focused test that can cover the
-  changed behaviour. Add a case only for a contract that nothing covers.
-- **Cover the hot path, and at most one failure case per contract per
-  code path.** Two paths that can each write a row are two contracts: the
-  poller and the reparse route both need their own case. The same failure
-  mode repeated on both paths is one case too many. Parameterized
-  variations count as cases.
-- **Each case must name the regression it protects.** The check for this
-  is a negative control: break the guard, and the case must fail. A case
-  that still passes with its guard disabled protects nothing.
-- **Do not assert implementation details.** The absence of a field, a
-  `raw_description` value (debug-only, excluded from dumps), or a fact the
-  type checker already proves are not contracts.
-- **Give a test stub every field the real object carries.** An incomplete
-  `SimpleNamespace` fake drives defensive `getattr` into production code.
-  Fix the stub, not the caller.
-- **A money path earns more than one failure case.** A duplicate or
-  phantom ledger row is the worst failure in this repo, so a matcher or a
-  merge path keeps its zero-candidate, many-candidate, and idempotence
-  cases.
-- **Prune by behaviour, not by count.** When cases overlap, keep the one
-  whose failure best names the break.
+When reporting before/after performance, use equivalent test selections and
+dependencies, repeated fresh processes, and explicitly state which caches were
+disabled. Measure coverage separately from timing. Report line and branch deltas;
+execution coverage does not establish assertion strength, and small timing
+differences within run-to-run variation do not establish a speedup or slowdown.
 
 ## Quality gates
 
 While you work, run the test files that cover what you changed. Run the
 whole suite once before you finish, and let CI catch the rest. The full
-suite takes five minutes, so a run after every edit wastes them.
+suite takes under a minute, so run it before you finish, not after every edit.
 
 Run all of these before finishing a refactor:
 

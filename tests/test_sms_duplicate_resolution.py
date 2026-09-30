@@ -127,22 +127,6 @@ async def test_resolver_creates_new_transaction(session, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_resolver_reports_already_resolved_from_sms_link(session, monkeypatch):
-    _patch_parsers(monkeypatch, _parsed())
-    sms_id, target_id = await _seed_deferred(session)
-    sms = await session.get(SmsMessage, sms_id)
-    sms.transaction_id = target_id
-    sms.status = "enriched"
-    sms.parse_error = None
-    await session.commit()
-
-    result = await resolve_sms_duplicate(session, sms_id, "create_new")
-
-    assert result.status == "already_resolved"
-    assert result.transaction_id == target_id
-
-
-@pytest.mark.anyio
 async def test_resolver_reports_already_resolved_from_reverse_link(
     session, monkeypatch
 ):

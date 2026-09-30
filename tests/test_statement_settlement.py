@@ -10,9 +10,9 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from financial_dashboard.db import Account, Base, StatementUpload, Transaction
+from financial_dashboard.db import Account, StatementUpload, Transaction
 from financial_dashboard.db.models import (
     AuditInteraction,
     TelegramConversation,
@@ -26,6 +26,7 @@ from financial_dashboard.services.statement_settlement import (
     answer,
     row_digest,
 )
+from tests.conftest import new_test_engine
 
 pytestmark = pytest.mark.anyio
 
@@ -36,17 +37,11 @@ NARRATION = "MW SAMPLE FUEL STATION Pune"
 
 
 @pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture
 async def maker():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     yield async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     await engine.dispose()
+    holder.close()
 
 
 def _row(

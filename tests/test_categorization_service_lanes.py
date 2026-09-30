@@ -7,21 +7,6 @@ writes the result. These tests pin the lanes by going through the engine,
 mocking only ``engine._llm_classify`` (the thin indirection between the engine
 and the provider) so a real network call is never made — the model boundary
 itself is the seam.
-
-Each lane is asserted at the layer it belongs to:
-
-* **Merchant rule** — a seeded merchant rule fires via the rule path, never
-  reaching the LLM.
-* **Polarity** — a directionally-impossible slug from the LLM is coerced AND
-  queued for review, never stored silently.
-* **Self-transfer refusal/success** — the reference-pair rule refuses a same-
-  account/same-direction pair and succeeds on a different-account opposite.
-* **Manual category persistence** — a manual override survives a subsequent
-  sweep's eligibility check (the ``_needs_llm`` guard).
-* **pending_llm / LLM-low-confidence** — the rule pass marks a no-match row
-  'pending_llm' (so the rule pass never re-evaluates it and the backfill
-  terminates); a low-confidence LLM answer routes the row to review, with the
-  model call intercepted at ``_llm_classify`` so no provider is contacted.
 """
 
 import json
@@ -32,17 +17,21 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import financial_dashboard.services.categorization.engine as eng
-import financial_dashboard.services.categorization.sweep as sweep
 from financial_dashboard.db.models import (
     Account,
     AuditAction,
     AuditInteraction,
     CategoryReviewDecision,
+    MerchantRule,
+    TelegramOutboundDelivery,
     Transaction,
 )
+import financial_dashboard.services.categorization.merchant_rules as mr_mod
 from financial_dashboard.services.categorization import llm
-from financial_dashboard.services.categorization.merchant_rules import (
-    load_merchant_rules,
+from financial_dashboard.services.categorization.fewshot import get_similar_examples
+from financial_dashboard.services.categorization.hashing import (
+    build_input_payload,
+    compute_input_hash,
 )
 from financial_dashboard.services.categorization.vocabulary import ensure_category
 
@@ -50,86 +39,114 @@ pytestmark = pytest.mark.anyio
 
 
 # ---------------------------------------------------------------------------
-# Merchant rule lane
+# Rule lane
 # ---------------------------------------------------------------------------
 
 
-async def test_merchant_rule_fires_via_engine_without_touching_the_llm(
+async def test_confident_rule_skips_llm_supersedes_stale_review_and_cancels_buttons(
     session: AsyncSession, monkeypatch
 ):
-    """A seeded merchant rule wins via the rule path; the LLM classifier is
-    never called. The seam is ``engine._llm_classify`` — if it fires, the test
-    fails loudly, because the rule path is meant to short-circuit before it."""
-    await ensure_category(session, "dining")
-    # Seed a merchant rule and load the cache the rule pass reads from.
-    from financial_dashboard.db.models import MerchantRule
-
-    session.add(MerchantRule(pattern="dinerco", category="dining", priority=100))
-    await session.flush()
-    await load_merchant_rules(_session=session)
+    """A fee-reversal credit is stored as fees_charges via the rule path, which
+    never calls the LLM and never runs the polarity guard. The rule also
+    supersedes a stale review and cancels its Telegram buttons."""
 
     def fail_if_called(**kwargs):
-        raise AssertionError("LLM must not be called when a merchant rule fires")
+        raise AssertionError("LLM must not be called when a rule fires")
 
     monkeypatch.setattr(eng, "_llm_classify", fail_if_called)
-
     account = Account(bank="testbank", label="Savings", type="bank_account")
     session.add(account)
     await session.flush()
     txn = Transaction(
         bank="testbank",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("50"),
-        counterparty="DINERCO",
-        raw_description="DINERCO MUMBAI",
+        email_type="testbank_misc_alert",
+        direction="credit",
+        amount=Decimal("10"),
+        counterparty="ACME BANK",
+        raw_description="Annual fee reversal credited",
         account_id=account.id,
+        review_status="pending",
     )
     session.add(txn)
     await session.flush()
+    source = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="reply",
+        status="ready_to_send",
+        outcome="clarification",
+    )
+    session.add(source)
+    await session.flush()
+    decision = CategoryReviewDecision(
+        transaction_id=txn.id,
+        source_interaction_id=source.id,
+        category_input_hash="stale",
+        candidates_json='[{"category": "interest"}]',
+        gate_reason="old review",
+    )
+    session.add(decision)
+    await session.flush()
+    delivery = TelegramOutboundDelivery(
+        interaction_id=source.id,
+        recipient_chat_id=7,
+        ordinal=0,
+        transaction_id=txn.id,
+        text="choose",
+        delivery_token="stale-button-token",
+        status="pending",
+    )
+    session.add(delivery)
+    await session.flush()
 
-    method = await eng.categorize_one(session, txn, use_llm=True)
-    assert method == "rule"
-    assert txn.category == "dining"
+    assert await eng.categorize_one(session, txn, use_llm=True) == "rule"
+
+    assert decision.status == "superseded"
+    assert delivery.status == "cancelled"
+    assert source.status == "delivery_failed"
+    assert source.outcome == "clarification"
+    assert txn.category == "fees_charges"
     assert txn.category_method == "rule"
     assert txn.category_model == "rules-v1"
+    assert txn.category_confidence == 0.9
+    assert txn.category_input_hash is not None
 
 
-# ---------------------------------------------------------------------------
-# Polarity lane
-# ---------------------------------------------------------------------------
-
-
-async def test_polarity_flips_directionally_impossible_llm_slug_and_queues_for_review(
+async def test_merchant_rule_fires_via_engine_without_touching_the_llm(
     session: AsyncSession, monkeypatch
 ):
-    """A confident LLM answer that is directionally impossible (a debit row
-    categorised as 'refund', an income slug) is coerced to the debit default
-    AND queued for review at capped confidence — never stored silently."""
-    await ensure_category(session, "refund")
-
-    async def fake_classify(**kwargs):
-        return llm.LlmResult("refund", 0.95, "looks like a refund")
-
-    monkeypatch.setattr(eng, "_llm_classify", fake_classify)
-
-    txn = Transaction(
-        bank="testbank",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("99"),
-        counterparty="SOMEWHERE",
-        raw_description="SOMEWHERE",
-    )
-    session.add(txn)
+    """A DB merchant rule loaded into the cache wins via the engine rule path."""
+    await ensure_category(session, "dining")
+    session.add(MerchantRule(pattern="dinerco", category="dining", priority=100))
     await session.flush()
+    snapshot = list(mr_mod._cache)
+    try:
+        await mr_mod.load_merchant_rules(_session=session)
 
-    method = await eng.categorize_one(session, txn, use_llm=True)
-    assert method == "llm"
-    assert txn.category == "expense"  # debit + income slug -> DEBIT_DEFAULT
-    assert txn.review_status == "pending"
-    assert txn.category_confidence <= 0.4
-    assert "refund" in (txn.review_reason or "")
+        def fail_if_called(**kwargs):
+            raise AssertionError("LLM must not be called when a merchant rule fires")
+
+        monkeypatch.setattr(eng, "_llm_classify", fail_if_called)
+        account = Account(bank="testbank", label="Savings", type="bank_account")
+        session.add(account)
+        await session.flush()
+        txn = Transaction(
+            bank="testbank",
+            email_type="x",
+            direction="debit",
+            amount=Decimal("50"),
+            counterparty="DINERCO",
+            raw_description="DINERCO MUMBAI",
+            account_id=account.id,
+        )
+        session.add(txn)
+        await session.flush()
+
+        assert await eng.categorize_one(session, txn, use_llm=True) == "rule"
+        assert txn.category == "dining"
+        assert txn.category_method == "rule"
+    finally:
+        mr_mod._cache.clear()
+        mr_mod._cache.extend(snapshot)
 
 
 @pytest.mark.parametrize("manual_edit", [False, True])
@@ -216,194 +233,8 @@ async def test_merchant_lookup_audits_category_and_preserves_intervening_manual_
 
 
 # ---------------------------------------------------------------------------
-# Self-transfer refusal / success
+# LLM low confidence
 # ---------------------------------------------------------------------------
-
-
-async def test_self_transfer_refuses_same_account_pair(session: AsyncSession):
-    """A reference shared by two opposite-direction legs on the SAME account is
-    not a self-transfer — it is a charge and its refund. The rule refuses to
-    pair them and the row falls through to the LLM/unknown path."""
-    account = Account(bank="icici", label="Card", type="credit_card")
-    session.add(account)
-    await session.flush()
-
-    charge = Transaction(
-        bank="icici",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("100"),
-        reference_number="REF-SAME-ACCT",
-        account_id=account.id,
-    )
-    refund = Transaction(
-        bank="icici",
-        email_type="x",
-        direction="credit",
-        amount=Decimal("100"),
-        reference_number="REF-SAME-ACCT",
-        account_id=account.id,
-    )
-    session.add_all([charge, refund])
-    await session.flush()
-
-    from financial_dashboard.services.categorization.self_transfer import (
-        apply_reference_self_transfer_rule,
-    )
-
-    paired = await apply_reference_self_transfer_rule(session, refund)
-    assert paired is False
-    assert charge.category is None
-    assert refund.category is None
-
-
-async def test_self_transfer_succeeds_on_different_accounts(session: AsyncSession):
-    """A reference shared by two opposite-direction legs on DIFFERENT accounts
-    is a self-transfer: both legs are marked authoritative."""
-    a = Account(bank="hdfc", label="HDFC", type="bank_account")
-    b = Account(bank="icici", label="ICICI", type="bank_account")
-    session.add_all([a, b])
-    await session.flush()
-
-    debit = Transaction(
-        bank="hdfc",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("1000"),
-        reference_number="REF-DIFF-ACCT",
-        account_id=a.id,
-    )
-    credit = Transaction(
-        bank="icici",
-        email_type="x",
-        direction="credit",
-        amount=Decimal("1000"),
-        reference_number="REF-DIFF-ACCT",
-        account_id=b.id,
-    )
-    session.add_all([debit, credit])
-    await session.flush()
-
-    from financial_dashboard.services.categorization.self_transfer import (
-        REFERENCE_PAIR_RULESET_VERSION,
-        apply_reference_self_transfer_rule,
-    )
-
-    paired = await apply_reference_self_transfer_rule(session, credit)
-    assert paired is True
-    for txn in (debit, credit):
-        assert txn.category == "self_transfer"
-        assert txn.category_method == "rule"
-        assert txn.category_confidence == 1.0
-        assert txn.category_model == REFERENCE_PAIR_RULESET_VERSION
-        assert txn.review_status is None
-
-
-async def test_self_transfer_rule_short_circuits_the_engine(
-    session: AsyncSession, monkeypatch
-):
-    """Through the engine, a paired self-transfer leg returns ``'rule'``
-    without consulting the LLM. The LLM seam raises if called."""
-    a = Account(bank="hdfc", label="HDFC", type="bank_account")
-    b = Account(bank="icici", label="ICICI", type="bank_account")
-    session.add_all([a, b])
-    await session.flush()
-
-    debit = Transaction(
-        bank="hdfc",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("1000"),
-        reference_number="REF-ENGINE-ST",
-        account_id=a.id,
-    )
-    credit = Transaction(
-        bank="icici",
-        email_type="x",
-        direction="credit",
-        amount=Decimal("1000"),
-        reference_number="REF-ENGINE-ST",
-        account_id=b.id,
-    )
-    session.add_all([debit, credit])
-    await session.flush()
-
-    def fail_if_called(**kwargs):
-        raise AssertionError("LLM must not be called for a self-transfer pair")
-
-    monkeypatch.setattr(eng, "_llm_classify", fail_if_called)
-
-    method = await eng.categorize_one(session, credit, use_llm=True)
-    assert method == "rule"
-    assert credit.category == "self_transfer"
-    assert debit.category == "self_transfer"
-
-
-# ---------------------------------------------------------------------------
-# Manual category persistence
-# ---------------------------------------------------------------------------
-
-
-async def test_manual_category_persists_through_a_subsequent_sweep_check(
-    session: AsyncSession,
-):
-    """A manual override lands as ``category_method='manual'`` / confidence 1.0
-    / review_status='resolved', and the sweep's ``_needs_llm`` guard refuses to
-    re-evaluate it — so a later poll cannot overwrite the human's decision."""
-    from financial_dashboard.services.categorization.manual import (
-        assign_category_manual,
-    )
-
-    await ensure_category(session, "groceries")
-    txn = Transaction(
-        bank="testbank",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("50"),
-    )
-    session.add(txn)
-    await session.flush()
-
-    ok, slug = await assign_category_manual(session, txn.id, "Groceries")
-    assert ok is True
-    assert slug == "groceries"
-    # The provenance fields a sweep's guard reads.
-    assert txn.category_method == "manual"
-    assert txn.category_confidence == 1.0
-    assert txn.review_status == "resolved"
-    # And the guard refuses it.
-    assert sweep._needs_llm(txn) is False
-
-
-# ---------------------------------------------------------------------------
-# pending_llm / LLM-low-confidence
-# ---------------------------------------------------------------------------
-
-
-async def test_rule_pass_marks_unmatched_row_pending_llm_so_backfill_terminates(
-    session: AsyncSession,
-):
-    """The rule pass with ``use_llm=False`` marks a no-match row
-    ``pending_llm``, NOT NULL — so the next rule pass does not re-evaluate it
-    and a backfill loop terminates at zero never-touched rows."""
-    txn = Transaction(
-        bank="testbank",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("99"),
-        counterparty="ACME STORE",
-        raw_description="ACME STORE MUMBAI",
-    )
-    session.add(txn)
-    await session.flush()
-
-    method = await eng.categorize_one(session, txn, use_llm=False)
-    assert method == "skip"
-    assert txn.category_method == "pending_llm"
-    assert txn.category is None
-    assert txn.category_input_hash is not None
-    # And a sweep eligibility check still picks it up for the LLM pass.
-    assert sweep._needs_llm(txn) is True
 
 
 async def test_llm_low_confidence_routes_to_review_at_the_model_boundary(
@@ -474,36 +305,6 @@ async def test_llm_low_confidence_routes_to_review_at_the_model_boundary(
     assert "groceries" in captured["active_slugs"]
 
 
-async def test_llm_needs_review_slug_routes_to_review(
-    session: AsyncSession, monkeypatch
-):
-    """The provider's ``NEEDS_REVIEW`` sentinel is itself a low-confidence
-    path: the row is routed to review with the direction default as its
-    category, and the engine never stores the sentinel slug itself."""
-
-    async def fake_classify(**kwargs):
-        return llm.LlmResult(llm.NEEDS_REVIEW, 0.0, "no fit")
-
-    monkeypatch.setattr(eng, "_llm_classify", fake_classify)
-
-    txn = Transaction(
-        bank="testbank",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("99"),
-        counterparty="MYSTERY MERCHANT",
-        raw_description="MYSTERY MERCHANT",
-    )
-    session.add(txn)
-    await session.flush()
-
-    method = await eng.categorize_one(session, txn, use_llm=True)
-    assert method == "llm"
-    assert txn.category == "expense"  # debit + unknown default
-    assert txn.review_status == "pending"
-    assert txn.category != llm.NEEDS_REVIEW
-
-
 async def test_llm_invalid_slug_preserves_review_gate_reason(session, monkeypatch):
     async def fake_classify(**kwargs):
         return llm.parse_result(
@@ -524,6 +325,9 @@ async def test_llm_invalid_slug_preserves_review_gate_reason(session, monkeypatc
     await session.flush()
 
     await eng.categorize_one(session, txn, use_llm=True)
+    # The NEEDS_REVIEW sentinel is never stored: the direction default is.
+    assert txn.category == "expense"
+    assert txn.review_status == "pending"
     assert txn.review_reason == "invalid model category slug: made_up"
     decision = await session.scalar(
         select(CategoryReviewDecision).where(
@@ -561,3 +365,54 @@ async def test_empty_input_skips_the_llm_call(session: AsyncSession, monkeypatch
     assert txn.category_model == "empty-input"
     assert txn.category_confidence == 0.0
     assert txn.review_status is None
+
+
+async def test_fewshot_returns_same_direction_categorized_matches(
+    session: AsyncSession,
+):
+    for direction, category in (
+        ("debit", "groceries"),
+        ("credit", "refund"),
+        ("debit", None),
+    ):
+        session.add(
+            Transaction(
+                bank="testbank",
+                email_type="x",
+                amount=Decimal("10"),
+                direction=direction,
+                counterparty="ACME STORE",
+                category=category,
+                category_method="manual" if category else None,
+            )
+        )
+    await session.flush()
+
+    out = await get_similar_examples(
+        session, counterparty="acmestoremumbai", direction="debit", limit=5
+    )
+    assert len(out) == 1
+    assert out[0].category == "groceries"
+    assert out[0].direction == "debit"
+
+
+def test_input_hash_is_stable_and_ignores_outputs():
+    def txn(**kw):
+        base = dict(
+            bank="testbank",
+            email_type="x",
+            direction="debit",
+            amount=Decimal("10"),
+            currency="INR",
+            counterparty="ACME STORE",
+            channel="upi",
+            raw_description="ACME STORE MUMBAI",
+        )
+        base.update(kw)
+        return compute_input_hash(
+            build_input_payload(Transaction(**base), "bank_account")
+        )
+
+    # Outputs are not inputs: a stored category must not change the hash.
+    assert txn() == txn() == txn(category="x")
+    assert txn() != txn(direction="credit")

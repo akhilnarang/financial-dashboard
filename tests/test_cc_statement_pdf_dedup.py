@@ -20,11 +20,6 @@ from financial_dashboard.services.statements import cc as cc_module
 
 
 @pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture
 async def session_factory(monkeypatch, tmp_path):
     db_path = tmp_path / "pdf-dedup-test.sqlite"
     sync_engine = create_engine(f"sqlite:///{db_path}")
@@ -38,27 +33,12 @@ async def session_factory(monkeypatch, tmp_path):
     await engine.dispose()
 
 
-async def _add_cc_account(
-    maker,
-    *,
-    bank: str = "jupiter",
-    label: str = "Jupiter",
-    account_number: str | None = None,
-    active: bool = True,
-    card_last4: str | None = "1234",
-) -> int:
+async def _add_cc_account(maker) -> int:
     async with maker() as session:
-        acc = Account(
-            bank=bank,
-            label=label,
-            type="credit_card",
-            account_number=account_number,
-            active=active,
-        )
+        acc = Account(bank="jupiter", label="Jupiter", type="credit_card")
         session.add(acc)
         await session.flush()
-        if card_last4:
-            session.add(Card(account_id=acc.id, card_mask=card_last4, is_primary=True))
+        session.add(Card(account_id=acc.id, card_mask="1234", is_primary=True))
         await session.commit()
         return acc.id
 
@@ -123,53 +103,7 @@ def _install_common_monkeypatches(monkeypatch, tmp_path, due_date, import_calls)
 
 
 @pytest.mark.anyio
-async def test_pdf_dedups_against_prior_pdf_upload(
-    session_factory, monkeypatch, tmp_path
-):
-    acc_id = await _add_cc_account(session_factory)
-    async with session_factory() as session:
-        existing = StatementUpload(
-            account_id=acc_id,
-            bank="jupiter",
-            filename="x",
-            file_path="x",
-            source_kind="pdf",
-            status="parsed",
-            due_date="05/05/2026",
-            payment_status="pending",
-        )
-        session.add(existing)
-        await session.commit()
-        existing_id = existing.id
-
-    import_calls: list = []
-    statements_dir = _install_common_monkeypatches(
-        monkeypatch, tmp_path, "05/05/2026", import_calls
-    )
-
-    result = await cc_module.process_statement_email(
-        "jupiter", b"raw", "Your Jupiter Card Statement"
-    )
-
-    assert result is not None
-    assert result["statement_upload_id"] == existing_id
-    assert result["deduped"] is True
-    assert result["matched"] == 0
-    assert result["missing"] == 0
-    assert result["imported"] == 0
-
-    assert import_calls == []
-    assert not statements_dir.exists() or not any(statements_dir.iterdir())
-
-    async with session_factory() as session:
-        rows = (await session.execute(select(StatementUpload))).scalars().all()
-        assert len(rows) == 1
-        assert rows[0].id == existing_id
-        assert rows[0].payment_status == "pending"
-
-
-@pytest.mark.anyio
-async def test_pdf_dedups_against_email_summary_upload(
+async def test_pdf_dedups_against_prior_upload_for_same_due_date(
     session_factory, monkeypatch, tmp_path
 ):
     acc_id = await _add_cc_account(session_factory)

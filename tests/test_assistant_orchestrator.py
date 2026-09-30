@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 from sqlalchemy import select
 
@@ -12,8 +14,10 @@ from financial_dashboard.services.assistant.contracts import (
     Error,
     ToolCalls,
 )
+from financial_dashboard.services.assistant.conversations import start_conversation
 from financial_dashboard.services.assistant.orchestrator import (
     OrchestrationResult,
+    _conversation_for_message,
     _queue_result,
     run_turn,
 )
@@ -35,7 +39,7 @@ class FakeProvider:
 
 
 @pytest.mark.anyio
-async def test_orchestrator_caps_tool_rounds(session):
+async def test_orchestrator_caps_tool_rounds_and_renews_lease(session):
     txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
     session.add(txn)
     await session.flush()
@@ -48,18 +52,23 @@ async def test_orchestrator_caps_tool_rounds(session):
         ]
         * 4
     )
+    renewals = 0
+
+    async def renew() -> bool:
+        nonlocal renewals
+        renewals += 1
+        return True
+
     result = await run_turn(
-        session, provider, user_message="look", transaction_id=txn.id
+        session,
+        provider,
+        user_message="look",
+        transaction_id=txn.id,
+        renew_lease=renew,
     )
     assert result.response.outcome == "error"
     assert provider.calls == 4
-
-
-@pytest.mark.anyio
-async def test_orchestrator_returns_answer(session):
-    provider = FakeProvider([Answer(outcome="answer", text="No changes made.")])
-    result = await run_turn(session, provider, user_message="why")
-    assert result.response.text == "No changes made."
+    assert renewals == 3
 
 
 @pytest.mark.anyio
@@ -154,39 +163,6 @@ async def test_turn_does_not_write_after_its_target_moved(session):
 
 
 @pytest.mark.anyio
-async def test_orchestrator_renews_lease_between_provider_tool_rounds(session):
-    txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
-    session.add(txn)
-    await session.flush()
-    provider = FakeProvider(
-        [
-            ToolCalls(
-                outcome="tool_calls",
-                calls=[{"name": "get_transaction", "transaction_id": txn.id}],
-            ),
-            Answer(outcome="answer", text="Found it."),
-        ]
-    )
-    renewals = 0
-
-    async def renew() -> bool:
-        nonlocal renewals
-        renewals += 1
-        return True
-
-    result = await run_turn(
-        session,
-        provider,
-        user_message="find it",
-        transaction_id=txn.id,
-        renew_lease=renew,
-    )
-
-    assert result.response.text == "Found it."
-    assert renewals == 1
-
-
-@pytest.mark.anyio
 @pytest.mark.parametrize("rows", [1, 2])
 async def test_multi_transaction_query_queues_individually_mapped_results(
     session, rows
@@ -265,7 +241,7 @@ async def test_multi_transaction_query_queues_individually_mapped_results(
 
 
 @pytest.mark.anyio
-async def test_error_outcome_is_not_overridden_by_transport_label(session):
+async def test_error_outcome_is_not_overridden_by_reads_or_transport_label(session):
     # A settlement fold moved this turn from row 100 to row 42 while it ran.
     interaction = AuditInteraction(
         inbound_chat_id=7,
@@ -282,7 +258,8 @@ async def test_error_outcome_is_not_overridden_by_transport_label(session):
         interaction_id=interaction.id,
         worker_token="worker",
         result=OrchestrationResult(
-            Error(outcome="error", message="download failed", code="attachment_failed")
+            Error(outcome="error", message="download failed", code="attachment_failed"),
+            transaction_ids=(42,),
         ),
         transaction_id=100,
         recipient_chat_id=7,
@@ -298,32 +275,20 @@ async def test_error_outcome_is_not_overridden_by_transport_label(session):
 
 
 @pytest.mark.anyio
-async def test_error_after_reads_is_not_classified_as_query_result(session):
-    interaction = AuditInteraction(
-        inbound_chat_id=7,
-        trigger="ask",
-        status="processing",
-        worker_token="worker",
-    )
-    session.add(interaction)
-    await session.flush()
+async def test_conversation_timestamp_survives_sqlite_round_trip(session):
+    conversation = await start_conversation(session, chat_id=10, started_by="ask")
+    await session.commit()
+    conversation_id = conversation.id
+    session.expunge_all()
 
-    await _queue_result(
+    reloaded = await session.get(type(conversation), conversation_id)
+
+    assert reloaded is not None
+    assert reloaded.expires_at is not None
+    resumed = await _conversation_for_message(
         session,
-        interaction_id=interaction.id,
-        worker_token="worker",
-        result=OrchestrationResult(
-            Error(
-                outcome="error",
-                message="invalid provider output",
-                code="invalid_model_output",
-            ),
-            transaction_ids=(42,),
-        ),
-        transaction_id=None,
-        recipient_chat_id=7,
+        chat_id=10,
+        trigger="reply",
+        mapped=SimpleNamespace(conversation_id=conversation_id, transaction_id=None),
     )
-
-    await session.refresh(interaction)
-    assert interaction.outcome == "error"
-    assert interaction.error_code == "invalid_model_output"
+    assert resumed.id == conversation_id

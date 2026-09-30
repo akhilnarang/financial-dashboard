@@ -7,140 +7,53 @@ accounts without an account_number, and accounts that already have any card.
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from financial_dashboard.db import Account, Base, Card
+from financial_dashboard.db import Account, Card
 from financial_dashboard.services.accounts import ensure_default_primary_card
 
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+pytestmark = pytest.mark.anyio
 
 
-@pytest.fixture
-async def session_factory():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    yield maker
-    await engine.dispose()
+async def _account(session, **kwargs) -> Account:
+    account = Account(bank="examplebank", label="Example", **kwargs)
+    session.add(account)
+    await session.flush()
+    return account
 
 
-async def _make_account(maker, **kwargs) -> Account:
-    async with maker() as session:
-        account = Account(**kwargs)
-        session.add(account)
-        await session.commit()
-        await session.refresh(account)
-        return account
-
-
-@pytest.mark.anyio
-async def test_seeds_primary_card_for_new_credit_card_account(session_factory):
-    account = await _make_account(
-        session_factory,
-        bank="hdfc",
-        label="HDFC Swiggy CC",
-        type="credit_card",
-        account_number="0264",
+async def _cards(session, account: Account) -> list[Card]:
+    return list(
+        (await session.scalars(select(Card).where(Card.account_id == account.id)))
     )
-    async with session_factory() as session:
-        account = await session.get(Account, account.id)
-        card = await ensure_default_primary_card(session, account)
-        await session.commit()
 
-    assert card is not None
-    async with session_factory() as session:
-        cards = (
-            (await session.execute(select(Card).where(Card.account_id == account.id)))
-            .scalars()
-            .all()
-        )
+
+async def test_seeds_primary_card_for_new_credit_card_account(session):
+    account = await _account(session, type="credit_card", account_number="1234")
+
+    assert await ensure_default_primary_card(session, account) is not None
+    await session.flush()
+
+    cards = await _cards(session, account)
     assert len(cards) == 1
-    assert cards[0].card_mask == "0264"
+    assert cards[0].card_mask == "1234"
     assert cards[0].is_primary is True
     assert cards[0].label == "self"
     assert cards[0].active is True
 
 
-@pytest.mark.anyio
-async def test_skips_when_account_already_has_cards(session_factory):
-    account = await _make_account(
-        session_factory,
-        bank="icici",
-        label="ICICI RubyX",
-        type="credit_card",
-        account_number="1003",
+async def test_skips_existing_cards_non_card_type_and_missing_number(session):
+    account = await _account(session, type="credit_card", account_number="5678")
+    session.add(
+        Card(account_id=account.id, card_mask="XX5678", label="Other", is_primary=True)
     )
-    async with session_factory() as session:
-        session.add(
-            Card(
-                account_id=account.id, card_mask="XX1003", label="Amex", is_primary=True
-            )
-        )
-        await session.commit()
+    bank = await _account(session, type="bank_account", account_number="000111222")
+    no_number = await _account(session, type="credit_card", account_number=None)
+    await session.flush()
 
-    async with session_factory() as session:
-        account = await session.get(Account, account.id)
-        result = await ensure_default_primary_card(session, account)
-        await session.commit()
+    for target in (account, bank, no_number):
+        assert await ensure_default_primary_card(session, target) is None
+    await session.flush()
 
-    assert result is None
-    async with session_factory() as session:
-        cards = (
-            (await session.execute(select(Card).where(Card.account_id == account.id)))
-            .scalars()
-            .all()
-        )
-    assert len(cards) == 1
-    assert cards[0].card_mask == "XX1003"
-
-
-@pytest.mark.anyio
-async def test_skips_bank_account_type(session_factory):
-    account = await _make_account(
-        session_factory,
-        bank="hdfc",
-        label="HDFC Savings",
-        type="bank_account",
-        account_number="00391000107703",
-    )
-    async with session_factory() as session:
-        account = await session.get(Account, account.id)
-        result = await ensure_default_primary_card(session, account)
-        await session.commit()
-
-    assert result is None
-    async with session_factory() as session:
-        cards = (
-            (await session.execute(select(Card).where(Card.account_id == account.id)))
-            .scalars()
-            .all()
-        )
-    assert cards == []
-
-
-@pytest.mark.anyio
-async def test_skips_when_account_number_missing(session_factory):
-    account = await _make_account(
-        session_factory,
-        bank="hdfc",
-        label="HDFC CC (no number)",
-        type="credit_card",
-        account_number=None,
-    )
-    async with session_factory() as session:
-        account = await session.get(Account, account.id)
-        result = await ensure_default_primary_card(session, account)
-        await session.commit()
-
-    assert result is None
-    async with session_factory() as session:
-        cards = (
-            (await session.execute(select(Card).where(Card.account_id == account.id)))
-            .scalars()
-            .all()
-        )
-    assert cards == []
+    assert [c.card_mask for c in await _cards(session, account)] == ["XX5678"]
+    assert await _cards(session, bank) == []
+    assert await _cards(session, no_number) == []

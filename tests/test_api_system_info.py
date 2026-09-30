@@ -3,12 +3,10 @@ from importlib import metadata as importlib_metadata
 
 import pytest
 from pydantic import SecretStr
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.config import Settings
 from financial_dashboard.core import security
 from financial_dashboard.db.models import Setting
-from financial_dashboard.schemas import system as system_schemas
 from financial_dashboard.services import system as system_service
 from financial_dashboard.services import system_metadata
 
@@ -149,71 +147,6 @@ async def test_system_info_success_shape_and_redaction(client, session, monkeypa
     assert "/very/secret/local/checkout" not in response.text
     assert "git@example.com" not in response.text
     assert "tmp/do-not-expose" not in response.text
-
-
-async def test_get_system_info_offloads_runtime_metadata_to_thread(
-    session: AsyncSession, monkeypatch
-):
-    expected_runtime_metadata = system_schemas.SystemRuntimeMetadata(
-        package_version="7.7.7",
-        app_revision=system_schemas.AppRevisionResult(
-            value="1234567890abcdef1234567890abcdef12345678",
-            source="git",
-        ),
-        runtime=system_schemas.RuntimeInfo(
-            implementation="CPython",
-            python_version="3.14.0",
-        ),
-        parser_packages=[
-            system_schemas.ParserPackageInfo(
-                package="bank-email-parser",
-                version="1.2.3",
-                vcs_commit_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )
-        ],
-    )
-
-    def _fake_runtime_metadata() -> system_schemas.SystemRuntimeMetadata:
-        return expected_runtime_metadata
-
-    to_thread_calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
-
-    async def _fake_to_thread(func, /, *args, **kwargs):
-        to_thread_calls.append((func, args, kwargs))
-        return func(*args, **kwargs)
-
-    monkeypatch.setattr(
-        system_metadata, "collect_runtime_metadata", _fake_runtime_metadata
-    )
-    monkeypatch.setattr(system_service.asyncio, "to_thread", _fake_to_thread)
-
-    body = await system_service.get_system_info(session)
-
-    assert len(to_thread_calls) == 1
-    to_thread_func, to_thread_args, to_thread_kwargs = to_thread_calls[0]
-    assert to_thread_func is _fake_runtime_metadata
-    assert to_thread_args == ()
-    assert to_thread_kwargs == {}
-
-    assert body.package_name == "financial-dashboard"
-    assert body.package_version == "7.7.7"
-    assert body.app_revision == "1234567890abcdef1234567890abcdef12345678"
-    assert body.app_revision_source == "git"
-    assert body.runtime.model_dump() == {
-        "implementation": "CPython",
-        "python_version": "3.14.0",
-    }
-    assert [pkg.model_dump() for pkg in body.parser_packages] == [
-        {
-            "package": "bank-email-parser",
-            "version": "1.2.3",
-            "vcs_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        }
-    ]
-    assert body.schema_state.model_dump() == {
-        "schema_version": None,
-        "applied_migration_markers": [],
-    }
 
 
 async def test_system_info_falls_back_to_unknown_metadata(

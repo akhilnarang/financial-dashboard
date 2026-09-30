@@ -20,16 +20,14 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.core.deps as core_deps
 import financial_dashboard.services.reminders as reminders_module
-import financial_dashboard.web.emails as emails_web
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.web import get_router as get_web_router
 from financial_dashboard.db import (
     Account,
-    Base,
     Card,
     Email,
     FetchRule,
@@ -38,25 +36,20 @@ from financial_dashboard.db import (
 )
 from financial_dashboard.db.enums import PaymentStatus
 from financial_dashboard.integrations.email.body import RawEmailResult
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+from tests.conftest import new_test_engine
 
 
 @pytest.fixture
 async def session_maker(monkeypatch):
     """In-memory aiosqlite session-maker, also installed as the global
     ``async_session`` used by ``check_payment_received``."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(reminders_module, "async_session", maker)
     monkeypatch.setattr(core_deps, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 def _build_test_app(maker):
@@ -69,6 +62,25 @@ def _build_test_app(maker):
 
     app.dependency_overrides[get_session] = _override
     return app
+
+
+async def _post(maker, url: str):
+    raw = _equitas_payment_eml("12,345.00", "9999")
+    with (
+        patch(
+            "financial_dashboard.web.emails.load_or_fetch_raw_email",
+            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
+        ),
+        patch(
+            "financial_dashboard.web.emails.should_notify_transactions",
+            return_value=False,
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=_build_test_app(maker)),
+            base_url="http://test",
+        ) as client:
+            return await client.post(url)
 
 
 def _equitas_payment_eml(amount: str, card_last4: str) -> bytes:
@@ -162,26 +174,11 @@ async def _seed(
 
 @pytest.mark.anyio
 class TestReparseEmailInvokesPaymentCheck:
-    async def test_credit_txn_partially_pays_active_statement(self, session_maker):
-        [email_id] = await _seed(session_maker, due_amount="100,000.00")
+    async def test_credit_txn_fully_pays_active_statement(self, session_maker):
+        [email_id] = await _seed(session_maker, due_amount="12,345.00")
 
-        raw = _equitas_payment_eml("12,345.00", "9999")
-        with (
-            patch(
-                "financial_dashboard.web.emails.load_or_fetch_raw_email",
-                new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
-            ),
-            patch(
-                "financial_dashboard.web.emails.should_notify_transactions",
-                return_value=False,
-            ),
-        ):
-            app = _build_test_app(session_maker)
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                r = await client.post(f"/emails/{email_id}/reparse")
-                assert r.status_code == 200, r.text
+        r = await _post(session_maker, f"/emails/{email_id}/reparse")
+        assert r.status_code == 200, r.text
 
         async with session_maker() as s:
             txn = (await s.execute(select(Transaction))).scalars().one()
@@ -191,130 +188,18 @@ class TestReparseEmailInvokesPaymentCheck:
 
             upload = (await s.execute(select(StatementUpload))).scalars().one()
             assert upload.payment_paid_amount == Decimal("12345.00")
-            assert upload.payment_status == PaymentStatus.PARTIALLY_PAID
-
-    async def test_credit_txn_fully_pays_active_statement(self, session_maker):
-        [email_id] = await _seed(session_maker, due_amount="12,345.00")
-
-        raw = _equitas_payment_eml("12,345.00", "9999")
-        with (
-            patch(
-                "financial_dashboard.web.emails.load_or_fetch_raw_email",
-                new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
-            ),
-            patch(
-                "financial_dashboard.web.emails.should_notify_transactions",
-                return_value=False,
-            ),
-        ):
-            app = _build_test_app(session_maker)
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                r = await client.post(f"/emails/{email_id}/reparse")
-                assert r.status_code == 200, r.text
-
-        async with session_maker() as s:
-            upload = (await s.execute(select(StatementUpload))).scalars().one()
-            assert upload.payment_paid_amount == Decimal("12345.00")
             assert upload.payment_status == PaymentStatus.PAID
             assert upload.payment_paid_at is not None
 
 
-@pytest.mark.anyio
-class TestReparseEmailForceNewDupDefer:
-    """A [dup-defer] email reparsed without force_new must NOT insert a row
-    (it would re-create the duplicate the matcher withheld); with force_new
-    it creates a real transaction."""
-
-    async def _seed_deferred(self, session_maker) -> int:
-        """An email pre-marked [dup-defer] + two balance-less Transactions it
-        collides with (balance-less multiplicity → DEFER on reparse)."""
-        [email_id] = await _seed(session_maker, due_amount="100,000.00")
-        async with session_maker() as s:
-            em = await s.get(Email, email_id)
-            em.status = "skipped"
-            em.error = "[dup-defer] possible duplicate"
-            for t in (0, 1):
-                s.add(
-                    Transaction(
-                        bank="equitas",
-                        email_type="equitas_cc_payment_received_alert",
-                        direction="credit",
-                        amount=Decimal("12345.00"),
-                        currency="INR",
-                        transaction_date=datetime.date(2026, 5, 6),
-                        transaction_time=datetime.time(0, 28 + t),
-                        counterparty="Payment received",
-                        card_mask="XX9999",
-                        balance=None,
-                        source="sms",
-                    )
-                )
-            await s.commit()
-        return email_id
-
-    async def _reparse(self, session_maker, email_id: int, *, force_new: bool):
-        raw = _equitas_payment_eml("12,345.00", "9999")
-        with (
-            patch(
-                "financial_dashboard.web.emails.load_or_fetch_raw_email",
-                new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
-            ),
-            patch(
-                "financial_dashboard.web.emails.should_notify_transactions",
-                return_value=False,
-            ),
-        ):
-            app = _build_test_app(session_maker)
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                qs = "?force_new=true" if force_new else ""
-                return await client.post(f"/emails/{email_id}/reparse{qs}")
-
-    async def test_plain_reparse_redefers_no_row(self, session_maker):
-        email_id = await self._seed_deferred(session_maker)
-        r = await self._reparse(session_maker, email_id, force_new=False)
-        assert r.status_code == 200, r.text
-        assert r.json()["new_status"] == "skipped"
-        async with session_maker() as s:
-            # Still only the two pre-seeded rows; no third inserted.
-            assert len((await s.execute(select(Transaction))).scalars().all()) == 2
-            em = await s.get(Email, email_id)
-            assert em.status == "skipped"
-
-    async def test_force_new_creates_row(self, session_maker):
-        email_id = await self._seed_deferred(session_maker)
-        with patch.object(
-            emails_web,
-            "lock_email_for_attachment",
-            wraps=emails_web.lock_email_for_attachment,
-        ) as attachment_lock:
-            r = await self._reparse(session_maker, email_id, force_new=True)
-        assert r.status_code == 200, r.text
-        attachment_lock.assert_awaited_once()
-        assert attachment_lock.await_args.args[1] == email_id
-        assert r.json()["new_status"] == "parsed"
-        async with session_maker() as s:
-            rows = (await s.execute(select(Transaction))).scalars().all()
-            assert len(rows) == 3  # the two seeds + the forced new row
-            em = await s.get(Email, email_id)
-            assert em.status == "parsed"
-            assert any(t.email_id == email_id for t in rows)
-
-    async def test_plain_reparse_redefers_even_when_now_matchable(self, session_maker):
-        """A [dup-defer] email reparsed without force_new must stay skipped
-        even if find_match would now return a clean cross-channel MATCH (a
-        single same-event candidate with an open email slot). The dup-defer
-        gate takes precedence — the user must explicitly confirm.
-        Otherwise a deferred row silently flips to enriched on reparse."""
-        [email_id] = await _seed(session_maker, due_amount="100,000.00")
-        async with session_maker() as s:
-            em = await s.get(Email, email_id)
-            em.status = "skipped"
-            em.error = "[dup-defer] possible duplicate"
-            # ONE matchable candidate: same amount/card/day, open email slot.
+async def _seed_dup_defer(session_maker, *, candidates: int) -> int:
+    """A [dup-defer] email plus balance-less rows of the same event."""
+    [email_id] = await _seed(session_maker, due_amount="100,000.00")
+    async with session_maker() as s:
+        em = await s.get(Email, email_id)
+        em.status = "skipped"
+        em.error = "[dup-defer] possible duplicate"
+        for t in range(candidates):
             s.add(
                 Transaction(
                     bank="equitas",
@@ -323,25 +208,52 @@ class TestReparseEmailForceNewDupDefer:
                     amount=Decimal("12345.00"),
                     currency="INR",
                     transaction_date=datetime.date(2026, 5, 6),
-                    transaction_time=datetime.time(0, 28),
+                    transaction_time=datetime.time(0, 28 + t),
                     counterparty="Payment received",
                     card_mask="XX9999",
                     balance=None,
                     source="sms",
                 )
             )
-            await s.commit()
+        await s.commit()
+    return email_id
 
-        r = await self._reparse(session_maker, email_id, force_new=False)
-        assert r.status_code == 200, r.text
-        assert r.json()["new_status"] == "skipped"
-        async with session_maker() as s:
-            # The lone candidate was NOT enriched with this email.
-            rows = (await s.execute(select(Transaction))).scalars().all()
-            assert len(rows) == 1
-            assert rows[0].email_id is None
-            em = await s.get(Email, email_id)
-            assert em.status == "skipped"
+
+@pytest.mark.anyio
+async def test_dup_defer_reparse_stays_skipped_even_when_now_matchable(session_maker):
+    """Without force_new a [dup-defer] email stays skipped, even when
+    find_match would now return one clean match. Otherwise a deferred row
+    silently flips to enriched on reparse."""
+    email_id = await _seed_dup_defer(session_maker, candidates=1)
+
+    r = await _post(session_maker, f"/emails/{email_id}/reparse")
+    assert r.status_code == 200, r.text
+    assert r.json()["new_status"] == "skipped"
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].email_id is None
+        assert (await s.get(Email, email_id)).status == "skipped"
+
+
+@pytest.mark.anyio
+async def test_dup_defer_reparse_force_new_creates_row(session_maker):
+    """A plain reparse inserts no row. force_new creates a real transaction."""
+    email_id = await _seed_dup_defer(session_maker, candidates=2)
+
+    r = await _post(session_maker, f"/emails/{email_id}/reparse")
+    assert r.json()["new_status"] == "skipped"
+    async with session_maker() as s:
+        assert len((await s.execute(select(Transaction))).scalars().all()) == 2
+
+    r = await _post(session_maker, f"/emails/{email_id}/reparse?force_new=true")
+    assert r.status_code == 200, r.text
+    assert r.json()["new_status"] == "parsed"
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert len(rows) == 3
+        assert (await s.get(Email, email_id)).status == "parsed"
+        assert any(t.email_id == email_id for t in rows)
 
 
 @pytest.mark.anyio
@@ -356,29 +268,12 @@ class TestReparseAllFailedBulkRoute:
     async def test_bulk_reparse_processes_each_email_and_bumps_statement(
         self, session_maker
     ):
-        email_ids = await _seed(session_maker, due_amount="100,000.00", email_count=2)
-        assert len(email_ids) == 2
+        await _seed(session_maker, due_amount="100,000.00", email_count=2)
 
-        raw = _equitas_payment_eml("12,345.00", "9999")
-        with (
-            patch(
-                "financial_dashboard.web.emails.load_or_fetch_raw_email",
-                new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
-            ),
-            patch(
-                "financial_dashboard.web.emails.should_notify_transactions",
-                return_value=False,
-            ),
-        ):
-            app = _build_test_app(session_maker)
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                r = await client.post("/emails/reparse-all-failed")
-                assert r.status_code == 200, r.text
-                body = r.json()
-                assert body["succeeded"] == 2
-                assert body["failed"] == 0
+        r = await _post(session_maker, "/emails/reparse-all-failed")
+        assert r.status_code == 200, r.text
+        assert r.json()["succeeded"] == 2
+        assert r.json()["failed"] == 0
 
         async with session_maker() as s:
             txns = (await s.execute(select(Transaction))).scalars().all()

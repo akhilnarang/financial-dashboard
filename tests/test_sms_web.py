@@ -1,53 +1,69 @@
-"""Tests for /sms web routes."""
+"""Tests for the SMS ingest API and the /sms web routes."""
 
 import datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import select
 
-from financial_dashboard.core.deps import get_session
-from financial_dashboard.db import Base, SmsMessage
-from financial_dashboard.web import router as web_app_router
+from financial_dashboard.db import SmsMessage, Transaction
 
 
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+def _ingest_json(**overrides) -> dict:
+    payload = {
+        "bank": "HDFC",
+        "sender": "VK-HDFCBK",
+        "body": "Sent Rs.500 from A/c XX1234 to ...",
+        "received_at": "2026-05-02T14:23:11+05:30",
+    }
+    payload.update(overrides)
+    return payload
 
 
-@pytest.fixture
-async def session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as s:
-        yield s
-    await engine.dispose()
+@pytest.mark.anyio
+async def test_post_sms_stores_trimmed_row_and_dedups_without_bank(client, session):
+    first = await client.post(
+        "/api/sms", json=_ingest_json(bank="  HDFC  ", sender="\tVK-HDFCBK\n")
+    )
+    # The dedup key omits the bank, and a duplicate does not update the row.
+    duplicate = await client.post("/api/sms", json=_ingest_json(bank="ICICI"))
+    other = await client.post("/api/sms", json=_ingest_json(body="A different body"))
 
-
-def _build_app(session_factory):
-    app = FastAPI()
-    app.dependency_overrides[get_session] = session_factory
-    app.include_router(web_app_router)
-    return app
-
-
-async def _client(session):
-    async def _override():
-        yield session
-
-    return AsyncClient(
-        transport=ASGITransport(app=_build_app(_override)), base_url="http://test"
+    assert (first.status_code, duplicate.status_code, other.status_code) == (
+        201,
+        204,
+        201,
+    )
+    assert first.content == duplicate.content == b""
+    rows = (
+        (await session.execute(select(SmsMessage).order_by(SmsMessage.id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2
+    assert (rows[0].bank, rows[0].sender) == ("HDFC", "VK-HDFCBK")
+    assert rows[0].received_at.replace(tzinfo=datetime.UTC) == datetime.datetime(
+        2026, 5, 2, 8, 53, 11, tzinfo=datetime.UTC
     )
 
 
 @pytest.mark.anyio
-async def test_reparse_single_pending_sms_returns_200(session):
+@pytest.mark.parametrize(
+    "mutation",
+    [{"sender": "   "}, {"received_at": "2026-05-02T14:23:11"}],
+    ids=["blank_sender", "naive_received_at"],
+)
+async def test_post_sms_invalid_returns_422(client, session, mutation):
+    r = await client.post("/api/sms", json=_ingest_json(**mutation))
+    assert r.status_code == 422
+    assert (await session.execute(select(SmsMessage))).scalars().all() == []
+
+
+@pytest.mark.anyio
+async def test_reparse_single_sms_creates_row_or_rejects_non_transaction(
+    session, client
+):
     sms = SmsMessage(
         bank="hdfc",
         sender="VK-HDFCBK",
@@ -55,54 +71,46 @@ async def test_reparse_single_pending_sms_returns_200(session):
         received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
         status="pending",
     )
-    session.add(sms)
-    await session.commit()
-
-    async with await _client(session) as client:
-        resp = await client.post(f"/sms/{sms.id}/reparse")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["new_status"] == "parsed"
-    assert data["txn_id"] is not None
-
-
-@pytest.mark.anyio
-async def test_reparse_single_otp_sms_returns_422(session):
-    sms = SmsMessage(
+    otp = SmsMessage(
         bank="hdfc",
         sender="VK-HDFCBK",
         body="OTP for your transaction is 123456. Valid 5 mins.",
-        received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
+        received_at=datetime.datetime(2026, 5, 2, 8, 54, 0, tzinfo=datetime.UTC),
         status="pending",
     )
-    session.add(sms)
+    session.add_all([sms, otp])
     await session.commit()
 
-    async with await _client(session) as client:
-        resp = await client.post(f"/sms/{sms.id}/reparse")
+    resp = await client.post(f"/sms/{sms.id}/reparse")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["new_status"] == "parsed"
+    txn = await session.get(Transaction, data["txn_id"])
+    assert (txn.direction, txn.amount, txn.transaction_date) == (
+        "debit",
+        Decimal("500"),
+        datetime.date(2026, 5, 2),
+    )
+    assert txn.card_mask is not None
+    await session.refresh(sms)
+    assert (sms.status, sms.transaction_id) == ("parsed", txn.id)
+
+    resp = await client.post(f"/sms/{otp.id}/reparse")
     assert resp.status_code == 422
+    assert len((await session.execute(select(Transaction))).scalars().all()) == 1
 
 
 @pytest.mark.anyio
-async def test_reparse_single_not_found_returns_404(session):
-    async with await _client(session) as client:
-        resp = await client.post("/sms/99999/reparse")
-    assert resp.status_code == 404
-
-
-@pytest.mark.anyio
-async def test_reparse_force_new_creates_row_for_deferred_sms(session):
+async def test_reparse_force_new_creates_row_for_deferred_sms(session, client):
     """A [dup-defer] SMS reparsed with ?force_new=true must create a real
     transaction (manual confirmation that it's a genuine second charge),
     bypassing the matcher that would DEFER it again."""
-    from financial_dashboard.db import Transaction
-
     # A pre-existing balance-less ICICI CC row the incoming SMS collides with.
     existing = Transaction(
         bank="icici",
         email_type="icici_cc_transaction_alert",
         direction="debit",
-        amount=__import__("decimal").Decimal("5000.00"),
+        amount=Decimal("5000.00"),
         currency="INR",
         transaction_date=datetime.date(2026, 6, 7),
         transaction_time=datetime.time(21, 36, 0),
@@ -128,15 +136,14 @@ async def test_reparse_force_new_creates_row_for_deferred_sms(session):
     session.add(sms)
     await session.commit()
 
-    async with await _client(session) as client:
-        # Without force_new it defers again (no row).
-        resp = await client.post(f"/sms/{sms.id}/reparse")
-        assert resp.status_code == 200
-        assert resp.json()["new_status"] == "skipped"
-        assert resp.json()["txn_id"] is None
+    # Without force_new it defers again (no row).
+    resp = await client.post(f"/sms/{sms.id}/reparse")
+    assert resp.status_code == 200
+    assert resp.json()["new_status"] == "skipped"
+    assert resp.json()["txn_id"] is None
 
-        # With force_new it creates a real transaction.
-        resp = await client.post(f"/sms/{sms.id}/reparse?force_new=true")
+    # With force_new it creates a real transaction.
+    resp = await client.post(f"/sms/{sms.id}/reparse?force_new=true")
     assert resp.status_code == 200
     data = resp.json()
     assert data["new_status"] == "parsed"
@@ -144,7 +151,7 @@ async def test_reparse_force_new_creates_row_for_deferred_sms(session):
 
 
 @pytest.mark.anyio
-async def test_reparse_all_pending_and_error(session):
+async def test_reparse_all_pending_and_error(session, client):
     good = SmsMessage(
         bank="hdfc",
         sender="VK-HDFCBK",
@@ -170,8 +177,7 @@ async def test_reparse_all_pending_and_error(session):
     session.add_all([good, bad, skipped])
     await session.commit()
 
-    async with await _client(session) as client:
-        resp = await client.post("/sms/reparse-all-failed")
+    resp = await client.post("/sms/reparse-all-failed")
     assert resp.status_code == 200
     data = resp.json()
     # good → processed; bad → still_error; skipped is not in the target set.
@@ -184,7 +190,7 @@ async def test_reparse_all_pending_and_error(session):
 
 @pytest.mark.anyio
 async def test_reparse_maskless_multi_card_dispatches_disambiguation_prompt(
-    session, monkeypatch
+    session, client, monkeypatch
 ):
     """A maskless CC bill-payment SMS with multiple CC candidates (and no
     statement amount-match) reaches the notification boundary: the web reparse
@@ -230,12 +236,12 @@ async def test_reparse_maskless_multi_card_dispatches_disambiguation_prompt(
         "financial_dashboard.services.telegram.send_disambiguation_prompt",
         prompt_mock,
     ):
-        async with await _client(session) as client:
-            resp = await client.post(f"/sms/{sms.id}/reparse")
+        resp = await client.post(f"/sms/{sms.id}/reparse")
 
     assert resp.status_code == 200
     # Fired exactly once at the notification boundary, carrying both candidates.
     prompt_mock.assert_awaited_once()
     payload = prompt_mock.await_args.args[0]
     assert set(payload["candidate_account_ids"]) == {a.id, b.id}
-    assert payload["txn_id"] is not None
+    txn = await session.get(Transaction, payload["txn_id"])
+    assert txn.account_id is None

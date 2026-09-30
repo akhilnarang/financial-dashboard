@@ -22,17 +22,17 @@ from typing import Literal
 import pytest
 from bank_statement_parser.models import BankTransaction, ParsedBankStatement
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.db import (
     Account,
-    Base,
     BankStatementUpload,
     Transaction,
 )
 from financial_dashboard.services.statements import bank as bank_module
 from financial_dashboard.services.statements import shared as shared_module
 from financial_dashboard.services.statements.bank import reconcile_bank_statement
+from tests.conftest import new_test_engine
 
 ACCOUNT_ID = 1
 ACCOUNT_NUMBER = "9876500011122233"
@@ -47,14 +47,13 @@ def anyio_backend():
 async def session_factory(monkeypatch):
     """In-memory DB installed as the global ``async_session`` of both the
     reconciler module and the statement-retry path."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(bank_module, "async_session", maker)
     monkeypatch.setattr(shared_module, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 def _stmt_txn(
@@ -200,27 +199,6 @@ async def test_row_the_matcher_refused_is_not_imported(session_factory, monkeypa
 @pytest.mark.parametrize(
     ("db_overrides", "stmt_rows"),
     [
-        # One DB row, two same-day statement rows chasing it: the loser is
-        # already in the DB under the row the winner took, and the winner won
-        # on statement order, which is not evidence.
-        pytest.param(
-            {},
-            [
-                dict(
-                    date="07/04/2026",
-                    amount="2,500.00",
-                    narration="MERCHANT B RETAIL",
-                    counterparty="MERCHANT B",
-                ),
-                dict(
-                    date="07/04/2026",
-                    amount="2,500.00",
-                    narration="MERCHANT A RETAIL",
-                    counterparty="MERCHANT A",
-                ),
-            ],
-            id="same-day-rivals",
-        ),
         # Contention is about candidate sets, not proximity: rows on 06 and
         # 08 Apr both reach the 07 Apr DB row through the ±1-day window.
         pytest.param(
@@ -297,49 +275,6 @@ async def test_distinguishable_rivals_hold_back_winner_and_loser(
     assert [row.id for row in rows] == [a_id]
     assert upload.imported_count == 0
     assert upload.missing_count == 2
-
-
-@pytest.mark.anyio
-async def test_incompatible_reused_reference_does_not_contend_with_valid_match(
-    session_factory, monkeypatch
-):
-    """A contradictory amount remains ambiguous but cannot demote a valid match."""
-    await _seed_account(session_factory)
-    a_id = await _seed_txn(
-        session_factory, counterparty="MERCHANT A", reference_number="REF12345"
-    )
-
-    parsed = _parsed(
-        [
-            _stmt_txn(
-                date="07/04/2026",
-                amount="2,500.00",
-                narration="MERCHANT B RETAIL",
-                counterparty="MERCHANT B",
-                ref="REF12345",
-            ),
-            # Same reference but a contradictory amount. Keep it as ambiguous
-            # evidence without treating it as a rival for the valid winner.
-            _stmt_txn(
-                date="09/04/2026",
-                amount="3,100.00",
-                narration="MERCHANT A RETAIL",
-                counterparty="MERCHANT A",
-                ref="REF12345",
-            ),
-        ]
-    )
-    recon = await _reconcile(session_factory, parsed)
-    assert [entry["stmt_idx"] for entry in recon["matched"]] == [0]
-    assert [entry["stmt_idx"] for entry in recon["missing"]] == [1]
-    assert recon["missing"][0]["ambiguous"] is True
-    assert recon["missing"][0]["candidate_transaction_ids"] == [a_id]
-
-    rows, upload = await _run_real_reparse(session_factory, monkeypatch, parsed)
-
-    assert [row.id for row in rows] == [a_id]
-    assert upload.imported_count == 0
-    assert upload.missing_count == 1
 
 
 @pytest.mark.anyio

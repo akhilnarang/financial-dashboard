@@ -1,56 +1,28 @@
-# tests/test_categorization_sweep.py
 import json
 from decimal import Decimal
 
 import pytest
 
-from financial_dashboard.db.models import Base, Transaction
-from financial_dashboard.services.categorization import sweep
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+import financial_dashboard.services.telegram as tg
+from financial_dashboard.db.models import Transaction
+from financial_dashboard.services.categorization import backfill, sweep
+from tests.conftest import new_test_engine
 
 pytestmark = pytest.mark.anyio
 
 
 @pytest.fixture
 async def memdb(monkeypatch):
-    from sqlalchemy.ext.asyncio import (
-        async_sessionmaker,
-        create_async_engine,
-        AsyncSession,
-    )
-
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(
         "financial_dashboard.services.categorization.sweep.async_session", maker
     )
     yield maker
     await engine.dispose()
-
-
-async def test_rule_sweep_categorizes_interest_rows(memdb):
-    async with memdb() as s:
-        s.add(
-            Transaction(
-                bank="testbank",
-                email_type="x",
-                direction="credit",
-                amount=Decimal("10"),
-                channel="interest",
-            )
-        )
-        await s.commit()
-
-    n = await sweep.run_rule_sweep()
-    assert n == 1
-
-    async with memdb() as s:
-        from sqlalchemy import select
-
-        row = (await s.execute(select(Transaction))).scalars().one()
-        assert row.category == "interest"
-        assert row.category_method == "rule"
+    holder.close()
 
 
 @pytest.mark.parametrize("prompt", ["sent", "failed", "assistant", "assistant_failed"])
@@ -121,6 +93,7 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         row.review_status = "notified"
         s.add(Category(slug="groceries", active=True))
         decision = await s.scalar(select(CategoryReviewDecision))
+        assert decision.proposed_slug == "groceries"
         # Another transaction's prompt failed. It must not look like this
         # row's prompt.
         other = CategoryReviewDecision(
@@ -179,9 +152,9 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         assert row.category_vocab_version == 2
         decisions = (
             await s.scalars(
-                select(CategoryReviewDecision).where(
-                    CategoryReviewDecision.transaction_id == row.id
-                )
+                select(CategoryReviewDecision)
+                .where(CategoryReviewDecision.transaction_id == row.id)
+                .order_by(CategoryReviewDecision.id)
             )
         ).all()
         assert [decision.status for decision in decisions] == (
@@ -194,49 +167,123 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
     assert await sweep.run_llm_sweep() == 0
 
 
-async def test_review_notify_links_id_and_escapes_fields(memdb, monkeypatch):
-    """Review messages link #id to the transaction page (when base_url set) and
-    html-escape counterparty/reason and the literal <note>/<category> hint."""
-    import financial_dashboard.services.telegram as tg
-    from financial_dashboard.db.models import Transaction
-
+@pytest.fixture
+def telegram_send(monkeypatch):
+    """Configure Telegram and record every review message the sweep sends."""
     monkeypatch.setattr(sweep, "is_telegram_configured", lambda: True)
     monkeypatch.setattr(sweep, "get_telegram_chat_id", lambda: 123)
-    # Adversarial base_url (stray quote) — must not break out of the href attribute.
+    # Adversarial base_url (stray quote) must not break out of the href attribute.
     monkeypatch.setattr(sweep, "get_app_base_url", lambda: 'http://host:8000"x')
-
     sent: list = []
 
     async def fake_send(app, *, chat_id, text, parse_mode=None, **kw):
         sent.append((text, parse_mode))
 
-    monkeypatch.setattr(tg, "tg_app", object())
     monkeypatch.setattr(tg, "_send_with_retry", fake_send)
+    monkeypatch.setattr(tg, "tg_app", object())
+    return sent
 
+
+async def _seed_pending(memdb, **kw) -> int:
+    async with memdb() as s:
+        fields = dict(
+            bank="testbank",
+            email_type="x",
+            direction="debit",
+            amount=Decimal("50"),
+            counterparty="MYSTERY MERCHANT",
+            review_status="pending",
+            review_reason="low confidence",
+        )
+        txn = Transaction(**(fields | kw))
+        s.add(txn)
+        await s.commit()
+        return txn.id
+
+
+async def test_pending_row_is_notified_once_with_escaped_fields(memdb, telegram_send):
+    """A 'pending' row is sent once and becomes 'notified'. A 'resolved' row is
+    not sent. The message links #id and html-escapes free-text fields."""
+    txn_id = await _seed_pending(
+        memdb,
+        direction="deb<it",
+        currency="IN&R",
+        counterparty="A & B <x>",
+        review_reason="unclear <tag>",
+    )
     async with memdb() as s:
         s.add(
             Transaction(
-                # direction/currency are free-text parser fields — include markup.
                 bank="b",
                 email_type="x",
-                direction="deb<it",
-                currency="IN&R",
-                amount=Decimal("5"),
-                counterparty="A & B <x>",
-                review_status="pending",
-                review_reason="unclear <tag>",
+                direction="debit",
+                amount=Decimal("1"),
+                review_status="resolved",
             )
         )
         await s.commit()
 
-    n = await sweep.run_review_notify()
-    assert n == 1
-    text, mode = sent[0]
+    assert await sweep.run_review_notify() == 1
+    assert len(telegram_send) == 1
+    async with memdb() as s:
+        txn = await s.get(Transaction, txn_id)
+    assert txn.review_status == "notified"
+    assert txn.last_notified_at is not None
+    assert txn.notify_attempts == 1
+    text, mode = telegram_send[0]
     assert mode == "HTML"
-    # href attribute value escaped — the stray quote can't terminate the attribute
     assert 'href="http://host:8000&quot;x/transactions/' in text
-    assert "A &amp; B &lt;x&gt;" in text  # counterparty escaped
-    assert "unclear &lt;tag&gt;" in text  # reason escaped
-    assert "deb&lt;it" in text  # direction escaped
-    assert "IN&amp;R" in text  # currency escaped
+    assert "A &amp; B &lt;x&gt;" in text
+    assert "unclear &lt;tag&gt;" in text
+    assert "deb&lt;it" in text
+    assert "IN&amp;R" in text
     assert "&lt;note&gt;" in text and "&lt;category&gt;" in text
+
+    assert await sweep.run_review_notify() == 0
+    assert len(telegram_send) == 1
+
+
+async def test_failed_send_is_retried_until_the_cap(memdb, telegram_send, monkeypatch):
+    """A transient send failure does not strand a row before the cap. A row at
+    the cap is skipped, so the queue drains."""
+    attempts = {"count": 0}
+
+    async def failing_send(*a, **kw):
+        attempts["count"] += 1
+        raise RuntimeError("still failing")
+
+    monkeypatch.setattr(tg, "_send_with_retry", failing_send)
+    txn_id = await _seed_pending(memdb)
+
+    for expected in (1, 2, 3):
+        await sweep.run_review_notify(max_attempts=3)
+        async with memdb() as s:
+            txn = await s.get(Transaction, txn_id)
+        assert txn.review_status == "pending"
+        assert txn.notify_attempts == expected
+        assert txn.last_notified_at is None
+
+    assert await sweep.run_review_notify(max_attempts=3) == 0
+    assert attempts["count"] == 3
+
+
+async def test_backfill_runs_rules_then_llm(monkeypatch):
+    order = []
+
+    async def fake_rule(**k):
+        order.append("rule")
+        return 0
+
+    async def fake_llm(**k):
+        order.append("llm")
+        return 0
+
+    monkeypatch.setattr(backfill, "run_rule_sweep", fake_rule)
+    monkeypatch.setattr(backfill, "run_llm_sweep", fake_llm)
+
+    assert await backfill.run_backfill(batch_size=50) == (0, 0)
+    assert order == ["rule", "llm"]
+
+    order.clear()
+    await backfill.run_backfill(rules_only=True)
+    assert order == ["rule"]

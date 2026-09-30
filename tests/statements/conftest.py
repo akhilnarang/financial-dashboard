@@ -8,9 +8,9 @@ tests override any of these via their own ``monkeypatch``.
 """
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from financial_dashboard.db import Base
+from tests.conftest import new_test_engine
 
 
 @pytest.fixture
@@ -23,9 +23,7 @@ async def maker(monkeypatch):
     """In-memory SQLite session factory wired into every module that owns a
     ``process_*`` / retry / reminder pipeline via its module-level
     ``async_session`` reference."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     import financial_dashboard.services.reminders as reminders_module
@@ -39,6 +37,7 @@ async def maker(monkeypatch):
     monkeypatch.setattr(reminders_module, "async_session", factory)
     yield factory
     await engine.dispose()
+    holder.close()
 
 
 @pytest.fixture(autouse=True)

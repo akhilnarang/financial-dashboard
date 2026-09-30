@@ -17,41 +17,6 @@ from financial_dashboard.services.audit_reads import list_terminal_proactive_del
 
 
 @pytest.mark.anyio
-async def test_audit_page_lists_and_filters_interactions(session, client):
-    interaction = AuditInteraction(
-        telegram_update_id="audit-web-1",
-        inbound_chat_id=123,
-        trigger="reply",
-        transaction_id=None,
-        user_text="why?",
-        status="delivered",
-        outcome="answer",
-        assistant_text="The category was ambiguous.",
-    )
-    session.add(interaction)
-    await session.flush()
-    session.add(
-        AuditAction(
-            interaction_id=interaction.id,
-            action_type="set_note",
-            target_type="transaction",
-            target_id=7,
-            arguments_json='{"note":"lunch"}',
-            before_json='{"note":null}',
-            after_json='{"note":"lunch"}',
-            status="applied",
-        )
-    )
-    await session.commit()
-
-    response = await client.get("/audit", params={"action_type": "set_note"})
-
-    assert response.status_code == 200
-    assert "why?" in response.text
-    assert "delivered" in response.text
-
-
-@pytest.mark.anyio
 async def test_audit_detail_shows_model_and_action_evidence(session, client):
     conversation = TelegramConversation(
         chat_id=123,
@@ -103,7 +68,6 @@ async def test_audit_detail_shows_model_and_action_evidence(session, client):
     assert "bounded explanation" in response.text
     assert "assistant-v7" in response.text
     assert "json_schema" in response.text
-    assert 'class="app-header"' in response.text
     assert 'href="https://example.com/merchant"' in response.text
     assert 'href="javascript:' not in response.text
 

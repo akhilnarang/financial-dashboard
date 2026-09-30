@@ -99,91 +99,41 @@ async def _seed_transactions(
     return matched, imported
 
 
-async def test_transactions_page_shows_escaped_note_and_scrollable_table(
-    client, session
-):
-    transaction = Transaction(
-        bank="hdfc",
-        email_type="test",
-        direction="debit",
-        amount=Decimal("10.00"),
-        category="rent",
-        note='<script>alert("list")</script>',
+async def test_statement_pages_show_current_category_and_escaped_note(client, session):
+    upload_kinds = (
+        ("credit_card", StatementUpload, "/statements/{}"),
+        ("bank_account", BankStatementUpload, "/statements/bank/{}"),
     )
-    session.add(transaction)
-    await session.flush()
+    for account_type, upload_model, path in upload_kinds:
+        account = Account(bank="hdfc", label="Test", type=account_type)
+        session.add(account)
+        await session.flush()
+        matched, imported = await _seed_transactions(session, account.id)
+        upload = upload_model(
+            account_id=account.id,
+            bank="hdfc",
+            filename="statement.pdf",
+            file_path="/tmp/statement.pdf",
+            status="parsed",
+            parsed_txn_count=3,
+            matched_count=1,
+            missing_count=2,
+            imported_count=1,
+            reconciliation_data=json.dumps(_reconciliation(matched.id, imported.id)),
+        )
+        session.add(upload)
+        await session.flush()
 
-    response = await client.get("/transactions")
+        response = await client.get(path.format(upload.id))
 
-    assert response.status_code == 200
-    assert "<th>Note</th>" in response.text
-    assert 'class="table transactions-table"' in response.text
-    assert ".table.transactions-table" in response.text
-    assert "&lt;script&gt;alert" in response.text
-    assert '<script>alert("list")</script>' not in response.text
+        assert response.status_code == 200
+        assert "Rent" in response.text
+        assert "Uncategorized" in response.text
+        assert "&lt;script&gt;alert" in response.text
+        assert '<script>alert("matched")</script>' not in response.text
+        assert "Imported note &amp; receipt" in response.text
 
-
-async def test_cc_statement_shows_current_category_and_escaped_note(client, session):
-    account = Account(bank="hdfc", label="Test card", type="credit_card")
-    session.add(account)
-    await session.flush()
-    matched, imported = await _seed_transactions(session, account.id)
-    reconciliation = _reconciliation(matched.id, imported.id)
-    upload = StatementUpload(
-        account_id=account.id,
-        bank="hdfc",
-        filename="statement.pdf",
-        file_path="/tmp/statement.pdf",
-        status="parsed",
-        parsed_txn_count=3,
-        matched_count=1,
-        missing_count=2,
-        imported_count=1,
-        reconciliation_data=json.dumps(reconciliation),
-    )
-    session.add(upload)
-    await session.flush()
-
-    response = await client.get(f"/statements/{upload.id}")
-
-    assert response.status_code == 200
-    assert response.text.count("<th>Category</th><th>Note</th>") == 2
-    assert '<span class="badge">Rent</span>' in response.text
-    assert '<span class="badge badge-pending">Uncategorized</span>' in response.text
-    assert "&lt;script&gt;alert" in response.text
-    assert '<script>alert("matched")</script>' not in response.text
-    assert "Imported note &amp; receipt" in response.text
-    assert "transaction_note" not in upload.reconciliation_data
-
-
-async def test_bank_statement_shows_current_category_and_escaped_note(client, session):
-    account = Account(bank="hdfc", label="Test bank", type="bank_account")
-    session.add(account)
-    await session.flush()
-    matched, imported = await _seed_transactions(session, account.id)
-    reconciliation = _reconciliation(matched.id, imported.id)
-    upload = BankStatementUpload(
-        account_id=account.id,
-        bank="hdfc",
-        filename="statement.pdf",
-        file_path="/tmp/statement.pdf",
-        status="parsed",
-        parsed_txn_count=3,
-        matched_count=1,
-        missing_count=2,
-        imported_count=1,
-        reconciliation_data=json.dumps(reconciliation),
-    )
-    session.add(upload)
-    await session.flush()
-
-    response = await client.get(f"/statements/bank/{upload.id}")
-
-    assert response.status_code == 200
-    assert response.text.count("<th>Category</th><th>Note</th>") == 2
-    assert '<span class="badge">Rent</span>' in response.text
-    assert '<span class="badge badge-pending">Uncategorized</span>' in response.text
-    assert "&lt;script&gt;alert" in response.text
-    assert '<script>alert("matched")</script>' not in response.text
-    assert "Imported note &amp; receipt" in response.text
-    assert "transaction_note" not in upload.reconciliation_data
+    listing = await client.get("/transactions")
+    assert listing.status_code == 200
+    assert "&lt;script&gt;alert" in listing.text
+    assert '<script>alert("matched")</script>' not in listing.text

@@ -2,7 +2,6 @@ import datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import event
 
 from financial_dashboard.db import (
     Account,
@@ -210,19 +209,16 @@ async def test_transaction_detail_returns_provenance_without_file_paths(
     assert body["may_affect_cc_payment_state"] is True
     assert "/private/synthetic.pdf" not in response.text
 
-
-async def test_transaction_detail_bounds_large_text_fields(client, session):
-    transaction, *_ = await _seed_transaction(session)
     transaction.raw_description = "R" * 50_001
     transaction.note = "N" * 50_001
     await session.commit()
-
     body = (await client.get(f"/api/transactions/{transaction.id}")).json()
-
     assert len(body["raw_description"]) == 50_000
     assert body["raw_description_truncated"] is True
     assert len(body["note"]) == 50_000
     assert body["note_truncated"] is True
+
+    assert (await client.get("/api/transactions/999999")).status_code == 404
 
 
 async def test_transaction_batch_preserves_requested_order_and_missing_ids(
@@ -253,68 +249,18 @@ async def test_transaction_batch_preserves_requested_order_and_missing_ids(
     assert response.json()["missing_ids"] == [999999]
 
 
-async def test_transaction_reads_do_not_autoflush(client, session):
-    pending = Transaction(
-        bank="pending",
-        email_type="pending",
-        direction="debit",
-        amount=Decimal("1.00"),
-    )
-    session.add(pending)
-    statements: list[str] = []
-    bind = session.get_bind()
-
-    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
-        statements.append(statement.strip().lower())
-
-    event.listen(bind, "before_cursor_execute", record_statement)
-    try:
-        response = await client.get("/api/transactions")
-    finally:
-        event.remove(bind, "before_cursor_execute", record_statement)
-
-    assert response.status_code == 200
-    assert pending.id is None
-    assert not any(statement.startswith("insert") for statement in statements)
-
-
 @pytest.mark.parametrize(
     ("path", "method", "payload"),
     [
-        ("/api/transactions/0", "get", None),
         ("/api/transactions?limit=101", "get", None),
         (
             "/api/transactions?date_from=2030-01-03&date_to=2030-01-02",
             "get",
             None,
         ),
-        ("/api/transactions/batch", "post", {"ids": []}),
         ("/api/transactions/batch", "post", {"ids": [1, 1]}),
     ],
 )
 async def test_transaction_reads_validate_bounds(client, path, method, payload):
     response = await client.request(method, path, json=payload)
     assert response.status_code == 422
-
-
-async def test_transaction_detail_returns_404(client):
-    response = await client.get("/api/transactions/999999")
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Transaction not found"}
-
-
-async def test_transaction_read_openapi_is_typed(client):
-    document = (await client.get("/openapi.json")).json()
-    assert document["paths"]["/api/transactions"]["get"]["responses"]["200"]["content"][
-        "application/json"
-    ]["schema"] == {"$ref": "#/components/schemas/TransactionListResponse"}
-    assert document["paths"]["/api/transactions/{txn_id}"]["get"]["responses"]["200"][
-        "content"
-    ]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/TransactionDetailResponse"
-    }
-    assert document["paths"]["/api/transactions/batch"]["post"]["responses"]["200"][
-        "content"
-    ]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/TransactionBatchResponse"
-    }

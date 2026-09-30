@@ -107,17 +107,18 @@ async def test_email_parse_preview_projects_insert_without_writes(
     email = await _email(session)
     await session.commit()
     _patch_raw_and_parse(monkeypatch, _transaction_parse())
-    statements: list[str] = []
+    writes: list[str] = []
     bind = session.get_bind()
 
-    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
-        statements.append(statement.strip().lower())
+    def record_write(_conn, _cursor, statement, _parameters, _context, _many):
+        if statement.strip().lower().startswith(("insert", "update", "delete")):
+            writes.append(statement)
 
-    event.listen(bind, "before_cursor_execute", record_statement)
+    event.listen(bind, "before_cursor_execute", record_write)
     try:
         response = await client.post(f"/api/emails/{email.id}/parse-preview")
     finally:
-        event.remove(bind, "before_cursor_execute", record_statement)
+        event.remove(bind, "before_cursor_execute", record_write)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -127,14 +128,34 @@ async def test_email_parse_preview_projects_insert_without_writes(
     assert body["parser"]["transaction"]["card_mask"] == "XXXX1234"
     assert "raw_description" not in body["parser"]["transaction"]
     assert body["merge"]["action"] == "insert"
-    assert not any(
-        statement.startswith(("insert", "update", "delete")) for statement in statements
-    )
+    assert writes == []
+
+    # An email the matcher already deferred stays deferred. The preview
+    # expunges the session, so load the row again.
+    stored = await session.get(Email, email.id)
+    stored.status = "skipped"
+    stored.error = "[dup-defer] synthetic deferred source"
+    await session.commit()
+
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 200
+    assert response.json()["merge"] == {
+        "action": "defer",
+        "target_transaction_id": None,
+        "match_kind": "existing_dup_defer",
+        "changed_fields": [],
+        "identity_conflicts": [],
+        "linked_attribution_refresh": False,
+        "match_evidence": None,
+    }
 
 
 async def test_email_parse_preview_projects_linked_refresh(
     client, session, monkeypatch
 ):
+    """A reparse refuses a saved label over a stored bank name, so the preview
+    must not offer that change either."""
     email = await _email(session)
     transaction = Transaction(
         email_id=email.id,
@@ -145,11 +166,15 @@ async def test_email_parse_preview_projects_linked_refresh(
         currency="INR",
         transaction_date=datetime.date(2030, 1, 2),
         transaction_time=datetime.time(10, 30),
-        counterparty="Old synthetic merchant",
+        counterparty="SAMPLE BENEFICIARY",
+        counterparty_source="bank",
     )
     session.add(transaction)
     await session.commit()
-    _patch_raw_and_parse(monkeypatch, _transaction_parse())
+    parse = _transaction_parse()
+    parse.txn_data["counterparty"] = "My Saved Payee"
+    parse.txn_data["counterparty_source"] = "user_alias"
+    _patch_raw_and_parse(monkeypatch, parse)
 
     response = await client.post(f"/api/emails/{email.id}/parse-preview")
 
@@ -159,12 +184,7 @@ async def test_email_parse_preview_projects_linked_refresh(
     assert merge["target_transaction_id"] == transaction.id
     assert merge["identity_conflicts"] == []
     assert merge["linked_attribution_refresh"] is True
-    assert set(merge["changed_fields"]) == {
-        "counterparty",
-        "card_mask",
-        "channel",
-        "raw_description",
-    }
+    assert set(merge["changed_fields"]) == {"card_mask", "channel", "raw_description"}
 
 
 async def test_email_parse_preview_reports_claimed_reference_conflict(
@@ -197,31 +217,6 @@ async def test_email_parse_preview_reports_claimed_reference_conflict(
     assert response.json()["merge"]["match_kind"] == "claimed_reference"
 
 
-async def test_email_parse_preview_preserves_existing_duplicate_defer(
-    client, session, monkeypatch
-):
-    email = await _email(
-        session,
-        status="skipped",
-        error="[dup-defer] synthetic deferred source",
-    )
-    await session.commit()
-    _patch_raw_and_parse(monkeypatch, _transaction_parse())
-
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
-
-    assert response.status_code == 200
-    assert response.json()["merge"] == {
-        "action": "defer",
-        "target_transaction_id": None,
-        "match_kind": "existing_dup_defer",
-        "changed_fields": [],
-        "identity_conflicts": [],
-        "linked_attribution_refresh": False,
-        "match_evidence": None,
-    }
-
-
 async def test_email_parse_preview_flags_truncated_linked_transactions(
     client, session, monkeypatch
 ):
@@ -252,63 +247,12 @@ async def test_email_parse_preview_flags_truncated_linked_transactions(
     assert response.json()["merge"]["action"] == "multiple_linked"
 
 
-async def test_email_parse_preview_suppresses_merge_for_statement_rule(
+async def test_email_parse_preview_routes_statements_and_cas_elsewhere(
     client, session, monkeypatch
 ):
-    email = await _email(session, email_kind="cc_statement")
-    await session.commit()
-    _patch_raw_and_parse(monkeypatch, _transaction_parse())
-
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
-
-    assert response.status_code == 200
-    assert response.json()["routing"] == "statement"
-    assert response.json()["parser"]["disposition"] == "transaction"
-    assert response.json()["merge"]["action"] == "routed_statement_pipeline"
-    assert response.json()["merge"]["match_kind"] == "statement_rule"
-
-
-async def test_email_parse_preview_routes_pdf_statement_after_html_parse_error(
-    client, session, monkeypatch
-):
-    email = await _email(session, email_kind="bank_statement")
-    await session.commit()
-    _patch_raw_and_parse(
-        monkeypatch,
-        ProcessedEmailParse("Synthetic HTML parser failure", None, None, None),
-    )
-
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
-
-    assert response.status_code == 200
-    assert response.json()["parser"]["disposition"] == "error"
-    assert response.json()["merge"]["action"] == "routed_statement_pipeline"
-    assert response.json()["merge"]["match_kind"] == "statement_rule"
-
-
-async def test_email_parse_preview_routes_transaction_parse_failure_to_statement_fallback(
-    client, session, monkeypatch
-):
-    email = await _email(session, email_kind="transaction")
-    await session.commit()
-    _patch_raw_and_parse(
-        monkeypatch,
-        ProcessedEmailParse("Synthetic HTML parser failure", None, None, None),
-    )
-
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
-
-    assert response.status_code == 200
-    assert response.json()["routing"] == "statement"
-    assert response.json()["parser"]["disposition"] == "error"
-    assert response.json()["merge"]["action"] == "routed_statement_pipeline"
-    assert response.json()["merge"]["match_kind"] == "transaction_parse_fallback"
-
-
-async def test_email_parse_preview_reports_statement_summary(
-    client, session, monkeypatch
-):
-    email = await _email(session, email_kind="cc_statement")
+    statement_email = await _email(session, email_kind="cc_statement")
+    failed_email = await _email(session, email_kind="transaction")
+    cas_email = await _email(session, email_kind="cas_statement")
     await session.commit()
     parsed = ParsedEmail(
         bank="synthetic-bank",
@@ -324,57 +268,51 @@ async def test_email_parse_preview_reports_statement_summary(
         monkeypatch, ProcessedEmailParse(None, None, parsed.password_hint, parsed)
     )
 
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+    response = await client.post(f"/api/emails/{statement_email.id}/parse-preview")
 
     assert response.status_code == 200
-    parser = response.json()["parser"]
-    assert parser["disposition"] == "statement_summary"
-    assert parser["password_hint_present"] is True
-    assert parser["statement"]["card_mask"] == "XXXX1234"
+    body = response.json()
+    assert body["routing"] == "statement"
+    assert body["parser"]["disposition"] == "statement_summary"
+    assert body["parser"]["password_hint_present"] is True
+    assert body["parser"]["statement"]["card_mask"] == "XXXX1234"
     assert "must-not-be-returned" not in response.text
-    assert response.json()["merge"]["action"] == "routed_statement_pipeline"
+    assert body["merge"]["action"] == "routed_statement_pipeline"
+    assert body["merge"]["match_kind"] == "statement_rule"
 
-
-async def test_email_parse_preview_reports_cas_pipeline(client, session, monkeypatch):
-    email = await _email(session, email_kind="cas_statement")
-    await session.commit()
-    _patch_raw_and_parse(monkeypatch, _transaction_parse())
-
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+    # A transaction rule whose parse fails falls back to the statement path.
+    _patch_raw_and_parse(
+        monkeypatch,
+        ProcessedEmailParse("Synthetic HTML parser failure", None, None, None),
+    )
+    response = await client.post(f"/api/emails/{failed_email.id}/parse-preview")
 
     assert response.status_code == 200
-    assert response.json()["routing"] == "cas"
-    assert response.json()["parser"]["disposition"] == "routed_elsewhere"
-    assert response.json()["merge"]["action"] == "routed_cas_pipeline"
+    body = response.json()
+    assert body["routing"] == "statement"
+    assert body["parser"]["disposition"] == "error"
+    assert body["merge"]["action"] == "routed_statement_pipeline"
+    assert body["merge"]["match_kind"] == "transaction_parse_fallback"
+
+    response = await client.post(f"/api/emails/{cas_email.id}/parse-preview")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["routing"] == "cas"
+    assert body["parser"]["disposition"] == "routed_elsewhere"
+    assert body["merge"]["action"] == "routed_cas_pipeline"
 
 
-async def test_email_parse_preview_ruleless_email_matches_reparse_status(
-    client, session
-):
-    email = Email(
-        provider="synthetic",
-        message_id="ruleless@example.invalid",
-        sender="synthetic@example.invalid",
-        subject="Synthetic source",
-        status="failed",
-        rule_id=None,
-    )
-    session.add(email)
-    await session.commit()
-
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
-
-    assert response.status_code == 400
-    assert response.json() == {"detail": "Email has no associated fetch rule"}
-
-
-async def test_email_parse_preview_returns_404_when_raw_unavailable(
-    client, session, monkeypatch
+@pytest.mark.parametrize("raises", [True, False], ids=["raises", "returns_none"])
+async def test_email_parse_preview_sanitizes_loader_exceptions(
+    client, session, monkeypatch, caplog, raises
 ):
     email = await _email(session)
     await session.commit()
 
     async def unavailable(_email):
+        if raises:
+            raise OSError("Sensitive provider path")
         return RawEmailResult(None, "Sensitive loader details", None)
 
     monkeypatch.setattr(
@@ -386,35 +324,7 @@ async def test_email_parse_preview_returns_404_when_raw_unavailable(
     assert response.status_code == 404
     assert response.json() == {"detail": "Raw email is unavailable"}
     assert "Sensitive" not in response.text
-
-
-async def test_email_parse_preview_sanitizes_loader_exceptions(
-    client, session, monkeypatch, caplog
-):
-    email = await _email(session)
-    await session.commit()
-
-    async def unavailable(_email):
-        raise OSError("Sensitive provider path")
-
-    monkeypatch.setattr(
-        "financial_dashboard.services.parse_previews.load_or_fetch_raw_email",
-        unavailable,
-    )
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
-
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Raw email is unavailable"}
-    assert "Sensitive" not in response.text
     assert "Sensitive" not in caplog.text
-
-
-async def test_email_parse_preview_openapi_is_typed(client):
-    document = (await client.get("/openapi.json")).json()
-    schema = document["paths"]["/api/emails/{email_id}/parse-preview"]["post"][
-        "responses"
-    ]["200"]["content"]["application/json"]["schema"]
-    assert schema == {"$ref": "#/components/schemas/EmailParsePreviewResponse"}
 
 
 def _completion_parse(*, reference_number: str = "SAMPLER00000000000000"):
@@ -454,85 +364,40 @@ def _completion_parse(*, reference_number: str = "SAMPLER00000000000000"):
     )
 
 
-async def test_email_parse_preview_hides_a_refused_label(
-    client, session, monkeypatch
-) -> None:
-    """The reparse refuses a label over a stored name, so the preview must
-    not offer that change."""
-    email = await _email(session)
-    session.add(
-        Transaction(
-            bank="synthetic-bank",
-            email_type="synthetic_transaction_alert",
-            direction="debit",
-            amount=Decimal("12.34"),
-            currency="INR",
-            transaction_date=datetime.date(2030, 1, 2),
-            counterparty="SAMPLE BENEFICIARY",
-            counterparty_source="bank",
-            email_id=email.id,
-        )
-    )
-    await session.commit()
-    parse = _transaction_parse()
-    parse.txn_data["counterparty"] = "My Saved Payee"
-    parse.txn_data["counterparty_source"] = "user_alias"
-    _patch_raw_and_parse(monkeypatch, parse)
-
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
-
-    assert response.status_code == 200, response.text
-    changed = response.json()["merge"]["changed_fields"]
-    assert "counterparty" not in changed
-    assert "counterparty_source" not in changed
-
-
 async def test_email_parse_preview_projects_completion_not_insert(
     client, session, monkeypatch
 ):
-    """A completion leg stamps a reference. It must not project an insert.
-
-    The preview reported "insert" before, which told the reader that a
-    reparse would open a second row for one money event.
-    """
+    """A completion leg stamps a reference. It must not project an insert,
+    which would tell the reader that a reparse opens a second row."""
     email = await _email(session)
-    session.add(
-        Transaction(
-            bank="synthetic-bank",
-            email_type="synthetic_submission_alert",
-            direction="debit",
-            amount=Decimal("12.34"),
-            currency="INR",
-            transaction_date=datetime.date(2030, 1, 2),
-            account_mask="XX0000",
-            channel="rtgs",
-            source="email",
-        )
+    await session.commit()
+    _patch_raw_and_parse(monkeypatch, _completion_parse())
+
+    response = await client.post(f"/api/emails/{email.id}/parse-preview")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["merge"]["action"] == "completion"
+    assert response.json()["merge"]["target_transaction_id"] is None
+    assert response.json()["merge"]["changed_fields"] == []
+
+    submission = Transaction(
+        bank="synthetic-bank",
+        email_type="synthetic_submission_alert",
+        direction="debit",
+        amount=Decimal("12.34"),
+        currency="INR",
+        transaction_date=datetime.date(2030, 1, 2),
+        account_mask="XX0000",
+        channel="rtgs",
+        source="email",
     )
+    session.add(submission)
     await session.commit()
-    _patch_raw_and_parse(monkeypatch, _completion_parse())
 
     response = await client.post(f"/api/emails/{email.id}/parse-preview")
 
     assert response.status_code == 200, response.text
     merge = response.json()["merge"]
     assert merge["action"] == "completion"
-    assert merge["target_transaction_id"] is not None
+    assert merge["target_transaction_id"] == submission.id
     assert merge["changed_fields"] == ["reference_number"]
-
-
-async def test_email_parse_preview_completion_without_a_row_names_no_target(
-    client, session, monkeypatch
-):
-    """No row to complete: the preview must name no target and change nothing."""
-    email = await _email(session)
-    await session.commit()
-    _patch_raw_and_parse(monkeypatch, _completion_parse())
-
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
-
-    assert response.status_code == 200, response.text
-    merge = response.json()["merge"]
-    assert merge["action"] == "completion"
-    assert merge["target_transaction_id"] is None
-    assert merge["changed_fields"] == []

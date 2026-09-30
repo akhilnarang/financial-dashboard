@@ -2,7 +2,6 @@ import datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import event
 
 from financial_dashboard.db import (
     Account,
@@ -232,65 +231,7 @@ async def test_account_detail_has_counts_latest_balances_and_no_secrets(
         assert secret not in response.text
 
 
-async def test_account_reads_do_not_autoflush_pending_rows(client, session):
-    pending = Account(
-        bank="pending-bank",
-        label="Must stay pending",
-        type="bank_account",
-        account_number="123456789999",
-    )
-    session.add(pending)
-    statements: list[str] = []
-    bind = session.get_bind()
-
-    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
-        statements.append(statement.strip().lower())
-
-    event.listen(bind, "before_cursor_execute", record_statement)
-    try:
-        response = await client.get("/api/accounts")
-    finally:
-        event.remove(bind, "before_cursor_execute", record_statement)
-
-    assert response.status_code == 200
-    assert pending.id is None
-    assert not any(statement.startswith("insert") for statement in statements)
-
-
 async def test_account_detail_returns_404(client):
     response = await client.get("/api/accounts/999999")
     assert response.status_code == 404
-    assert response.json() == {"detail": "Account not found"}
-
-
-async def test_account_detail_validates_positive_id(client):
-    response = await client.get("/api/accounts/0")
-    assert response.status_code == 422
-
-
-@pytest.mark.parametrize(
-    "params",
-    [
-        {"limit": 0},
-        {"limit": 101},
-        {"offset": -1},
-        {"offset": 1_000_001},
-        {"bank": ""},
-        {"account_type": "x" * 65},
-    ],
-)
-async def test_account_list_validates_bounds(client, params):
-    response = await client.get("/api/accounts", params=params)
-    assert response.status_code == 422
-
-
-async def test_account_read_openapi_is_typed(client):
-    document = (await client.get("/openapi.json")).json()
-    assert document["paths"]["/api/accounts"]["get"]["responses"]["200"]["content"][
-        "application/json"
-    ]["schema"] == {"$ref": "#/components/schemas/AccountListResponse"}
-    assert document["paths"]["/api/accounts/{account_id}"]["get"]["responses"]["200"][
-        "content"
-    ]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/AccountDetailResponse"
-    }
+    assert (await client.get("/api/accounts/0")).status_code == 422

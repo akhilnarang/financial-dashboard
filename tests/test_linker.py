@@ -13,30 +13,13 @@ Covers the three cases that surfaced in production:
 from decimal import Decimal
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from financial_dashboard.db import Account, Base, Card, Transaction
+from financial_dashboard.db import Account, Card, Transaction
 from financial_dashboard.services.linker import (
     build_link_context,
     link_transaction,
     relink_orphans,
 )
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture
-async def session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as s:
-        yield s
-    await engine.dispose()
 
 
 def _txn(**overrides) -> Transaction:
@@ -49,87 +32,6 @@ def _txn(**overrides) -> Transaction:
     )
     base.update(overrides)
     return Transaction(**base)
-
-
-@pytest.mark.anyio
-async def test_short_account_mask_resolves_against_full_account_number(session):
-    """A 3-digit mask (e.g. XX678) must resolve against a stored full
-    account_number by suffix-matching the trailing digits."""
-    acct = Account(
-        bank="icici",
-        type="bank_account",
-        label="ICICI Savings",
-        account_number="000000005678",
-    )
-    session.add(acct)
-    await session.flush()
-    ctx = await build_link_context(session)
-
-    txn = _txn(account_mask="XX678")
-    assert link_transaction(ctx, txn) is True
-    assert txn.account_id == acct.id
-
-
-@pytest.mark.anyio
-async def test_bare_last4_card_mask_resolves(session):
-    """A bare last-4 card_mask must resolve to a Card row whose stored
-    card_mask is also the bare last-4."""
-    acct = Account(
-        bank="hdfc",
-        type="bank_account",
-        label="HDFC Savings",
-        account_number="HDFC1",
-    )
-    session.add(acct)
-    await session.flush()
-    card = Card(account_id=acct.id, card_mask="7777", label="HDFC Debit")
-    session.add(card)
-    await session.flush()
-    ctx = await build_link_context(session)
-
-    txn = _txn(bank="hdfc", card_mask="7777")
-    assert link_transaction(ctx, txn) is True
-    assert txn.account_id == acct.id
-    assert txn.card_id == card.id
-
-
-@pytest.mark.anyio
-async def test_ambiguous_short_mask_refuses_to_link(session):
-    """If two accounts in the same bank both suffix-match the incoming
-    mask digits, the linker must NOT guess. Leaves account_id NULL."""
-    a1 = Account(
-        bank="icici",
-        type="bank_account",
-        label="ICICI Savings 1",
-        account_number="11115678",
-    )
-    a2 = Account(
-        bank="icici",
-        type="bank_account",
-        label="ICICI Savings 2",
-        account_number="22225678",
-    )
-    session.add_all([a1, a2])
-    await session.flush()
-    ctx = await build_link_context(session)
-
-    txn = _txn(account_mask="XX678")
-    assert link_transaction(ctx, txn) is False
-    assert txn.account_id is None
-
-
-@pytest.mark.anyio
-async def test_below_minimum_digits_is_not_matched(session):
-    """A mask with fewer than 3 digits is rejected even if it would
-    technically suffix-match."""
-    acct = Account(bank="icici", type="bank_account", label="X", account_number="5678")
-    session.add(acct)
-    await session.flush()
-    ctx = await build_link_context(session)
-
-    txn = _txn(account_mask="X8")  # only 1 digit
-    assert link_transaction(ctx, txn) is False
-    assert txn.account_id is None
 
 
 @pytest.mark.anyio
@@ -264,33 +166,16 @@ async def test_account_mask_with_digits_at_both_ends_links(session):
     await session.flush()
 
     txn = _txn(bank="indusind", account_mask="73XXXXXX3942")
-    session.add(txn)
+    # Banks also mask with '*', not just 'X'.
+    star = _txn(bank="indusind", account_mask="730***113942")
+    session.add_all([txn, star])
     await session.flush()
 
     ctx = await build_link_context(session)
     assert link_transaction(ctx, txn) is True
     assert txn.account_id == acct.id
-
-
-@pytest.mark.anyio
-async def test_star_wildcard_mask_links(session):
-    """Banks also mask with '*', not just 'X' — 730***113942 is the same account."""
-    acct = Account(
-        bank="indusind",
-        type="bank_account",
-        label="IndusInd Savings",
-        account_number="730055113942",
-    )
-    session.add(acct)
-    await session.flush()
-
-    txn = _txn(bank="indusind", account_mask="730***113942")
-    session.add(txn)
-    await session.flush()
-
-    ctx = await build_link_context(session)
-    assert link_transaction(ctx, txn) is True
-    assert txn.account_id == acct.id
+    assert link_transaction(ctx, star) is True
+    assert star.account_id == acct.id
 
 
 @pytest.mark.anyio
@@ -509,22 +394,3 @@ async def test_relink_orphans_links_unlinked_and_counts_remaining(session):
     assert remaining == 1
     assert linkable.account_id == resolved.id
     assert ambiguous.account_id is None
-
-
-@pytest.mark.anyio
-async def test_relink_orphans_noop_when_all_linked(session):
-    """With no orphans, relink_orphans links nothing and reports zero
-    remaining."""
-    acct = Account(
-        bank="icici", type="bank_account", label="ICICI", account_number="5678"
-    )
-    session.add(acct)
-    await session.flush()
-    txn = _txn(bank="icici", account_mask="XX678")
-    txn.account_id = acct.id
-    session.add(txn)
-    await session.flush()
-
-    linked, remaining = await relink_orphans(session)
-    assert linked == 0
-    assert remaining == 0

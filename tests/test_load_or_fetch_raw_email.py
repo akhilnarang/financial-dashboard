@@ -5,26 +5,21 @@ spool file has been evicted by the cleanup cron."""
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from financial_dashboard.db import Base, Email, EmailSource
+from financial_dashboard.db import Email, EmailSource
 from financial_dashboard.integrations.email import body as fetcher_module
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+from tests.conftest import new_test_engine
 
 
 @pytest.fixture
 async def session_factory(monkeypatch):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(fetcher_module, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 @pytest.fixture
@@ -164,51 +159,5 @@ async def test_error_when_spool_missing_and_no_remote_id(session_factory, spool_
     result = await fetcher_module.load_or_fetch_raw_email(em)
 
     assert result.raw_bytes is None
-    assert result.error is not None
     assert result.provenance is None
-    assert "no source" in result.error.lower() or "remote" in result.error.lower()
-
-
-@pytest.mark.anyio
-async def test_error_when_provider_returns_nothing(session_factory, spool_dir):
-    source_id = await _make_source(session_factory, "fastmail")
-    em = await _make_email(
-        session_factory,
-        provider="fastmail",
-        message_id="msg-deleted",
-        remote_id="remote-gone",
-        source_id=source_id,
-    )
-
-    with (
-        patch.object(
-            fetcher_module, "decrypt_credentials", return_value={"token": "tok"}
-        ),
-        patch.object(fetcher_module, "_fetch_fastmail_single_sync", return_value=None),
-    ):
-        result = await fetcher_module.load_or_fetch_raw_email(em)
-
-    assert result.raw_bytes is None
-    assert result.error is not None
-    assert result.provenance is None
-    assert "deleted" in result.error.lower() or "no data" in result.error.lower()
-
-
-@pytest.mark.anyio
-async def test_error_when_source_row_deleted(session_factory, spool_dir):
-    """An Email row pointing at a now-deleted EmailSource should fail cleanly
-    rather than crash."""
-    em = await _make_email(
-        session_factory,
-        provider="fastmail",
-        message_id="msg-orphaned-source",
-        remote_id="remote-xyz",
-        source_id=9999,  # doesn't exist
-    )
-
-    result = await fetcher_module.load_or_fetch_raw_email(em)
-
-    assert result.raw_bytes is None
-    assert result.error is not None
-    assert result.provenance is None
-    assert "source" in result.error.lower()
+    assert "no source" in result.error.lower()

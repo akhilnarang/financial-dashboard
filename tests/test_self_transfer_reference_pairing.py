@@ -96,7 +96,15 @@ async def test_reference_pair_supersedes_active_decisions_for_both_legs(
 
     assert all(decision.status == "superseded" for decision in decisions)
     assert all(delivery.status == "cancelled" for delivery in deliveries)
-    assert debit.category == credit.category == "self_transfer"
+    _assert_reference_rule(debit)
+    _assert_reference_rule(credit)
+    categorized_at = (debit.categorized_at, credit.categorized_at)
+
+    # A second call finds the pair again but must not churn either leg.
+    assert await apply_reference_self_transfer_rule(session, credit)
+    _assert_reference_rule(debit)
+    _assert_reference_rule(credit)
+    assert (debit.categorized_at, credit.categorized_at) == categorized_at
 
 
 async def test_ingest_matching_opposite_reference_marks_both_legs(
@@ -157,41 +165,14 @@ async def test_fd_counterparty_is_never_self_transfer(session: AsyncSession):
     session.add(fd)
     await session.flush()
 
-    paired = await apply_reference_self_transfer_rule(session, fd)
-
-    assert paired is False
-    assert fd.category != "self_transfer"
-    assert credit.category != "self_transfer"
-
-
-async def test_fd_match_is_not_self_transferred_reverse_order(session: AsyncSession):
-    # Reverse order: the FD debit is stored first (already a manual investment),
-    # then a non-FD credit with the same reference is processed as the caller.
-    # The FD must be excluded from the matches so it is never overwritten.
-    fd = _transaction(
-        bank="slice",
-        direction="debit",
-        reference_number="900000000002",
-        account_mask="XX5678",
-    )
-    fd.counterparty = "Slice FD"
+    # The FD leg triggers the rule.
+    assert await apply_reference_self_transfer_rule(session, fd) is False
+    # The other leg triggers the rule. The FD match must be excluded.
     fd.category = "investment"
     fd.category_method = "manual"
-    session.add(fd)
     await session.flush()
+    assert await apply_reference_self_transfer_rule(session, credit) is False
 
-    credit = _transaction(
-        bank="idfc",
-        direction="credit",
-        reference_number="900000000002",
-        account_mask="XX1234",
-    )
-    session.add(credit)
-    await session.flush()
-
-    paired = await apply_reference_self_transfer_rule(session, credit)
-
-    assert paired is False
     assert fd.category == "investment"
     assert fd.category_method == "manual"
     assert credit.category != "self_transfer"
@@ -289,71 +270,21 @@ async def test_same_account_uber_auth_reversal_is_not_self_transfer(
     assert reversal.category_method is None
 
 
-async def test_apply_reference_self_transfer_rule_idempotent_second_call(
-    session: AsyncSession,
-):
-    """Calling apply_reference_self_transfer_rule twice on the same pair is a
-    no-op the second time: both legs stay categorized and the second call
-    does not churn category timestamps or re-fire."""
-    debit = _transaction(
-        bank="hdfc",
-        direction="debit",
-        reference_number="619445758035",
-        account_mask="XX7702",
-    )
-    credit = _transaction(
-        bank="icici",
-        direction="credit",
-        reference_number="619445758035",
-        account_mask="XX214",
-    )
-    session.add_all([debit, credit])
-    await session.flush()
-
-    first = await apply_reference_self_transfer_rule(session, credit)
-    assert first is True
-    _assert_reference_rule(debit)
-    _assert_reference_rule(credit)
-    debit_categorized_at = debit.categorized_at
-    credit_categorized_at = credit.categorized_at
-
-    # Second call: opposite leg still exists → still returns True, but the
-    # already-current guard must leave the categorization untouched (no
-    # timestamp churn on either leg).
-    second = await apply_reference_self_transfer_rule(session, credit)
-    assert second is True
-    _assert_reference_rule(debit)
-    _assert_reference_rule(credit)
-    assert credit.categorized_at == credit_categorized_at
-    assert debit.categorized_at == debit_categorized_at
-
-
-async def test_short_account_masks_are_not_enough_to_prove_different_accounts(
-    session: AsyncSession,
-):
-    debit = _transaction(
+async def test_pair_needs_proof_of_different_accounts(session: AsyncSession):
+    """Masks with fewer than three digits prove nothing. One linked account
+    on both legs is a charge and its refund."""
+    short_debit = _transaction(
         bank="icici",
         direction="debit",
         reference_number="SHORT-MASK-REF",
         account_mask="XX1",
     )
-    credit = _transaction(
+    short_credit = _transaction(
         bank="icici",
         direction="credit",
         reference_number="SHORT-MASK-REF",
         account_mask="XX2",
     )
-    session.add_all([debit, credit])
-    await session.flush()
-
-    paired = await apply_reference_self_transfer_rule(session, credit)
-
-    assert paired is False
-    assert debit.category is None
-    assert credit.category is None
-
-
-async def test_same_linked_account_id_does_not_pair(session: AsyncSession):
     charge = _transaction(
         bank="icici",
         direction="debit",
@@ -366,16 +297,10 @@ async def test_same_linked_account_id_does_not_pair(session: AsyncSession):
         reference_number="SAME-ACCOUNT-REF",
         account_id=4,
     )
-    session.add_all([charge, refund])
+    legs = [short_debit, short_credit, charge, refund]
+    session.add_all(legs)
     await session.flush()
 
-    paired = await apply_reference_self_transfer_rule(session, refund)
-
-    assert paired is False
-    assert charge.category is None
-    assert refund.category is None
-
-
-def test_transaction_schema_has_reference_lookup_index():
-    index_names = {index.name for index in Transaction.__table__.indexes}
-    assert "ix_transactions_reference_number" in index_names
+    assert await apply_reference_self_transfer_rule(session, short_credit) is False
+    assert await apply_reference_self_transfer_rule(session, refund) is False
+    assert all(leg.category is None for leg in legs)

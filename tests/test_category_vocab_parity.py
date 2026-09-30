@@ -25,47 +25,19 @@ from financial_dashboard.services.categorization.vocabulary import SEED_CATEGORI
 from scripts.synth.constants import SEED_CATEGORY_SLUGS
 
 
-def test_dashboard_and_synth_seed_categories_are_exactly_equal_as_sets():
-    """Every dashboard seed slug is a synth seed slug and vice versa, with no
-    silent duplicates on either side.
-
-    Set equality is what both consumers actually depend on: ``init_db`` writes
-    ``categories`` rows from ``SEED_CATEGORIES`` under a UNIQUE constraint, and
-    the synth generator emits ``SynthCategory`` rows from
-    ``SEED_CATEGORY_SLUGS`` keyed by slug. Order is incidental in both paths.
-    """
-    dashboard = set(SEED_CATEGORIES)
-    synth = set(SEED_CATEGORY_SLUGS)
-
-    assert dashboard == synth
-    # Either side silently growing a duplicate would still satisfy set equality
-    # but would be a real bug (a UNIQUE constraint violation at write time, or
-    # a synth row count that disagrees with the manifest). Pin the duplicate
-    # count to zero on both sides so the equality stays meaningful.
-    assert len(SEED_CATEGORIES) == len(dashboard), (
-        "SEED_CATEGORIES contains duplicate slugs"
-    )
-    assert len(SEED_CATEGORY_SLUGS) == len(synth), (
-        "SEED_CATEGORY_SLUGS contains duplicate slugs"
-    )
-    # And the two lengths match, which (with no duplicates) is the same
-    # statement as the set equality above but reads as the count parity the
-    # synth manifest's row count is meant to mirror.
-    assert len(SEED_CATEGORIES) == len(SEED_CATEGORY_SLUGS)
-
-
-def test_the_documented_reconciliation_slugs_are_in_both_vocabularies():
-    """A few slugs are load-bearing across the dashboard — the polarity guard's
-    named sentinels, the cashflow bucket map's contra-expense pair, and the
-    report's transfers-in slug. Each one has to be in BOTH vocabularies, or the
-    side that's missing it would emit an out-of-vocab slug the other cannot
-    load."""
+def test_dashboard_and_synth_seed_categories_match():
+    """Both vocabularies hold the same slugs, with no duplicates, and both hold
+    the slugs the polarity guard, cashflow buckets and reports depend on."""
     from financial_dashboard.services.categorization.slugs import (
         CREDIT_CARD_PAYMENT_SLUG,
         REPAYMENT_SLUG,
         UNKNOWN_SLUG,
     )
     from financial_dashboard.services.cashflow.buckets import CONTRA_EXPENSE_SLUGS
+
+    dashboard = set(SEED_CATEGORIES)
+    assert dashboard == set(SEED_CATEGORY_SLUGS)
+    assert len(SEED_CATEGORIES) == len(SEED_CATEGORY_SLUGS) == len(dashboard)
 
     load_bearing = {
         "salary",
@@ -79,9 +51,4 @@ def test_the_documented_reconciliation_slugs_are_in_both_vocabularies():
         REPAYMENT_SLUG,
         UNKNOWN_SLUG,
     } | CONTRA_EXPENSE_SLUGS
-
-    dashboard = set(SEED_CATEGORIES)
-    synth = set(SEED_CATEGORY_SLUGS)
-    for slug in load_bearing:
-        assert slug in dashboard, f"missing from dashboard SEED_CATEGORIES: {slug}"
-        assert slug in synth, f"missing from synth SEED_CATEGORY_SLUGS: {slug}"
+    assert load_bearing <= dashboard, load_bearing - dashboard

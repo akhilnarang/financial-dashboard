@@ -1,11 +1,21 @@
+import itertools
+import sqlite3
 from decimal import Decimal  # noqa: F401
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import StaticPool
 
 import financial_dashboard
 from financial_dashboard.api import router as api_router
@@ -76,15 +86,50 @@ async def card_account(session: AsyncSession) -> int:
     return await ensure_account(session, CARD_ACCOUNT_ID, "credit_card")
 
 
+_schema_template: sqlite3.Connection | None = None
+_db_names = itertools.count()
+
+
+def _template() -> sqlite3.Connection:
+    """Build the schema once. Each test copies it instead of running create_all."""
+    global _schema_template
+    if _schema_template is None:
+        builder = create_engine("sqlite://")
+        Base.metadata.create_all(builder)
+        _schema_template = sqlite3.connect(":memory:")
+        builder.raw_connection().driver_connection.backup(_schema_template)
+        builder.dispose()
+    return _schema_template
+
+
+class TestEngine(NamedTuple):
+    engine: AsyncEngine
+    holder: sqlite3.Connection
+
+
+def new_test_engine() -> TestEngine:
+    """Return an async engine on a fresh in-memory DB that has the full schema.
+
+    The DB is a named shared-cache memory DB. ``holder`` keeps it alive; close it
+    after ``engine.dispose()``. StaticPool keeps one connection, as ``:memory:`` did.
+    """
+    uri = f"file:testdb{next(_db_names)}?mode=memory&cache=shared"
+    holder = sqlite3.connect(uri, uri=True)
+    _template().backup(holder)
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{uri}&uri=true", poolclass=StaticPool
+    )
+    return TestEngine(engine, holder)
+
+
 @pytest.fixture
 async def session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with maker() as s:
         yield s
     await engine.dispose()
+    holder.close()
 
 
 @pytest.fixture
