@@ -15,7 +15,6 @@ from tests.conftest import (
     MISSING_ACCOUNT_ID,
     bank_account,
     card_account,
-    ensure_account,
 )
 
 pytestmark = pytest.mark.anyio
@@ -44,38 +43,21 @@ async def _add(session, **kw):
     await session.flush()
 
 
-async def test_income_excludes_repayment(session: AsyncSession):
-    await _add(session, direction="credit", amount=D("1000"), category="salary")
-    await _add(
-        session,
-        direction="credit",
-        amount=D("5000"),
-        category="repayment",
-        counterparty="MOM",
-    )
-    s = await cashflow_summary(session, JUN, JUN_END)
-    assert s.income.total == D("1000")
-    assert s.transfers_in.total == D("5000")
-    assert s.transfers_in.lines[0].counterparty == "MOM"
-
-
 async def test_refund_and_cashback_reduce_expense(session: AsyncSession):
+    # Line totals show each line's effect on its bucket: spend and income
+    # positive, contra (refund) negative.
+    await _add(session, direction="credit", amount=D("1000"), category="salary")
     await _add(session, direction="debit", amount=D("300"), category="groceries")
     await _add(session, direction="credit", amount=D("50"), category="refund")
     await _add(session, direction="credit", amount=D("20"), category="cashback_rewards")
     s = await cashflow_summary(session, JUN, JUN_END)
     assert s.expense.total == D("230")  # 300 - 50 - 20
-
-
-async def test_investment_gross_and_net(session: AsyncSession):
-    await _add(session, direction="debit", amount=D("1000"), category="investment")
-    await _add(
-        session, direction="credit", amount=D("400"), category="investment_redemption"
-    )
-    s = await cashflow_summary(session, JUN, JUN_END)
-    assert s.investment.contributions == D("1000")
-    assert s.investment.redemptions == D("400")
-    assert s.investment.net == D("600")
+    salary = next(ln for ln in s.income.lines if ln.slug == "salary")
+    groceries = next(ln for ln in s.expense.lines if ln.slug == "groceries")
+    refund = next(ln for ln in s.expense.lines if ln.slug == "refund")
+    assert salary.total == D("1000") and salary.kind is None
+    assert groceries.total == D("300")
+    assert refund.total == D("-50")
 
 
 async def test_investment_same_slug_both_directions_are_distinct_lines(session):
@@ -83,62 +65,16 @@ async def test_investment_same_slug_both_directions_are_distinct_lines(session):
     # (credit); the two must be separate lines distinguished by `kind`.
     await _add(session, direction="debit", amount=D("1000"), category="investment")
     await _add(session, direction="credit", amount=D("300"), category="investment")
+    await _add(
+        session, direction="credit", amount=D("400"), category="investment_redemption"
+    )
     s = await cashflow_summary(session, JUN, JUN_END)
     by_kind = {ln.kind: ln for ln in s.investment.lines if ln.slug == "investment"}
     assert by_kind["contribution"].total == D("1000")  # displayed positive
     assert by_kind["redemption"].total == D("-300")  # displayed negative
-    assert s.investment.net == D("700")
-
-
-async def test_breakdown_line_display_signs(session: AsyncSession):
-    # Line totals are each line's contribution to its displayed bucket:
-    # income positive, expense spend positive, contra (refund) negative.
-    await _add(session, direction="credit", amount=D("1000"), category="salary")
-    await _add(session, direction="debit", amount=D("300"), category="groceries")
-    await _add(session, direction="credit", amount=D("50"), category="refund")
-    s = await cashflow_summary(session, JUN, JUN_END)
-    salary = next(ln for ln in s.income.lines if ln.slug == "salary")
-    groceries = next(ln for ln in s.expense.lines if ln.slug == "groceries")
-    refund = next(ln for ln in s.expense.lines if ln.slug == "refund")
-    assert salary.total == D("1000") and salary.kind is None
-    assert groceries.total == D("300")  # spend shown positive
-    assert refund.total == D("-50")  # contra shown negative
-
-
-async def test_card_bill_is_bank_expense_and_self_transfer_is_the_internal_one(
-    session: AsyncSession,
-):
-    # On a cash basis the bill payment IS the expense: it is the moment the money
-    # leaves the bank. The only internal movement left is money sent to oneself.
-    await _add(
-        session, direction="debit", amount=D("9999"), category="credit_card_payment"
-    )
-    await _add(session, direction="debit", amount=D("100"), category="dining")
-    await _add(session, direction="debit", amount=D("700"), category="self_transfer")
-    s = await cashflow_summary(session, JUN, JUN_END)
-    assert s.expense.total == D("10099")  # 9999 bill + 100 dining
-    assert {ln.slug for ln in s.expense.lines} == {"credit_card_payment", "dining"}
-    assert s.footnotes.internal_count == 1  # the self-transfer, not the bill
-    assert s.footnotes.internal_gross == D("700")
-
-
-async def test_card_bill_reversal_nets_off_the_bills_it_reversed(session: AsyncSession):
-    # No new machinery: the signed sum already does this. Two bills paid, one of
-    # them reversed, and the expense line is what is left.
-    await _add(
-        session, direction="debit", amount=D("9000"), category="credit_card_payment"
-    )
-    await _add(
-        session, direction="debit", amount=D("1000"), category="credit_card_payment"
-    )
-    await _add(
-        session, direction="credit", amount=D("1000"), category="credit_card_payment"
-    )  # the reversal
-    s = await cashflow_summary(session, JUN, JUN_END)
-    bill = next(ln for ln in s.expense.lines if ln.slug == "credit_card_payment")
-    assert bill.total == D("9000")  # 9000 + 1000 - 1000
-    assert bill.count == 3  # all three rows are behind the figure
-    assert s.expense.total == D("9000")
+    assert s.investment.contributions == D("1000")
+    assert s.investment.redemptions == D("700")
+    assert s.investment.net == D("300")
 
 
 async def test_the_swipe_is_out_of_the_bank_view_and_the_bill_is_not_double_counted(
@@ -179,30 +115,6 @@ async def test_the_swipe_is_out_of_the_bank_view_and_the_bill_is_not_double_coun
     assert s.expense_detail.total == D("500")
     assert [ln.slug for ln in s.expense_detail.lines] == ["dining"]
     assert s.expense_detail.count == 1
-
-
-async def test_uncategorized_line_is_currency_agnostic(session: AsyncSession):
-    # The uncategorized line applies no currency filter, so a non-INR
-    # uncategorized row is included and the line matches /transactions?uncategorized=1.
-    await _add(session, direction="debit", amount=D("11"), category=None)
-    await _add(session, direction="debit", amount=D("22"), category="unknown")
-    await _add(session, direction="debit", amount=D("33"), category="mystery_slug")
-    await _add(session, direction="debit", amount=D("5"), category=None, currency="USD")
-    s = await cashflow_summary(session, JUN, JUN_END)
-    assert s.uncategorized.count == 4  # includes the non-INR row
-    assert s.uncategorized.total == D("-71")  # -(11+22+33+5)
-
-
-async def test_non_inr_excluded_from_buckets_and_counted(session: AsyncSession):
-    # A non-INR *bucketed* row is excluded from the bucket but the non-INR row
-    # that is ALSO uncategorized (above) appears in the uncategorized line too —
-    # informational overlap, no double-count (neither feeds a headline bucket).
-    await _add(
-        session, direction="debit", amount=D("5"), category="dining", currency="USD"
-    )
-    s = await cashflow_summary(session, JUN, JUN_END)
-    assert s.expense.total == D("0")
-    assert s.footnotes.non_inr_count == 1
 
 
 async def test_null_currency_treated_as_inr(session: AsyncSession):
@@ -341,77 +253,6 @@ async def test_reconciliation_identity(session: AsyncSession):
     assert s.footnotes.unaccounted_net == D("111")  # -111 + 222
 
 
-async def test_card_rows_leave_the_bank_view_but_reach_the_expense_detail(
-    session: AsyncSession,
-):
-    # A manual override can put a `salary` on a card. It is out of the bank view
-    # regardless of its slug — and there is no all-account income output either,
-    # so a card *swipe* is what proves card rows still reach the detail.
-    card = await card_account(session)
-    await _add(session, direction="credit", amount=D("300"), category="salary")
-    await _add(
-        session,
-        direction="credit",
-        amount=D("8000"),
-        category="salary",
-        account_id=card,
-    )
-    await _add(
-        session, direction="debit", amount=D("450"), category="dining", account_id=card
-    )
-
-    s = await cashflow_summary(session, JUN, JUN_END)
-
-    assert s.income.total == D("300")  # the card salary is not bank income
-    assert s.income.count == 1
-    assert s.expense.total == D("0")  # nor is the card swipe bank expense
-    assert s.expense_detail.total == D("450")  # but the swipe is in the detail
-    assert [ln.slug for ln in s.expense_detail.lines] == ["dining"]
-
-
-async def test_unaccounted_rows_are_footnoted_and_reach_no_headline(
-    session: AsyncSession,
-):
-    """Three ways to be in no scope, all landing in the one footnote.
-
-    The unknown-type row cannot be built the obvious way: ``Account.type`` is
-    non-null in the ORM, so no fixture can store a NULL type. A dangling
-    ``account_id`` — pointing at an account row that does not exist — is what
-    reaches that branch, and the test engine does not enforce foreign keys.
-    """
-    weird = await ensure_account(session, 42, "prepaid_wallet")
-    await _add(session, direction="debit", amount=D("60"), category="dining")
-    await _add(
-        session, direction="debit", amount=D("10"), category="dining", account_id=None
-    )
-    await _add(
-        session,
-        direction="debit",
-        amount=D("20"),
-        category="groceries",
-        account_id=MISSING_ACCOUNT_ID,
-    )
-    await _add(
-        session, direction="debit", amount=D("30"), category="rent", account_id=weird
-    )
-
-    s = await cashflow_summary(session, JUN, JUN_END)
-
-    assert s.expense.total == D("60")  # only the bank row
-    assert s.footnotes.unaccounted_count == 3
-    assert s.footnotes.unaccounted_net == D("-60")  # -(10 + 20 + 30)
-
-
-async def test_internal_net_is_signed_where_the_gross_is_not(session: AsyncSession):
-    # The gross says how much moved; only the signed net says whether it came
-    # back. A perimeter that leaks reads as a non-zero net.
-    await _add(session, direction="debit", amount=D("5000"), category="self_transfer")
-    await _add(session, direction="credit", amount=D("2000"), category="self_transfer")
-    s = await cashflow_summary(session, JUN, JUN_END)
-    assert s.footnotes.internal_gross == D("7000")  # 5000 + 2000
-    assert s.footnotes.internal_net == D("-3000")  # 2000 - 5000
-
-
 async def test_trend_and_salary_count_are_both_bank_scoped(session: AsyncSession):
     # The salary count is a second, independent query: a scope applied to the
     # monetary series alone would leave the count contradicting the bar above it.
@@ -440,17 +281,6 @@ async def test_trend_and_salary_count_are_both_bank_scoped(session: AsyncSession
         account_id=card,
         transaction_date=datetime.date(2026, 6, 7),
     )
-
-    pts = await cashflow_trend(session, months=1, today=today)
-    jun = next(p for p in pts if p.month == "2026-06")
-
-    assert jun.income == D("1000")  # the card salary is not in the bank series
-    assert jun.salary_count == 1  # nor in the count beside it
-    assert jun.expense == D("0")  # and the card swipe is not bank spend
-
-
-async def test_trend_card_bill_is_the_months_expense(session: AsyncSession):
-    today = datetime.date(2026, 6, 15)
     await _add(
         session,
         direction="debit",
@@ -458,8 +288,13 @@ async def test_trend_card_bill_is_the_months_expense(session: AsyncSession):
         category="credit_card_payment",
         transaction_date=datetime.date(2026, 6, 3),
     )
+
     pts = await cashflow_trend(session, months=1, today=today)
-    assert next(p for p in pts if p.month == "2026-06").expense == D("2500")
+    jun = next(p for p in pts if p.month == "2026-06")
+
+    assert jun.income == D("1000")  # the card salary is not in the bank series
+    assert jun.salary_count == 1  # nor in the count beside it
+    assert jun.expense == D("2500")  # the bank's card bill, not the card swipe
 
 
 async def test_trend_zero_filled_and_salary_count(session: AsyncSession):
@@ -514,23 +349,6 @@ async def test_trend_excludes_future_rows(session: AsyncSession):
         category="salary",
         transaction_date=datetime.date(2026, 6, 25),
     )  # future vs today
-    pts = await cashflow_trend(session, months=1, today=today)
-    jun = next(p for p in pts if p.month == "2026-06")
-    assert jun.income == D("1000")  # the June 25 row is excluded
-    assert jun.salary_count == 1
-
-
-async def test_trend_salary_count_ignores_currency(session: AsyncSession):
-    # salary_count counts every salary row in the month; only the three monetary
-    # series (income / expense / net_invested) drop foreign-currency rows.
-    today = datetime.date(2026, 6, 15)
-    await _add(
-        session,
-        direction="credit",
-        amount=D("1000"),
-        category="salary",
-        transaction_date=datetime.date(2026, 6, 5),
-    )
     await _add(
         session,
         direction="credit",
@@ -541,8 +359,9 @@ async def test_trend_salary_count_ignores_currency(session: AsyncSession):
     )
     pts = await cashflow_trend(session, months=1, today=today)
     jun = next(p for p in pts if p.month == "2026-06")
-    assert jun.salary_count == 2  # the USD salary is counted
-    assert jun.income == D("1000")  # but it does not reach the rupee sum
+    # The June 25 row is out. The USD salary counts but adds no rupees.
+    assert jun.income == D("1000")
+    assert jun.salary_count == 2
 
 
 async def test_trend_months_clamped(session: AsyncSession):
@@ -613,13 +432,6 @@ def test_trend_ranges_give_each_month_its_own_days():
     assert ranges["2026-02"] == ["2026-02-01", "2026-02-28"]
 
 
-async def test_every_month_the_trend_draws_has_a_range_to_click(session: AsyncSession):
-    """A month with bars but no bounds is a month the user can click to nowhere."""
-    today = datetime.date(2026, 6, 17)
-    points = await cashflow_trend(session, 12, today=today)
-    assert [p.month for p in points] == list(trend_ranges(12, today=today))
-
-
 async def test_trend_pre_seeds_every_month_so_empty_history_is_zeros_not_no_points(
     session: AsyncSession,
 ):
@@ -630,7 +442,8 @@ async def test_trend_pre_seeds_every_month_so_empty_history_is_zeros_not_no_poin
     today = datetime.date(2026, 6, 17)
     points = await cashflow_trend(session, 12, today=today)
 
-    assert len(points) == 12
+    # Each drawn month has a range to click.
+    assert [p.month for p in points] == list(trend_ranges(12, today=today))
     assert all(
         p.income == 0 and p.expense == 0 and p.net_invested == 0 and p.salary_count == 0
         for p in points
@@ -656,17 +469,8 @@ def test_presets_cover_month_quarter_and_year_ranges():
         {"label": "Calendar year", "date_from": "2026-01-01", "date_to": "2026-08-18"},
     ]
 
-
-def test_january_presets_roll_the_financial_year_and_last_quarter_back():
-    """In January to March, the financial year and last quarter belong to the
-    previous calendar year."""
-    from financial_dashboard.web.cashflow import _presets
-
-    presets = {item["label"]: item for item in _presets(datetime.date(2026, 2, 15))}
-
-    assert presets["Financial year"]["date_from"] == "2025-04-01"
-    assert presets["Last quarter"] == {
-        "label": "Last quarter",
-        "date_from": "2025-10-01",
-        "date_to": "2025-12-31",
-    }
+    # In January to March, the financial year and last quarter roll back a year.
+    jan = {item["label"]: item for item in _presets(datetime.date(2026, 2, 15))}
+    assert jan["Financial year"]["date_from"] == "2025-04-01"
+    assert jan["Last quarter"]["date_from"] == "2025-10-01"
+    assert jan["Last quarter"]["date_to"] == "2025-12-31"

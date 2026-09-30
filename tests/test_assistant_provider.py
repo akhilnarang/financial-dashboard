@@ -48,11 +48,8 @@ async def test_gemini_attempts_full_schema_then_records_json_fallback():
     result = await provider.complete(
         PromptContext("show transactions", tool_results=[tool_result])
     )
-    schema = calls[0]["config"].response_json_schema
     assert result.output_mode == "validated_json_object"
-    assert schema == response_json_schema()
-    assert schema["type"] == "object"
-    assert schema["additionalProperties"] is False
+    assert calls[0]["config"].response_json_schema == response_json_schema()
     assert calls[0]["config"].response_schema is None
     assert calls[1]["config"].response_json_schema is None
     supplied_results = calls[1]["contents"].split(

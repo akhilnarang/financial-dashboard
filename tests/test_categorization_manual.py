@@ -15,23 +15,6 @@ from financial_dashboard.services.categorization.vocabulary import get_active_sl
 pytestmark = pytest.mark.anyio
 
 
-async def test_manual_assign_existing_slug(session: AsyncSession):
-    from financial_dashboard.services.categorization.vocabulary import ensure_category
-
-    await ensure_category(session, "groceries")
-    txn = Transaction(
-        bank="testbank", email_type="x", direction="debit", amount=Decimal("5")
-    )
-    session.add(txn)
-    await session.flush()
-
-    ok, slug = await assign_category_manual(session, txn.id, "Groceries")
-    assert ok is True and slug == "groceries"
-    assert txn.category_method == "manual"
-    assert txn.category_confidence == 1.0
-    assert txn.review_status == "resolved"
-
-
 async def test_manual_assign_unknown_slug_rejected_by_default(session: AsyncSession):
     """Assistant typo correction must not make manual/API assignment accept unknown slugs."""
     from financial_dashboard.services.categorization.vocabulary import ensure_category

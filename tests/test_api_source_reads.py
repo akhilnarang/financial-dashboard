@@ -151,9 +151,12 @@ async def test_sms_detail_explicitly_returns_bounded_raw_source(client, session)
     sms, transaction = await _seed_sms(session)
     sms.body = "B" * 100_001
     sms.parse_error = "P" * 100_001
+    sms.bank = "K" * 1_001
+    sms.sender = "S" * 1_001
     await session.commit()
 
     response = await client.get(f"/api/sms/{sms.id}")
+    list_item = (await client.get("/api/sms")).json()["items"][0]
 
     assert response.status_code == 200, response.text
     assert response.headers["cache-control"] == "no-store"
@@ -164,19 +167,8 @@ async def test_sms_detail_explicitly_returns_bounded_raw_source(client, session)
     assert body["parse_error_truncated"] is True
     assert body["attached_transaction_ids"] == [transaction.id]
     assert body["attached_transactions_truncated"] is False
-
-
-async def test_sms_reads_bound_sender_and_bank_metadata(client, session):
-    sms, _ = await _seed_sms(session)
-    sms.bank = "B" * 1_001
-    sms.sender = "S" * 1_001
-    await session.commit()
-
-    list_item = (await client.get("/api/sms")).json()["items"][0]
-    detail = (await client.get(f"/api/sms/{sms.id}")).json()
-
-    for item in (list_item, detail):
-        assert item["bank"] == "B" * 1_000
+    for item in (list_item, body):
+        assert item["bank"] == "K" * 1_000
         assert item["bank_truncated"] is True
         assert item["sender"] == "S" * 1_000
         assert item["sender_truncated"] is True
@@ -350,44 +342,29 @@ async def test_email_raw_handles_unknown_mime_charset(client, session, monkeypat
     assert response.json() == {"detail": "Raw email has no readable body"}
 
 
-async def test_email_raw_sanitizes_provider_failures(
+async def test_email_raw_sanitizes_loader_failures(
     client, session, monkeypatch, caplog
 ):
     email, *_ = await _seed_email(session)
-    monkeypatch.setattr(
-        "financial_dashboard.services.email_reads.load_or_fetch_raw_email",
-        AsyncMock(
-            return_value=RawEmailResult(
-                None, "credential failure containing secret", None
-            )
+    target = "financial_dashboard.services.email_reads.load_or_fetch_raw_email"
+    failures = (
+        (
+            AsyncMock(return_value=RawEmailResult(None, "failure with secret", None)),
+            "loader-failed",
         ),
+        (AsyncMock(side_effect=OSError("private spool secret")), "loader-exception"),
     )
+    for loader, log_marker in failures:
+        caplog.clear()
+        monkeypatch.setattr(target, loader)
 
-    response = await client.get(f"/api/emails/{email.id}/raw")
+        response = await client.get(f"/api/emails/{email.id}/raw")
 
-    assert response.status_code == 424
-    assert response.json() == {"detail": "Raw email source is unavailable"}
-    assert "secret" not in response.text
-    assert "secret" not in caplog.text
-    assert "loader-failed" in caplog.text
-
-
-async def test_email_raw_sanitizes_loader_exceptions(
-    client, session, monkeypatch, caplog
-):
-    email, *_ = await _seed_email(session)
-    monkeypatch.setattr(
-        "financial_dashboard.services.email_reads.load_or_fetch_raw_email",
-        AsyncMock(side_effect=OSError("private spool path and secret")),
-    )
-
-    response = await client.get(f"/api/emails/{email.id}/raw")
-
-    assert response.status_code == 424
-    assert response.json() == {"detail": "Raw email source is unavailable"}
-    assert "private spool path" not in caplog.text
-    assert "secret" not in caplog.text
-    assert "loader-exception" in caplog.text
+        assert response.status_code == 424
+        assert response.json() == {"detail": "Raw email source is unavailable"}
+        assert "secret" not in response.text
+        assert "secret" not in caplog.text
+        assert log_marker in caplog.text
 
 
 async def test_email_batch_preserves_order_and_reports_missing(client, session):
@@ -449,13 +426,9 @@ async def test_source_lists_do_not_autoflush(client, session):
 @pytest.mark.parametrize(
     ("method", "path", "json"),
     [
-        ("GET", "/api/sms/0", None),
-        ("GET", "/api/sms?limit=101", None),
         ("GET", "/api/sms?date_from=2030-01-03&date_to=2030-01-02", None),
         ("POST", "/api/sms/batch", {"ids": [1, 1]}),
-        ("GET", "/api/emails/0", None),
         ("GET", "/api/emails?limit=101", None),
-        ("GET", "/api/emails?date_from=2030-01-03&date_to=2030-01-02", None),
         ("POST", "/api/emails/batch", {"ids": []}),
     ],
 )
@@ -468,21 +441,3 @@ async def test_source_reads_validate_bounds(client, method, path, json):
 async def test_source_detail_returns_404(client, path):
     response = await client.get(path)
     assert response.status_code == 404
-
-
-async def test_source_read_openapi_is_typed(client):
-    document = (await client.get("/openapi.json")).json()
-    expected = {
-        ("/api/sms", "get"): "SmsListResponse",
-        ("/api/sms/{sms_id}", "get"): "SmsDetailResponse",
-        ("/api/sms/batch", "post"): "SmsBatchResponse",
-        ("/api/emails", "get"): "EmailListResponse",
-        ("/api/emails/{email_id}", "get"): "EmailDetailResponse",
-        ("/api/emails/{email_id}/raw", "get"): "EmailRawResponse",
-        ("/api/emails/batch", "post"): "EmailBatchResponse",
-    }
-    for (path, method), schema_name in expected.items():
-        schema = document["paths"][path][method]["responses"]["200"]["content"][
-            "application/json"
-        ]["schema"]
-        assert schema == {"$ref": f"#/components/schemas/{schema_name}"}

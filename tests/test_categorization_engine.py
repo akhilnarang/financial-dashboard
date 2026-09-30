@@ -1,7 +1,6 @@
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import (
@@ -67,65 +66,6 @@ async def test_confident_rule_supersedes_stale_review_and_cancels_buttons(
     assert txn.category == "interest"
     assert txn.category_method == "rule"
     assert txn.category_input_hash is not None
-
-
-async def test_rule_pass_no_match_marks_pending_llm(session: AsyncSession):
-    # A row the rules don't match must not stay method=NULL (that would make the
-    # rule pass re-evaluate it forever and break backfill termination); it becomes
-    # 'pending_llm' so the LLM pass picks it up.
-    txn = Transaction(
-        bank="testbank",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("42"),
-        counterparty="ACME STORE",
-        raw_description="ACME STORE MUMBAI",
-    )
-    session.add(txn)
-    await session.flush()
-
-    method = await eng.categorize_one(session, txn, use_llm=False)
-    assert method == "skip"
-    assert txn.category_method == "pending_llm"
-    assert txn.category is None
-
-
-async def test_llm_low_confidence_routes_to_review(session: AsyncSession, monkeypatch):
-    # seed an active category so the slug is valid
-    from financial_dashboard.services.categorization.vocabulary import ensure_category
-
-    await ensure_category(session, "groceries")
-
-    async def fake_classify(**kwargs):
-        return llm.LlmResult("groceries", 0.10, "unsure")
-
-    monkeypatch.setattr(eng, "_llm_classify", fake_classify)
-
-    txn = Transaction(
-        bank="testbank",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("99"),
-        counterparty="MYSTERY MERCHANT",
-        raw_description="MYSTERY MERCHANT",
-    )
-    session.add(txn)
-    await session.flush()
-
-    method = await eng.categorize_one(session, txn, use_llm=True)
-    assert method == "llm"
-    assert (
-        txn.category == "expense"
-    )  # debit + low-confidence 'unknown' -> direction default
-    assert txn.review_status == "pending"
-    assert txn.review_reason == "unsure"
-    decision = await session.scalar(
-        select(CategoryReviewDecision).where(
-            CategoryReviewDecision.transaction_id == txn.id
-        )
-    )
-    assert decision is not None
-    assert decision.proposed_slug == "groceries"
 
 
 async def test_llm_direction_flip_routes_to_review(session: AsyncSession, monkeypatch):

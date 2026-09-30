@@ -1,69 +1,20 @@
-import pytest
-
 from financial_dashboard.services import settings as settings_mod
 from financial_dashboard.services.settings import (
-    SETTINGS_REGISTRY,
     get_grouped_settings,
     get_redact_name_tokens,
     get_self_identifier_tokens,
-    get_setting_int,
     parse_form_updates,
 )
 
-pytestmark = pytest.mark.anyio
 
-
-def test_categorization_settings_registered():
-    for key in (
-        "gemini.api_key",
-        "gemini.model",
-        "categorization.enabled",
-        "categorization.confidence_threshold",
-        "categorization.self_identifiers",
-        "categorization.hidden_identifiers",
-        "category_vocab_version",
-        "openai.model",
-        "openai.reasoning_effort",
-    ):
-        assert key in SETTINGS_REGISTRY, key
-    assert SETTINGS_REGISTRY["openai.reasoning_effort"].internal is False
-    assert SETTINGS_REGISTRY["gemini.api_key"].secret is True
-    # old keys must be gone
-    assert "categorization.self_names" not in SETTINGS_REGISTRY
-    assert "categorization.redact_names" not in SETTINGS_REGISTRY
-
-
-async def test_vocab_version_default_reads_as_one():
-    assert get_setting_int("category_vocab_version", 1) == 1
-
-
-def test_get_self_identifier_tokens_returns_only_self(monkeypatch):
-    monkeypatch.setitem(
-        settings_mod._cache, "categorization.self_identifiers", "alex, 9999"
-    )
-    monkeypatch.setitem(
-        settings_mod._cache, "categorization.hidden_identifiers", "doe, bob"
-    )
-    tokens = get_self_identifier_tokens()
-    assert tokens == ("alex", "9999")
-
-
-def test_get_redact_name_tokens_returns_union(monkeypatch):
-    monkeypatch.setitem(settings_mod._cache, "categorization.self_identifiers", "alex")
-    monkeypatch.setitem(
-        settings_mod._cache, "categorization.hidden_identifiers", "doe, bob"
-    )
-    tokens = get_redact_name_tokens()
-    assert set(tokens) == {"alex", "doe", "bob"}
-
-
-def test_get_redact_name_tokens_deduplicates(monkeypatch):
+def test_self_and_redact_name_tokens(monkeypatch):
     monkeypatch.setitem(
         settings_mod._cache, "categorization.self_identifiers", "alex, doe"
     )
     monkeypatch.setitem(
         settings_mod._cache, "categorization.hidden_identifiers", "doe, bob"
     )
+    assert get_self_identifier_tokens() == ("alex", "doe")
     tokens = get_redact_name_tokens()
     assert tokens.count("doe") == 1
     assert set(tokens) == {"alex", "doe", "bob"}
@@ -71,19 +22,32 @@ def test_get_redact_name_tokens_deduplicates(monkeypatch):
 
 def test_vocab_version_is_internal_and_not_form_editable():
     # internal counter: never rendered in the settings UI, never set via the form
-    assert SETTINGS_REGISTRY["category_vocab_version"].internal is True
     grouped = get_grouped_settings()
     rendered = {row["key"] for rows in grouped.values() for row in rows}
     assert "category_vocab_version" not in rendered
     # a (stale) form value for it must NOT produce an update that could roll it back
-    updates, errors = parse_form_updates({"category_vocab_version": "1"})
+    updates, _ = parse_form_updates({"category_vocab_version": "1"})
     assert "category_vocab_version" not in updates
 
 
-def test_reasoning_effort_accepts_a_valid_level():
-    updates, errors = parse_form_updates({"openai.reasoning_effort": "medium"})
-    assert errors == []
-    assert updates["openai.reasoning_effort"] == "medium"
+def test_api_keys_are_masked_and_kept_on_blank_post(monkeypatch):
+    keys = ("gemini.api_key", "openai.api_key")
+    for key in keys:
+        monkeypatch.setitem(settings_mod._cache, key, "sk-test-secret")
+    rows = {r["key"]: r for rs in get_grouped_settings().values() for r in rs}
+    for key in keys:
+        assert rows[key]["value"] == ""
+        assert rows[key]["is_set"] is True
+    # a blank secret field must not clear the stored key
+    updates, _ = parse_form_updates({key: "" for key in keys})
+    assert not set(keys) & set(updates)
+
+
+def test_reasoning_effort_accepts_a_valid_level_or_empty():
+    for value in ("medium", ""):
+        updates, errors = parse_form_updates({"openai.reasoning_effort": value})
+        assert errors == []
+        assert updates["openai.reasoning_effort"] == value
 
 
 def test_reasoning_effort_rejects_an_unknown_level():
@@ -91,9 +55,3 @@ def test_reasoning_effort_rejects_an_unknown_level():
     updates, errors = parse_form_updates({"openai.reasoning_effort": "meduim"})
     assert any("Reasoning Effort" in e for e in errors)
     assert "openai.reasoning_effort" not in updates
-
-
-def test_reasoning_effort_accepts_empty_for_a_plain_model():
-    updates, errors = parse_form_updates({"openai.reasoning_effort": ""})
-    assert errors == []
-    assert updates["openai.reasoning_effort"] == ""

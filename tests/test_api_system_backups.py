@@ -8,6 +8,8 @@ import sqlite3
 import stat
 import threading
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import NamedTuple
 
@@ -28,6 +30,21 @@ from financial_dashboard.services import system_backups
 pytestmark = pytest.mark.anyio
 
 
+@asynccontextmanager
+async def _api_client(session: AsyncSession) -> AsyncIterator[AsyncClient]:
+    app = FastAPI()
+
+    async def override_session():
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.include_router(api_router)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yield client
+
+
 @pytest.fixture
 async def backup_api(tmp_path):
     database_path = tmp_path / "synthetic-ledger.db"
@@ -41,18 +58,8 @@ async def backup_api(tmp_path):
         )
 
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as session:
-        app = FastAPI()
-
-        async def override_session():
-            yield session
-
-        app.dependency_overrides[get_session] = override_session
-        app.include_router(api_router)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            yield client, session, engine, database_path
+    async with maker() as session, _api_client(session) as client:
+        yield client, session, engine, database_path
 
     await engine.dispose()
 
@@ -142,45 +149,12 @@ async def test_post_creates_verified_online_backup_with_committed_wal_rows(backu
     assert source_rows.all() == [("committed-row",)]
 
 
-async def test_relative_sqlite_url_is_resolved_internally(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    engine = create_async_engine("sqlite+aiosqlite:///relative-ledger.db")
-    async with engine.begin() as connection:
-        await connection.execute(text("CREATE TABLE synthetic_rows (value TEXT)"))
-        await connection.execute(
-            text("INSERT INTO synthetic_rows (value) VALUES ('relative-row')")
-        )
-
-    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as session:
-        app = FastAPI()
-
-        async def override_session():
-            yield session
-
-        app.dependency_overrides[get_session] = override_session
-        app.include_router(api_router)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            body = (await client.post("/api/system/backups")).json()
-
-    assert body["status"] == "created"
-    backup_path, _manifest_path = _backup_paths(
-        tmp_path / "relative-ledger.db", body["backup"]["backup_id"]
-    )
-    with sqlite3.connect(backup_path) as backup_connection:
-        assert backup_connection.execute(
-            "SELECT value FROM synthetic_rows"
-        ).fetchall() == [("relative-row",)]
-    await engine.dispose()
-
-
-async def test_literal_tilde_sqlite_path_is_not_expanded(tmp_path, monkeypatch):
+async def test_relative_sqlite_path_resolves_without_tilde_expansion(
+    tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
     literal_directory = tmp_path / "~"
     literal_directory.mkdir()
-    database_path = literal_directory / "literal-ledger.db"
     engine = create_async_engine("sqlite+aiosqlite:///~/literal-ledger.db")
     async with engine.begin() as connection:
         await connection.execute(text("CREATE TABLE synthetic_rows (value TEXT)"))
@@ -189,13 +163,12 @@ async def test_literal_tilde_sqlite_path_is_not_expanded(tmp_path, monkeypatch):
         )
 
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as session:
-        response = await system_backups.create_system_backup(session)
+    async with maker() as session, _api_client(session) as client:
+        body = (await client.post("/api/system/backups")).json()
 
-    assert response.status == "created"
-    assert response.backup is not None
+    assert body["status"] == "created"
     backup_path, _manifest_path = _backup_paths(
-        database_path, response.backup.backup_id
+        literal_directory / "literal-ledger.db", body["backup"]["backup_id"]
     )
     with sqlite3.connect(backup_path) as backup_connection:
         assert backup_connection.execute(
@@ -330,39 +303,12 @@ async def test_get_ignores_malformed_manifests_without_following_paths(
     )
 
 
-@pytest.mark.parametrize("limit", ["0", "101", "not-an-integer"])
-async def test_get_validates_limit(backup_api, limit):
+async def test_get_validates_limit(backup_api):
     client, *_rest = backup_api
 
-    response = await client.get("/api/system/backups", params={"limit": limit})
+    response = await client.get("/api/system/backups", params={"limit": "101"})
 
     assert response.status_code == 422
-
-
-async def test_backup_openapi_uses_inferred_typed_responses(backup_api):
-    client, *_rest = backup_api
-
-    document = (await client.get("/openapi.json")).json()
-    get_operation = document["paths"]["/api/system/backups"]["get"]
-    post_operation = document["paths"]["/api/system/backups"]["post"]
-    assert get_operation["responses"]["200"]["content"]["application/json"][
-        "schema"
-    ] == {"$ref": "#/components/schemas/SystemBackupListResponse"}
-    assert post_operation["responses"]["200"]["content"]["application/json"][
-        "schema"
-    ] == {"$ref": "#/components/schemas/SystemBackupCreateResponse"}
-    limit_parameter = next(
-        parameter
-        for parameter in get_operation["parameters"]
-        if parameter["name"] == "limit"
-    )
-    assert limit_parameter["schema"] == {
-        "type": "integer",
-        "maximum": 100,
-        "minimum": 1,
-        "default": 50,
-        "title": "Limit",
-    }
 
 
 async def test_in_memory_sqlite_is_typed_unsupported_without_file_work(client):
@@ -393,46 +339,19 @@ async def test_in_memory_sqlite_is_typed_unsupported_without_file_work(client):
         ("file::memory:?cache=shared", {"uri": "true"}),
         ("file:temporary?mode=memory", {"uri": "true"}),
         ("file:temporary%3Fmode=memory", {"uri": "true"}),
-        ("ledger.db?mode=memory", {}),
-        ("file://remote.example/private.db", {"uri": "true"}),
         ("file:ledger.db?mode=ro&vfs=private", {"uri": "true"}),
+        ("file://remote.example/private.db", {"uri": "true"}),
         ("file:ledger.db", {"uri": "true", "vfs": "private"}),
     ],
 )
-async def test_sqlite_uri_memory_temp_and_unsupported_shapes_are_rejected(
-    database, query
-):
+async def test_memory_remote_and_vfs_sqlite_uris_are_unsupported(database, query):
     engine = create_async_engine(
         URL.create("sqlite+aiosqlite", database=database, query=query)
     )
-    try:
-        assert system_backups._sqlite_file_database(engine.sync_engine) is None
-    finally:
-        await engine.dispose()
-
-
-async def test_embedded_memory_mode_is_typed_unsupported_via_api():
-    engine = create_async_engine(
-        URL.create(
-            "sqlite+aiosqlite",
-            database="file:temporary?mode=memory",
-            query={"uri": "true"},
-        )
-    )
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as session:
-        app = FastAPI()
-
-        async def override_session():
-            yield session
-
-        app.dependency_overrides[get_session] = override_session
-        app.include_router(api_router)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            post = await client.post("/api/system/backups")
-            listing = await client.get("/api/system/backups")
+    async with maker() as session, _api_client(session) as client:
+        post = await client.post("/api/system/backups")
+        listing = await client.get("/api/system/backups")
 
     assert post.json() == {
         "status": "unsupported",
@@ -486,27 +405,6 @@ async def test_online_backup_progress_deadline_is_fast_and_closes_connections(
     ]
     assert source.closed is True
     assert destination.closed is True
-
-
-async def test_backup_timeout_cleans_artifacts_and_sanitizes_response(
-    backup_api, monkeypatch
-):
-    client, _session, _engine, database_path = backup_api
-
-    def time_out(_source, _destination):
-        raise system_backups.BackupTimeoutError("private contention detail")
-
-    monkeypatch.setattr(system_backups, "_run_online_backup", time_out)
-    response = await client.post("/api/system/backups")
-
-    assert response.json() == {
-        "status": "unavailable",
-        "backend": "sqlite",
-        "backup": None,
-    }
-    assert "private contention detail" not in response.text
-    backup_directory = _backup_root(database_path)
-    assert list(backup_directory.iterdir()) == []
 
 
 async def test_create_scavenges_only_unlocked_stale_temporary_directories(

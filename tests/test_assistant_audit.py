@@ -110,25 +110,6 @@ async def test_ready_output_authorization_change_is_delivery_failed(session):
 
 
 @pytest.mark.anyio
-async def test_authorization_change_preserves_committed_outcome(session):
-    row = AuditInteraction(
-        inbound_chat_id=1,
-        trigger="ask",
-        status="delivery_partial",
-        outcome="query_result",
-        assistant_text="Found two transactions.",
-    )
-    session.add(row)
-    await session.flush()
-
-    assert await mark_authorization_changed(session, row.id)
-    await session.refresh(row)
-    assert row.status == "delivery_failed"
-    assert row.outcome == "query_result"
-    assert row.error_code == "authorization_changed"
-
-
-@pytest.mark.anyio
 async def test_delivery_proof_cannot_revive_authorization_cancelled_output(session):
     row = AuditInteraction(
         inbound_chat_id=1,

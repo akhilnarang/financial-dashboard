@@ -9,9 +9,10 @@ authoritative.
 from decimal import Decimal
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from financial_dashboard.db.models import Base, Transaction
+from financial_dashboard.db.models import Transaction
+from tests.conftest import new_test_engine
 from financial_dashboard.services.statements import bank as bank_module
 from financial_dashboard.services.statements.bank import enrich_matched_transactions
 
@@ -20,13 +21,12 @@ pytestmark = pytest.mark.anyio
 
 @pytest.fixture
 async def maker(monkeypatch):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     m = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(bank_module, "async_session", m)
     yield m
     await engine.dispose()
+    holder.close()
 
 
 def _fd_row(counterparty: str) -> Transaction:

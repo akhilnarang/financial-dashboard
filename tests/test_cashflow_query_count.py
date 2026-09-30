@@ -72,49 +72,20 @@ def count_transaction_reads():
         event.remove(Engine, "before_cursor_execute", before_cursor_execute)
 
 
-async def test_page_load_aggregates_the_range_once(client, session):
-    """The page aggregates the selected range exactly once.
+async def test_page_load_is_one_summary_plus_trend(client, session):
+    """The page aggregates the selected range once; its only fetch is the trend.
 
-    The breakdown chart is handed the summary the page was rendered from instead
-    of fetching it back, so the range is not aggregated twice.
-    """
-    await _seed(session)
-    with count_transaction_reads() as queries:
-        page = await client.get(f"/cashflow?{RANGE}")
-    assert page.status_code == 200
-    assert len(queries) == SUMMARY_QUERIES
-
-    # The page carries the summary, so there is nothing for the chart to re-read.
-    assert "/api/cashflow/summary" not in page.text
-    assert 'id="cf-summary"' in page.text
-
-
-async def test_full_page_load_is_summary_plus_trend_and_nothing_more(client, session):
-    """Everything one page load costs, counted end to end.
-
-    The document is one summary; the only fetch it then makes is the trend, whose
-    trailing-twelve-month window really is a different question from the selected
-    range. A page that also re-fetched the summary would pay for a second full
-    summary.
+    The breakdown chart gets the summary the page rendered from. A page that
+    re-fetched ``/api/cashflow/summary`` would pay for a second full summary.
     """
     await _seed(session)
     with count_transaction_reads() as page_queries:
         page = await client.get(f"/cashflow?{RANGE}")
+    assert page.status_code == 200
+    assert len(page_queries) == SUMMARY_QUERIES
+    assert "/api/cashflow/summary" not in page.text
+
     with count_transaction_reads() as trend_queries:
         trend = await client.get("/api/cashflow/trend?months=12")
     assert trend.status_code == 200
-
-    assert len(page_queries) == SUMMARY_QUERIES
     assert len(trend_queries) == TREND_QUERIES
-    assert len(page_queries) + len(trend_queries) == SUMMARY_QUERIES + TREND_QUERIES
-
-    # The figure the removed fetch would have added back, measured rather than
-    # asserted from memory: it is a second full summary.
-    with count_transaction_reads() as summary_queries:
-        await client.get(f"/api/cashflow/summary?{RANGE}")
-    assert len(summary_queries) == SUMMARY_QUERIES
-    assert (
-        len(page_queries) + len(trend_queries) + len(summary_queries)
-        == 2 * SUMMARY_QUERIES + TREND_QUERIES
-    )
-    assert page.status_code == 200

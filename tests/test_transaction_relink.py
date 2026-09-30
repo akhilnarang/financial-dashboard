@@ -15,7 +15,7 @@ from decimal import Decimal
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.core.deps as core_deps
 import financial_dashboard.services.reminders as reminders_module
@@ -23,29 +23,23 @@ from financial_dashboard.api import router as api_router
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.db import (
     Account,
-    Base,
     Card,
     StatementUpload,
     Transaction,
 )
 from financial_dashboard.db.enums import PaymentStatus
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+from tests.conftest import new_test_engine
 
 
 @pytest.fixture
 async def session_maker(monkeypatch):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(reminders_module, "async_session", maker)
     monkeypatch.setattr(core_deps, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 def _build_test_app(maker):
@@ -246,38 +240,10 @@ async def test_relink_card_account_mismatch_rejected(session_maker):
 
 
 @pytest.mark.anyio
-async def test_relink_clears_when_both_null(session_maker):
-    """Passing null/null clears the existing link — useful for undo."""
-    account_id, card_id, _stmt, txn_id = await _seed(session_maker, orphan=False)
-
-    app = _build_test_app(session_maker)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.post(
-            f"/api/transactions/{txn_id}/relink",
-            json={"account_id": None, "card_id": None},
-        )
-        assert r.status_code == 200
-        assert r.json()["account_id"] is None
-        assert r.json()["card_id"] is None
-
-    async with session_maker() as s:
-        txn = await s.get(Transaction, txn_id)
-        assert txn.account_id is None
-        assert txn.card_id is None
-
-
-@pytest.mark.anyio
-async def test_relink_clears_card_while_keeping_account(session_maker):
-    """Hybrid: operator sets account_id but leaves card_id null. The
-    null is interpreted as 'clear' (not 'leave alone'), matching the
-    null/null clear semantic. Useful when the operator knows the
-    account but not which specific card."""
-    account_id, card_id, _stmt, txn_id = await _seed(session_maker, orphan=False)
-    # Sanity: prior state has both linked.
-    async with session_maker() as s:
-        txn = await s.get(Transaction, txn_id)
-        assert txn.account_id == account_id
-        assert txn.card_id == card_id
+async def test_relink_null_clears_the_link(session_maker):
+    """A null means 'clear', not 'leave alone'. A null card keeps the account;
+    null/null clears both, which is the undo."""
+    account_id, _card_id, _stmt, txn_id = await _seed(session_maker, orphan=False)
 
     app = _build_test_app(session_maker)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
@@ -290,9 +256,15 @@ async def test_relink_clears_card_while_keeping_account(session_maker):
         assert body["account_id"] == account_id
         assert body["card_id"] is None
 
+        r = await c.post(
+            f"/api/transactions/{txn_id}/relink",
+            json={"account_id": None, "card_id": None},
+        )
+        assert r.status_code == 200, r.text
+
     async with session_maker() as s:
         txn = await s.get(Transaction, txn_id)
-        assert txn.account_id == account_id
+        assert txn.account_id is None
         assert txn.card_id is None
 
 

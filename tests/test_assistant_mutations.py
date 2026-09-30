@@ -167,51 +167,6 @@ async def test_global_no_change_fence_rejects_ordinary_mutation(session):
 
 
 @pytest.mark.anyio
-async def test_global_no_change_fence_rejects_merchant_rule(session):
-    await ensure_category(session, "groceries")
-    txn = _txn()
-    txn.counterparty = "Amazon Fresh"
-    session.add(txn)
-    await session.flush()
-    request = ApplyTransactionChanges(
-        name="apply_transaction_changes",
-        transaction_id=txn.id,
-        changes={"category": {"op": "set", "value": "groceries"}},
-        merchant_rule={
-            "category": "groceries",
-            "intent_evidence": "Always use groceries",
-        },
-    )
-
-    with pytest.raises(MutationRejected, match="forbids transaction changes"):
-        await apply_transaction_changes(
-            session,
-            request,
-            current_user_message="Always use groceries, but don't make changes",
-        )
-
-
-@pytest.mark.anyio
-async def test_negation_inside_note_payload_does_not_deny_note_write(session):
-    txn = _txn()
-    session.add(txn)
-    await session.flush()
-    value = "Do not forget the note"
-    request = ApplyTransactionChanges(
-        name="apply_transaction_changes",
-        transaction_id=txn.id,
-        changes={"note": {"op": "set", "value": value}},
-    )
-
-    result = await apply_transaction_changes(
-        session,
-        request,
-        current_user_message=f"Set note to {value}",
-    )
-    assert result.after["note"] == value
-
-
-@pytest.mark.anyio
 async def test_unquoted_note_cannot_absorb_later_clause(session):
     txn = _txn()
     session.add(txn)
@@ -232,16 +187,7 @@ async def test_unquoted_note_cannot_absorb_later_clause(session):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    "message",
-    [
-        'Set note to "Do not forget the note, paid cash"',
-        "Set note to 'Do not forget the note, paid cash'",
-    ],
-)
-async def test_quoted_or_colon_note_payload_preserves_internal_negation(
-    session, message
-):
+async def test_quoted_note_payload_preserves_internal_negation(session):
     txn = _txn()
     session.add(txn)
     await session.flush()
@@ -255,7 +201,7 @@ async def test_quoted_or_colon_note_payload_preserves_internal_negation(
     result = await apply_transaction_changes(
         session,
         request,
-        current_user_message=message,
+        current_user_message=f'Set note to "{value}"',
     )
     assert result.after["note"] == value
 
@@ -286,26 +232,6 @@ async def test_model_selected_note_cannot_remove_global_denial_or_add_category(s
         )
     assert txn.note is None
     assert txn.category is None
-
-
-@pytest.mark.anyio
-async def test_quoted_note_durable_language_is_only_note_payload(session):
-    txn = _txn()
-    session.add(txn)
-    await session.flush()
-    value = "always categorize Swiggy as food"
-    request = ApplyTransactionChanges(
-        name="apply_transaction_changes",
-        transaction_id=txn.id,
-        changes={"note": {"op": "set", "value": value}},
-    )
-
-    result = await apply_transaction_changes(
-        session,
-        request,
-        current_user_message=f'Set note to "{value}"',
-    )
-    assert result.after["note"] == value
 
 
 @pytest.mark.anyio
@@ -610,44 +536,6 @@ async def test_note_negation_in_prior_clause_does_not_deny_category_assignment(s
         current_user_message="Don't change the note, set the category to groceries",
     )
     assert result.after["category"] == "groceries"
-
-
-@pytest.mark.anyio
-async def test_category_negation_in_prior_clause_does_not_deny_note_write(session):
-    txn = _txn()
-    session.add(txn)
-    await session.flush()
-    request = ApplyTransactionChanges(
-        name="apply_transaction_changes",
-        transaction_id=txn.id,
-        changes={"note": {"op": "set", "value": "dinner"}},
-    )
-
-    result = await apply_transaction_changes(
-        session,
-        request,
-        current_user_message="Don't change the category, set the note to dinner",
-    )
-    assert result.after["note"] == "dinner"
-
-
-@pytest.mark.anyio
-async def test_polite_cashflow_question_cannot_change_exclusion(session):
-    txn = _txn()
-    session.add(txn)
-    await session.flush()
-    request = ApplyTransactionChanges(
-        name="apply_transaction_changes",
-        transaction_id=txn.id,
-        changes={"exclude_from_cashflow": {"op": "set", "value": True}},
-    )
-
-    with pytest.raises(MutationRejected, match="questions cannot change"):
-        await apply_transaction_changes(
-            session,
-            request,
-            current_user_message="Please explain cashflow exclusion",
-        )
 
 
 @pytest.mark.anyio

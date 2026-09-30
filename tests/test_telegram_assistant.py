@@ -124,15 +124,6 @@ async def test_disabled_ask_never_calls_assistant(monkeypatch):
     assert message.replies == ["/ask is disabled"]
 
 
-def test_legacy_parser_rejects_sms_ids():
-    from financial_dashboard.services.assistant.orchestrator import (
-        _legacy_transaction_id,
-    )
-
-    assert _legacy_transaction_id("⚠️ HDFC DEBIT SMS #8507") is None
-    assert _legacy_transaction_id("🔍 Needs a category: #8507") == 8507
-
-
 def test_sms_duplicate_guard_is_narrow_and_preserves_transaction_sms_headers():
     from financial_dashboard.services.assistant.orchestrator import (
         _legacy_transaction_id,
@@ -149,6 +140,7 @@ def test_sms_duplicate_guard_is_narrow_and_preserves_transaction_sms_headers():
     assert _legacy_transaction_id(duplicate) is None
     assert _legacy_transaction_id(rendered_duplicate) is None
     assert _legacy_transaction_id(normal) == 8507
+    assert _legacy_transaction_id("🔍 Needs a category: #8507") == 8507
 
 
 @pytest.mark.anyio

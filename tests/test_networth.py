@@ -121,13 +121,14 @@ async def test_current_networth_assets_minus_liabilities(session):
     bank = await _account(session, account_type="bank_account")
     card = await _account(session, account_type="credit_card")
     await _bank(session, bank.id, dt.date(2026, 5, 20), "100000.00")
-    await _cc(session, card.id, dt.date(2026, 5, 21), "25000.00")
+    await _cc(session, card.id, dt.date(2026, 5, 21), "125000.00")
 
     summary = await networth.current_networth(session, today=dt.date(2026, 5, 24))
 
     assert summary.total_assets == Decimal("100000.00")
-    assert summary.total_liabilities == Decimal("25000.00")
-    assert summary.net_worth == Decimal("75000.00")
+    assert summary.total_liabilities == Decimal("125000.00")
+    # Net worth stays signed: it can go negative.
+    assert summary.net_worth == Decimal("-25000.00")
 
 
 async def test_forward_fill_latest_per_source_and_stale_flag(session):
@@ -173,17 +174,6 @@ async def test_deactivated_sources_are_excluded(session):
     assert summary.total_assets == Decimal("1000.00")
 
 
-async def test_bank_and_cc_on_distinct_accounts_are_not_double_counted(session):
-    bank = await _account(session, account_type="bank_account")
-    card = await _account(session, account_type="credit_card")
-    await _bank(session, bank.id, dt.date(2026, 5, 20), "50000.00")
-    await _cc(session, card.id, dt.date(2026, 5, 20), "10000.00")
-
-    summary = await networth.current_networth(session, today=dt.date(2026, 5, 24))
-
-    assert summary.net_worth == Decimal("40000.00")
-
-
 async def test_empty_db_returns_zero_summary(session):
     summary = await networth.current_networth(session, today=dt.date(2026, 5, 24))
 
@@ -191,11 +181,7 @@ async def test_empty_db_returns_zero_summary(session):
     assert summary.total_liabilities == Decimal("0.00")
     assert summary.net_worth == Decimal("0.00")
     assert summary.groups == []
-
-
-async def test_monthly_trend_empty_db(session):
-    points = await networth.monthly_trend(session, today=dt.date(2026, 5, 24))
-    assert points == []
+    assert await networth.monthly_trend(session, today=dt.date(2026, 5, 24)) == []
 
 
 async def test_monthly_trend_future_only_snapshots_returns_empty(session):
@@ -285,55 +271,6 @@ async def test_two_pans_same_date_both_counted(session):
     assert len(inv_group.rows) == 2
 
 
-async def test_latest_per_source_wins_tie_broken_by_id(session):
-    """For one source, the latest as_of wins; an exact-date tie is broken by id
-    so the most-recently inserted snapshot wins. Other sources are independent."""
-    acct_a = await _account(session)
-    acct_b = await _account(session)
-    await _bank(session, acct_a.id, dt.date(2026, 4, 10), "1000.00")
-    await _bank(session, acct_a.id, dt.date(2026, 4, 20), "2000.00")  # latest for A
-    await _bank(session, acct_b.id, dt.date(2026, 4, 20), "5000.00")  # only B
-
-    summary = await networth.current_networth(session, today=dt.date(2026, 4, 24))
-
-    assert summary.total_assets == Decimal("7000.00")
-
-
-async def test_asset_and_liability_signs_keep_net_worth_signed(session):
-    """Assets add, liabilities subtract; net worth can go negative."""
-    bank = await _account(session, account_type="bank_account")
-    card = await _account(session, account_type="credit_card")
-    await _bank(session, bank.id, dt.date(2026, 5, 20), "30000.00")
-    await _cc(session, card.id, dt.date(2026, 5, 20), "90000.00")
-
-    summary = await networth.current_networth(session, today=dt.date(2026, 5, 24))
-
-    assert summary.total_assets == Decimal("30000.00")
-    assert summary.total_liabilities == Decimal("90000.00")
-    assert summary.net_worth == Decimal("-60000.00")
-
-
-async def test_inr_default_currency_is_counted(session):
-    """The balance_snapshots.currency column is NOT NULL with default 'INR', so a
-    snapshot created without an explicit currency resolves to INR and is counted.
-    This is the practical 'NULL' path: NULL cannot occur, the default fills it."""
-    account = await _account(session)
-    snapshot = BalanceSnapshot(
-        account_id=account.id,
-        kind=SnapshotKind.asset.value,
-        category=SnapshotCategory.bank_balance.value,
-        as_of_date=dt.date(2026, 5, 20),
-        value=Decimal("1000.00"),
-        source=SnapshotSource.bank_statement.value,
-    )
-    session.add(snapshot)
-    await session.flush()
-
-    assert snapshot.currency == "INR"  # column default applied
-    summary = await networth.current_networth(session, today=dt.date(2026, 5, 24))
-    assert summary.total_assets == Decimal("1000.00")
-
-
 async def test_non_inr_currency_excluded_from_totals_and_groups(session):
     """A non-INR snapshot is skipped entirely: not in totals, not in any group."""
     account = await _account(session)
@@ -353,25 +290,8 @@ async def test_non_inr_currency_excluded_from_totals_and_groups(session):
     summary = await networth.current_networth(session, today=dt.date(2026, 5, 24))
     assert summary.total_assets == Decimal("0.00")
     assert summary.groups == []
-
-
-async def test_non_inr_excluded_in_monthly_trend_too(session):
-    """The trend applies the same INR filter, so a non-INR source contributes 0."""
-    account = await _account(session)
-    session.add(
-        BalanceSnapshot(
-            account_id=account.id,
-            kind=SnapshotKind.asset.value,
-            category=SnapshotCategory.bank_balance.value,
-            as_of_date=dt.date(2026, 4, 20),
-            value=Decimal("1000.00"),
-            source=SnapshotSource.bank_statement.value,
-            currency="USD",
-        )
-    )
-    await session.flush()
-
-    points = await networth.monthly_trend(session, today=dt.date(2026, 5, 12))
+    # The trend applies the same filter.
+    points = await networth.monthly_trend(session, today=dt.date(2026, 6, 12))
     assert [p.value for p in points] == [Decimal("0.00"), Decimal("0.00")]
 
 

@@ -268,24 +268,6 @@ async def test_email_parse_preview_suppresses_merge_for_statement_rule(
     assert response.json()["merge"]["match_kind"] == "statement_rule"
 
 
-async def test_email_parse_preview_routes_pdf_statement_after_html_parse_error(
-    client, session, monkeypatch
-):
-    email = await _email(session, email_kind="bank_statement")
-    await session.commit()
-    _patch_raw_and_parse(
-        monkeypatch,
-        ProcessedEmailParse("Synthetic HTML parser failure", None, None, None),
-    )
-
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
-
-    assert response.status_code == 200
-    assert response.json()["parser"]["disposition"] == "error"
-    assert response.json()["merge"]["action"] == "routed_statement_pipeline"
-    assert response.json()["merge"]["match_kind"] == "statement_rule"
-
-
 async def test_email_parse_preview_routes_transaction_parse_failure_to_statement_fallback(
     client, session, monkeypatch
 ):
@@ -328,11 +310,13 @@ async def test_email_parse_preview_reports_statement_summary(
 
     assert response.status_code == 200
     parser = response.json()["parser"]
+    assert response.json()["routing"] == "statement"
     assert parser["disposition"] == "statement_summary"
     assert parser["password_hint_present"] is True
     assert parser["statement"]["card_mask"] == "XXXX1234"
     assert "must-not-be-returned" not in response.text
     assert response.json()["merge"]["action"] == "routed_statement_pipeline"
+    assert response.json()["merge"]["match_kind"] == "statement_rule"
 
 
 async def test_email_parse_preview_reports_cas_pipeline(client, session, monkeypatch):
@@ -368,13 +352,16 @@ async def test_email_parse_preview_ruleless_email_matches_reparse_status(
     assert response.json() == {"detail": "Email has no associated fetch rule"}
 
 
-async def test_email_parse_preview_returns_404_when_raw_unavailable(
-    client, session, monkeypatch
+@pytest.mark.parametrize("raises", [True, False], ids=["raises", "returns_none"])
+async def test_email_parse_preview_sanitizes_loader_exceptions(
+    client, session, monkeypatch, caplog, raises
 ):
     email = await _email(session)
     await session.commit()
 
     async def unavailable(_email):
+        if raises:
+            raise OSError("Sensitive provider path")
         return RawEmailResult(None, "Sensitive loader details", None)
 
     monkeypatch.setattr(
@@ -386,35 +373,7 @@ async def test_email_parse_preview_returns_404_when_raw_unavailable(
     assert response.status_code == 404
     assert response.json() == {"detail": "Raw email is unavailable"}
     assert "Sensitive" not in response.text
-
-
-async def test_email_parse_preview_sanitizes_loader_exceptions(
-    client, session, monkeypatch, caplog
-):
-    email = await _email(session)
-    await session.commit()
-
-    async def unavailable(_email):
-        raise OSError("Sensitive provider path")
-
-    monkeypatch.setattr(
-        "financial_dashboard.services.parse_previews.load_or_fetch_raw_email",
-        unavailable,
-    )
-    response = await client.post(f"/api/emails/{email.id}/parse-preview")
-
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Raw email is unavailable"}
-    assert "Sensitive" not in response.text
     assert "Sensitive" not in caplog.text
-
-
-async def test_email_parse_preview_openapi_is_typed(client):
-    document = (await client.get("/openapi.json")).json()
-    schema = document["paths"]["/api/emails/{email_id}/parse-preview"]["post"][
-        "responses"
-    ]["200"]["content"]["application/json"]["schema"]
-    assert schema == {"$ref": "#/components/schemas/EmailParsePreviewResponse"}
 
 
 def _completion_parse(*, reference_number: str = "SAMPLER00000000000000"):

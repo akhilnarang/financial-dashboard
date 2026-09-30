@@ -18,14 +18,13 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.core.deps as core_deps
 import financial_dashboard.services.reminders as reminders_module
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.db import (
     Account,
-    Base,
     Card,
     Email,
     FetchRule,
@@ -35,6 +34,7 @@ from financial_dashboard.db import (
 from financial_dashboard.db.enums import PaymentStatus
 from financial_dashboard.integrations.email.body import RawEmailResult
 from financial_dashboard.web import get_router as get_web_router
+from tests.conftest import new_test_engine
 
 
 @pytest.fixture
@@ -44,14 +44,13 @@ def anyio_backend():
 
 @pytest.fixture
 async def session_maker(monkeypatch):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(reminders_module, "async_session", maker)
     monkeypatch.setattr(core_deps, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 def _build_test_app(maker):

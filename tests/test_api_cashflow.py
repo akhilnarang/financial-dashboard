@@ -47,17 +47,6 @@ async def test_summary_defaults_to_current_month(client, session: AsyncSession):
     r = await client.get("/api/cashflow/summary")
     assert r.status_code == 200
     body = r.json()
-    for key in (
-        "income",
-        "expense",
-        "investment",
-        "transfers_in",
-        "uncategorized",
-        "net_cash_retained",
-        "footnotes",
-    ):
-        assert key in body
-
     # Missing bounds → first of the current month through today: the June row is
     # outside that window, the row dated today is inside it.
     assert body["date_from"] == TODAY.replace(day=1).isoformat()
@@ -103,7 +92,7 @@ async def test_summary_invalid_bound_does_not_reset_the_other(client):
     assert body["date_to"] == "2026-06-30"
 
 
-async def test_trend_shape(client, session: AsyncSession):
+async def test_trend_current_month_figures(client, session: AsyncSession):
     await _add(
         session,
         direction="credit",
@@ -123,7 +112,6 @@ async def test_trend_shape(client, session: AsyncSession):
     assert r.status_code == 200
     pts = r.json()
     assert len(pts) == 6
-    assert {"month", "income", "expense", "net_invested", "salary_count"} <= set(pts[0])
 
     current = pts[-1]
     assert current["month"] == f"{TODAY.year:04d}-{TODAY.month:02d}"
@@ -132,13 +120,11 @@ async def test_trend_shape(client, session: AsyncSession):
     assert current["salary_count"] == 1
 
 
-async def test_trend_defaults_to_twelve_months(client):
-    r = await client.get("/api/cashflow/trend")
-    assert r.status_code == 200
-    assert len(r.json()) == 12
+async def test_trend_months_default_and_clamp(client):
+    default = await client.get("/api/cashflow/trend")
+    assert default.status_code == 200
+    assert len(default.json()) == 12
 
-
-async def test_trend_months_is_clamped(client):
     low = await client.get("/api/cashflow/trend?months=0")
     assert low.status_code == 200
     assert len(low.json()) == 1

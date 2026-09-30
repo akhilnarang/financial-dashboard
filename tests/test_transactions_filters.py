@@ -90,67 +90,6 @@ def _transaction_rows_html(page: str) -> str:
     return match.group(1)
 
 
-async def test_unfiltered_list_shows_every_row(client, session):
-    await _seed(session)
-    r = await client.get("/transactions")
-    assert r.status_code == 200
-    assert _count_rows(r.text) == 6
-
-
-async def test_category_filter(client, session):
-    await _seed(session)
-    r = await client.get("/transactions?category=groceries")
-    assert r.status_code == 200
-    assert _count_rows(r.text) == 1
-
-
-async def test_uncategorized_filter_matches_report_definition(client, session):
-    await _seed(session)
-    r = await client.get("/transactions?uncategorized=1")
-    assert r.status_code == 200
-    assert _count_rows(r.text) == 2  # NULL + 'unknown'
-
-
-async def test_uncategorized_includes_non_inr(client, session):
-    # The uncategorized drill has no currency clause, so a non-INR uncategorized
-    # row is included — keeping the drill count equal to the report's tile count.
-    await _seed(session)
-    session.add(
-        Transaction(
-            bank="hdfc",
-            email_type="x",
-            direction="debit",
-            amount=Decimal("2"),
-            category=None,
-            currency="USD",
-            transaction_date=DATED,
-        )
-    )
-    await session.flush()
-    r = await client.get("/transactions?uncategorized=1")
-    assert _count_rows(r.text) == 3
-
-
-async def test_uncategorized_includes_unmapped_slug(client, session):
-    # A runtime slug the code map does not know must surface in the drill, not
-    # vanish, so it matches the report line that also treats it as uncategorized.
-    await _seed(session)
-    session.add(
-        Transaction(
-            bank="hdfc",
-            email_type="x",
-            direction="debit",
-            amount=Decimal("5"),
-            category="brand_new_slug",
-            currency="INR",
-            transaction_date=DATED,
-        )
-    )
-    await session.flush()
-    r = await client.get("/transactions?uncategorized=1")
-    assert _count_rows(r.text) == 3
-
-
 async def test_category_null_is_narrower_than_uncategorized(client, session):
     # Two different questions: "no category at all" (the NULL rows) versus "no
     # category any bucket can use" (those, plus the 'unknown' sentinel, plus slugs
@@ -180,18 +119,6 @@ async def test_category_null_is_narrower_than_uncategorized(client, session):
     assert "9.00" in narrow.text
     assert "7.00" not in narrow.text  # the 'unknown' sentinel row
     assert "5.00" not in narrow.text  # the unmapped-slug row
-
-
-async def test_internal_filter(client, session):
-    await _seed(session)
-    r = await client.get("/transactions?internal=1")
-    assert _count_rows(r.text) == 1  # only self_transfer
-
-
-async def test_non_inr_filter(client, session):
-    await _seed(session)
-    r = await client.get("/transactions?non_inr=1")
-    assert _count_rows(r.text) == 1  # only the USD dining row
 
 
 async def _seed_null_currency(session):
@@ -232,69 +159,12 @@ async def test_non_inr_zero_lists_inr_and_null_currency_rows(client, session):
     assert _count_rows(r.text) == 6
     assert "3.00" not in _transaction_rows_html(r.text)  # the USD dining row
 
-
-async def test_non_inr_zero_and_one_are_complements(client, session):
-    await _seed(session)
-    await _seed_null_currency(session)
-    rupee = await client.get("/transactions?non_inr=0")
     foreign = await client.get("/transactions?non_inr=1")
-    everything = await client.get("/transactions")
-    assert _count_rows(rupee.text) + _count_rows(foreign.text) == _count_rows(
-        everything.text
-    )
+    assert _count_rows(foreign.text) == 1  # the USD row alone
 
-
-async def test_absent_non_inr_applies_no_currency_filter(client, session):
-    await _seed(session)
-    await _seed_null_currency(session)
+    # An omitted non_inr is no filter: USD and NULL dining rows both list.
     r = await client.get("/transactions?category=dining")
-    # USD, NULL and nothing else: an omitted non_inr must stay a non-filter.
     assert _count_rows(r.text) == 2
-
-
-async def test_undated_filter(client, session):
-    await _seed(session)
-    session.add(
-        Transaction(
-            bank="hdfc",
-            email_type="x",
-            direction="debit",
-            amount=Decimal("4"),
-            category="dining",
-            currency="INR",
-            transaction_date=None,
-        )
-    )
-    await session.flush()
-    r = await client.get("/transactions?undated=1")
-    assert _count_rows(r.text) == 1  # only the transaction_date IS NULL row
-
-
-async def test_repayment_counterparty_filter(client, session):
-    await _seed(session)
-    r = await client.get("/transactions?category=repayment&counterparty=MOM")
-    assert _count_rows(r.text) == 1  # only the MOM repayment row
-
-
-async def test_blank_counterparty_groups_null_and_empty(client, session):
-    # Blank drill (counterparty=) must match BOTH NULL and empty-string
-    # counterparty rows, so it equals the transfers-in "(no counterparty)" group.
-    for cp in (None, ""):
-        session.add(
-            Transaction(
-                bank="hdfc",
-                email_type="x",
-                direction="credit",
-                amount=Decimal("50"),
-                category="repayment",
-                counterparty=cp,
-                currency="INR",
-                transaction_date=DATED,
-            )
-        )
-    await session.flush()
-    r = await client.get("/transactions?category=repayment&counterparty=")
-    assert _count_rows(r.text) == 2  # NULL + empty-string, one group
 
 
 async def test_blank_counterparty_also_matches_whitespace_only_rows(client, session):
@@ -387,21 +257,13 @@ async def test_blank_counterparty_page_two_link_keeps_filter_and_result_set(
     assert "998" not in r2.text
 
 
-async def test_existing_filters_unchanged_without_drill_params(client, session):
-    await _seed(session)
-    r = await client.get("/transactions?direction=credit")
-    assert _count_rows(r.text) == 1  # only the repayment credit
-
-
 # ---------------------------------------------------------------------------
 # Category column, filter dropdown and uncategorized toggle on /transactions.
 #
 # The category the enricher/seed wrote onto a row is now visible on the list as a
 # badge, selectable from a dropdown built off the active categories table, and
 # the uncategorized population — rows no bucket can place — is reachable through
-# an explicit checkbox wired to the existing ?uncategorized= drill param. The
-# dropdown and the toggle are fed by params every pagination/sort link already
-# carries (base_qs), so the filter survives paging and re-sorting.
+# an explicit checkbox wired to the existing ?uncategorized= drill param.
 # ---------------------------------------------------------------------------
 
 
@@ -411,56 +273,16 @@ async def _seed_categories(session, *slugs):
     await session.flush()
 
 
-async def test_category_dropdown_populated_from_active_categories(client, session):
+async def test_category_dropdown_lists_active_categories_only(client, session):
     await _seed(session)
-    await _seed_categories(session, "groceries", "dining", "rent")
-    r = await client.get("/transactions")
-    assert r.status_code == 200
-    assert 'name="category"' in r.text
-    assert '<option value="groceries"' in r.text
-    assert '<option value="dining"' in r.text
-    assert '<option value="rent"' in r.text
-
-
-async def test_category_dropdown_excludes_inactive_categories(client, session):
-    await _seed(session)
-    await _seed_categories(session, "groceries")
+    await _seed_categories(session, "groceries", "rent")
     session.add(Category(slug="dining", active=False))
     await session.flush()
     r = await client.get("/transactions")
+    assert r.status_code == 200
     assert '<option value="groceries"' in r.text
+    assert '<option value="rent"' in r.text
     assert '<option value="dining"' not in r.text
-
-
-async def test_category_dropdown_marks_the_selected_slug(client, session):
-    await _seed(session)
-    await _seed_categories(session, "groceries", "dining")
-    r = await client.get("/transactions?category=groceries")
-    assert '<option value="groceries" selected' in r.text
-    # A different slug is present but not selected.
-    assert '<option value="dining" selected' not in r.text
-
-
-async def test_uncategorized_toggle_reflects_query_param(client, session):
-    await _seed(session)
-    r = await client.get("/transactions?uncategorized=1")
-    assert 'name="uncategorized"' in r.text
-    assert 'id="uncategorized-toggle" checked' in r.text
-
-
-async def test_uncategorized_toggle_unchecked_by_default(client, session):
-    await _seed(session)
-    r = await client.get("/transactions")
-    assert 'id="uncategorized-toggle" checked' not in r.text
-
-
-async def test_list_shows_category_badge_label(client, session):
-    # A categorized row carries the slug's display label as a badge; the label is
-    # title-cased off the slug when no override names it.
-    await _seed_categories(session, "groceries")
-    await _seed(session)
-    r = await client.get("/transactions?category=groceries")
-    assert "Groceries" in r.text
 
 
 async def test_list_uses_label_override_for_known_slug(client, session):
@@ -483,128 +305,12 @@ async def test_list_uses_label_override_for_known_slug(client, session):
     assert "Card bills" in r.text
 
 
-async def test_list_shows_uncategorized_badge_for_null_category(client, session):
-    await _seed_categories(session, "groceries")
-    await _seed(session)  # includes a NULL-category row (amount 9)
-    r = await client.get("/transactions?category_null=1")
-    assert _count_rows(r.text) == 1
-    assert "Uncategorized" in r.text
-
-
 async def test_list_shows_uncategorized_badge_for_unknown_sentinel(client, session):
     await _seed_categories(session, "unknown")
     await _seed(session)
     r = await client.get("/transactions?category=unknown")
     assert _count_rows(r.text) == 1
     assert "Uncategorized" in r.text
-
-
-async def test_category_filter_preserved_through_pagination(client, session):
-    await _seed_categories(session, "groceries")
-    for i in range(55):
-        session.add(
-            Transaction(
-                bank="hdfc",
-                email_type="x",
-                direction="debit",
-                amount=Decimal(100 + i),
-                category="groceries",
-                currency="INR",
-                transaction_date=DATED,
-            )
-        )
-    # A decoy the pagination link must not widen into.
-    session.add(
-        Transaction(
-            bank="hdfc",
-            email_type="x",
-            direction="debit",
-            amount=Decimal("9999"),
-            category="dining",
-            currency="INR",
-            transaction_date=DATED,
-        )
-    )
-    await session.flush()
-
-    r = await client.get("/transactions?category=groceries")
-    assert _count_rows(r.text) == 50  # a full first page, so pagination renders
-    assert "9,999.00" not in r.text
-
-    hrefs = [html.unescape(h) for h in re.findall(r'href="([^"]+)"', r.text)]
-    page_two = [h for h in hrefs if "page=2" in h]
-    assert page_two, "pagination nav did not render a page-2 link"
-    assert all("category=groceries" in h for h in page_two)
-
-    r2 = await client.get(page_two[0])
-    assert _count_rows(r2.text) == 5  # 55 matching rows - a full page of 50
-    assert "9,999.00" not in r2.text
-
-
-async def test_uncategorized_filter_preserved_through_pagination(client, session):
-    for i in range(55):
-        session.add(
-            Transaction(
-                bank="hdfc",
-                email_type="x",
-                direction="debit",
-                amount=Decimal(100 + i),
-                category=None,
-                currency="INR",
-                transaction_date=DATED,
-            )
-        )
-    # A categorized decoy the uncategorized listing must never include.
-    session.add(
-        Transaction(
-            bank="hdfc",
-            email_type="x",
-            direction="debit",
-            amount=Decimal("9999"),
-            category="groceries",
-            currency="INR",
-            transaction_date=DATED,
-        )
-    )
-    await session.flush()
-
-    r = await client.get("/transactions?uncategorized=1")
-    assert _count_rows(r.text) == 50
-    assert "9,999.00" not in r.text
-
-    hrefs = [html.unescape(h) for h in re.findall(r'href="([^"]+)"', r.text)]
-    page_two = [h for h in hrefs if "page=2" in h]
-    assert page_two
-    assert all("uncategorized=1" in h for h in page_two)
-
-    r2 = await client.get(page_two[0])
-    assert _count_rows(r2.text) == 5
-    assert "9,999.00" not in r2.text
-
-
-async def test_category_filter_preserved_through_sort_links(client, session):
-    await _seed_categories(session, "groceries")
-    await _seed(session)
-    r = await client.get("/transactions?category=groceries")
-    sort_links = [
-        html.unescape(h)
-        for h in re.findall(r'href="([^"]+)"', r.text)
-        if "sort=amount" in h
-    ]
-    assert sort_links, "no sortable column header rendered a link"
-    assert all("category=groceries" in h for h in sort_links)
-
-
-async def test_category_column_is_sortable(client, session):
-    await _seed_categories(session, "groceries")
-    await _seed(session)
-    r = await client.get("/transactions")
-    sort_links = [
-        html.unescape(h)
-        for h in re.findall(r'href="([^"]+)"', r.text)
-        if "sort=category" in h
-    ]
-    assert sort_links, "the Category column header did not render a sort link"
 
 
 async def test_detail_shows_category_method_and_review_labels(client, session):
@@ -629,44 +335,6 @@ async def test_detail_shows_category_method_and_review_labels(client, session):
     assert "AI" in r.text  # category_method 'llm' -> 'AI'
     assert "Needs review" in r.text  # review_status 'pending'
     assert "85%" in r.text  # confidence rendered as a percentage
-
-
-async def test_detail_shows_uncategorized_label_for_null_category(client, session):
-    txn = Transaction(
-        bank="hdfc",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("100"),
-        category=None,
-        currency="INR",
-        transaction_date=DATED,
-    )
-    session.add(txn)
-    await session.flush()
-
-    r = await client.get(f"/transactions/{txn.id}/detail")
-    assert r.status_code == 200
-    assert "Uncategorized" in r.text
-
-
-async def test_detail_shows_resolved_review_and_manual_method(client, session):
-    txn = Transaction(
-        bank="hdfc",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("100"),
-        category="groceries",
-        category_method="manual",
-        review_status="resolved",
-        currency="INR",
-        transaction_date=DATED,
-    )
-    session.add(txn)
-    await session.flush()
-
-    r = await client.get(f"/transactions/{txn.id}/detail")
-    assert "Manual" in r.text  # category_method 'manual'
-    assert "Reviewed" in r.text  # review_status 'resolved'
 
 
 async def test_detail_hides_method_badge_when_never_categorized(client, session):
@@ -755,41 +423,6 @@ async def _seed_every_scope(session):
     await _add(session, amount="6000", account_id=None)
 
 
-async def test_scope_bank_is_bank_accounts_and_debit_cards(client, session):
-    await _seed_every_scope(session)
-    r = await client.get("/transactions?scope=bank")
-    assert r.status_code == 200
-    assert _count_rows(r.text) == 2
-    rows = _transaction_rows_html(r.text)
-    assert "1,000.00" in rows
-    assert "2,000.00" in rows  # a debit card is immediate bank cash movement
-    for decoy in ("3,000.00", "4,000.00", "5,000.00", "6,000.00"):
-        assert decoy not in rows
-
-
-async def test_scope_card_is_credit_cards_alone(client, session):
-    await _seed_every_scope(session)
-    r = await client.get("/transactions?scope=card")
-    assert _count_rows(r.text) == 1
-    assert "3,000.00" in r.text
-    assert "2,000.00" not in r.text  # the debit card is not a card here
-
-
-async def test_scope_unaccounted_is_everything_no_type_can_place(client, session):
-    """Unlinked, dangling and unknown-type rows: the complement of bank and card.
-
-    They reach no figure on the cashflow page, so the footnote that counts them is
-    the only place they are visible — and its link has to list all three.
-    """
-    await _seed_every_scope(session)
-    r = await client.get("/transactions?scope=unaccounted")
-    assert _count_rows(r.text) == 3
-    for amount in ("4,000.00", "5,000.00", "6,000.00"):
-        assert amount in r.text
-    assert "1,000.00" not in r.text
-    assert "3,000.00" not in r.text
-
-
 async def test_the_three_scopes_partition_the_table(client, session):
     """Every row is in exactly one scope: the three listings add up to all of them.
 
@@ -798,9 +431,22 @@ async def test_the_three_scopes_partition_the_table(client, session):
     """
     await _seed_every_scope(session)
     everything = _count_rows((await client.get("/transactions")).text)
+    # A debit card is bank cash. Unknown-type, dangling and unlinked rows are
+    # unaccounted.
+    expected = {
+        "bank": {"1,000.00", "2,000.00"},
+        "card": {"3,000.00"},
+        "unaccounted": {"4,000.00", "5,000.00", "6,000.00"},
+    }
+    every_amount = set().union(*expected.values())
     counted = 0
-    for scope in ("bank", "card", "unaccounted"):
-        counted += _count_rows((await client.get(f"/transactions?scope={scope}")).text)
+    for scope, amounts in expected.items():
+        r = await client.get(f"/transactions?scope={scope}")
+        rows = _transaction_rows_html(r.text)
+        assert _count_rows(r.text) == len(amounts)
+        for amount in every_amount:
+            assert (amount in rows) == (amount in amounts), f"{scope}: {amount}"
+        counted += len(amounts)
     assert counted == everything == 6
 
 

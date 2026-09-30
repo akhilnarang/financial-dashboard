@@ -31,9 +31,9 @@ def test_prompt_lists_slugs_and_redacts():
     assert "email_type: cc_transaction" in prompt
 
 
-def test_prompt_flags_dr_cr_as_a_direction_marker_for_banks_with_the_bug():
-    for bank in ("indusind", "idfc", "sbi", "uboi"):
-        prompt = build_prompt(
+def test_prompt_flags_dr_cr_only_for_banks_with_the_hint():
+    def prompt_for(bank):
+        return build_prompt(
             fields={
                 "bank": bank,
                 "counterparty": "someone@axl",
@@ -46,26 +46,13 @@ def test_prompt_flags_dr_cr_as_a_direction_marker_for_banks_with_the_bug():
             examples=[],
             active_slugs=["groceries", "dining"],
         )
+
+    for bank in ("indusind", "idfc", "sbi", "uboi"):
+        prompt = prompt_for(bank)
         assert "format note" in prompt
         assert "debit or credit" in prompt
         assert "healthcare" in prompt
-
-
-def test_prompt_has_no_format_note_for_a_bank_without_a_hint():
-    prompt = build_prompt(
-        fields={
-            "bank": "hdfc",
-            "counterparty": "someone@axl",
-            "raw_description": "some narration",
-            "direction": "debit",
-            "channel": "upi",
-            "amount": "500",
-            "currency": "INR",
-        },
-        examples=[],
-        active_slugs=["groceries", "dining"],
-    )
-    assert "format note" not in prompt
+    assert "format note" not in prompt_for("hdfc")
 
 
 def test_parse_result_clamps_and_defaults():

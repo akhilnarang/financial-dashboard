@@ -324,7 +324,8 @@ async def _seed_cc_upload_with_status(
 
 
 @pytest.mark.anyio
-async def test_mark_paid_sets_status_and_amount(maker):
+async def test_mark_paid_then_unpaid_round_trip(maker):
+    """Mark paid stamps the full amount once; mark unpaid clears it."""
     upload_id, _ = await _seed_cc_upload_with_status(
         maker, payment_status=PaymentStatus.UNPAID
     )
@@ -335,30 +336,26 @@ async def test_mark_paid_sets_status_and_amount(maker):
         resp = await client.post(
             f"/statements/{upload_id}/payment", data={"action": "mark_paid"}
         )
-    assert resp.status_code == 303
+        assert resp.status_code == 303
+        async with maker() as session:
+            upload = await session.get(StatementUpload, upload_id)
+            assert upload.payment_status == PaymentStatus.PAID
+            assert upload.payment_paid_amount == Decimal("5000.00")
+            first_paid_at = upload.payment_paid_at
+        assert first_paid_at is not None
 
-    async with maker() as session:
-        upload = await session.get(StatementUpload, upload_id)
-        assert upload.payment_status == PaymentStatus.PAID
-        assert upload.payment_paid_amount == Decimal("5000.00")
-        assert upload.payment_paid_at is not None
+        # A second mark_paid must not stamp a new paid_at.
+        await client.post(
+            f"/statements/{upload_id}/payment", data={"action": "mark_paid"}
+        )
+        async with maker() as session:
+            upload = await session.get(StatementUpload, upload_id)
+            assert upload.payment_paid_at == first_paid_at
 
-
-@pytest.mark.anyio
-async def test_mark_unpaid_from_full_clears(maker):
-    upload_id, _ = await _seed_cc_upload_with_status(
-        maker,
-        payment_status=PaymentStatus.PAID,
-        paid_amount=Decimal("5000.00"),
-    )
-    app = _build_app(maker)
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
         resp = await client.post(
             f"/statements/{upload_id}/payment", data={"action": "mark_unpaid"}
         )
-    assert resp.status_code == 303
+        assert resp.status_code == 303
 
     async with maker() as session:
         upload = await session.get(StatementUpload, upload_id)
@@ -392,32 +389,6 @@ async def test_mark_unpaid_preserves_partial(maker):
         assert upload.payment_status == PaymentStatus.PARTIALLY_PAID
         assert upload.payment_paid_amount == Decimal("2000.00")
         assert upload.payment_paid_at is None
-
-
-@pytest.mark.anyio
-async def test_mark_paid_is_noop_when_already_paid(maker):
-    """Re-marking an already-PAID statement must not stamp a new paid_at."""
-    upload_id, _ = await _seed_cc_upload_with_status(
-        maker,
-        payment_status=PaymentStatus.PAID,
-        paid_amount=Decimal("5000.00"),
-    )
-    async with maker() as session:
-        upload = await session.get(StatementUpload, upload_id)
-        first_paid_at = upload.payment_paid_at
-    assert first_paid_at is not None
-
-    app = _build_app(maker)
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        await client.post(
-            f"/statements/{upload_id}/payment", data={"action": "mark_paid"}
-        )
-
-    async with maker() as session:
-        upload = await session.get(StatementUpload, upload_id)
-        assert upload.payment_paid_at == first_paid_at  # unchanged
 
 
 @pytest.mark.anyio

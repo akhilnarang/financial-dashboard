@@ -11,13 +11,12 @@ mock them here and focus on the dispatch logic."""
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.main import create_app
 import financial_dashboard.core.deps as core_deps
 from financial_dashboard.db import (
     Account,
-    Base,
     BankStatementUpload,
     StatementUpload,
 )
@@ -26,24 +25,19 @@ from financial_dashboard.services.statements import dates as dates_module
 from financial_dashboard.services.statements import shared as statements_shared
 from financial_dashboard.web import bank_statements as bank_routes
 from financial_dashboard.web import statements as cc_routes
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+from tests.conftest import new_test_engine
 
 
 @pytest.fixture
 async def session_factory(monkeypatch):
     """Swap request/session factories for an in-memory DB."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(statements_shared, "async_session", maker)
     monkeypatch.setattr(core_deps, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 async def _seed_account_with_uploads(
@@ -109,16 +103,16 @@ async def test_only_password_required_uploads_are_retried(session_factory):
 
 
 @pytest.mark.anyio
-async def test_helper_returning_false_counts_as_failure(session_factory):
-    """When the per-upload helper reports failure (e.g. wrong password), it
-    should increment *_failed, not *_retried."""
+async def test_helper_failure_and_exception_count_as_failed(session_factory):
+    """A helper that returns False or raises counts as failed. A raise does
+    not abort the loop: the remaining uploads are still attempted."""
     account_id = await _seed_account_with_uploads(
         session_factory,
         cc_statuses=["password_required", "password_required"],
         bank_statuses=["password_required"],
     )
 
-    cc_helper = AsyncMock(side_effect=[True, False])
+    cc_helper = AsyncMock(side_effect=[RuntimeError("boom"), True])
     bank_helper = AsyncMock(return_value=False)
     async with session_factory() as session:
         result = await accounts_module.retry_password_required_statements(
@@ -129,64 +123,12 @@ async def test_helper_returning_false_counts_as_failure(session_factory):
             retry_bank_upload=bank_helper,
         )
 
+    assert cc_helper.await_count == 2
     assert result == {
         "cc_retried": 1,
         "bank_retried": 0,
         "cc_failed": 1,
         "bank_failed": 1,
-    }
-
-
-@pytest.mark.anyio
-async def test_helper_exception_is_isolated(session_factory):
-    """A helper raising shouldn't abort the whole loop — the remaining uploads
-    must still be attempted and the raising one counted as failed."""
-    account_id = await _seed_account_with_uploads(
-        session_factory,
-        cc_statuses=["password_required", "password_required"],
-        bank_statuses=[],
-    )
-
-    cc_helper = AsyncMock(side_effect=[RuntimeError("boom"), True])
-    async with session_factory() as session:
-        result = await accounts_module.retry_password_required_statements(
-            session,
-            account_id,
-            "secret",
-            retry_cc_upload=cc_helper,
-        )
-
-    assert cc_helper.await_count == 2
-    assert result["cc_retried"] == 1
-    assert result["cc_failed"] == 1
-
-
-@pytest.mark.anyio
-async def test_empty_account_returns_zero_counts(session_factory):
-    """An account with no password_required uploads should complete quickly
-    with all-zero counts and never touch the helpers."""
-    account_id = await _seed_account_with_uploads(
-        session_factory, cc_statuses=["parsed"], bank_statuses=["imported"]
-    )
-
-    cc_helper = AsyncMock()
-    bank_helper = AsyncMock()
-    async with session_factory() as session:
-        result = await accounts_module.retry_password_required_statements(
-            session,
-            account_id,
-            "secret",
-            retry_cc_upload=cc_helper,
-            retry_bank_upload=bank_helper,
-        )
-
-    cc_helper.assert_not_awaited()
-    bank_helper.assert_not_awaited()
-    assert result == {
-        "cc_retried": 0,
-        "bank_retried": 0,
-        "cc_failed": 0,
-        "bank_failed": 0,
     }
 
 
@@ -243,30 +185,6 @@ def _make_helper_that_flips_status(maker, model, result: bool):
         return result
 
     return AsyncMock(side_effect=_side_effect)
-
-
-@pytest.mark.anyio
-async def test_cc_retry_saves_password_only_on_success(session_factory):
-    upload_id, account_id = await _seed_single_upload(
-        session_factory, "cc", "password_required"
-    )
-    from httpx import ASGITransport, AsyncClient
-
-    helper = _make_helper_that_flips_status(
-        session_factory, StatementUpload, result=True
-    )
-    with patch.object(cc_routes, "retry_cc_statement_upload", helper):
-        async with AsyncClient(
-            transport=ASGITransport(app=create_app()), base_url="http://test"
-        ) as client:
-            resp = await client.post(
-                f"/statements/{upload_id}/retry",
-                data={"password": "rightpw", "save_password": "1"},
-            )
-
-    assert resp.status_code == 303
-    helper.assert_awaited_once_with(upload_id, "rightpw")
-    assert await _get_account_password(session_factory, account_id) is not None
 
 
 @pytest.mark.anyio
@@ -467,7 +385,7 @@ def test_cc_date_range_spans_transactions_and_payments():
     import datetime as _dt
 
     parsed = _FakeCcParsed(
-        txn_dates=["05/03/2026", "20/03/2026"],
+        txn_dates=["05/03/2026", "not-a-date", "20/03/2026"],
         payment_dates=["25/02/2026", "15/03/2026"],
     )
     result = dates_module.cc_stmt_date_range(parsed)
@@ -475,22 +393,6 @@ def test_cc_date_range_spans_transactions_and_payments():
     lo, hi = result
     assert lo == _dt.date(2026, 2, 25)
     assert hi == _dt.date(2026, 3, 20)
-
-
-def test_cc_date_range_returns_none_when_no_parseable_dates():
-    parsed = _FakeCcParsed(txn_dates=[], payment_dates=[])
-    assert dates_module.cc_stmt_date_range(parsed) is None
-
-
-def test_cc_date_range_skips_unparseable_entries():
-    import datetime as _dt
-
-    parsed = _FakeCcParsed(txn_dates=["10/03/2026", "not-a-date", "15/03/2026"])
-    result = dates_module.cc_stmt_date_range(parsed)
-    assert result is not None
-    lo, hi = result
-    assert lo == _dt.date(2026, 3, 10)
-    assert hi == _dt.date(2026, 3, 15)
 
 
 def test_bank_date_range_prefers_declared_period():

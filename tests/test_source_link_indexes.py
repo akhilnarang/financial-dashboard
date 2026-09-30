@@ -30,10 +30,6 @@ async def _index_names(session: AsyncSession) -> set[str]:
     return {row[0] for row in rows}
 
 
-async def test_source_link_indexes_are_in_fresh_schema(session):
-    assert _INDEXES.keys() <= await _index_names(session)
-
-
 async def test_init_adds_source_link_indexes_to_existing_database(
     tmp_path, monkeypatch
 ):

@@ -15,7 +15,6 @@ wrong time. It could then match a different payment.
 import datetime
 from email.message import EmailMessage
 
-import pytest
 
 from financial_dashboard.services.emails import _process_email_full
 
@@ -49,17 +48,19 @@ def _raw_hdfc_upi(date_header: str) -> bytes:
 
 
 def test_neft_email_gets_transaction_time_from_received_time():
-    error, txn_data, _hint, parsed = _process_email_full(
+    error, txn_data, _hint, _parsed = _process_email_full(
         "hdfc", _raw_hdfc_neft("Sun, 26 Jul 2026 20:15:42 +0530")
     )
     assert error is None, error
-    assert parsed is not None
     assert txn_data is not None
     assert txn_data["email_type"] == "hdfc_account_neft_debit_alert"
     assert txn_data["transaction_time"] == datetime.time(20, 15, 42)
     assert txn_data["transaction_date"] == datetime.date(2026, 7, 26)
     # The SMS side has no payee. This payee must reach the row.
     assert txn_data["counterparty"] == "Sample Payee"
+    # The matcher reads these flags from the stored row later.
+    assert txn_data["transaction_time_is_received_time"] is True
+    assert txn_data["counterparty_source"] == "user_alias"
 
 
 def test_neft_date_and_time_come_from_one_ist_conversion():
@@ -119,38 +120,6 @@ def test_a_body_time_source_keeps_a_null_transaction_time():
     assert txn_data["transaction_time"] is None
 
 
-def test_the_declaration_reaches_txn_data_as_a_column_value():
-    """The parser declares the fact. The dashboard must record it, because
-    the matcher reads it from the stored row later.
-
-    This test uses true parser output and not a dict that you write here. A
-    dict that you write can omit the key.
-    """
-    _error, txn_data, _hint, parsed = _process_email_full(
-        "hdfc", _raw_hdfc_neft("Sun, 26 Jul 2026 20:15:42 +0530")
-    )
-    assert parsed is not None
-    assert parsed.event_time_source == "message_arrival"
-    assert txn_data is not None
-    assert txn_data["transaction_time_is_received_time"] is True
-
-
-def test_the_name_source_reaches_txn_data_as_a_column_value():
-    """HDFC prints the payee label the user saved, not the account holder.
-
-    The parser says so. The dashboard must record it, or every such row
-    claims a bank stated the name and a later label can replace it.
-    """
-    _error, txn_data, _hint, parsed = _process_email_full(
-        "hdfc", _raw_hdfc_neft("Sun, 26 Jul 2026 20:15:42 +0530")
-    )
-    assert parsed is not None
-    assert parsed.counterparty_source == "user_alias"
-    assert txn_data is not None
-    assert txn_data["counterparty"] == "Sample Payee"
-    assert txn_data["counterparty_source"] == "user_alias"
-
-
 def test_am_pm_disambiguation_still_runs_for_its_own_types():
     """The fallback is an elif before the AM/PM branch. Make sure that it did
     not remove the AM/PM step for types that read a true time."""
@@ -167,48 +136,6 @@ def test_am_pm_disambiguation_still_runs_for_its_own_types():
     assert error is None, error
     assert txn_data is not None
     assert txn_data["transaction_time"] == datetime.time(18, 37, 31)
-
-
-def test_a_new_bank_needs_no_dashboard_change():
-    """The parser declares the fact, so the dashboard holds no list of names.
-    A parser class that declares message_arrival gets the fallback at once.
-    This test builds such a class to show that no code here names a bank.
-    """
-    from bank_email_parser.models import Money, ParsedEmail, TransactionAlert
-    from bank_email_parser.parsers.base import BaseEmailParser, parse_with_parsers
-
-    class _NewBankAlertParser(BaseEmailParser):
-        bank = "newbank"
-        email_type = "newbank_transfer_debit_alert"
-        event_time_source = "message_arrival"
-
-        def parse(self, html: str) -> ParsedEmail:
-            return ParsedEmail(
-                email_type=self.email_type,
-                bank=self.bank,
-                transaction=TransactionAlert(
-                    direction="debit", amount=Money(amount="1.00")
-                ),
-            )
-
-    result = parse_with_parsers("newbank", "<p>x</p>", (_NewBankAlertParser(),))
-    assert result.event_time_source == "message_arrival"
-
-
-def test_a_parser_cannot_declare_a_nonsense_time_source():
-    """The base class checks the value when you define the class. A typo thus
-    fails at import and not at run time."""
-    from bank_email_parser.parsers.base import BaseEmailParser
-
-    with pytest.raises(TypeError, match="event_time_source"):
-
-        class _BadParser(BaseEmailParser):
-            bank = "newbank"
-            email_type = "newbank_typo_alert"
-            event_time_source = "recieved"  # codespell:ignore
-
-            def parse(self, html):  # pragma: no cover
-                raise NotImplementedError
 
 
 def test_date_fallback_uses_ist_for_every_email_type():

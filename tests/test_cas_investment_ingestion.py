@@ -1,6 +1,6 @@
 """CAS ingestion integration with investment lots: backward compatibility with
-payloads that carry no transaction facts, complete-lot creation on re-ingest,
-force-replace idempotency, and Decimal precision through the round-trip.
+payloads that carry no transaction facts, complete-lot creation with Decimal
+precision, re-ingest and force-replace idempotency.
 """
 
 import datetime
@@ -96,24 +96,18 @@ async def test_old_payload_without_transactions_still_works(
     assert holding_total == Decimal("200000.00")
 
 
-async def test_raw_payload_preserved_verbatim(session):
-    """The raw payload (including transactions) is preserved for diagnostics."""
-    payload = _payload_with_transactions(_mf_purchase())
-    upload = await ingest_cas_payload(session, payload)
-    await session.flush()
-    preserved = json.loads(upload.raw_holdings_json)
-    assert preserved["transactions"] == [_mf_purchase()]
-
-
 # ---------------------------------------------------------------------------
 # Complete-lot creation
 # ---------------------------------------------------------------------------
 
 
 async def test_complete_lot_created_from_explicit_mf_purchase(session):
-    payload = _payload_with_transactions(_mf_purchase())
-    upload = await ingest_cas_payload(session, payload)
+    txn = _mf_purchase(units="123.456789", nav="12.3456", amount="1524.15")
+    upload = await ingest_cas_payload(session, _payload_with_transactions(txn))
     await session.flush()
+
+    # The raw payload stays verbatim. The legacy lot backfill reads it.
+    assert json.loads(upload.raw_holdings_json)["transactions"] == [txn]
 
     lots = (await session.execute(select(InvestmentLot))).scalars().all()
     assert len(lots) == 1
@@ -121,9 +115,9 @@ async def test_complete_lot_created_from_explicit_mf_purchase(session):
     assert lot.cas_upload_id == upload.id
     assert lot.instrument_id == "INE000A01018"
     assert lot.instrument_name == "Example Fund"
-    assert lot.quantity == Decimal("1000")
-    assert lot.unit_cost == Decimal("50")
-    assert lot.cost_basis == Decimal("50000")
+    assert lot.quantity == Decimal("123.456789")
+    assert lot.unit_cost == Decimal("12.3456")
+    assert lot.cost_basis == Decimal("1524.15")
     assert lot.currency == "INR"
     assert lot.acquired_on == datetime.date(2026, 1, 15)
     assert lot.source_ref == "123/45"
@@ -203,25 +197,3 @@ async def test_identical_transactions_within_one_payload_preserve_multiplicity(s
     lots = (await session.execute(select(InvestmentLot))).scalars().all()
     assert len(lots) == 2
     assert sorted(lot.source_occurrence for lot in lots) == [0, 1]
-
-
-# ---------------------------------------------------------------------------
-# Decimal precision round-trip
-# ---------------------------------------------------------------------------
-
-
-async def test_decimal_precision_survives_ingest_round_trip(session):
-    payload = _payload_with_transactions(
-        _mf_purchase(
-            units="123.456789",
-            nav="12.3456",
-            amount="1524.15",
-            reference="P1",
-        )
-    )
-    await ingest_cas_payload(session, payload)
-    await session.flush()
-    lot = (await session.execute(select(InvestmentLot))).scalar_one()
-    assert lot.quantity == Decimal("123.456789")
-    assert lot.unit_cost == Decimal("12.3456")
-    assert lot.cost_basis == Decimal("1524.15")

@@ -74,16 +74,14 @@ async def test_bare_category_filter_seeks_instead_of_scanning(session):
     assert INDEX in count_plan
     assert "SEARCH" in count_plan
 
-
-async def test_dated_drill_through_uses_both_terms_of_the_index(session):
-    """A cashflow drill-through carries dates, and gets both of them from one index."""
-    plan = await _plan(
+    # A cashflow drill-through carries dates, and gets both terms from one index.
+    dated_plan = await _plan(
         session,
         "SELECT * FROM transactions WHERE category = 'rent' "
         "AND transaction_date BETWEEN '2026-06-01' AND '2026-06-30'",
     )
-    assert INDEX in plan
-    assert "category=?" in plan and "transaction_date>?" in plan
+    assert INDEX in dated_plan
+    assert "category=?" in dated_plan and "transaction_date>?" in dated_plan
 
 
 async def test_migration_adds_the_index_to_an_existing_database_and_is_idempotent(

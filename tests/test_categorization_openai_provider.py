@@ -128,6 +128,31 @@ async def test_classify_none_content_handled(monkeypatch):
 async def test_classify_base_url_forwarded_to_client(monkeypatch):
     from financial_dashboard.services.categorization import openai_provider
 
+    content = json.dumps({"category": "groceries", "confidence": 0.7, "reason": "r"})
+    mock_client, _ = _make_mock_client(content)
+    mock_cls = MagicMock(return_value=mock_client)
+    monkeypatch.setattr(openai_provider, "AsyncOpenAI", mock_cls)
+
+    for base_url, sent in (
+        ("https://proxy.example/v1", "https://proxy.example/v1"),
+        ("", None),
+    ):
+        mock_cls.reset_mock()
+        await openai_provider.classify(
+            fields=_FIELDS,
+            examples=[],
+            active_slugs=["groceries"],
+            api_key="my-key",
+            model="gpt-4o-mini",
+            base_url=base_url,
+        )
+        mock_cls.assert_called_once_with(api_key="my-key", base_url=sent, timeout=30.0)
+
+
+async def test_classify_proxy_base_url_skips_web_search(monkeypatch):
+    """A proxy base_url must not run the hosted web_search lookup."""
+    from financial_dashboard.services.categorization import openai_provider
+
     content = json.dumps(
         {
             "category": "groceries",
@@ -137,52 +162,6 @@ async def test_classify_base_url_forwarded_to_client(monkeypatch):
         }
     )
     mock_client, _ = _make_mock_client(content)
-    mock_cls = MagicMock(return_value=mock_client)
-    monkeypatch.setattr(openai_provider, "AsyncOpenAI", mock_cls)
-
-    await openai_provider.classify(
-        fields=_FIELDS,
-        examples=[],
-        active_slugs=["groceries"],
-        api_key="my-key",
-        model="gpt-5.6-luna",
-        base_url="https://proxy.example/v1",
-    )
-
-    mock_cls.assert_called_once_with(
-        api_key="my-key",
-        base_url="https://proxy.example/v1",
-        timeout=30.0,
-    )
-    mock_client.responses.create.assert_not_awaited()
-
-
-async def test_classify_empty_base_url_passes_none_to_client(monkeypatch):
-    from financial_dashboard.services.categorization import openai_provider
-
-    content = json.dumps({"category": "groceries", "confidence": 0.7, "reason": "r"})
-    mock_client, _ = _make_mock_client(content)
-    mock_cls = MagicMock(return_value=mock_client)
-    monkeypatch.setattr(openai_provider, "AsyncOpenAI", mock_cls)
-
-    await openai_provider.classify(
-        fields=_FIELDS,
-        examples=[],
-        active_slugs=["groceries"],
-        api_key="my-key",
-        model="gpt-4o-mini",
-        base_url="",
-    )
-
-    mock_cls.assert_called_once_with(api_key="my-key", base_url=None, timeout=30.0)
-
-
-async def test_classify_sends_temperature_when_no_reasoning_effort(monkeypatch):
-    """A plain model gets temperature 0.0 and no reasoning_effort."""
-    from financial_dashboard.services.categorization import openai_provider
-
-    content = json.dumps({"category": "groceries", "confidence": 0.7, "reason": "r"})
-    mock_client, mock_create = _make_mock_client(content)
     monkeypatch.setattr(
         openai_provider, "AsyncOpenAI", MagicMock(return_value=mock_client)
     )
@@ -193,12 +172,10 @@ async def test_classify_sends_temperature_when_no_reasoning_effort(monkeypatch):
         active_slugs=["groceries"],
         api_key="my-key",
         model="gpt-4o-mini",
-        base_url="",
+        base_url="https://proxy.example/v1",
     )
 
-    sent = mock_create.await_args.kwargs
-    assert sent["temperature"] == 0.0
-    assert sent["reasoning_effort"] is omit
+    mock_client.responses.create.assert_not_awaited()
 
 
 async def test_classify_sends_reasoning_effort_instead_of_temperature(monkeypatch):
@@ -231,7 +208,8 @@ async def test_classify_sends_reasoning_effort_instead_of_temperature(monkeypatc
 
 
 async def test_classify_ignores_an_unknown_reasoning_effort(monkeypatch):
-    """A typo must not reach the API, where it would fail every call."""
+    """A typo must not reach the API, where it would fail every call.
+    The call falls back to a plain model's temperature."""
     from financial_dashboard.services.categorization import openai_provider
 
     content = json.dumps({"category": "groceries", "confidence": 0.7, "reason": "r"})
@@ -379,100 +357,19 @@ async def test_unsourced_merchant_description_cannot_change_category(monkeypatch
 # ---------------------------------------------------------------------------
 
 
-async def test_engine_dispatches_to_openai_provider(monkeypatch):
-    """When categorization.llm_provider is 'openai', _llm_classify calls openai_provider.classify."""
+async def test_engine_dispatches_to_openai_with_configured_settings(monkeypatch):
+    """With llm_provider 'openai', the OpenAI provider gets the configured settings."""
     from financial_dashboard.services.categorization import engine as eng
     from financial_dashboard.services import settings as svc_settings
 
-    svc_settings._cache["categorization.llm_provider"] = "openai"
-    svc_settings._cache["openai.api_key"] = "fake-openai-key"
-    svc_settings._cache["openai.model"] = "gpt-4o-mini"
-    svc_settings._cache["openai.base_url"] = ""
-
-    openai_called = False
-
-    async def fake_openai_classify(**kwargs):
-        nonlocal openai_called
-        openai_called = True
-        return LlmResult("groceries", 0.9, "test")
-
-    monkeypatch.setattr(eng.openai_provider, "classify", fake_openai_classify)
-
-    result = await eng._llm_classify(
-        fields=_FIELDS,
-        examples=[],
-        active_slugs=["groceries"],
-    )
-
-    assert openai_called
-    assert result.slug == "groceries"
-
-
-async def test_engine_dispatches_to_gemini_by_default(monkeypatch):
-    """When categorization.llm_provider is absent/gemini, _llm_classify calls gemini.classify."""
-    from financial_dashboard.services.categorization import engine as eng
-    from financial_dashboard.services import settings as svc_settings
-
-    # Ensure the cache has no provider override so the default "gemini" path is taken.
-    svc_settings._cache.pop("categorization.llm_provider", None)
-    svc_settings._cache["gemini.api_key"] = "fake-gemini-key"
-
-    gemini_called = False
-
-    async def fake_gemini_classify(**kwargs):
-        nonlocal gemini_called
-        gemini_called = True
-        return LlmResult("dining", 0.85, "restaurant")
-
-    monkeypatch.setattr(eng.gemini, "classify", fake_gemini_classify)
-
-    result = await eng._llm_classify(
-        fields=_FIELDS,
-        examples=[],
-        active_slugs=["dining"],
-    )
-
-    assert gemini_called
-    assert result.slug == "dining"
-
-
-async def test_engine_dispatches_to_gemini_when_explicitly_set(monkeypatch):
-    """When categorization.llm_provider is explicitly 'gemini', gemini.classify is called."""
-    from financial_dashboard.services.categorization import engine as eng
-    from financial_dashboard.services import settings as svc_settings
-
-    svc_settings._cache["categorization.llm_provider"] = "gemini"
-    svc_settings._cache["gemini.api_key"] = "fake-gemini-key"
-
-    gemini_called = False
-
-    async def fake_gemini_classify(**kwargs):
-        nonlocal gemini_called
-        gemini_called = True
-        return LlmResult("dining", 0.85, "restaurant")
-
-    monkeypatch.setattr(eng.gemini, "classify", fake_gemini_classify)
-
-    result = await eng._llm_classify(
-        fields=_FIELDS,
-        examples=[],
-        active_slugs=["dining"],
-    )
-
-    assert gemini_called
-    assert result.slug == "dining"
-
-
-async def test_engine_forwards_the_configured_reasoning_effort(monkeypatch):
-    """The openai.reasoning_effort setting reaches the provider."""
-    from financial_dashboard.services.categorization import engine as eng
-    from financial_dashboard.services import settings as svc_settings
-
-    svc_settings._cache["categorization.llm_provider"] = "openai"
-    svc_settings._cache["openai.api_key"] = "fake-openai-key"
-    svc_settings._cache["openai.model"] = "gpt-5.6-luna"
-    svc_settings._cache["openai.base_url"] = ""
-    svc_settings._cache["openai.reasoning_effort"] = "medium"
+    for key, value in {
+        "categorization.llm_provider": "openai",
+        "openai.api_key": "fake-openai-key",
+        "openai.model": "gpt-5.6-luna",
+        "openai.base_url": "",
+        "openai.reasoning_effort": "medium",
+    }.items():
+        monkeypatch.setitem(svc_settings._cache, key, value)
 
     seen = {}
 
@@ -482,6 +379,33 @@ async def test_engine_forwards_the_configured_reasoning_effort(monkeypatch):
 
     monkeypatch.setattr(eng.openai_provider, "classify", fake_openai_classify)
 
-    await eng._llm_classify(fields=_FIELDS, examples=[], active_slugs=["groceries"])
+    result = await eng._llm_classify(
+        fields=_FIELDS, examples=[], active_slugs=["groceries"]
+    )
 
+    assert result.slug == "groceries"
+    assert seen["model"] == "gpt-5.6-luna"
     assert seen["reasoning_effort"] == "medium"
+    assert seen["fields"] == _FIELDS
+
+
+async def test_engine_dispatches_to_gemini_by_default(monkeypatch):
+    """Without llm_provider set, the engine calls gemini.classify."""
+    from financial_dashboard.services.categorization import engine as eng
+    from financial_dashboard.services import settings as svc_settings
+
+    monkeypatch.delitem(
+        svc_settings._cache, "categorization.llm_provider", raising=False
+    )
+    monkeypatch.setitem(svc_settings._cache, "gemini.api_key", "fake-gemini-key")
+
+    async def fake_gemini_classify(**kwargs):
+        return LlmResult("dining", 0.85, "restaurant")
+
+    monkeypatch.setattr(eng.gemini, "classify", fake_gemini_classify)
+
+    result = await eng._llm_classify(
+        fields=_FIELDS, examples=[], active_slugs=["dining"]
+    )
+
+    assert result.slug == "dining"

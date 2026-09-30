@@ -13,9 +13,10 @@ from types import SimpleNamespace
 import pytest
 from cc_parser.parsers.models import Transaction as CcTransaction
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from financial_dashboard.db import Account, Base, StatementUpload, Transaction
+from financial_dashboard.db import Account, StatementUpload, Transaction
+from tests.conftest import new_test_engine
 from financial_dashboard.services.statements import cc as cc_module
 from financial_dashboard.services.statements.cc import (
     claim_internal_transfer_twin,
@@ -31,19 +32,13 @@ INSTALMENT = "TEST MERCHANT CC000000000000 1ST OF 3 INSTALLMENTS PRINCIPAL"
 
 
 @pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture
 async def session_factory(monkeypatch):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(cc_module, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 def _row(direction: str, credit_reasons: str | None = None) -> CcTransaction:

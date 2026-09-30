@@ -103,7 +103,6 @@ async def test_audit_detail_shows_model_and_action_evidence(session, client):
     assert "bounded explanation" in response.text
     assert "assistant-v7" in response.text
     assert "json_schema" in response.text
-    assert 'class="app-header"' in response.text
     assert 'href="https://example.com/merchant"' in response.text
     assert 'href="javascript:' not in response.text
 

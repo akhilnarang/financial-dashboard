@@ -19,7 +19,6 @@ from tests.test_web_cashflow import (
     RANGE,
     RANGE_HTML,
     _add,
-    _month_start,
     _region,
     _tile,
 )
@@ -36,6 +35,12 @@ def _href(markup: str) -> str:
     assert match, f"no anchor in {markup!r}"
     # Autoescaping wrote the separators as entities; a client needs them back.
     return match.group(1).replace("&amp;", "&")
+
+
+def _month_start(today: datetime.date, back: int) -> datetime.date:
+    """The first of the month ``back`` months before ``today``'s month."""
+    absolute = today.year * 12 + (today.month - 1) - back
+    return datetime.date(absolute // 12, absolute % 12 + 1, 1)
 
 
 def _count(markup: str) -> int:
@@ -110,25 +115,6 @@ async def test_empty_db_renders_zero_tiles_not_a_broken_page(client):
         tile = _tile(r.text, name)
         assert "₹0.00" in tile, f"{name} tile does not read zero"
     assert "No transactions in this range" in r.text
-
-
-async def test_income_line_agrees_with_the_rows_its_own_link_lists(client, session):
-    """A core bucket line: its count and its exact total must both be provable
-    from the listing its anchor points at, decoys included."""
-    await _add(session, amount="90000", direction="credit", category="salary")
-    await _add(session, amount="10000", direction="credit", category="salary", day=20)
-    await _add(session, amount="4321", direction="credit", category="interest")
-
-    page = (await client.get(f"/cashflow?{RANGE}")).text
-    row = _row_with(_region(page, "data-section", "income"), ">Salary<")
-    assert "₹1,00,000.00" in row
-
-    listing = await _listed(client, row)
-    assert listing.count(DETAIL) == _line_count(row) == 2
-    assert "90,000.00" in listing
-    assert "10,000.00" in listing
-    # The other income line's row is not in this line's list.
-    assert "4,321.00" not in listing
 
 
 async def test_no_counterparty_group_lists_every_blank_spelling(client, session):
@@ -214,28 +200,12 @@ async def test_uncategorized_lines_label_null_and_unmapped_slugs(client, session
     assert format_inr_compact(sum(listed)) in tile
     assert format_inr_exact(sum(listed)) in section
 
-
-async def test_null_category_line_lists_only_the_rows_it_counts(client, session):
-    """The "(uncategorized)" line is the NULL-category rows alone.
-
-    Its drill-through must be the NULL rows alone as well. The whole-bucket filter
-    is a superset — it also takes in the 'unknown' sentinel and unmapped slugs — so
-    pointing this line at it would print "1 txn" above a list of three.
-    """
-    await _add(session, amount="800", direction="debit", category=None)
-    await _add(session, amount="250", direction="debit", category="crypto_yield")
-    await _add(session, amount="90", direction="debit", category="unknown")
-
-    page = (await client.get(f"/cashflow?{RANGE}")).text
-    section = _region(page, "data-section", "uncategorized")
-    row = _row_with(section, ">(uncategorized)<")
-
-    listing = await _listed(client, row)
-    assert listing.count(DETAIL) == _line_count(row) == 1
-    assert _listed_amounts(listing) == [Decimal("-800")]
-    # The other two members of the bucket are not this line's rows.
-    assert "250.00" not in listing
-    assert "90.00" not in listing
+    # The "(uncategorized)" line is the NULL rows alone, and so is its drill. The
+    # whole-bucket filter is a superset, so it must not be this line's link.
+    null_row = _row_with(section, ">(uncategorized)<")
+    null_listing = await _listed(client, null_row)
+    assert null_listing.count(DETAIL) == _line_count(null_row) == 1
+    assert _listed_amounts(null_listing) == [Decimal("-800")]
 
 
 async def test_trend_survives_a_range_with_no_activity(client, session):
@@ -442,25 +412,6 @@ async def test_reimbursement_credit_nets_against_spend(client, session):
     assert "Reimbursement" not in _region(page, "data-section", "income")
 
 
-async def test_non_inr_footnote_count_agrees_with_its_drill(client, session):
-    await _add(
-        session, amount="100", direction="debit", category="rent", currency="USD"
-    )
-    await _add(
-        session, amount="60", direction="debit", category="dining", currency="EUR"
-    )
-    await _add(session, amount="20000", direction="debit", category="rent")
-
-    page = (await client.get(f"/cashflow?{RANGE}")).text
-    row = _region(page, "data-footnote", "non_inr")
-    assert f"non_inr=1&amp;{RANGE_HTML}" in row
-
-    listing = await _listed(client, row)
-    assert listing.count(DETAIL) == _count(row) == 2
-    # The rupee row belongs to a bucket above, never to this footnote's list.
-    assert "20,000.00" not in listing
-
-
 async def test_undated_footnote_count_agrees_with_its_unscoped_drill(client, session):
     """The undated link carries no range because an undated row matches none: the
     figure is range-independent, so following the link must return the same rows
@@ -492,6 +443,9 @@ async def test_reconciliation_footer_adds_up_from_the_tiles_it_names(client, ses
     # Excluded populations must not move the identity.
     await _add(session, amount="5000", direction="debit", category="self_transfer")
     await _add(session, amount="70", direction="debit", category="rent", currency="USD")
+    # Uncategorized rows move no term. The footer prints their net as its error bar.
+    await _add(session, amount="1234", direction="debit", category=None)
+    await _add(session, amount="4000", direction="debit", category="crypto_yield")
 
     page = (await client.get(f"/cashflow?{RANGE}")).text
     footer = _region(page, "data-reconciliation")
@@ -503,37 +457,7 @@ async def test_reconciliation_footer_adds_up_from_the_tiles_it_names(client, ses
     assert "net cash retained ₹62,500.00" in footer
     assert "₹5,000.00" not in footer
     assert "70.00" not in footer
-
-
-async def test_reconciliation_footer_carries_its_error_bar_and_its_caveat(
-    client, session
-):
-    """The identity is not an invariant, and the footer has to say so.
-
-    Two things make it honest rather than a balance that silently fails to balance:
-    the uncategorized net printed beside it — the money the buckets could not place,
-    and therefore the margin the retained figure may be wrong by — and wording that
-    it is informational. Both assertions are scoped to the footer, so neither can be
-    satisfied by the tile or the section that print the same figure elsewhere.
-    """
-    await _add(session, amount="90000", direction="credit", category="salary")
-    await _add(session, amount="20000", direction="debit", category="rent")
-    await _add(session, amount="1234", direction="debit", category=None)
-    await _add(session, amount="4000", direction="debit", category="crypto_yield")
-
-    page = (await client.get(f"/cashflow?{RANGE}")).text
-    footer = _region(page, "data-reconciliation")
-
-    assert "net cash retained ₹70,000.00" in footer
-    # The error bar: the uncategorized net, exact and Indian-grouped, not the
-    # compact figure the tile shows.
     assert "uncategorized -₹5,234.00" in footer
-    assert format_inr_exact(Decimal("-5234")) == "-₹5,234.00"
-
-    lowered = footer.lower()
-    assert "informational" in lowered
-    assert "not an enforced invariant" in lowered
-    assert "error bar" in lowered
 
 
 # ---------------------------------------------------------------------------

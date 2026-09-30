@@ -85,14 +85,12 @@ async def test_sms_parse_preview_projects_insert_without_writes(
     )
 
 
-async def test_sms_parse_preview_shows_a_name_replacing_a_label(
+async def test_sms_parse_preview_projects_completion_without_writes(
     client, session, monkeypatch
-) -> None:
-    """The settlement replaces a label with the name the bank holds.
-
-    The preview must show that, or it tells the reader that only the
-    reference changes.
-    """
+):
+    """A completion leg previews as 'completion' with its target row, not as an
+    insert/match/defer from the matcher. The bank name replaces a saved label.
+    The preview writes nothing."""
     primary = Transaction(
         bank="synthetic-bank",
         email_type="synthetic_debit_alert",
@@ -120,54 +118,8 @@ async def test_sms_parse_preview_shows_a_name_replacing_a_label(
                 direction="debit",
                 amount=Money(amount=Decimal("12.34"), currency="INR"),
                 transaction_date=datetime.date(2030, 1, 2),
-                counterparty="SAMPLE BENEFICIARY",
-                reference_number="INFULLREF0002",
-                channel="neft",
-            ),
-        )
-
-    monkeypatch.setattr(
-        "financial_dashboard.services.parse_previews.parse_sms", _completion
-    )
-    response = await client.post(f"/api/sms/{sms.id}/parse-preview")
-
-    assert response.status_code == 200, response.text
-    changed = response.json()["merge"]["changed_fields"]
-    assert "counterparty" in changed
-    assert "counterparty_source" in changed
-
-
-async def test_sms_parse_preview_projects_completion_without_writes(
-    client, session, monkeypatch
-):
-    """A completion leg previews as 'completion' with its target row, not as an
-    insert/match/defer from the matcher. The preview writes nothing."""
-    primary = Transaction(
-        bank="synthetic-bank",
-        email_type="synthetic_debit_alert",
-        direction="debit",
-        amount=Decimal("12.34"),
-        currency="INR",
-        transaction_date=datetime.date(2030, 1, 2),
-        channel="neft",
-        account_mask="XX000",
-        reference_number=None,
-        source="sms",
-    )
-    session.add(primary)
-    sms = await _sms(session)
-    await session.commit()
-
-    def _completion(*_args, **_kwargs):
-        return ParsedSms(
-            bank="synthetic-bank",
-            email_type="synthetic_neft_completion",
-            ledger_role="completion",
-            transaction=SmsTransactionAlert(
-                direction="debit",
-                amount=Money(amount=Decimal("12.34"), currency="INR"),
-                transaction_date=datetime.date(2030, 1, 2),
                 transaction_time=datetime.time(10, 30),
+                counterparty="SAMPLE BENEFICIARY",
                 reference_number="INFULLREF0001",
                 channel="neft",
             ),
@@ -192,7 +144,11 @@ async def test_sms_parse_preview_projects_completion_without_writes(
     merge = response.json()["merge"]
     assert merge["action"] == "completion"
     assert merge["target_transaction_id"] == primary.id
-    assert "reference_number" in merge["changed_fields"]
+    assert set(merge["changed_fields"]) == {
+        "reference_number",
+        "counterparty",
+        "counterparty_source",
+    }
     assert not any(
         statement.startswith(("insert", "update", "delete")) for statement in statements
     )
@@ -374,11 +330,3 @@ async def test_sms_parse_preview_reports_parser_error(client, session, monkeypat
 async def test_sms_parse_preview_returns_404(client):
     response = await client.post("/api/sms/999999/parse-preview")
     assert response.status_code == 404
-
-
-async def test_sms_parse_preview_openapi_is_typed(client):
-    document = (await client.get("/openapi.json")).json()
-    schema = document["paths"]["/api/sms/{sms_id}/parse-preview"]["post"]["responses"][
-        "200"
-    ]["content"]["application/json"]["schema"]
-    assert schema == {"$ref": "#/components/schemas/SmsParsePreviewResponse"}

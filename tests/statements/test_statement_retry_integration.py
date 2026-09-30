@@ -124,36 +124,11 @@ async def test_retry_cc_reimports_missing_and_idempotent(
 
 
 @pytest.mark.anyio
-async def test_retry_bank_wrong_password(maker, statements_dir, monkeypatch, tmp_path):
-    import financial_dashboard.services.statements.bank as bank_module
-    from financial_dashboard.services.statements import shared as shared_module
-
-    acc_id = await h.add_bank_account(maker)
-    pdf = tmp_path / "bank.pdf"
-    pdf.write_bytes(b"%PDF fake")
-    upload_id = await _seed_bank_upload(maker, acc_id, file_path=str(pdf))
-
-    def _bad(path, bank, password):
-        raise ValueError("The PDF is encrypted and needs a password")
-
-    monkeypatch.setattr(bank_module, "parse_bank_statement", _bad)
-    monkeypatch.setattr(shared_module, "parse_bank_statement", _bad)
-
-    ok = await retry_bank_statement_upload(upload_id, "wrongpw")
-    assert ok is False
-
-    async with maker() as session:
-        upload = await session.get(BankStatementUpload, upload_id)
-        assert upload.status == "password_required"
-        assert "encrypted" in (upload.error or "").lower()
-
-
-@pytest.mark.anyio
-async def test_retry_bank_non_password_error_sets_parse_error(
+async def test_retry_bank_parse_errors_set_status_by_kind(
     maker, statements_dir, monkeypatch, tmp_path
 ):
-    """A non-password parse error during retry flips status to parse_error
-    (not password_required) so the retry UI stops offering a password form."""
+    """A password error keeps password_required. Any other parse error flips
+    the status to parse_error, so the retry UI stops offering a password form."""
     import financial_dashboard.services.statements.bank as bank_module
     from financial_dashboard.services.statements import shared as shared_module
 
@@ -162,18 +137,22 @@ async def test_retry_bank_non_password_error_sets_parse_error(
     pdf.write_bytes(b"%PDF fake")
     upload_id = await _seed_bank_upload(maker, acc_id, file_path=str(pdf))
 
-    def _bad(path, bank, password):
-        raise ValueError("unexpected EOF in PDF")
+    for message, expected_status in (
+        ("The PDF is encrypted and needs a password", "password_required"),
+        ("unexpected EOF in PDF", "parse_error"),
+    ):
 
-    monkeypatch.setattr(bank_module, "parse_bank_statement", _bad)
-    monkeypatch.setattr(shared_module, "parse_bank_statement", _bad)
+        def _bad(path, bank, password, message=message):
+            raise ValueError(message)
 
-    ok = await retry_bank_statement_upload(upload_id, "any")
-    assert ok is False
+        monkeypatch.setattr(bank_module, "parse_bank_statement", _bad)
+        monkeypatch.setattr(shared_module, "parse_bank_statement", _bad)
 
-    async with maker() as session:
-        upload = await session.get(BankStatementUpload, upload_id)
-        assert upload.status == "parse_error"
+        assert await retry_bank_statement_upload(upload_id, "wrongpw") is False
+        async with maker() as session:
+            upload = await session.get(BankStatementUpload, upload_id)
+            assert upload.status == expected_status
+            assert upload.error == message
 
 
 @pytest.mark.anyio

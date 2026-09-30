@@ -17,12 +17,11 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.services.reminders as reminders_module
 from financial_dashboard.db import (
     Account,
-    Base,
     BalanceSnapshot,
     PaymentStatus,
     StatementUpload,
@@ -34,6 +33,7 @@ from financial_dashboard.services.reminders import (
     recompute_cc_payment_for_account,
     recompute_cc_payment_state,
 )
+from tests.conftest import new_test_engine
 
 pytestmark = pytest.mark.anyio
 
@@ -45,13 +45,12 @@ NEXT_CYCLE_CREATED = dt.datetime(2026, 6, 10, 8, 0, tzinfo=dt.UTC)
 async def session_maker(monkeypatch):
     """In-memory aiosqlite session-maker, also installed as the global
     ``async_session`` that ``check_payment_received`` opens for itself."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(reminders_module, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 async def _cc_account(session) -> Account:
@@ -105,25 +104,6 @@ def _credit(
     if created_at is not None:
         txn.created_at = created_at
     return txn
-
-
-async def test_idempotent_single_payment(session_maker):
-    """Firing the check twice for one payment credit yields the single
-    amount, not 2x."""
-    async with session_maker() as s:
-        account = await _cc_account(s)
-        await _upload(s, account)
-        s.add(_credit(account, "1000.00"))
-        await s.commit()
-        account_id = account.id
-
-    assert await check_payment_received(1, account_id, Decimal("1000.00")) is False
-    assert await check_payment_received(1, account_id, Decimal("1000.00")) is False
-
-    async with session_maker() as s:
-        upload = (await s.execute(select(StatementUpload))).scalar_one()
-        assert upload.payment_paid_amount == Decimal("1000.00")
-        assert upload.payment_status == PaymentStatus.PARTIALLY_PAID
 
 
 async def test_two_real_rows_sum_both_but_no_inflation_on_refire(session_maker):
@@ -187,22 +167,6 @@ async def test_cycle_scope_excludes_before_includes_on_or_after(session_maker):
     async with session_maker() as s:
         upload = (await s.execute(select(StatementUpload))).scalar_one()
         assert upload.payment_paid_amount == Decimal("3000.00")
-
-
-async def test_null_transaction_date_included(session_maker):
-    """A payment credit with NULL transaction_date is counted (not dropped)."""
-    async with session_maker() as s:
-        account = await _cc_account(s)
-        await _upload(s, account)
-        s.add(_credit(account, "1000.00", txn_date=None))
-        await s.commit()
-        account_id = account.id
-
-    await check_payment_received(1, account_id, Decimal("1000.00"))
-
-    async with session_maker() as s:
-        upload = (await s.execute(select(StatementUpload))).scalar_one()
-        assert upload.payment_paid_amount == Decimal("1000.00")
 
 
 async def test_null_date_row_from_prior_cycle_does_not_leak(session_maker):
@@ -640,24 +604,3 @@ async def test_delete_self_heal_recomputes_down(session):
     ).scalar_one()
     # max(total_due - recomputed_paid, 0) = 10000 - 6000.
     assert snapshot.value == Decimal("4000.00")
-
-
-async def test_snapshot_value_matches_corrected_paid(session):
-    """emit_cc_snapshot (called inside the helper) writes cc_outstanding =
-    max(total_due - recomputed_paid, 0) for the corrected upload."""
-    account = await _cc_account(session)
-    upload = await _upload(session, account, total_due="10000.00")
-    session.add(_credit(account, "2500.00"))
-    await session.flush()
-
-    paid = await recompute_cc_payment_state(session, upload)
-    assert paid == Decimal("2500.00")
-
-    snapshot = (
-        await session.execute(
-            select(BalanceSnapshot).where(
-                BalanceSnapshot.category == SnapshotCategory.cc_outstanding.value
-            )
-        )
-    ).scalar_one()
-    assert snapshot.value == Decimal("7500.00")

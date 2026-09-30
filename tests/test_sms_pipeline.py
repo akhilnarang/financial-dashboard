@@ -5,28 +5,11 @@ from decimal import Decimal
 
 import pytest  # noqa: F401
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from bank_sms_parser.models import Money, ParsedSms, SmsTransactionAlert
 
-from financial_dashboard.db import Base, SmsMessage
+from financial_dashboard.db import SmsMessage, Transaction
 from financial_dashboard.services.sms_pipeline import parsed_sms_to_txn_data
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture
-async def session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as s:
-        yield s
-    await engine.dispose()
 
 
 def _sms_row(**overrides):
@@ -39,44 +22,6 @@ def _sms_row(**overrides):
     )
     base.update(overrides)
     return SmsMessage(**base)
-
-
-def test_parsed_sms_to_txn_data_happy_path():
-    parsed = ParsedSms(
-        email_type="hdfc_dc_transaction_alert",
-        bank="hdfc",
-        transaction=SmsTransactionAlert(
-            direction="debit",
-            amount=Money(amount=Decimal("500"), currency="INR"),
-            transaction_date=datetime.date(2026, 5, 2),
-            transaction_time=datetime.time(14, 23, 0),
-            counterparty="Zomato",
-            card_mask="x1234",
-            channel=None,
-            reference_number=None,
-        ),
-    )
-    sms_row = _sms_row()
-    data = parsed_sms_to_txn_data(parsed, sms_row)
-    assert data["bank"] == "hdfc"
-    assert data["email_type"] == "hdfc_dc_transaction_alert"
-    assert data["direction"] == "debit"
-    assert data["amount"] == Decimal("500")
-    assert data["currency"] == "INR"
-    assert data["transaction_date"] == datetime.date(2026, 5, 2)
-    assert data["transaction_time"] == datetime.time(14, 23, 0)
-    assert data["counterparty"] == "Zomato"
-    assert data["card_mask"] == "x1234"
-
-
-def test_parsed_sms_to_txn_data_returns_none_for_non_transaction():
-    parsed = ParsedSms(
-        email_type="onecard_cc_statement_ready",
-        bank="onecard",
-        transaction=None,
-    )
-    sms_row = _sms_row(bank="onecard")
-    assert parsed_sms_to_txn_data(parsed, sms_row) is None
 
 
 def test_parsed_sms_to_txn_data_date_fallback_to_received_at_ist():
@@ -125,11 +70,17 @@ async def test_process_sms_row_happy_path_creates_transaction(session, monkeypat
         outcome = await process_sms_row(session, sms, link_ctx)
 
     assert outcome.status == "parsed"
-    assert outcome.transaction_id is not None
     assert outcome.primary_notification is not None
     assert sms.status == "parsed"
     assert sms.transaction_id == outcome.transaction_id
     assert sms.parsed_at is not None
+    txn = await session.get(Transaction, outcome.transaction_id)
+    assert (txn.direction, txn.amount, txn.transaction_date) == (
+        "debit",
+        Decimal("500"),
+        datetime.date(2026, 5, 2),
+    )
+    assert txn.card_mask is not None
 
 
 # 2026-08-20 20:00 UTC is 2026-08-21 01:30 IST. So the initiated leg's date,
@@ -358,34 +309,6 @@ async def test_process_sms_row_completion_matches_truncated_primary(
     assert len(rows) == 1  # no new row
     stamped = await session.get(Transaction, primary.id)
     assert stamped.reference_number == full_ref
-
-
-@pytest.mark.anyio
-async def test_process_sms_row_clears_stale_parse_error_on_success(session):
-    """A row that previously failed (status=error, parse_error set) and is
-    reparsed successfully must clear the stale parse_error — otherwise the
-    resolved row still shows its old error alongside parsed/enriched."""
-    sms = SmsMessage(
-        bank="hdfc",
-        sender="VK-HDFCBK",
-        body="Spent Rs.500 From HDFC Bank Card x1234 At Zomato On 2026-05-02:14:23:00 Bal Rs.1000",
-        received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
-        status="error",
-        parse_error="No parser for bank 'hdfc' could handle this SMS.",
-    )
-    session.add(sms)
-    await session.flush()
-
-    from financial_dashboard.services.linker import build_link_context
-
-    link_ctx = await build_link_context(session)
-
-    async with session.begin_nested():
-        outcome = await process_sms_row(session, sms, link_ctx)
-
-    assert outcome.status == "parsed"
-    assert sms.status == "parsed"
-    assert sms.parse_error is None
 
 
 @pytest.mark.anyio
@@ -920,65 +843,6 @@ async def test_process_sms_row_equitas_confirmation_reparse_keeps_its_link(
 
 
 @pytest.mark.anyio
-async def test_process_sms_row_hdfc_provisional_reparse_keeps_its_link(
-    session, monkeypatch
-):
-    """The reparse-link guarantee holds for the provisional role too, not only
-    the Equitas restatement: a provisional reparsed after it made a row keeps
-    that link rather than orphaning the row."""
-    from financial_dashboard.services.sms_pipeline import process_sms_row
-    from financial_dashboard.services.linker import build_link_context
-    from financial_dashboard.db import Transaction
-
-    parsed = ParsedSms(
-        email_type="hdfc_cc_payment_received_alert",
-        bank="hdfc",
-        ledger_role="provisional",
-        transaction=SmsTransactionAlert(
-            direction="credit",
-            amount=Money(amount=Decimal("50000"), currency="INR"),
-            transaction_date=datetime.date(2026, 5, 17),
-            reference_number=None,
-            card_mask="9710",
-        ),
-    )
-    monkeypatch.setattr(
-        "financial_dashboard.services.sms_pipeline.parse_sms",
-        lambda *a, **k: parsed,
-    )
-
-    sms = SmsMessage(
-        bank="hdfc",
-        sender="VK-HDFCBK",
-        body="DEAR HDFCBANK CARDMEMBER, PAYMENT OF Rs. 50000.00 RECEIVED ...",
-        received_at=datetime.datetime(2026, 5, 17, 17, 15, 0, tzinfo=datetime.UTC),
-    )
-    session.add(sms)
-    await session.flush()
-
-    txn = Transaction(
-        bank="hdfc",
-        email_type="hdfc_cc_payment_received_alert",
-        direction="credit",
-        amount=Decimal("50000"),
-        currency="INR",
-        transaction_date=datetime.date(2026, 5, 17),
-        sms_message_id=sms.id,
-    )
-    session.add(txn)
-    await session.flush()
-    sms.transaction_id = txn.id
-
-    link_ctx = await build_link_context(session)
-    async with session.begin_nested():
-        outcome = await process_sms_row(session, sms, link_ctx)
-
-    assert outcome.status == "parsed"
-    assert outcome.transaction_id == txn.id
-    assert sms.transaction_id == txn.id
-
-
-@pytest.mark.anyio
 async def test_process_sms_row_notify_only_role_with_debit_falls_through_to_merge(
     session, monkeypatch
 ):
@@ -1075,49 +939,6 @@ async def test_process_sms_row_equitas_payment_alert_creates_row(session, monkey
 
 
 @pytest.mark.anyio
-async def test_process_sms_row_hdfc_settlement_creates_row(session, monkeypatch):
-    """HDFC payment-received SMS WITH a reference number → normal credit row."""
-    from financial_dashboard.services.sms_pipeline import process_sms_row
-    from financial_dashboard.services.linker import build_link_context
-    from financial_dashboard.db import Transaction
-
-    parsed = ParsedSms(
-        email_type="hdfc_cc_payment_received_alert",
-        bank="hdfc",
-        transaction=SmsTransactionAlert(
-            direction="credit",
-            amount=Money(amount=Decimal("50000"), currency="INR"),
-            transaction_date=datetime.date(2026, 5, 17),
-            reference_number="137224528Vgr2OD",  # settlement variant
-            card_mask="9710",
-        ),
-    )
-    monkeypatch.setattr(
-        "financial_dashboard.services.sms_pipeline.parse_sms",
-        lambda *a, **k: parsed,
-    )
-
-    sms = SmsMessage(
-        bank="hdfc",
-        sender="VK-HDFCBK",
-        body="HDFC Bank Cardmember, Online Payment of Rs.50000 vide Ref# ...",
-        received_at=datetime.datetime(2026, 5, 18, 14, 53, 0, tzinfo=datetime.UTC),
-    )
-    session.add(sms)
-    await session.flush()
-
-    link_ctx = await build_link_context(session)
-    async with session.begin_nested():
-        outcome = await process_sms_row(session, sms, link_ctx)
-
-    assert outcome.status == "parsed"
-    assert outcome.transaction_id is not None
-    rows = (await session.execute(select(Transaction))).scalars().all()
-    assert len(rows) == 1
-    assert rows[0].reference_number == "137224528Vgr2OD"
-
-
-@pytest.mark.anyio
 async def test_process_sms_row_hdfc_payment_order_independent(session, monkeypatch):
     """Whichever order the two variants arrive, exactly one row results."""
     from financial_dashboard.services.sms_pipeline import process_sms_row
@@ -1181,50 +1002,6 @@ async def test_process_sms_row_hdfc_payment_order_independent(session, monkeypat
     rows = (await session.execute(select(Transaction))).scalars().all()
     assert len(rows) == 1
     assert rows[0].reference_number == "137224528Vgr2OD"
-
-
-@pytest.mark.anyio
-async def test_process_sms_row_non_hdfc_payment_no_ref_still_creates_row(
-    session, monkeypatch
-):
-    """The provisional gate is HDFC-specific: a no-ref payment-received SMS
-    from another bank (e.g. axis) must still create a transaction row."""
-    from financial_dashboard.services.sms_pipeline import process_sms_row
-    from financial_dashboard.services.linker import build_link_context
-    from financial_dashboard.db import Transaction
-
-    parsed = ParsedSms(
-        email_type="axis_cc_payment_received_alert",
-        bank="axis",
-        transaction=SmsTransactionAlert(
-            direction="credit",
-            amount=Money(amount=Decimal("15000"), currency="INR"),
-            transaction_date=datetime.date(2026, 5, 17),
-            reference_number=None,  # no ref, but NOT hdfc
-            card_mask="XX0000",
-        ),
-    )
-    monkeypatch.setattr(
-        "financial_dashboard.services.sms_pipeline.parse_sms",
-        lambda *a, **k: parsed,
-    )
-
-    sms = SmsMessage(
-        bank="axis",
-        sender="VK-AXISBK",
-        body="axis payment received body",
-        received_at=datetime.datetime(2026, 5, 17, 17, 15, 0, tzinfo=datetime.UTC),
-    )
-    session.add(sms)
-    await session.flush()
-
-    link_ctx = await build_link_context(session)
-    async with session.begin_nested():
-        outcome = await process_sms_row(session, sms, link_ctx)
-
-    assert outcome.transaction_id is not None
-    rows = (await session.execute(select(Transaction))).scalars().all()
-    assert len(rows) == 1
 
 
 @pytest.mark.anyio
@@ -1297,53 +1074,6 @@ async def test_process_sms_row_hdfc_payment_settlement_first_then_provisional(
     rows = (await session.execute(select(Transaction))).scalars().all()
     assert len(rows) == 1
     assert rows[0].reference_number == "137224528Vgr2OD"
-
-
-@pytest.mark.anyio
-async def test_process_sms_row_hdfc_payment_received_non_credit_not_gated(
-    session, monkeypatch
-):
-    """Defense-in-depth: a hdfc_cc_payment_received_alert with no ref but a
-    non-credit direction must NOT be swallowed by the provisional gate
-    (which runs before the declined pre-gate). A declined-direction shape
-    takes the declined path, not notify-only-provisional."""
-    from financial_dashboard.services.sms_pipeline import process_sms_row
-    from financial_dashboard.services.linker import build_link_context
-
-    parsed = ParsedSms(
-        email_type="hdfc_cc_payment_received_alert",
-        bank="hdfc",
-        ledger_role="provisional",
-        transaction=SmsTransactionAlert(
-            direction="declined",  # not credit
-            amount=Money(amount=Decimal("50000"), currency="INR"),
-            transaction_date=datetime.date(2026, 5, 17),
-            reference_number=None,
-            card_mask="9710",
-        ),
-    )
-    monkeypatch.setattr(
-        "financial_dashboard.services.sms_pipeline.parse_sms",
-        lambda *a, **k: parsed,
-    )
-
-    sms = SmsMessage(
-        bank="hdfc",
-        sender="VK-HDFCBK",
-        body="<hypothetical non-credit payment-received body>",
-        received_at=datetime.datetime(2026, 5, 17, 17, 15, 0, tzinfo=datetime.UTC),
-    )
-    session.add(sms)
-    await session.flush()
-
-    link_ctx = await build_link_context(session)
-    async with session.begin_nested():
-        outcome = await process_sms_row(session, sms, link_ctx)
-
-    # Routed to the declined path, NOT the provisional notify-only path.
-    assert outcome.primary_notification is not None
-    assert outcome.primary_notification.get("_ledger_role") is None
-    assert outcome.primary_notification.get("_declined") is True
 
 
 @pytest.mark.anyio

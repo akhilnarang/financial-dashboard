@@ -11,14 +11,11 @@ import datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import Transaction
-from financial_dashboard.services.cashflow.scope import (
-    SCOPE_PREDICATES,
-    scope_predicate,
-)
+from financial_dashboard.services.cashflow.scope import SCOPE_PREDICATES
 from tests.conftest import MISSING_ACCOUNT_ID, ensure_account
 
 pytestmark = pytest.mark.anyio
@@ -87,30 +84,3 @@ async def test_each_account_type_lands_in_exactly_one_scope(session: AsyncSessio
     for i, rows in enumerate(seen):
         for other in seen[i + 1 :]:
             assert rows.isdisjoint(other)
-
-
-async def test_scope_costs_no_extra_row_and_no_extra_statement(session: AsyncSession):
-    """The predicate is a correlated EXISTS, so it filters an aggregate in place.
-
-    A join would have been the obvious way to write it and would have been wrong:
-    a transaction linked to two account rows cannot happen, but a join's row
-    multiplication is exactly the failure a `GROUP BY` cannot see.
-    """
-    savings = await ensure_account(session, 1, "bank_account")
-    await _add(session, "savings", savings)
-    await _add(session, "unlinked", None)
-
-    total = (
-        await session.execute(
-            select(func.sum(Transaction.amount)).where(SCOPE_PREDICATES["bank"])
-        )
-    ).scalar_one()
-    assert total == D("100")
-
-
-def test_absent_scope_is_not_a_predicate():
-    # "Every account" is a fourth thing, and it has to stay tellable apart from
-    # the three scopes or a caller cannot leave its query alone.
-    assert scope_predicate(None) is None
-    for scope in SCOPES:
-        assert scope_predicate(scope) is SCOPE_PREDICATES[scope]

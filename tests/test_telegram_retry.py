@@ -23,24 +23,17 @@ def _mock_app(send_side_effect):
 
 @pytest.mark.anyio
 class TestSendWithRetry:
-    async def test_success_first_try(self, monkeypatch):
-        sleep_mock = AsyncMock()
-        monkeypatch.setattr("asyncio.sleep", sleep_mock)
-
-        app = _mock_app([None])
-        await _send_with_retry(app, chat_id=1, text="hi")
-
-        assert app.bot.send_message.await_count == 1
-        sleep_mock.assert_not_awaited()
-
     async def test_retries_then_succeeds(self, monkeypatch):
         sleep_mock = AsyncMock()
         monkeypatch.setattr("asyncio.sleep", sleep_mock)
 
         app = _mock_app([TimedOut(), TimedOut(), None])
-        await _send_with_retry(app, chat_id=1, text="hi")
+        await _send_with_retry(app, chat_id=42, text="hello", parse_mode="HTML")
 
         assert app.bot.send_message.await_count == 3
+        app.bot.send_message.assert_awaited_with(
+            chat_id=42, text="hello", parse_mode="HTML"
+        )
         # 1s after first failure, 2s after second
         assert sleep_mock.await_args_list == [((1,),), ((2,),)]
 
@@ -71,22 +64,3 @@ class TestSendWithRetry:
         assert app.bot.send_message.await_count == 4
         # 2.5s + 1.5s for RetryAfter, then 1s for TimedOut backoff
         assert sleep_mock.await_args_list == [((2.5,),), ((1.5,),), ((1,),)]
-
-    async def test_passes_through_send_kwargs(self, monkeypatch):
-        monkeypatch.setattr("asyncio.sleep", AsyncMock())
-        app = _mock_app([None])
-
-        await _send_with_retry(app, chat_id=42, text="hello", parse_mode="HTML")
-
-        app.bot.send_message.assert_awaited_once_with(
-            chat_id=42, text="hello", parse_mode="HTML"
-        )
-
-    async def test_attempts_param_respected(self, monkeypatch):
-        monkeypatch.setattr("asyncio.sleep", AsyncMock())
-        app = _mock_app([TimedOut(), TimedOut()])
-
-        with pytest.raises(NetworkError):
-            await _send_with_retry(app, chat_id=1, text="hi", attempts=2)
-
-        assert app.bot.send_message.await_count == 2

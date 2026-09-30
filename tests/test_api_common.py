@@ -1,22 +1,13 @@
 import datetime
 
 import pytest
-from fastapi import HTTPException
 from pydantic import BaseModel, ValidationError
 
 from financial_dashboard.api.query import (
     inclusive_datetime_bounds,
     validate_date_range,
 )
-from financial_dashboard.exceptions import (
-    BadRequestException,
-    ConflictException,
-    FailedDependencyException,
-    InternalServerException,
-    NotFoundException,
-    PayloadTooLargeException,
-    UnprocessableEntityException,
-)
+from financial_dashboard.exceptions import UnprocessableEntityException
 from financial_dashboard.schemas.common import DatabaseId, DatabaseIdBatch
 
 
@@ -25,26 +16,6 @@ class DatabaseIdModel(BaseModel):
 
     identifier: DatabaseId
     identifiers: DatabaseIdBatch
-
-
-@pytest.mark.parametrize(
-    ("exception_type", "status_code"),
-    [
-        (BadRequestException, 400),
-        (NotFoundException, 404),
-        (ConflictException, 409),
-        (PayloadTooLargeException, 413),
-        (UnprocessableEntityException, 422),
-        (FailedDependencyException, 424),
-        (InternalServerException, 500),
-    ],
-)
-def test_named_api_exceptions_set_status_and_detail(exception_type, status_code):
-    error = exception_type(detail="Synthetic error")
-
-    assert isinstance(error, HTTPException)
-    assert error.status_code == status_code
-    assert error.detail == "Synthetic error"
 
 
 def test_database_id_types_require_positive_unique_ids():

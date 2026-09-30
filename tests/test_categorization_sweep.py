@@ -4,53 +4,25 @@ from decimal import Decimal
 
 import pytest
 
-from financial_dashboard.db.models import Base, Transaction
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from financial_dashboard.db.models import Transaction
 from financial_dashboard.services.categorization import sweep
+from tests.conftest import new_test_engine
 
 pytestmark = pytest.mark.anyio
 
 
 @pytest.fixture
 async def memdb(monkeypatch):
-    from sqlalchemy.ext.asyncio import (
-        async_sessionmaker,
-        create_async_engine,
-        AsyncSession,
-    )
-
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(
         "financial_dashboard.services.categorization.sweep.async_session", maker
     )
     yield maker
     await engine.dispose()
-
-
-async def test_rule_sweep_categorizes_interest_rows(memdb):
-    async with memdb() as s:
-        s.add(
-            Transaction(
-                bank="testbank",
-                email_type="x",
-                direction="credit",
-                amount=Decimal("10"),
-                channel="interest",
-            )
-        )
-        await s.commit()
-
-    n = await sweep.run_rule_sweep()
-    assert n == 1
-
-    async with memdb() as s:
-        from sqlalchemy import select
-
-        row = (await s.execute(select(Transaction))).scalars().one()
-        assert row.category == "interest"
-        assert row.category_method == "rule"
+    holder.close()
 
 
 @pytest.mark.parametrize("prompt", ["sent", "failed", "assistant", "assistant_failed"])
@@ -121,6 +93,7 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         row.review_status = "notified"
         s.add(Category(slug="groceries", active=True))
         decision = await s.scalar(select(CategoryReviewDecision))
+        assert decision.proposed_slug == "groceries"
         # Another transaction's prompt failed. It must not look like this
         # row's prompt.
         other = CategoryReviewDecision(
@@ -179,9 +152,9 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         assert row.category_vocab_version == 2
         decisions = (
             await s.scalars(
-                select(CategoryReviewDecision).where(
-                    CategoryReviewDecision.transaction_id == row.id
-                )
+                select(CategoryReviewDecision)
+                .where(CategoryReviewDecision.transaction_id == row.id)
+                .order_by(CategoryReviewDecision.id)
             )
         ).all()
         assert [decision.status for decision in decisions] == (

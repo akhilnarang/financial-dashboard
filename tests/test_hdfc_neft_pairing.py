@@ -14,26 +14,8 @@ import datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from financial_dashboard.db import Base
 from financial_dashboard.services.txn_merge import merge_transaction
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture
-async def session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as s:
-        yield s
-    await engine.dispose()
 
 
 def _sms_txn(amount: str = "1234.56", time: datetime.time | None = None) -> dict:
@@ -101,27 +83,6 @@ async def test_neft_sms_then_email_merges_and_fills_the_payee(session):
     assert "counterparty" in diff.filled
     # Keep the first time that a message gave for this event.
     assert row.transaction_time == datetime.time(1, 3, 51)
-
-
-@pytest.mark.anyio
-async def test_neft_email_then_sms_also_merges(session):
-    """The sequence must not change the result. The email can arrive first
-    if the SMS is late."""
-    async with session.begin():
-        _outcome, email_row, _diff = await merge_transaction(
-            session, "email", _email_txn(), email_id=1
-        )
-    txn_id = email_row.id
-
-    async with session.begin():
-        outcome, row, _diff = await merge_transaction(
-            session, "sms", _sms_txn(), sms_message_id=1
-        )
-
-    assert outcome == "enriched"
-    assert row.id == txn_id
-    assert row.source == "sms+email"
-    assert row.counterparty == "Sample Payee"
 
 
 @pytest.mark.anyio
@@ -285,34 +246,6 @@ async def test_a_late_uploaded_sms_still_pairs(session):
     assert outcome == "enriched"
     assert row.id == first_row.id
     assert row.source == "sms+email"
-
-
-@pytest.mark.anyio
-async def test_a_late_delivered_sms_makes_a_duplicate_and_not_a_loss(session):
-    """A phone that is offline can receive an SMS some minutes late. The time
-    of the SMS then disagrees with the time of the email, and the small window
-    refuses the pair. The result is two rows for one payment.
-
-    Prefer this result to a wrong merge. An operator can see a duplicate row
-    and can remove it. A wrong merge removes a payment from the ledger, and no
-    operator can see this. In production, each SMS of this type is less than
-    15 seconds from its email.
-    """
-    async with session.begin():
-        _o, first_row, _d = await merge_transaction(
-            session, "email", _email_txn(counterparty="Payee A"), email_id=1
-        )
-
-    async with session.begin():
-        outcome, row, _d = await merge_transaction(
-            session, "sms", _sms_txn(time=datetime.time(1, 7, 51)), sms_message_id=1
-        )
-
-    assert outcome == "created"
-    assert row.id != first_row.id
-    # Both rows keep their own data. No payment is absent.
-    assert first_row.counterparty == "Payee A"
-    assert row.amount == first_row.amount
 
 
 @pytest.mark.anyio

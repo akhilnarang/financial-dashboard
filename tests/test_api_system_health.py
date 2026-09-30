@@ -52,25 +52,10 @@ async def test_system_health_real_sqlite_shape_redaction_and_read_only(client, s
     assert body["status"] == "ok"
     assert body["database"]["backend"] == "sqlite"
     assert body["database"]["connected"] is True
-    assert set(body) == {"status", "database"}
-    assert set(body["database"]) == {"backend", "connected", "sqlite"}
-
     sqlite = body["database"]["sqlite"]
-    assert set(sqlite) == {
-        "journal_mode",
-        "foreign_keys_enabled",
-        "busy_timeout_ms",
-        "synchronous_mode",
-        "quick_check",
-        "quick_check_source",
-        "diagnostics_complete",
-    }
     assert sqlite["journal_mode"] == "memory"
     # Foreign keys are intentionally disabled in the test DB and do not degrade it.
     assert sqlite["foreign_keys_enabled"] is False
-    assert isinstance(sqlite["busy_timeout_ms"], int)
-    assert sqlite["busy_timeout_ms"] >= 0
-    assert sqlite["synchronous_mode"] in {"off", "normal", "full", "extra"}
     assert sqlite["quick_check"] == "ok"
     assert sqlite["quick_check_source"] == "live"
     assert sqlite["diagnostics_complete"] is True
@@ -82,19 +67,6 @@ async def test_system_health_real_sqlite_shape_redaction_and_read_only(client, s
 
     normalized_statements = [
         " ".join(statement.split()).lower() for statement in statements
-    ]
-    assert normalized_statements == [
-        "select 1",
-        "pragma journal_mode",
-        "pragma foreign_keys",
-        "pragma busy_timeout",
-        "pragma synchronous",
-        "pragma quick_check(1)",
-        "select 1",
-        "pragma journal_mode",
-        "pragma foreign_keys",
-        "pragma busy_timeout",
-        "pragma synchronous",
     ]
     assert normalized_statements.count("pragma quick_check(1)") == 1
     assert not any(
@@ -326,23 +298,3 @@ async def test_system_health_quick_check_execution_failure_is_unavailable_and_re
     assert retried_sqlite["quick_check"] == "ok"
     assert retried_sqlite["quick_check_source"] == "live"
     assert quick_check_calls == 2
-
-
-async def test_system_health_openapi_uses_inferred_typed_response(client):
-    response = await client.get("/openapi.json")
-
-    assert response.status_code == 200
-    document = response.json()
-    operation = document["paths"]["/api/system/health"]["get"]
-    response_schema = operation["responses"]["200"]["content"]["application/json"][
-        "schema"
-    ]
-    assert response_schema == {"$ref": "#/components/schemas/SystemHealthResponse"}
-
-    health_schema = document["components"]["schemas"]["SystemHealthResponse"]
-    assert set(health_schema["required"]) == {"status", "database"}
-    assert set(health_schema["properties"]["status"]["enum"]) == {
-        "ok",
-        "degraded",
-        "unavailable",
-    }

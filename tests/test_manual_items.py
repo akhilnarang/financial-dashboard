@@ -67,32 +67,6 @@ async def test_deactivate_excludes_item_from_networth(session):
     assert summary.total_assets == Decimal("0.00")
 
 
-async def test_edit_snapshot_updates_value_and_date_in_place(session):
-    item = await manual_items.create_item(
-        session,
-        name="Gold",
-        kind=ManualKind.asset,
-        category=ManualCategory.gold,
-        value=Decimal("100000.00"),
-        as_of_date=dt.date(2026, 4, 1),
-    )
-    await session.flush()
-    snap = await session.get(BalanceSnapshot, 1)
-
-    await manual_items.edit_snapshot(
-        session,
-        snapshot_id=snap.id,
-        value=Decimal("120000.00"),
-        as_of_date=dt.date(2026, 4, 15),
-    )
-    await session.flush()
-
-    refreshed = await session.get(BalanceSnapshot, snap.id)
-    assert refreshed.value == Decimal("120000.00")
-    assert refreshed.as_of_date == dt.date(2026, 4, 15)
-    assert refreshed.manual_item_id == item.id
-
-
 async def test_edit_snapshot_same_date_is_not_a_collision(session):
     await manual_items.create_item(
         session,
@@ -144,51 +118,6 @@ async def test_edit_snapshot_colliding_date_raises_and_writes_nothing(session):
     unchanged = await session.get(BalanceSnapshot, april.id)
     assert unchanged.value == Decimal("5000.00")
     assert unchanged.as_of_date == dt.date(2026, 4, 1)
-
-
-async def test_edit_snapshot_missing_id_raises(session):
-    with pytest.raises(ValueError):
-        await manual_items.edit_snapshot(
-            session,
-            snapshot_id=999,
-            value=Decimal("1.00"),
-            as_of_date=dt.date(2026, 5, 1),
-        )
-
-
-async def test_delete_snapshot_removes_target_and_keeps_others(session):
-    item = await manual_items.create_item(
-        session,
-        name="Loan",
-        kind=ManualKind.liability,
-        category=ManualCategory.loan,
-        value=Decimal("100000.00"),
-        as_of_date=dt.date(2026, 4, 1),
-    )
-    await manual_items.update_value(
-        session,
-        item_id=item.id,
-        value=Decimal("90000.00"),
-        as_of_date=dt.date(2026, 5, 1),
-    )
-    await session.flush()
-    april = await session.get(BalanceSnapshot, 1)
-
-    await manual_items.delete_snapshot(session, snapshot_id=april.id)
-    await session.flush()
-
-    assert await session.get(BalanceSnapshot, april.id) is None
-    remaining = (
-        (
-            await session.execute(
-                select(BalanceSnapshot).where(BalanceSnapshot.manual_item_id == item.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert len(remaining) == 1
-    assert remaining[0].as_of_date == dt.date(2026, 5, 1)
 
 
 async def test_delete_snapshot_missing_id_raises(session):

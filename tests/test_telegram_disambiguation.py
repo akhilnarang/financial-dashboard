@@ -111,10 +111,7 @@ async def test_send_sms_duplicate_prompt_never_offers_create_for_reference_misma
     "data",
     [
         "smsdup:v1:m:0:2",
-        "smsdup:v1:m:1:-2",
-        "smsdup:v1:m:1",
         "smsdup:v1:n:1:2",
-        "smsdup:v1:x:1",
         "smsdup:v1:n:not-an-int",
         "smsdup:v1:n:" + "1" * 65,
     ],

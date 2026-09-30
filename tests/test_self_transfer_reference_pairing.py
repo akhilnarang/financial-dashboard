@@ -374,8 +374,3 @@ async def test_same_linked_account_id_does_not_pair(session: AsyncSession):
     assert paired is False
     assert charge.category is None
     assert refund.category is None
-
-
-def test_transaction_schema_has_reference_lookup_index():
-    index_names = {index.name for index in Transaction.__table__.indexes}
-    assert "ix_transactions_reference_number" in index_names

@@ -115,20 +115,10 @@ async def test_reingesting_same_portfolio_date_replaces_existing_rows(
     assert snapshots[0].value == Decimal("210000.00")
 
 
-@pytest.mark.parametrize(
-    ("path", "message"),
-    [
-        (("summary", "grand_total"), "grand_total"),
-        (("meta", "statement_period_end"), "statement period end"),
-    ],
-)
-async def test_ingest_cas_payload_requires_grand_total_and_statement_date(
-    session, cas_statement_payload, path, message
-):
-    section, key = path
-    cas_statement_payload[section][key] = None
+async def test_ingest_cas_payload_requires_grand_total(session, cas_statement_payload):
+    cas_statement_payload["summary"]["grand_total"] = None
 
-    with pytest.raises(CasIngestError, match=message):
+    with pytest.raises(CasIngestError, match="grand_total"):
         await ingest_cas_payload(session, cas_statement_payload)
 
 

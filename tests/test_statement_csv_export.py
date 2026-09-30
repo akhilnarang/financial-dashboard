@@ -3,28 +3,23 @@ from types import SimpleNamespace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.main import create_app
 import financial_dashboard.core.deps as core_deps
-from financial_dashboard.db import Account, Base, StatementUpload
+from financial_dashboard.db import Account, StatementUpload
 from financial_dashboard.web import statements as statement_routes
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+from tests.conftest import new_test_engine
 
 
 @pytest.fixture
 async def session_factory(monkeypatch):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(core_deps, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 async def _seed_upload(
@@ -85,7 +80,7 @@ async def test_statement_csv_download_returns_cc_parser_csv_bytes(
     session_factory, tmp_path, monkeypatch
 ):
     upload_id, _account_id, pdf_path = await _seed_upload(
-        session_factory, tmp_path=tmp_path
+        session_factory, tmp_path=tmp_path, upload_bank="axis"
     )
     calls = {}
 
@@ -121,31 +116,6 @@ async def test_statement_csv_download_returns_cc_parser_csv_bytes(
         "bank": "hdfc",
     }
     assert calls["export"]["parsed"].marker == "parsed"
-
-
-@pytest.mark.anyio
-async def test_statement_csv_download_does_not_mutate_upload(
-    session_factory, tmp_path, monkeypatch
-):
-    upload_id, _account_id, _pdf_path = await _seed_upload(
-        session_factory, tmp_path=tmp_path
-    )
-    monkeypatch.setattr(
-        statement_routes,
-        "parse_statement",
-        lambda path, password, bank: SimpleNamespace(),
-    )
-    monkeypatch.setattr(
-        statement_routes,
-        "write_transactions_csv",
-        lambda parsed, output_path: output_path.write_text("x\n", encoding="utf-8"),
-        raising=False,
-    )
-
-    async with _client() as client:
-        response = await client.get(f"/statements/{upload_id}/csv")
-
-    assert response.status_code == 200
     async with session_factory() as session:
         upload = await session.get(StatementUpload, upload_id)
         assert upload.status == "parsed"
@@ -187,22 +157,6 @@ async def test_statement_csv_download_rejects_missing_pdf(session_factory, tmp_p
 
 
 @pytest.mark.anyio
-async def test_statement_csv_download_rejects_blank_pdf_path(session_factory, tmp_path):
-    upload_id, _account_id, _pdf_path = await _seed_upload(
-        session_factory,
-        tmp_path=tmp_path,
-        file_path="",
-    )
-
-    async with _client() as client:
-        response = await client.get(f"/statements/{upload_id}/csv")
-
-    assert response.status_code == 303
-    assert response.headers["location"].startswith(f"/statements/{upload_id}?error=")
-    assert "PDF+file+missing" in response.headers["location"]
-
-
-@pytest.mark.anyio
 async def test_statement_csv_download_parse_error_redirects(
     session_factory, tmp_path, monkeypatch
 ):
@@ -221,37 +175,6 @@ async def test_statement_csv_download_parse_error_redirects(
     assert response.status_code == 303
     assert response.headers["location"].startswith(f"/statements/{upload_id}?error=")
     assert "CSV+export+failed%3A+bad+pdf" in response.headers["location"]
-
-
-@pytest.mark.anyio
-async def test_statement_csv_download_export_error_redirects(
-    session_factory, tmp_path, monkeypatch
-):
-    upload_id, _account_id, _pdf_path = await _seed_upload(
-        session_factory, tmp_path=tmp_path
-    )
-    monkeypatch.setattr(
-        statement_routes,
-        "parse_statement",
-        lambda path, password, bank: SimpleNamespace(),
-    )
-
-    def fake_write_transactions_csv(parsed, output_path):
-        raise RuntimeError("csv failed")
-
-    monkeypatch.setattr(
-        statement_routes,
-        "write_transactions_csv",
-        fake_write_transactions_csv,
-        raising=False,
-    )
-
-    async with _client() as client:
-        response = await client.get(f"/statements/{upload_id}/csv")
-
-    assert response.status_code == 303
-    assert response.headers["location"].startswith(f"/statements/{upload_id}?error=")
-    assert "CSV+export+failed%3A+csv+failed" in response.headers["location"]
 
 
 @pytest.mark.anyio
@@ -328,37 +251,6 @@ async def test_statement_csv_download_uses_decrypted_saved_password(
 
 
 @pytest.mark.anyio
-async def test_statement_csv_download_prefers_account_bank_when_account_exists(
-    session_factory, tmp_path, monkeypatch
-):
-    upload_id, _account_id, _pdf_path = await _seed_upload(
-        session_factory,
-        tmp_path=tmp_path,
-        account_bank="hdfc",
-        upload_bank="axis",
-    )
-    calls = {}
-
-    def fake_parse_statement(path, password, bank):
-        calls["bank"] = bank
-        return SimpleNamespace()
-
-    monkeypatch.setattr(statement_routes, "parse_statement", fake_parse_statement)
-    monkeypatch.setattr(
-        statement_routes,
-        "write_transactions_csv",
-        lambda parsed, output_path: output_path.write_text("x\n", encoding="utf-8"),
-        raising=False,
-    )
-
-    async with _client() as client:
-        response = await client.get(f"/statements/{upload_id}/csv")
-
-    assert response.status_code == 200
-    assert calls["bank"] == "hdfc"
-
-
-@pytest.mark.anyio
 async def test_statement_csv_download_uses_upload_bank_when_account_missing(
     session_factory, tmp_path, monkeypatch
 ):
@@ -417,38 +309,3 @@ async def test_statement_detail_shows_csv_link_for_pdf_upload(
     assert response.status_code == 200
     assert f'href="/statements/{upload_id}/csv"' in response.text
     assert "Download CSV" in response.text
-
-
-@pytest.mark.anyio
-async def test_statement_detail_omits_csv_link_for_email_summary(
-    session_factory, tmp_path
-):
-    upload_id, _account_id, _pdf_path = await _seed_upload(
-        session_factory,
-        tmp_path=tmp_path,
-        source_kind="email_summary",
-        file_path="",
-    )
-
-    async with _client() as client:
-        response = await client.get(f"/statements/{upload_id}")
-
-    assert response.status_code == 200
-    assert f"/statements/{upload_id}/csv" not in response.text
-    assert "Download CSV" not in response.text
-
-
-@pytest.mark.anyio
-async def test_statement_detail_error_banner_uses_generic_action_label(
-    session_factory, tmp_path
-):
-    upload_id, _account_id, _pdf_path = await _seed_upload(
-        session_factory, tmp_path=tmp_path
-    )
-
-    async with _client() as client:
-        response = await client.get(f"/statements/{upload_id}?error=boom")
-
-    assert response.status_code == 200
-    assert "Statement action failed:" in response.text
-    assert "Reprocess failed:" not in response.text

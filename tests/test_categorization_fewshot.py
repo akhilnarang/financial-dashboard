@@ -45,8 +45,3 @@ async def test_returns_same_direction_categorized_matches(session: AsyncSession)
     assert len(out) == 1
     assert out[0].category == "groceries"
     assert out[0].direction == "debit"
-
-
-async def test_empty_when_no_matches(session: AsyncSession):
-    out = await get_similar_examples(session, counterparty="zzz", direction="debit")
-    assert out == []

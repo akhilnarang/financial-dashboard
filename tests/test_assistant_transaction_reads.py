@@ -28,7 +28,7 @@ def _transaction(**overrides: object) -> Transaction:
 
 
 @pytest.mark.anyio
-async def test_get_transaction_redacts_private_identifiers(session):
+async def test_get_transaction_redacts_private_identifiers_and_misses_as_none(session):
     settings_service._cache["categorization.hidden_identifiers"] = "Alice"
     transaction = _transaction(
         raw_description="merchant metadata",
@@ -45,6 +45,7 @@ async def test_get_transaction_redacts_private_identifiers(session):
     assert result.counterparty == "PUREBERRYSMUMBAI"
     assert result.reference_number == "[redacted-num]"
     assert result.note == "lunch with [redacted-name]"
+    assert await get_transaction(session, 404) is None
 
 
 @pytest.mark.anyio
@@ -109,8 +110,3 @@ async def test_list_caps_model_context_rows(session):
     result = await list_transactions(session, limit=MAX_CONTEXT_ROWS + 100)
 
     assert len(result) == MAX_CONTEXT_ROWS
-
-
-@pytest.mark.anyio
-async def test_missing_transaction_is_none(session):
-    assert await get_transaction(session, 404) is None

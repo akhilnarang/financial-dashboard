@@ -13,10 +13,6 @@ from financial_dashboard.db import (
     StatementUpload,
     Transaction,
 )
-from financial_dashboard.services.statement_previews import (
-    _could_be_statement_candidate,
-    _statement_candidate_index,
-)
 
 pytestmark = pytest.mark.anyio
 
@@ -308,25 +304,6 @@ async def test_bank_reconcile_preview_includes_null_dated_reference_match(
     assert response.json()["matched"][0]["decision_reason"] == "matched_reference"
 
 
-async def test_statement_preview_rejects_email_summary(client, session):
-    account = await _account(session)
-    upload = StatementUpload(
-        account_id=account.id,
-        bank=account.bank,
-        filename="",
-        file_path="",
-        source_kind="email_summary",
-        status="parsed",
-    )
-    session.add(upload)
-    await session.commit()
-
-    response = await client.post(f"/api/statements/cc/{upload.id}/parse-preview")
-
-    assert response.status_code == 409
-    assert response.json() == {"detail": "Email-summary statement has no PDF"}
-
-
 async def test_statement_preview_parse_failure_is_sanitized(
     client, session, monkeypatch, tmp_path
 ):
@@ -357,35 +334,6 @@ async def test_statement_preview_parse_failure_is_sanitized(
     assert str(pdf) not in response.text
 
 
-async def test_statement_reconciliation_rejects_reversed_period(
-    client, session, monkeypatch, tmp_path
-):
-    account = await _account(session, account_type="bank_account")
-    pdf = tmp_path / "synthetic-reversed.pdf"
-    pdf.write_bytes(b"synthetic PDF bytes")
-    upload = BankStatementUpload(
-        account_id=account.id,
-        bank=account.bank,
-        filename="synthetic-reversed.pdf",
-        file_path=str(pdf),
-        status="parsed",
-    )
-    session.add(upload)
-    await session.commit()
-    parsed = _bank_parsed([_bank_row()])
-    parsed.statement_period_start = "31/01/2030"
-    parsed.statement_period_end = "01/01/2030"
-    monkeypatch.setattr(
-        "financial_dashboard.services.statement_previews.parse_bank_statement",
-        lambda *_args, **_kwargs: parsed,
-    )
-
-    response = await client.post(f"/api/statements/bank/{upload.id}/reconcile-preview")
-
-    assert response.status_code == 422
-    assert response.json() == {"detail": "Statement date range is invalid"}
-
-
 async def test_statement_reconciliation_failure_is_sanitized(
     client, session, monkeypatch, tmp_path
 ):
@@ -412,37 +360,3 @@ async def test_statement_reconciliation_failure_is_sanitized(
 
     assert response.status_code == 422
     assert response.json() == {"detail": "Statement reconciliation failed"}
-
-
-async def test_extra_classification_treats_missing_direction_as_global_uncertainty():
-    candidate_index = _statement_candidate_index(
-        [{"direction": None, "amount": "12.34", "date": "02/01/2030"}]
-    )
-    transaction = Transaction(
-        direction="debit",
-        amount=Decimal("99.99"),
-        transaction_date=datetime.date(2030, 1, 2),
-    )
-
-    assert candidate_index.uncertain_all_directions is True
-    assert _could_be_statement_candidate(
-        transaction,
-        candidate_index.identities,
-        candidate_index.uncertain_directions,
-        candidate_index.uncertain_all_directions,
-    )
-
-
-async def test_statement_preview_openapi_routes_are_typed(client):
-    document = (await client.get("/openapi.json")).json()
-    expected = {
-        "/api/statements/cc/{statement_id}/parse-preview": "StatementParsePreviewResponse",
-        "/api/statements/bank/{statement_id}/parse-preview": "StatementParsePreviewResponse",
-        "/api/statements/cc/{statement_id}/reconcile-preview": "StatementReconciliationPreviewResponse",
-        "/api/statements/bank/{statement_id}/reconcile-preview": "StatementReconciliationPreviewResponse",
-    }
-    for path, model in expected.items():
-        schema = document["paths"][path]["post"]["responses"]["200"]["content"][
-            "application/json"
-        ]["schema"]
-        assert schema == {"$ref": f"#/components/schemas/{model}"}

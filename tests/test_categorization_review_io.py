@@ -84,59 +84,42 @@ async def test_apply_reviewed_rows_basic(session: AsyncSession):
     assert txn1.category_method == "manual"
 
 
-async def test_apply_reviewed_rows_invalid_slug(session: AsyncSession):
-    """Rows with invalid slugs are recorded in invalid, not applied."""
-    txn = Transaction(
+async def test_apply_reviewed_rows_invalid_rows(session: AsyncSession):
+    """Bad slugs and malformed ids land in invalid; valid rows still apply."""
+    await ensure_category(session, "groceries")
+    bad = Transaction(
         bank="testbank", email_type="x", direction="debit", amount=Decimal("100")
     )
-    session.add(txn)
-    await session.flush()
-
-    rows = [
-        {
-            "id": str(txn.id),
-            "final_category": "123",
-            "amount": str(txn.amount),
-            "date": str(txn.transaction_date or ""),
-            "direction": txn.direction or "",
-        }
-    ]
-    result = await apply_reviewed_rows(session, rows)
-
-    assert result.applied == 0
-    assert result.skipped == 0
-    assert len(result.invalid) == 1
-    assert result.invalid[0] == f"{txn.id}:123"
-    # txn must not have been modified
-    assert txn.category_method != "manual"
-
-
-async def test_apply_reviewed_rows_malformed_id(session: AsyncSession):
-    """A non-integer id lands in invalid without crashing; other valid rows still apply."""
-    await ensure_category(session, "groceries")
-    txn = Transaction(
+    good = Transaction(
         bank="testbank", email_type="x", direction="debit", amount=Decimal("50")
     )
-    session.add(txn)
+    session.add_all([bad, good])
     await session.flush()
 
     rows = [
         {"id": "not-an-int", "final_category": "groceries"},
         {
-            "id": str(txn.id),
+            "id": str(bad.id),
+            "final_category": "123",
+            "amount": str(bad.amount),
+            "date": "",
+            "direction": bad.direction,
+        },
+        {
+            "id": str(good.id),
             "final_category": "groceries",
-            "amount": str(txn.amount),
-            "date": str(txn.transaction_date or ""),
-            "direction": txn.direction or "",
+            "amount": str(good.amount),
+            "date": "",
+            "direction": good.direction,
         },
     ]
     result = await apply_reviewed_rows(session, rows)
 
     assert result.applied == 1
     assert result.skipped == 0
-    assert len(result.invalid) == 1
-    assert result.invalid[0] == "not-an-int:groceries"
-    assert txn.category == "groceries"
+    assert result.invalid == ["not-an-int:groceries", f"{bad.id}:123"]
+    assert bad.category_method != "manual"
+    assert good.category == "groceries"
 
 
 async def test_apply_reviewed_rows_mismatch(session: AsyncSession):

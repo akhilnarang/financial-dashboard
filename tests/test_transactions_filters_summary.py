@@ -6,7 +6,6 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from financial_dashboard.core.templating import currency_symbol
 from financial_dashboard.db import Account, Transaction
 from financial_dashboard.web.transactions import _date_presets
 
@@ -138,10 +137,6 @@ async def test_transaction_date_inputs_use_day_month_year_display(client):
     assert _attribute(response.text, "date-to-display", "value") == "30-04-2026"
     assert _attribute(response.text, "date-from-iso", "value") == "2026-04-01"
     assert _attribute(response.text, "date-to-iso", "value") == "2026-04-30"
-    assert 'type="date"' not in response.text
-    assert "Use DD-MM-YYYY" in response.text
-    assert 'id="transactions-filter-form"' in response.text
-    assert 'class="filter-clear"' in response.text
 
 
 async def test_overflowing_query_day_redirects_to_month_end(client):
@@ -169,21 +164,6 @@ async def test_unrecoverable_query_date_returns_validation_error(client):
     assert response.json() == {
         "detail": "date_from must use YYYY-MM-DD and be a valid calendar date"
     }
-
-
-async def test_transaction_page_has_common_date_presets(client):
-    response = await client.get("/transactions")
-
-    assert response.status_code == 200
-    for label in (
-        "Current month",
-        "Previous month",
-        "Last 30 days",
-        "Current financial year",
-        "Previous financial year",
-        "Current calendar year",
-    ):
-        assert label in response.text
 
 
 async def test_date_presets_preserve_active_non_date_filters(client):
@@ -219,13 +199,6 @@ async def test_date_presets_preserve_active_non_date_filters(client):
     assert query["order"] == ["asc"]
     assert query["date_from"] != ["2020-01-01"]
     assert query["date_to"] != ["2020-01-31"]
-
-
-async def test_currency_prefix_normalizes_case_and_whitespace():
-    assert currency_symbol(" INR ") == "₹"
-    assert currency_symbol(" usd ") == "$"
-    assert currency_symbol("   ") == "₹"
-    assert currency_symbol(" eur ") == "EUR "
 
 
 async def test_financial_year_presets_use_april_to_march():

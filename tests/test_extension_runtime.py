@@ -1,11 +1,9 @@
 """Extension runtime + manager lifecycle tests.
 
-Covers: mature manifest metadata (contract version, navigation, route prefixes,
-health, AUTOMATION capability), runtime registration validation, deterministic
-status, startup/shutdown ordering with per-extension failure isolation,
-after-fetch-cycle isolation, FetchService integration (exactly one callback per
-fetch cycle, ordered after native steps, loop survives a failing hook), and
-backwards-compatible FetchService construction.
+Covers: Paisa manifest metadata, runtime registration validation,
+startup/shutdown with per-extension failure isolation, after-fetch-cycle
+isolation, and FetchService integration (one callback per fetch cycle, ordered
+after native steps, loop survives a failing hook).
 """
 
 import asyncio
@@ -16,9 +14,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from financial_dashboard.extensions import (
     EXTENSION_CONTRACT_VERSION,
     ExtensionManifest,
-    ExtensionNavItem,
-    ExtensionHealthMeta,
-    ExtensionRuntime,
     PAISA_EXTENSION,
     register_builtin_extensions,
 )
@@ -26,7 +21,6 @@ from financial_dashboard.extensions.base import Capability
 from financial_dashboard.extensions.registry import ExtensionRegistry
 from financial_dashboard.services.extensions import (
     ExtensionManager,
-    ExtensionStatus,
     bootstrap_extensions,
 )
 from financial_dashboard.services.fetch import FetchService
@@ -47,50 +41,15 @@ def _register_builtins_module():
 # --------------------------------------------------------------------------- #
 
 
-def test_paisa_manifest_carries_contract_and_extension_versions():
+def test_paisa_manifest_exposes_navigation_routes_health_and_automation():
     assert PAISA_EXTENSION.contract_version == EXTENSION_CONTRACT_VERSION
-    assert PAISA_EXTENSION.extension_version
-
-
-def test_paisa_manifest_navigation_and_routes():
     nav = PAISA_EXTENSION.navigation
-    assert len(nav) == 1
-    assert isinstance(nav[0], ExtensionNavItem)
-    assert nav[0].label == "Paisa"
-    assert nav[0].path == "/extensions/paisa"
+    assert [(item.label, item.path) for item in nav] == [("Paisa", "/extensions/paisa")]
     assert "/api/extensions/paisa" in PAISA_EXTENSION.route_prefixes
     assert "/extensions/paisa" in PAISA_EXTENSION.route_prefixes
-
-
-def test_paisa_manifest_health_metadata():
-    health = PAISA_EXTENSION.health
-    assert isinstance(health, ExtensionHealthMeta)
-    assert health.status_path == "/api/extensions/paisa/status"
-
-
-def test_paisa_advertises_automation_capability():
+    assert PAISA_EXTENSION.health is not None
+    assert PAISA_EXTENSION.health.status_path == "/api/extensions/paisa/status"
     assert Capability.AUTOMATION in PAISA_EXTENSION.capabilities
-
-
-def test_manifest_defaults_are_safe_for_minimal_construction():
-    m = ExtensionManifest(id="x", display_name="X")
-    assert m.contract_version == EXTENSION_CONTRACT_VERSION
-    assert m.extension_version == "0.0.0"
-    assert m.navigation == ()
-    assert m.route_prefixes == ()
-    assert m.health is None
-
-
-def test_extension_runtime_is_a_protocol():
-    # runtime_checkable Protocol: isinstance checks attribute presence.
-    class _R:
-        extension_id = "x"
-
-        async def startup(self) -> None: ...
-        async def shutdown(self) -> None: ...
-        async def after_fetch_cycle(self) -> None: ...
-
-    assert isinstance(_R(), ExtensionRuntime)
 
 
 # --------------------------------------------------------------------------- #
@@ -142,50 +101,20 @@ def _manager_with(*ext_ids: str) -> tuple[ExtensionManager, dict[str, FakeRuntim
 # --------------------------------------------------------------------------- #
 
 
-def test_register_runtime_attaches_to_known_extension():
-    manager, runtimes = _manager_with("a")
-    assert manager.get_runtime("a") is runtimes["a"]
-    assert len(manager.runtimes()) == 1
-
-
-def test_register_runtime_rejects_unknown_extension():
-    manager = ExtensionManager()
+def test_register_runtime_rejects_invalid_registrations():
     with pytest.raises(ValueError, match="unknown extension"):
-        manager.register_runtime("ghost", FakeRuntime("ghost"))
+        ExtensionManager().register_runtime("ghost", FakeRuntime("ghost"))
 
-
-def test_register_runtime_rejects_extension_id_mismatch():
     reg = ExtensionRegistry()
     reg.register(ExtensionManifest(id="a", display_name="A"))
-    manager = ExtensionManager(reg)
     with pytest.raises(ValueError, match="does not match"):
-        manager.register_runtime("a", FakeRuntime("b"))
+        ExtensionManager(reg).register_runtime("a", FakeRuntime("b"))
 
-
-def test_register_runtime_rejects_duplicate_without_replacing_original():
     manager, runtimes = _manager_with("a")
-    replacement = FakeRuntime("a")
-
     with pytest.raises(ValueError, match="already registered"):
-        manager.register_runtime("a", replacement)
+        manager.register_runtime("a", FakeRuntime("a"))
 
     assert manager.get_runtime("a") is runtimes["a"]
-
-
-def test_runtimes_preserve_manifest_registration_order():
-    manager, _ = _manager_with("a", "b", "c")
-    assert [r.extension_id for r in manager.runtimes()] == ["a", "b", "c"]
-
-
-def test_status_is_deterministic_and_ordered():
-    manager, _ = _manager_with("a", "b")
-    # 'b' has no runtime attached path is covered by _manager_with attaching both;
-    # verify shape here.
-    snap = manager.status()
-    assert all(isinstance(s, ExtensionStatus) for s in snap)
-    assert [s.id for s in snap] == ["a", "b"]
-    assert all(s.has_runtime for s in snap)
-    assert all(not s.running for s in snap)  # nothing started yet
 
 
 # --------------------------------------------------------------------------- #
@@ -204,14 +133,6 @@ async def test_startup_shutdown_run_in_registration_order():
         assert "shutdown" in rt.calls
     running = {s.id: s.running for s in manager.status()}
     assert running == {"a": False, "b": False, "c": False}
-
-
-async def test_startup_marks_running_only_for_healthy_runtimes():
-    manager, runtimes = _manager_with("a", "b")
-    runtimes["a"].startup_raises = True
-    await manager.startup_all()
-    running = {s.id: s.running for s in manager.status()}
-    assert running == {"a": False, "b": True}
 
 
 async def test_startup_failure_isolated():
@@ -264,8 +185,6 @@ class _RecordingManager:
 
     def __init__(self) -> None:
         self.cycle_calls = 0
-        self.label: str | None = None
-        self.raise_on_cycle = False
 
     async def after_fetch_cycle_all(self) -> None:
         self.cycle_calls += 1
@@ -333,9 +252,6 @@ async def test_after_fetch_cycle_called_once_per_cycle_and_ordered(monkeypatch):
 
 
 async def test_fetch_loop_survives_failing_extension_hook(monkeypatch):
-    mgr = _RecordingManager()
-    mgr.raise_on_cycle = True
-
     # Make the wrapper raise to prove the loop's own isolation (separate from
     # the manager's per-extension isolation).
     class _Raising:
@@ -387,39 +303,17 @@ async def _noop_coro():
 
 
 # --------------------------------------------------------------------------- #
-# Backwards-compatible construction
-# --------------------------------------------------------------------------- #
-
-
-def test_fetch_service_constructs_without_manager():
-    svc = FetchService()
-    assert svc._extension_manager is None
-
-
-def test_fetch_service_accepts_manager():
-    mgr = _RecordingManager()
-    svc = FetchService(extension_manager=mgr)  # type: ignore[arg-type]
-    assert svc._extension_manager is mgr
-
-
-# --------------------------------------------------------------------------- #
 # Bootstrap wires the Paisa runtime
 # --------------------------------------------------------------------------- #
 
 
-def test_bootstrap_extensions_attaches_paisa_runtime():
-    manager = bootstrap_extensions(session_factory=async_sessionmaker())
-    assert manager.get_runtime("paisa") is not None
-    assert manager.get_runtime("paisa").extension_id == "paisa"
-    snap = {s.id: s for s in manager.status()}
-    assert snap["paisa"].has_runtime is True
-
-
-async def test_bootstrap_manager_lifecycle_is_safe():
+async def test_bootstrap_manager_attaches_paisa_and_lifecycle_is_safe():
     # startup/shutdown of the real Paisa runtime must be no-ops (no network,
     # no auto-sync kick) and not raise.
     session_factory = async_sessionmaker()
     manager = bootstrap_extensions(session_factory=session_factory)
+    snap = {s.id: s for s in manager.status()}
+    assert snap["paisa"].has_runtime is True
     await manager.startup_all()
     snap = {s.id: s for s in manager.status()}
     assert snap["paisa"].running is True

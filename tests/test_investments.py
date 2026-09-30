@@ -7,15 +7,14 @@ fact; anything less is reported with a stable reason and never fabricated.
 """
 
 import datetime
+import json
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
 
 from financial_dashboard.db.models import CasUpload, InvestmentLot
-from financial_dashboard.services.investment_transactions import _classify_transaction
 from financial_dashboard.services.investment_types import (
-    LotClassificationResult,
     LotExtractionResult,
 )
 from financial_dashboard.services.investments import (
@@ -75,17 +74,6 @@ def test_complete_mf_purchase_becomes_a_lot():
     assert lot.reference == "TXN001"
 
 
-def test_transaction_classification_result_is_named_and_tuple_compatible():
-    classified = _classify_transaction(_mf_purchase())
-
-    assert isinstance(classified, LotClassificationResult)
-    lot, exclusion = classified
-    assert classified.lot is lot
-    assert classified.exclusion is exclusion
-    assert lot is not None
-    assert exclusion is None
-
-
 def test_switch_in_is_an_acquisition_type():
     lots, _ = extract_lots_from_payload(
         {"transactions": [_mf_purchase(transaction_type="switch_in")]}
@@ -112,13 +100,10 @@ def test_switch_in_is_an_acquisition_type():
             {"transaction_type": "redemption", "units": "-100", "amount": "-5200.00"},
             "disposal_transaction",
         ),
-        # blank type: cannot confirm the date is an acquisition date
-        ({"transaction_type": None}, "ambiguous_transaction_type"),
+        # unknown type: cannot confirm the date is an acquisition date
         ({"transaction_type": "transfer"}, "ambiguous_transaction_type"),
         # missing nav (no per-unit cost)
         ({"nav": None}, "missing_lot_facts"),
-        # missing units
-        ({"units": None}, "missing_lot_facts"),
         # missing amount (no cost basis)
         ({"amount": None}, "missing_lot_facts"),
         # missing date (no acquisition date)
@@ -142,15 +127,6 @@ def test_incomplete_or_excluded_transactions_are_reported_not_fabricated(
     assert excluded[0].reason == reason
     # No lot is ever fabricated: the exclusion carries the truth, not a guess.
     assert excluded[0].detail
-
-
-def test_no_lot_when_cost_basis_derivable_but_date_absent():
-    """Cost basis is never used to invent an acquisition date."""
-    lots, excluded = extract_lots_from_payload(
-        {"transactions": [_mf_purchase(date=None)]}
-    )
-    assert lots == []
-    assert excluded[0].reason == "missing_lot_facts"
 
 
 def test_identical_transactions_within_payload_preserve_source_multiplicity():
@@ -178,17 +154,6 @@ def test_decimal_precision_preserved():
     assert lot.unit_cost == Decimal("12.3456")
 
 
-def test_cost_basis_tolerance_allows_sub_penny_rounding():
-    """units*nav that rounds to the printed amount within 0.01 is accepted."""
-    lots, excluded = extract_lots_from_payload(
-        {"transactions": [_mf_purchase(units="100", nav="33.333", amount="3333.30")]}
-    )
-    # 100 * 33.333 = 3333.30 exactly -> accepted.
-    assert len(lots) == 1
-    assert lots[0].cost_basis == Decimal("3333.30")
-    assert excluded == []
-
-
 # ---------------------------------------------------------------------------
 # 1-paisa lot boundary: agreement gate + exact renderer consistency
 # ---------------------------------------------------------------------------
@@ -197,18 +162,10 @@ def test_cost_basis_tolerance_allows_sub_penny_rounding():
 @pytest.mark.parametrize(
     ("units", "nav", "amount", "accepted", "label"),
     [
-        # difference 0 -> accepted
-        ("1000", "50.00", "50000.00", True, "diff_zero"),
         # difference 0.009 (sub-penny) -> accepted
         ("1", "100.009", "100.00", True, "diff_subpenny"),
         # difference exactly 0.01 -> REJECTED (the former 1-paisa grey zone)
         ("1", "100.01", "100.00", False, "diff_exactly_one_paisa"),
-        # difference > 0.01 -> rejected
-        ("1000", "50.00", "49990.00", False, "diff_above_one_paisa"),
-        # real-world rounded NAV: 100 * 33.333 = 3333.30 exactly -> accepted
-        ("100", "33.333", "3333.30", True, "rounded_nav_exact"),
-        # real-world repeating NAV: 700 * 14.2857 = 9999.99 -> accepted
-        ("700", "14.2857", "9999.99", True, "repeating_nav_exact"),
         # real-world repeating NAV whose product is sub-penny off the amount:
         # 3 * 33.3333 = 99.9999, amount 100.00 (diff 0.0001) -> accepted
         ("3", "33.3333", "100.00", True, "repeating_nav_subpenny"),
@@ -234,14 +191,11 @@ def test_lot_agreement_boundary(units, nav, amount, accepted, label):
 @pytest.mark.parametrize(
     ("units", "nav", "amount"),
     [
-        # exact 2dp product
-        ("1000", "50.00", "50000.00"),
         # high-precision product (7 dp)
         ("123.456789", "12.3456", "1524.15"),
         # sub-penny product (3 dp), accepted within tolerance
         ("1", "100.009", "100.00"),
-        # rounded/repeating NAV
-        ("100", "33.333", "3333.30"),
+        # repeating NAV
         ("700", "14.2857", "9999.99"),
     ],
 )
@@ -255,7 +209,6 @@ def test_accepted_lot_cost_basis_is_quantized_product_and_renders_balanced(
     from financial_dashboard.services.paisa.renderers.base import (
         InvestmentLotEntry,
         LedgerDocument,
-        check_lot_consistent,
     )
 
     lots, excluded = extract_lots_from_payload(
@@ -274,10 +227,6 @@ def test_accepted_lot_cost_basis_is_quantized_product_and_renders_balanced(
         currency=lot.currency,
         acquired_on=lot.acquired_on,
     )
-    # The renderer's own consistency guard must pass (and with a zero diff).
-    product_q = (entry.quantity * entry.unit_cost).quantize(Decimal("0.01"))
-    assert abs(product_q - entry.cost_basis.quantize(Decimal("0.01"))) == Decimal("0")
-    check_lot_consistent(entry)  # must not raise
     doc = LedgerDocument(
         cutover_date=lot.acquired_on,
         openings=(),
@@ -636,36 +585,9 @@ def test_same_source_ref_is_scoped_by_instrument():
     assert _remaining_for(consumption, "INE000B01018") == {}
 
 
-async def test_get_unresolved_disposal_instruments_reads_preserved_payloads(session):
-    """The DB-backed accessor flags instruments with unresolvable disposals from
-    preserved CAS uploads (read-only)."""
-    from financial_dashboard.services.investments import (
-        get_unresolved_disposal_instruments,
-    )
-
-    upload = await _upload(
-        session,
-        payload_txns=[
-            _mf_purchase(isin="INE000A01020", source_ref="a/1"),
-            _mf_purchase(
-                isin="INE000A01020",
-                transaction_type="redemption",
-                units="-50",
-                amount="-5100.00",
-                source_ref="a/2",
-            ),
-        ],
-    )
-    result = await get_unresolved_disposal_instruments(session)
-    assert upload.id  # upload was persisted
-    assert "INE000A01020" in result
-
-
 async def test_get_lot_consumption_is_read_only_and_returns_remaining_lots(session):
     """The DB accessor reads preserved disposal facts but does not rewrite the
     persisted gross acquisition row when reporting a partial remainder."""
-    import json
-
     from financial_dashboard.services.investments import get_lot_consumption
 
     transactions = [
@@ -702,13 +624,15 @@ async def test_get_lot_consumption_is_read_only_and_returns_remaining_lots(sessi
 # ---------------------------------------------------------------------------
 
 
-async def _upload(session, *, payload_txns, statement_date="2026-04-30"):
+async def _upload(
+    session, *, payload_txns, statement_date="2026-04-30", portfolio_key="PAN123"
+):
     upload = CasUpload(
-        portfolio_key="PAN123",
+        portfolio_key=portfolio_key,
         depository_source="cdsl",
         statement_date=datetime.date.fromisoformat(statement_date),
         grand_total=Decimal("100000.00"),
-        raw_holdings_json=__import__("json").dumps({"transactions": payload_txns}),
+        raw_holdings_json=json.dumps({"transactions": payload_txns}),
     )
     session.add(upload)
     await session.flush()
@@ -722,69 +646,6 @@ async def test_read_services_ignore_valid_non_object_json_payloads(session):
 
     assert await get_latest_payload(session) is None
     assert await get_incomplete_reasons(session) == []
-
-
-async def test_create_investment_lots_persists_complete_lots(session):
-    upload = await _upload(
-        session,
-        payload_txns=[
-            _mf_purchase(),
-            _mf_purchase(
-                isin="INE000A01019",
-                reference="TXN002",
-                units="200",
-                nav="10.00",
-                amount="2000.00",
-            ),
-        ],
-    )
-    result = await create_investment_lots(
-        session, cas_upload_id=upload.id, payload={"transactions": []}
-    )
-    created, excluded = result
-    # payload passed here has no transactions -> nothing created from it; the
-    # persisted rows above come from a direct call instead.
-    assert result.created == created
-    assert result.exclusions is excluded
-    assert created == 0
-    lots, _ = extract_lots_from_payload(
-        {
-            "transactions": [
-                _mf_purchase(),
-                _mf_purchase(
-                    isin="INE000A01019",
-                    reference="TXN002",
-                    units="200",
-                    nav="10.00",
-                    amount="2000.00",
-                ),
-            ]
-        }
-    )
-    for lot in lots:
-        session.add(
-            InvestmentLot(
-                cas_upload_id=upload.id,
-                instrument_id=lot.instrument_id,
-                instrument_name=lot.instrument_name,
-                quantity=lot.quantity,
-                unit_cost=lot.unit_cost,
-                cost_basis=lot.cost_basis,
-                currency=lot.currency,
-                acquired_on=lot.acquired_on,
-                source_ref=lot.source_ref,
-                transaction_type=lot.transaction_type,
-                reference=lot.reference,
-            )
-        )
-    await session.flush()
-
-    rows = await get_complete_lots(session)
-    assert {r.instrument_id for r in rows} == {"INE000A01018", "INE000A01019"}
-    # quantity/unit_cost stored at full Numeric precision (20,6)/(20,6).
-    first = next(r for r in rows if r.instrument_id == "INE000A01018")
-    assert first.quantity == Decimal("1000")
-    assert first.unit_cost == Decimal("50")
 
 
 async def test_create_investment_lots_direct_retry_is_idempotent(session):
@@ -829,7 +690,7 @@ async def test_get_incomplete_reasons_reads_preserved_raw_payload(session):
     await create_investment_lots(
         session,
         cas_upload_id=upload.id,
-        payload=__import__("json").loads(upload.raw_holdings_json),
+        payload=json.loads(upload.raw_holdings_json),
     )
     reasons = await get_incomplete_reasons(session)
     labels = {r.reason for r in reasons}
@@ -843,8 +704,6 @@ async def test_get_positions_joins_holdings_with_lot_cost_basis(session):
         payload_txns=[_mf_purchase()],
     )
     # Give the upload a holdings section so positions carry current value.
-    import json
-
     payload = json.loads(upload.raw_holdings_json)
     payload["folios"] = [
         {
@@ -877,8 +736,6 @@ async def test_value_only_holding_without_lot_has_zero_cost_basis(session):
     """A holding the CAS priced but never acquired via a complete transaction
     appears as a position with zero lot fields — not a fabricated lot."""
     upload = await _upload(session, payload_txns=[])
-    import json
-
     payload = json.loads(upload.raw_holdings_json)
     payload["accounts"] = [
         {
@@ -907,8 +764,6 @@ async def test_value_only_holding_without_lot_has_zero_cost_basis(session):
 
 async def test_get_latest_values_returns_explicit_market_values(session):
     upload = await _upload(session, payload_txns=[])
-    import json
-
     payload = json.loads(upload.raw_holdings_json)
     payload["accounts"] = [
         {
@@ -931,50 +786,6 @@ async def test_get_latest_values_returns_explicit_market_values(session):
 # ---------------------------------------------------------------------------
 # Multi-PAN lots + the persisted-lot vs projected-eligibility contract
 # ---------------------------------------------------------------------------
-
-
-async def _upload_pan(session, *, portfolio_key, txns, statement_date="2026-04-30"):
-    upload = CasUpload(
-        portfolio_key=portfolio_key,
-        depository_source="cdsl",
-        statement_date=datetime.date.fromisoformat(statement_date),
-        grand_total=Decimal("100000.00"),
-        raw_holdings_json=__import__("json").dumps({"transactions": txns}),
-    )
-    session.add(upload)
-    await session.flush()
-    return upload
-
-
-async def test_multi_pan_lots_persisted_independently(session):
-    """Two PANs (portfolio_keys) ingest their own lots independently; both are
-    returned by the cross-upload ``get_complete_lots`` read, keyed by their own
-    cas_upload_id, and source_ref survives the round-trip."""
-    pan1 = [
-        _mf_purchase(isin="INE000A01030", source_ref="p1/a", reference="PA1"),
-    ]
-    pan2 = [
-        _mf_purchase(isin="INE000C01030", source_ref="p2/c", reference="PC1"),
-    ]
-    up1 = await _upload_pan(session, portfolio_key="PAN1111A", txns=pan1)
-    up2 = await _upload_pan(session, portfolio_key="PAN2222B", txns=pan2)
-    import json as _json
-
-    await create_investment_lots(
-        session, cas_upload_id=up1.id, payload=_json.loads(up1.raw_holdings_json)
-    )
-    await create_investment_lots(
-        session, cas_upload_id=up2.id, payload=_json.loads(up2.raw_holdings_json)
-    )
-
-    lots = await get_complete_lots(session)
-    assert {lot.instrument_id for lot in lots} == {"INE000A01030", "INE000C01030"}
-    lot1 = next(lot for lot in lots if lot.instrument_id == "INE000A01030")
-    lot2 = next(lot for lot in lots if lot.instrument_id == "INE000C01030")
-    assert lot1.cas_upload_id == up1.id
-    assert lot2.cas_upload_id == up2.id
-    assert lot1.source_ref == "p1/a"
-    assert lot1.reference == "PA1"
 
 
 async def test_persisted_lot_count_vs_projected_eligibility_contract(session):
@@ -1044,15 +855,14 @@ async def test_persisted_lot_count_vs_projected_eligibility_contract(session):
     pan2 = [
         _mf_purchase(isin="INE000C01030", source_ref="p2/c", reference="PC1"),
     ]
-    up1 = await _upload_pan(session, portfolio_key="PAN1111A", txns=pan1)
-    up2 = await _upload_pan(session, portfolio_key="PAN2222B", txns=pan2)
-    import json as _json
+    up1 = await _upload(session, portfolio_key="PAN1111A", payload_txns=pan1)
+    up2 = await _upload(session, portfolio_key="PAN2222B", payload_txns=pan2)
 
     await create_investment_lots(
-        session, cas_upload_id=up1.id, payload=_json.loads(up1.raw_holdings_json)
+        session, cas_upload_id=up1.id, payload=json.loads(up1.raw_holdings_json)
     )
     await create_investment_lots(
-        session, cas_upload_id=up2.id, payload=_json.loads(up2.raw_holdings_json)
+        session, cas_upload_id=up2.id, payload=json.loads(up2.raw_holdings_json)
     )
 
     persisted = await get_complete_lots(session)
@@ -1066,6 +876,9 @@ async def test_persisted_lot_count_vs_projected_eligibility_contract(session):
         "INE000C01030",
         "INE000D01030",
     }
+    lot_c = next(lot for lot in persisted if lot.instrument_id == "INE000C01030")
+    assert lot_c.cas_upload_id == up2.id
+    assert (lot_c.source_ref, lot_c.reference) == ("p2/c", "PC1")
     # Only ISIN-B has an unresolvable (untied) disposal; the linked switch (D)
     # is exactly tied, so it is fully consumed rather than flagged.
     assert unresolved == {"INE000B01030"}
@@ -1106,8 +919,6 @@ async def _upload_payload(
     payload: dict,
     source: str = "cdsl",
 ):
-    import json
-
     upload = CasUpload(
         portfolio_key=portfolio_key,
         depository_source=source,

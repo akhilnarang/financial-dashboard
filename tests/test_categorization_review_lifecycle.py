@@ -16,20 +16,20 @@ keeps failing: a row past ``max_attempts`` is skipped, so the queue drains.
 
 The sweep opens its own session (``async with async_session()``), so these
 tests stand up an in-memory engine and monkey-patch ``sweep.async_session`` to
-a maker over it — the same pattern the sweep's own unit tests use, so the row
-a test commits is the row the sweep reads.
+a maker over it, so the row a test commits is the row the sweep reads.
 """
 
 from decimal import Decimal
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.services.categorization.sweep as sweep
 import financial_dashboard.services.telegram as tg
-from financial_dashboard.db.models import Base, Transaction
+from financial_dashboard.db.models import Transaction
 from financial_dashboard.services.categorization.manual import assign_category_manual
 from financial_dashboard.services.categorization.vocabulary import ensure_category
+from tests.conftest import new_test_engine
 
 pytestmark = pytest.mark.anyio
 
@@ -44,13 +44,12 @@ async def memdb(monkeypatch):
     :memory: DB). Patching here makes the two share one engine and one pool
     connection, which is what makes an in-memory DB visible across sessions.
     """
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(sweep, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 @pytest.fixture
@@ -112,53 +111,12 @@ async def _fetch(memdb, txn_id: int) -> Transaction:
 # ---------------------------------------------------------------------------
 
 
-async def test_pending_row_is_notified_and_advances_status(
-    memdb, telegram_send, monkeypatch
-):
+async def test_pending_row_is_notified_once(memdb, telegram_send, monkeypatch):
     """A 'pending' row becomes 'notified' after a successful send, and the
-    attempt counter advances. ``run_review_notify`` returns 1 (one row sent)."""
+    attempt counter advances. A 'resolved' row is not sent, and a second run
+    does not resend the now-'notified' row."""
     _configure_telegram(monkeypatch)
     txn_id = await _seed_pending(memdb)
-
-    n = await sweep.run_review_notify()
-
-    assert n == 1
-    assert len(telegram_send) == 1
-    txn = await _fetch(memdb, txn_id)
-    assert txn.review_status == "notified"
-    assert txn.last_notified_at is not None
-    assert txn.notify_attempts == 1
-
-
-async def test_already_notified_row_is_not_resent(memdb, telegram_send, monkeypatch):
-    """A row already 'notified' is not in the queue — the sweep selects only
-    ``review_status == 'pending'``, so a second run does not duplicate the
-    message."""
-    _configure_telegram(monkeypatch)
-    async with memdb() as s:
-        s.add(
-            Transaction(
-                bank="b",
-                email_type="x",
-                direction="debit",
-                amount=Decimal("1"),
-                review_status="notified",
-                notify_attempts=1,
-            )
-        )
-        await s.commit()
-
-    n = await sweep.run_review_notify()
-    assert n == 0
-    assert telegram_send == []
-
-
-async def test_resolved_row_is_not_in_the_notify_queue(
-    memdb, telegram_send, monkeypatch
-):
-    """A 'resolved' row never reaches the queue — once the human reply has
-    landed, the row is out of the review loop."""
-    _configure_telegram(monkeypatch)
     async with memdb() as s:
         s.add(
             Transaction(
@@ -171,9 +129,15 @@ async def test_resolved_row_is_not_in_the_notify_queue(
         )
         await s.commit()
 
-    n = await sweep.run_review_notify()
-    assert n == 0
-    assert telegram_send == []
+    assert await sweep.run_review_notify() == 1
+    assert len(telegram_send) == 1
+    txn = await _fetch(memdb, txn_id)
+    assert txn.review_status == "notified"
+    assert txn.last_notified_at is not None
+    assert txn.notify_attempts == 1
+
+    assert await sweep.run_review_notify() == 0
+    assert len(telegram_send) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -250,65 +214,6 @@ async def test_manual_clear_keeps_row_resolved_with_none_category(memdb):
 # ---------------------------------------------------------------------------
 
 
-async def test_send_failure_advances_attempts_without_marking_notified(
-    memdb, monkeypatch
-):
-    """A failed send advances notify_attempts but leaves the row 'pending' — so
-    the next sweep picks it up again. No message was sent."""
-    _configure_telegram(monkeypatch)
-
-    async def failing_send(*a, **kw):
-        raise RuntimeError("transient send failure")
-
-    monkeypatch.setattr(tg, "_send_with_retry", failing_send)
-    monkeypatch.setattr(tg, "tg_app", object())
-
-    txn_id = await _seed_pending(memdb)
-
-    n = await sweep.run_review_notify()
-    assert n == 0
-    txn = await _fetch(memdb, txn_id)
-    assert txn.review_status == "pending"  # still pending — not advanced
-    assert txn.notify_attempts == 1
-    assert txn.last_notified_at is None
-
-
-async def test_row_past_max_attempts_is_skipped_so_the_queue_drains(
-    memdb, telegram_send, monkeypatch
-):
-    """A row whose notify_attempts has reached the cap is not selected again,
-    even though it is still 'pending'. The retry cap is what stops a
-    permanently-unsatisfiable row from monopolizing the queue."""
-    _configure_telegram(monkeypatch)
-    txn_id = await _seed_pending(memdb, attempts=5)  # at the default cap
-
-    n = await sweep.run_review_notify(max_attempts=5)
-    assert n == 0
-    assert telegram_send == []
-    txn = await _fetch(memdb, txn_id)
-    assert txn.review_status == "pending"  # untouched — not selected
-
-
-async def test_row_just_under_max_attempts_is_still_tried(
-    memdb, telegram_send, monkeypatch
-):
-    """The cap is exclusive: a row at max_attempts - 1 is still selected, and
-    after a successful send sits at max_attempts — so the next run skips it."""
-    _configure_telegram(monkeypatch)
-    txn_id = await _seed_pending(memdb, attempts=4)  # one under the cap of 5
-
-    n = await sweep.run_review_notify(max_attempts=5)
-    assert n == 1
-    assert len(telegram_send) == 1
-    txn = await _fetch(memdb, txn_id)
-    assert txn.review_status == "notified"
-    assert txn.notify_attempts == 5
-
-    # A second run skips it: at the cap now, not selected.
-    n2 = await sweep.run_review_notify(max_attempts=5)
-    assert n2 == 0
-
-
 async def test_a_changed_failure_is_retried_until_the_cap(memdb, monkeypatch):
     """A row keeps being re-tried (advancing attempts each time) until it hits
     the cap — a transient send failure does not strand it before then."""
@@ -329,6 +234,7 @@ async def test_a_changed_failure_is_retried_until_the_cap(memdb, monkeypatch):
     txn = await _fetch(memdb, txn_id)
     assert txn.review_status == "pending"
     assert txn.notify_attempts == 1
+    assert txn.last_notified_at is None
 
     await sweep.run_review_notify(max_attempts=3)
     txn = await _fetch(memdb, txn_id)

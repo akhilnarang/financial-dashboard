@@ -31,7 +31,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.core.deps as core_deps
 import financial_dashboard.services.emails as emails_mod
@@ -39,7 +39,6 @@ import financial_dashboard.services.reminders as reminders_module
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.db import (
     Account,
-    Base,
     Card,
     Email,
     FetchRule,
@@ -53,6 +52,7 @@ from financial_dashboard.services.emails import (
 )
 from financial_dashboard.services.linker import build_link_context
 from financial_dashboard.web import get_router as get_web_router
+from tests.conftest import new_test_engine
 
 
 @pytest.fixture
@@ -62,9 +62,7 @@ def anyio_backend():
 
 @pytest.fixture
 async def session_maker(monkeypatch):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     # handle_polled_email / check_payment_received open their own async_session();
     # install the in-memory maker so they see (and commit to) the test DB.
@@ -73,6 +71,7 @@ async def session_maker(monkeypatch):
     monkeypatch.setattr(core_deps, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 def _build_web_app(maker):
@@ -150,6 +149,7 @@ async def _run_handle_polled_email(
     msg_id,
     raw_bytes=None,
     should_notify=True,
+    ledger_role=None,
 ):
     """Drive handle_polled_email with the parser stubbed to return *txn_data*.
 
@@ -157,7 +157,10 @@ async def _run_handle_polled_email(
     ``check_payment_received`` it needs to assert on (or passes
     ``should_notify=False`` to skip dispatch entirely).
     """
-    _stub_parser(monkeypatch, txn_data)
+    if ledger_role is None:
+        _stub_parser(monkeypatch, txn_data)
+    else:
+        _stub_parser_with_role(monkeypatch, txn_data, ledger_role=ledger_role)
 
     async with maker() as s:
         rule = await s.get(FetchRule, rule_id)
@@ -203,7 +206,6 @@ async def test_sbi_declined_is_notify_only(session_maker, monkeypatch):
     async def _capture_notification(txn_id, txn_info, chat_id, **kwargs):
         captured.append((txn_id, txn_info))
 
-    _stub_parser(monkeypatch, txn_data)
     monkeypatch.setattr(
         emails_mod, "send_transaction_notification", _capture_notification
     )
@@ -211,21 +213,13 @@ async def test_sbi_declined_is_notify_only(session_maker, monkeypatch):
     monkeypatch.setattr(emails_mod, "send_enrichment_notification", AsyncMock())
     monkeypatch.setattr(emails_mod, "send_disambiguation_prompt", AsyncMock())
 
-    async with session_maker() as s:
-        rule = await s.get(FetchRule, rule_id)
-        link_ctx = await build_link_context(s)
-
-    stats = {"parsed": 0, "skipped": 0, "failed": 0, "fetched": 0}
-    await handle_polled_email(
-        rule=rule,
-        provider="gmail",
-        source_id=1,
+    stats = await _run_handle_polled_email(
+        session_maker,
+        monkeypatch,
+        rule_id=rule_id,
+        txn_data=txn_data,
         msg_id="sbi-declined-1",
-        remote_id="remote-1",
         raw_bytes=_raw_email(subject="Transaction declined"),
-        should_notify=True,
-        link_context=link_ctx,
-        stats=stats,
     )
 
     assert stats["parsed"] == 1
@@ -474,21 +468,7 @@ async def test_reparse_multiple_transactions_returns_409(session_maker, monkeypa
         ),
     )
 
-    with (
-        patch(
-            "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=RawEmailResult(_raw_email(), None, "provider")),
-        ),
-        patch(
-            "financial_dashboard.web.emails.should_notify_transactions",
-            return_value=False,
-        ),
-    ):
-        app = _build_web_app(session_maker)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            r = await client.post(f"/emails/{email_id}/reparse")
+    r = await _post_reparse(session_maker, email_id)
 
     assert r.status_code == 409
     assert "more than one" in r.json()["detail"].lower()
@@ -583,27 +563,20 @@ async def test_rtgs_completion_email_stamps_the_reference_and_makes_no_row(
         await s.commit()
 
     txn_data = _rtgs_completion_txn_data()
-    _stub_parser_with_role(monkeypatch, txn_data, ledger_role="completion")
     monkeypatch.setattr(emails_mod, "send_transaction_notification", AsyncMock())
     monkeypatch.setattr(emails_mod, "send_bulk_summary", AsyncMock())
     monkeypatch.setattr(emails_mod, "send_enrichment_notification", AsyncMock())
     monkeypatch.setattr(emails_mod, "send_disambiguation_prompt", AsyncMock())
 
-    async with session_maker() as s:
-        rule = await s.get(FetchRule, rule_id)
-        link_ctx = await build_link_context(s)
-
-    stats = {"parsed": 0, "skipped": 0, "failed": 0, "fetched": 0}
-    await handle_polled_email(
-        rule=rule,
-        provider="gmail",
-        source_id=1,
+    await _run_handle_polled_email(
+        session_maker,
+        monkeypatch,
+        rule_id=rule_id,
+        txn_data=txn_data,
         msg_id="rtgs-completed-1",
-        remote_id="remote-rtgs-1",
         raw_bytes=_raw_email(subject="RTGS transfer completed"),
         should_notify=False,
-        link_context=link_ctx,
-        stats=stats,
+        ledger_role="completion",
     )
 
     async with session_maker() as s:
@@ -631,23 +604,15 @@ async def test_rtgs_completion_email_skips_when_two_rows_match(
         await s.commit()
 
     txn_data = _rtgs_completion_txn_data()
-    _stub_parser_with_role(monkeypatch, txn_data, ledger_role="completion")
-
-    async with session_maker() as s:
-        rule = await s.get(FetchRule, rule_id)
-        link_ctx = await build_link_context(s)
-
-    stats = {"parsed": 0, "skipped": 0, "failed": 0, "fetched": 0}
-    await handle_polled_email(
-        rule=rule,
-        provider="gmail",
-        source_id=1,
+    await _run_handle_polled_email(
+        session_maker,
+        monkeypatch,
+        rule_id=rule_id,
+        txn_data=txn_data,
         msg_id="rtgs-completed-2",
-        remote_id="remote-rtgs-2",
         raw_bytes=_raw_email(subject="RTGS transfer completed"),
         should_notify=False,
-        link_context=link_ctx,
-        stats=stats,
+        ledger_role="completion",
     )
 
     async with session_maker() as s:
@@ -657,6 +622,25 @@ async def test_rtgs_completion_email_skips_when_two_rows_match(
         em = (await s.execute(select(Email))).scalar_one()
         assert em.status == "skipped"
         assert "no unique primary row" in (em.error or "")
+
+
+async def _post_reparse(session_maker, email_id):
+    """POST /emails/{id}/reparse with the raw loader stubbed."""
+    with (
+        patch(
+            "financial_dashboard.web.emails.load_or_fetch_raw_email",
+            new=AsyncMock(return_value=RawEmailResult(_raw_email(), None, "provider")),
+        ),
+        patch(
+            "financial_dashboard.web.emails.should_notify_transactions",
+            return_value=False,
+        ),
+    ):
+        app = _build_web_app(session_maker)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            return await client.post(f"/emails/{email_id}/reparse")
 
 
 async def _reparse_completion_email(session_maker, monkeypatch, *, email_id, txn_data):
@@ -674,21 +658,7 @@ async def _reparse_completion_email(session_maker, monkeypatch, *, email_id, txn
             )
         ),
     )
-    with (
-        patch(
-            "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=RawEmailResult(_raw_email(), None, "provider")),
-        ),
-        patch(
-            "financial_dashboard.web.emails.should_notify_transactions",
-            return_value=False,
-        ),
-    ):
-        app = _build_web_app(session_maker)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            return await client.post(f"/emails/{email_id}/reparse")
+    return await _post_reparse(session_maker, email_id)
 
 
 async def _seed_completion_email(session_maker, rule_id) -> int:
@@ -734,38 +704,21 @@ async def test_reparse_completion_with_no_candidate_makes_no_row(
 
 
 @pytest.mark.anyio
-async def test_reparse_completion_stamps_the_unique_row(session_maker, monkeypatch):
-    """One submission matches. A reparse completes it and adds no row."""
-    rule_id = await _seed_rule(session_maker, bank="hdfc")
-    email_id = await _seed_completion_email(session_maker, rule_id)
-    async with session_maker() as s:
-        s.add(_rtgs_submission_row())
-        await s.commit()
-
-    r = await _reparse_completion_email(
-        session_maker,
-        monkeypatch,
-        email_id=email_id,
-        txn_data=_rtgs_completion_txn_data(),
-    )
-    assert r.status_code in (200, 303)
-
-    async with session_maker() as s:
-        rows = (await s.execute(select(Transaction))).scalars().all()
-        assert len(rows) == 1
-        assert rows[0].reference_number == _RTGS_UTR
-        em = await s.get(Email, email_id)
-        assert em.status == "parsed"
-
-
-@pytest.mark.anyio
-async def test_reparse_keeps_a_bank_name_over_an_incoming_label(
-    session_maker, monkeypatch
+@pytest.mark.parametrize(
+    ("stored_name", "expected"),
+    [
+        ("SAMPLE BENEFICIARY", ("SAMPLE BENEFICIARY", "bank")),
+        (None, ("My Saved Payee", "user_alias")),
+    ],
+    ids=["keeps_bank_name", "fills_empty_name"],
+)
+async def test_reparse_applies_the_name_rule(
+    session_maker, monkeypatch, stored_name, expected
 ) -> None:
     """A reparse must apply the same name rule as the matcher.
 
-    It assigns every incoming value directly, so without the guard the label
-    lands on the row and the name the bank states is lost.
+    A label must not replace the name the bank states. A label that fills an
+    empty name must also store its source, so a later bank name can replace it.
     """
     rule_id = await _seed_rule(session_maker, bank="hdfc")
     async with session_maker() as s:
@@ -788,7 +741,7 @@ async def test_reparse_keeps_a_bank_name_over_an_incoming_label(
                 amount=Decimal("500"),
                 currency="INR",
                 transaction_date=datetime.date(2026, 6, 2),
-                counterparty="SAMPLE BENEFICIARY",
+                counterparty=stored_name,
                 counterparty_source="bank",
                 email_id=em.id,
                 source="email",
@@ -806,97 +759,11 @@ async def test_reparse_keeps_a_bank_name_over_an_incoming_label(
         counterparty_source="user_alias",
     )
     _stub_parser_with_role(monkeypatch, txn_data, ledger_role="primary")
-    with (
-        patch(
-            "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=RawEmailResult(_raw_email(), None, "provider")),
-        ),
-        patch(
-            "financial_dashboard.web.emails.should_notify_transactions",
-            return_value=False,
-        ),
-    ):
-        app = _build_web_app(session_maker)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            await client.post(f"/emails/{email_id}/reparse")
+    await _post_reparse(session_maker, email_id)
 
     async with session_maker() as s:
         row = (await s.execute(select(Transaction))).scalars().one()
-        assert row.counterparty == "SAMPLE BENEFICIARY"
-        assert row.counterparty_source == "bank"
-
-
-@pytest.mark.anyio
-async def test_reparse_records_the_source_of_a_name_it_accepts(
-    session_maker, monkeypatch
-) -> None:
-    """A reparse that fills an empty name must state where the name came from.
-
-    The row holds no name, so the guard allows the write. The stored source
-    must follow the stored name. If it stays "bank", a later email that
-    carries the true name cannot replace the label.
-    """
-    rule_id = await _seed_rule(session_maker, bank="hdfc")
-    async with session_maker() as s:
-        em = Email(
-            provider="gmail",
-            message_id="reparse-alias-2",
-            sender="alerts@example.bank.in",
-            subject="Account update",
-            received_at=datetime.datetime(2026, 6, 2, 10, 0, tzinfo=datetime.UTC),
-            status="parsed",
-            rule_id=rule_id,
-        )
-        s.add(em)
-        await s.flush()
-        s.add(
-            Transaction(
-                bank="hdfc",
-                email_type="hdfc_account_neft_debit_alert",
-                direction="debit",
-                amount=Decimal("500"),
-                currency="INR",
-                transaction_date=datetime.date(2026, 6, 2),
-                counterparty=None,
-                counterparty_source="bank",
-                email_id=em.id,
-                source="email",
-            )
-        )
-        await s.commit()
-        email_id = em.id
-
-    txn_data = _txn_data(
-        bank="hdfc",
-        email_type="hdfc_account_neft_debit_alert",
-        transaction_date=datetime.date(2026, 6, 2),
-        transaction_time=None,
-        counterparty="My Saved Payee",
-        counterparty_source="user_alias",
-    )
-    _stub_parser_with_role(monkeypatch, txn_data, ledger_role="primary")
-    with (
-        patch(
-            "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=RawEmailResult(_raw_email(), None, "provider")),
-        ),
-        patch(
-            "financial_dashboard.web.emails.should_notify_transactions",
-            return_value=False,
-        ),
-    ):
-        app = _build_web_app(session_maker)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            await client.post(f"/emails/{email_id}/reparse")
-
-    async with session_maker() as s:
-        row = (await s.execute(select(Transaction))).scalars().one()
-        assert row.counterparty == "My Saved Payee"
-        assert row.counterparty_source == "user_alias"
+        assert (row.counterparty, row.counterparty_source) == expected
 
 
 @pytest.mark.anyio
@@ -919,23 +786,15 @@ async def test_completion_email_replaces_a_saved_label(
 
     txn_data = _rtgs_completion_txn_data()
     txn_data["counterparty"] = "SAMPLE BENEFICIARY"
-    _stub_parser_with_role(monkeypatch, txn_data, ledger_role="completion")
-
-    async with session_maker() as s:
-        rule = await s.get(FetchRule, rule_id)
-        link_ctx = await build_link_context(s)
-
-    stats = {"parsed": 0, "skipped": 0, "failed": 0, "fetched": 0}
-    await handle_polled_email(
-        rule=rule,
-        provider="gmail",
-        source_id=1,
+    await _run_handle_polled_email(
+        session_maker,
+        monkeypatch,
+        rule_id=rule_id,
+        txn_data=txn_data,
         msg_id="rtgs-completed-alias",
-        remote_id="remote-rtgs-alias",
         raw_bytes=_raw_email(subject="RTGS transfer completed"),
         should_notify=False,
-        link_context=link_ctx,
-        stats=stats,
+        ledger_role="completion",
     )
 
     async with session_maker() as s:
@@ -946,7 +805,8 @@ async def test_completion_email_replaces_a_saved_label(
 
 @pytest.mark.anyio
 async def test_reparse_completion_twice_is_idempotent(session_maker, monkeypatch):
-    """A second reparse must not add a row or steal an existing email link."""
+    """A reparse stamps the one matching row. A second reparse must not add a
+    row or steal an existing email link."""
     rule_id = await _seed_rule(session_maker, bank="hdfc")
     email_id = await _seed_completion_email(session_maker, rule_id)
     async with session_maker() as s:
@@ -966,6 +826,8 @@ async def test_reparse_completion_twice_is_idempotent(session_maker, monkeypatch
         rows = (await s.execute(select(Transaction))).scalars().all()
         assert len(rows) == 1
         assert rows[0].reference_number == _RTGS_UTR
+        em = await s.get(Email, email_id)
+        assert em.status == "parsed"
 
 
 def test_populate_skips_a_completion_leg():

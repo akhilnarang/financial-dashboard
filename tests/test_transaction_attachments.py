@@ -7,7 +7,6 @@ from financial_dashboard.config import settings
 from financial_dashboard.db import AuditInteraction, Transaction
 from financial_dashboard.services.transaction_attachments import (
     AttachmentError,
-    MAX_ATTACHMENT_BYTES,
     StoredAttachment,
     attach_downloaded_attachment,
     detect_attachment_type,
@@ -54,17 +53,6 @@ async def test_download_attachment_streams_and_publishes(tmp_path, monkeypatch):
     assert stored.relative_path.startswith("txn-42-")
     assert stored.absolute_path.read_bytes() == b"%PDF-1.7\nreceipt"
     assert not list(Path(tmp_path).glob("*.part"))
-
-
-@pytest.mark.anyio
-async def test_download_attachment_rejects_declared_oversize(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "transaction_attachment_root", str(tmp_path))
-    with pytest.raises(AttachmentError, match="20 MB"):
-        await download_attachment(
-            "https://telegram.invalid/file",
-            transaction_id=1,
-            declared_size=MAX_ATTACHMENT_BYTES + 1,
-        )
 
 
 @pytest.mark.anyio

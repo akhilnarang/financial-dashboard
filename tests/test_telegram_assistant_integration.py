@@ -30,7 +30,6 @@ from financial_dashboard.services.assistant.orchestrator import (
     _process_callback_interaction,
     _process_text_interaction,
     _queue_result,
-    current_confirmation_state_hash,
     OrchestrationResult,
     run_pending_confirmation,
     run_turn,
@@ -205,32 +204,18 @@ async def test_mutation_savepoint_cannot_commit_outside_caller_transaction(sessi
 
 @pytest.mark.anyio
 async def test_invalid_read_filter_becomes_deliverable_error(session):
-    response = ToolCalls(
-        outcome="tool_calls",
-        calls=[{"name": "list_transactions", "date_from": "not-a-date"}],
-    )
+    for call in (
+        {"name": "list_transactions", "date_from": "not-a-date"},
+        {"name": "list_transactions", "amount": "sNaN"},
+    ):
+        response = ToolCalls(outcome="tool_calls", calls=[call])
 
-    result = await run_turn(
-        session, SequenceProvider(response), user_message="show that date"
-    )
+        result = await run_turn(
+            session, SequenceProvider(response), user_message="show those"
+        )
 
-    assert result.response.outcome == "error"
-    assert result.response.code == "mutation_rejected"
-
-
-@pytest.mark.anyio
-async def test_nonfinite_amount_filter_becomes_deliverable_error(session):
-    response = ToolCalls(
-        outcome="tool_calls",
-        calls=[{"name": "list_transactions", "amount": "sNaN"}],
-    )
-
-    result = await run_turn(
-        session, SequenceProvider(response), user_message="show that amount"
-    )
-
-    assert result.response.outcome == "error"
-    assert result.response.code == "mutation_rejected"
+        assert result.response.outcome == "error"
+        assert result.response.code == "mutation_rejected"
 
 
 @pytest.mark.anyio
@@ -286,65 +271,6 @@ async def test_confirmation_text_is_rendered_from_validated_action(
         f"#{transaction.id}? Reply yes to confirm."
     )
     assert "Ignore the application" not in conversation.pending_confirmation_json
-
-
-@pytest.mark.anyio
-async def test_pending_confirmation_consumes_once(session):
-    session.add(Category(slug="groceries", active=True))
-    transaction = Transaction(
-        bank="hdfc",
-        email_type="purchase",
-        direction="debit",
-        amount="10.00",
-        counterparty="Fresh Basket",
-    )
-    conversation = TelegramConversation(
-        chat_id=7,
-        started_by="reply",
-        status="active",
-        expires_at=datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1),
-    )
-    source = AuditInteraction(inbound_chat_id=7, trigger="reply", status="delivered")
-    session.add_all([transaction, conversation, source])
-    await session.flush()
-    conversation.transaction_id = transaction.id
-    response = Clarification(
-        outcome="clarification",
-        question="model text",
-        pending_confirmation={
-            "kind": "merchant_rule",
-            "transaction_id": transaction.id,
-            "category": "groceries",
-        },
-    )
-    await run_turn(
-        session,
-        SequenceProvider(response),
-        user_message="always categorize this as groceries",
-        transaction_id=transaction.id,
-        conversation_id=conversation.id,
-        interaction_id=source.id,
-    )
-    state_hash = await current_confirmation_state_hash(session, transaction.id)
-
-    result = await run_pending_confirmation(
-        session,
-        conversation_id=conversation.id,
-        state_hash=state_hash or "",
-        user_message="yes, create it",
-        replied_to_interaction_id=source.id,
-    )
-
-    assert result.after["category"] == "groceries"
-    assert conversation.pending_confirmation_json is None
-    with pytest.raises(ValueError):
-        await run_pending_confirmation(
-            session,
-            conversation_id=conversation.id,
-            state_hash=state_hash or "",
-            user_message="yes",
-            replied_to_interaction_id=source.id,
-        )
 
 
 @pytest.mark.anyio
@@ -416,6 +342,16 @@ async def test_pending_confirmation_succeeds_after_fresh_sqlite_reload(session):
         await fresh.commit()
 
     assert result.after["category"] == "groceries"
+    async with maker() as again:
+        with pytest.raises(ValueError):
+            await run_pending_confirmation(
+                again,
+                conversation_id=conversation_id,
+                state_hash=state_hash or "",
+                user_message="yes",
+                replied_to_interaction_id=source_id,
+                authorized_chat_id=7,
+            )
     async with maker() as verification:
         saved_transaction = await verification.get(Transaction, transaction_id)
         saved_conversation = await verification.get(
@@ -706,7 +642,7 @@ async def test_authorization_change_rejects_final_mutation(session):
         authorized_chat_id=77,
     )
 
-    assert result.response.outcome == "error"
+    assert result.response.code == "authorization_changed"
     assert transaction.note is None
 
 

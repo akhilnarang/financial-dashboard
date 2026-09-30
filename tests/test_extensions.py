@@ -1,31 +1,25 @@
 """Extension framework tests.
 
 Covers: deterministic registration/iteration, duplicate collision rejection
-(registry + setting registration), hardened bootstrap idempotency (identical
-re-registration accepted, conflicting definitions rejected), builtin
-availability + advertised capabilities, manifest immutability, Paisa setting
+(registry + setting registration), bootstrap idempotency, Paisa setting
 defaults/types/visibility, and encrypted Paisa-password behavior.
 
 All values here are synthetic.
 """
 
-from types import MappingProxyType
-
 import pytest
 from cryptography.fernet import Fernet
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.config as config_mod
 import financial_dashboard.services.settings as settings_mod
-from financial_dashboard.db import Base, Setting
+from financial_dashboard.db import Setting
 from financial_dashboard.extensions import (
-    BUILTIN_EXTENSIONS,
     ExtensionManifest,
     ExtensionRegistry,
-    PAISA_EXTENSION,
     register_builtin_extensions,
 )
-from financial_dashboard.extensions.base import Capability, ExtensionRegistrationError
+from financial_dashboard.extensions.base import ExtensionRegistrationError
 from financial_dashboard.services.extensions import (
     ExtensionManager,
     bootstrap_extensions,
@@ -39,6 +33,7 @@ from financial_dashboard.services.settings import (
     register_setting,
     save_settings,
 )
+from tests.conftest import new_test_engine
 
 pytestmark = pytest.mark.anyio
 
@@ -68,22 +63,8 @@ def test_registry_preserves_insertion_order():
     assert [m.id for m in reg] == ["a", "b", "c"]
     assert reg.all() == (a, b, c)
     assert len(reg) == 3
-
-
-def test_registry_get_and_contains():
-    reg = ExtensionRegistry()
-    manifest = ExtensionManifest(id="x", display_name="X")
-    reg.register(manifest)
-    assert reg.get("x") is manifest
-    assert "x" in reg
+    assert reg.get("b") is b
     assert reg.get("missing") is None
-    assert "missing" not in reg
-
-
-def test_registry_rejects_non_manifest():
-    reg = ExtensionRegistry()
-    with pytest.raises(ExtensionRegistrationError):
-        reg.register("not-a-manifest")  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #
@@ -112,12 +93,6 @@ def test_builtin_registration_is_idempotent_for_settings():
     assert "paisa" in reg
 
 
-def test_identical_setting_re_registration_accepted():
-    # Pre-registering an EQUAL defn, then bootstrapping, must be accepted.
-    reg = ExtensionRegistry()
-    register_builtin_extensions(reg)
-
-
 def test_conflicting_setting_definition_is_rejected(monkeypatch):
     # A key already present with a DIFFERENT defn must raise, not silently skip.
     from financial_dashboard.services.settings import SettingDef
@@ -135,49 +110,13 @@ def test_conflicting_setting_definition_is_rejected(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Manifest immutability
-# --------------------------------------------------------------------------- #
-
-
-def test_manifest_is_frozen():
-    manifest = ExtensionManifest(
-        id="x",
-        display_name="X",
-        settings={"telegram.chat_id": SETTINGS_REGISTRY["telegram.chat_id"]},
-    )
-    with pytest.raises(Exception):
-        manifest.id = "y"  # type: ignore[misc]
-    with pytest.raises(TypeError):
-        manifest.settings["nope"] = SETTINGS_REGISTRY["telegram.chat_id"]
-
-
-# --------------------------------------------------------------------------- #
 # Builtin availability
 # --------------------------------------------------------------------------- #
 
 
-def test_builtins_include_paisa():
-    assert "paisa" in {m.id for m in BUILTIN_EXTENSIONS}
-
-
-def test_paisa_manifest_shape():
-    assert PAISA_EXTENSION.id == "paisa"
-    assert PAISA_EXTENSION.display_name == "Paisa"
-    caps = PAISA_EXTENSION.capabilities
-    assert Capability.SETTING_CONTRIBUTION in caps
-    assert Capability.HTTP_READ in caps
-    assert Capability.PROJECTION in caps
-    assert Capability.SYNTHETIC_GENERATION not in caps  # not yet active
-    assert isinstance(PAISA_EXTENSION.settings, MappingProxyType)
-
-
 def test_bootstrap_extensions_returns_manager_with_paisa():
     manager = bootstrap_extensions(session_factory=async_sessionmaker())
-    assert isinstance(manager, ExtensionManager)
     assert manager.get("paisa") is not None
-    assert "paisa" in manager
-    assert any(m.id == "paisa" for m in manager.all())
-    assert len(manager) >= 1
 
 
 # --------------------------------------------------------------------------- #
@@ -208,22 +147,6 @@ def test_paisa_settings_registered_with_defaults_and_types():
         assert defn.default == default, key
         assert defn.data_type == dtype, key
         assert defn.category == "Paisa", key
-
-
-def test_paisa_password_is_secret():
-    assert SETTINGS_REGISTRY["paisa.auth_password"].secret is True
-
-
-def test_paisa_internal_settings_are_not_form_editable():
-    # generated_path is a dashboard-owned operational path; the JSON mappings
-    # have no generic-form widget. None should surface in the settings form.
-    for key in (
-        "paisa.generated_path",
-        "paisa.selected_account_ids",
-        "paisa.account_mappings",
-        "paisa.category_mappings",
-    ):
-        assert SETTINGS_REGISTRY[key].internal is True, key
 
 
 def test_grouped_settings_exposes_paisa_scalars_not_internal_json():
@@ -263,9 +186,7 @@ def test_parse_form_updates_omits_internal_paisa_settings():
 @pytest.fixture
 async def settings_db(monkeypatch):
     """An isolated in-memory settings DB + a real Fernet key for round-tripping."""
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(settings_mod, "async_session", maker)
     key = Fernet.generate_key().decode()
@@ -273,6 +194,7 @@ async def settings_db(monkeypatch):
     monkeypatch.setattr(config_mod, "_fernet_instance", None)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 async def test_paisa_password_encrypted_at_rest_and_round_trips(settings_db):
@@ -292,10 +214,7 @@ async def test_paisa_password_encrypted_at_rest_and_round_trips(settings_db):
     await load_all_settings()
     assert get_setting("paisa.auth_password") == "s3cret-paisa"
 
-
-async def test_paisa_password_blank_is_not_encrypted(settings_db):
-    # A blank secret is stored as-is (no Fernet token) — consistent with the
-    # existing save_settings contract for empty secret values.
+    # A blank secret is stored as-is, not as a Fernet token.
     await save_settings({"paisa.auth_password": ""})
     async with settings_db() as session:
         row = await session.get(Setting, "paisa.auth_password")

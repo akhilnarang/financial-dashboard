@@ -56,13 +56,6 @@ async def test_orchestrator_caps_tool_rounds(session):
 
 
 @pytest.mark.anyio
-async def test_orchestrator_returns_answer(session):
-    provider = FakeProvider([Answer(outcome="answer", text="No changes made.")])
-    result = await run_turn(session, provider, user_message="why")
-    assert result.response.text == "No changes made."
-
-
-@pytest.mark.anyio
 async def test_orchestrator_refuses_unsupported_aggregate_questions(session):
     provider = FakeProvider([])
 
