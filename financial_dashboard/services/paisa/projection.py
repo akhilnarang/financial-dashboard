@@ -61,6 +61,7 @@ from financial_dashboard.services.paisa.accounting import (
     KIND_INVESTMENT,
     KIND_LOT,
     KIND_OPENING,
+    KIND_LIABILITY,
     KIND_REPAYMENT,
     KIND_SELF_TRANSFER,
     KIND_UNKNOWN,
@@ -114,6 +115,8 @@ from financial_dashboard.services.settings import get_setting
 #   (asset movement, not expense/income).
 # * ``repayment`` → Equity:Transfers In (non-income clearing root — somebody
 #   paying you back is not earned income).
+# * ``personal_loan`` / ``passthrough`` → a Liabilities account (money the owner
+#   owes, not income or spend).
 # * ``self_transfer`` / ``credit_card_payment`` stay special-cased above this
 #   table (a self-transfer pair is one balanced transfer; a card payment is a
 #   bank→liability transfer).
@@ -143,6 +146,7 @@ DASHBOARD_KINDS = frozenset(
         KIND_CONTRA_EXPENSE,
         KIND_INVESTMENT,
         KIND_REPAYMENT,
+        KIND_LIABILITY,
         KIND_SELF_TRANSFER,
         KIND_CARD_PAYMENT,
         KIND_OPENING,

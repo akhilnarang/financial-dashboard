@@ -478,12 +478,12 @@
         <table>
             <tbody>
                 <tr data-footnote="internal">
-                    {#- `internal=1` under `scope=bank` is self-transfers alone, which is
+                    {#- `internal=1` under `scope=bank` is the owner-neutral slugs alone, which is
                         exactly what this footnote counts: over the bank a card bill is
                         money gone, so it reads as expense above and an unscoped link
                         here would list bills this row never counted. -#}
                     <td><a href="/transactions?internal=1&amp;{{ bank_qs }}">Internal movements</a></td>
-                    <td class="text-sm text-muted">{{ fn.internal_count }} txns &middot; self-transfers, in neither income nor expense &middot; gross {{ fn.internal_gross|inr_exact }} &middot; net {{ fn.internal_net|inr_exact }} (rough figure &mdash; may mix currencies)</td>
+                    <td class="text-sm text-muted">{{ fn.internal_count }} txns &middot; self-transfers, passthrough and personal loans, in neither income nor expense &middot; gross {{ fn.internal_gross|inr_exact }} &middot; net {{ fn.internal_net|inr_exact }} (rough figure &mdash; may mix currencies)</td>
                 </tr>
                 <tr data-footnote="family">
                     {#- Family rows span every account (a family member's card swipe as

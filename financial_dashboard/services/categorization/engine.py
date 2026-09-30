@@ -18,6 +18,7 @@ from financial_dashboard.services.categorization.rules import (
     match_rules,
 )
 from financial_dashboard.services.categorization.polarity import resolve_direction
+from financial_dashboard.services.categorization.slugs import MANUAL_ONLY_SLUGS
 from financial_dashboard.services.categorization.self_transfer import (
     apply_reference_self_transfer_rule,
 )
@@ -145,7 +146,7 @@ async def categorize_one(
     active_slugs = [
         s
         for s in (await get_active_slugs(session))
-        if s not in {"self_transfer", "passthrough", "personal_loan"}
+        if s != "self_transfer" and s not in MANUAL_ONLY_SLUGS
     ]
     examples = await get_similar_examples(
         session, counterparty=txn.counterparty, direction=txn.direction, limit=5
