@@ -35,6 +35,11 @@ CREDIT_CARD_PAYMENT_SLUG = "credit_card_payment"
 INCOME_CATEGORY_SLUGS = frozenset({"salary", "interest", "other_income", "tax_refund"})
 CONTRA_EXPENSE_CATEGORY_SLUGS = frozenset({"refund", "cashback_rewards"})
 INVESTMENT_CATEGORY_SLUGS = frozenset({"investment", "investment_redemption"})
+# Money the owner owes: a loan from a person, or money held for someone else.
+LIABILITY_CATEGORY_ACCOUNTS = {
+    "personal_loan": "Liabilities:Personal Loan",
+    "passthrough": "Liabilities:Passthrough",
+}
 
 # Closed dashboard_kind taxonomy. Every emitted entry carries exactly one.
 KIND_EXPENSE = "expense"
@@ -42,6 +47,7 @@ KIND_INCOME = "income"
 KIND_CONTRA_EXPENSE = "contra_expense"
 KIND_INVESTMENT = "investment"
 KIND_REPAYMENT = "repayment"
+KIND_LIABILITY = "liability"
 KIND_SELF_TRANSFER = "self_transfer"
 KIND_CARD_PAYMENT = "card_payment"
 KIND_OPENING = "opening"
@@ -119,6 +125,8 @@ def category_kind(slug: str) -> str:
         return KIND_INVESTMENT
     if slug == REPAYMENT_SLUG:
         return KIND_REPAYMENT
+    if slug in LIABILITY_CATEGORY_ACCOUNTS:
+        return KIND_LIABILITY
     if slug in ("", "unknown", "misc"):
         return KIND_UNKNOWN
     return KIND_EXPENSE
@@ -147,6 +155,8 @@ def contra_account(
         raw = INVESTMENT_UNALLOCATED_ACCOUNT
     elif kind == KIND_REPAYMENT:
         raw = REPAYMENT_CLEARING_ACCOUNT
+    elif kind == KIND_LIABILITY:
+        raw = LIABILITY_CATEGORY_ACCOUNTS[slug]
     elif kind == KIND_INCOME:
         raw = f"Income:{title}"
     elif kind == KIND_CONTRA_EXPENSE:
@@ -191,6 +201,7 @@ __all__ = [
     "KIND_EXPENSE",
     "KIND_INCOME",
     "KIND_INVESTMENT",
+    "KIND_LIABILITY",
     "KIND_LOT",
     "KIND_VALUATION",
     "KIND_OPENING",

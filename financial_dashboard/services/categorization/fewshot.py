@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import Transaction
 from financial_dashboard.services.categorization.normalize import normalize_counterparty
+from financial_dashboard.services.categorization.slugs import MANUAL_ONLY_SLUGS
 
 
 class FewShotExample(NamedTuple):
@@ -53,6 +54,7 @@ async def get_similar_examples(
         .where(
             Transaction.direction == direction,
             Transaction.category.is_not(None),
+            Transaction.category.not_in(MANUAL_ONLY_SLUGS),
             Transaction.category_method.in_(("manual", "rule")),
         )
         .order_by(Transaction.created_at.desc())

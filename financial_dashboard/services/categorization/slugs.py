@@ -19,6 +19,10 @@ REPAYMENT_SLUG = "repayment"
 # cashflow report counts it as neither income nor spend:
 CREDIT_CARD_PAYMENT_SLUG = "credit_card_payment"
 
+# Slugs only the owner can set. A narration cannot show that money is a loan
+# from a person or is held for someone else, so the LLM never gets them.
+MANUAL_ONLY_SLUGS = frozenset({"passthrough", "personal_loan"})
+
 # A merchant handing money back:
 REFUND_SLUG = "refund"
 
