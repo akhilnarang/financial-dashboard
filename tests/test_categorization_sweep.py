@@ -1,4 +1,5 @@
 # tests/test_categorization_sweep.py
+import json
 from decimal import Decimal
 
 import pytest
@@ -52,10 +53,11 @@ async def test_rule_sweep_categorizes_interest_rows(memdb):
         assert row.category_method == "rule"
 
 
-@pytest.mark.parametrize("prompt_failed", [False, True])
+@pytest.mark.parametrize("prompt", ["sent", "failed", "assistant"])
 async def test_sweeps_retry_review_once_after_vocabulary_changes(
-    memdb, monkeypatch, prompt_failed
+    memdb, monkeypatch, prompt
 ):
+    prompt_failed = prompt == "failed"
     from sqlalchemy import select
 
     from financial_dashboard.db.models import (
@@ -117,8 +119,16 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         assert row.review_status == "pending"
         row.review_status = "notified"
         s.add(Category(slug="groceries", active=True))
+        decision = await s.scalar(select(CategoryReviewDecision))
+        if prompt == "assistant":
+            # An assistant proposal stores its candidates with "slug" keys.
+            decision.candidates_json = json.dumps(
+                [
+                    {"slug": "groceries", "reason": "r", "confidence": 0.4},
+                    {"slug": "food", "reason": "r", "confidence": 0.2},
+                ]
+            )
         if prompt_failed:
-            decision = await s.scalar(select(CategoryReviewDecision))
             s.add(
                 TelegramOutboundDelivery(
                     category_review_decision_id=decision.id,

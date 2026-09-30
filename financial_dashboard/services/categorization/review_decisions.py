@@ -87,6 +87,19 @@ def candidates_from_result(result: LlmResult) -> list[dict[str, object]]:
     return output
 
 
+def _candidate_slugs(candidates_json: str) -> set[str]:
+    """Return the slugs of stored candidates.
+
+    The classifier stores ``category`` keys. An assistant proposal stores
+    ``slug`` keys.
+    """
+    return {
+        row.get("category", row.get("slug"))
+        for row in json.loads(candidates_json)
+        if isinstance(row, dict)
+    }
+
+
 async def create_or_reuse_decision(
     session: AsyncSession,
     txn: Transaction,
@@ -119,8 +132,7 @@ async def create_or_reuse_decision(
     if (
         existing is not None
         and existing.category_input_hash == txn.category_input_hash
-        and {c["category"] for c in json.loads(existing.candidates_json)}
-        == {c["category"] for c in candidates}
+        and _candidate_slugs(existing.candidates_json) == _candidate_slugs(encoded)
         and (existing.expires_at is None or as_utc(existing.expires_at) > now)
     ):
         return existing
@@ -186,13 +198,7 @@ async def consume_decision(
     txn = await session.get(Transaction, decision.transaction_id)
     if txn is None:
         return None
-    candidate_rows = json.loads(decision.candidates_json)
-    candidate_slugs = {
-        row.get("category", row.get("slug"))
-        for row in candidate_rows
-        if isinstance(row, dict)
-    }
-    if selected_slug not in candidate_slugs:
+    if selected_slug not in _candidate_slugs(decision.candidates_json):
         return None
     if decision.source_interaction_id is None and txn.review_status not in {
         "pending",
