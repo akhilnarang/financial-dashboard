@@ -48,7 +48,9 @@ def test_consistent_with_polarity_except_rehomings():
 
 
 def test_internal_slugs_excluded():
-    assert INTERNAL_SLUGS == frozenset({"self_transfer", "credit_card_payment"})
+    assert INTERNAL_SLUGS == frozenset(
+        {"self_transfer", "passthrough", "personal_loan", "credit_card_payment"}
+    )
     assert BUCKET_BY_SLUG["self_transfer"] == "internal"
     assert BUCKET_BY_SLUG["credit_card_payment"] == "internal"
 
@@ -62,9 +64,10 @@ def test_card_payment_is_the_one_slug_whose_bucket_depends_on_scope():
     assert bucket_for_slug("credit_card_payment", scope=None) == "internal"
 
 
-def test_self_transfer_is_internal_under_every_scope():
-    assert bucket_for_slug("self_transfer", scope="bank") == "internal"
-    assert bucket_for_slug("self_transfer") == "internal"
+def test_owner_neutral_slugs_are_internal_under_every_scope():
+    for slug in ("self_transfer", "passthrough", "personal_loan"):
+        assert bucket_for_slug(slug, scope="bank") == "internal"
+        assert bucket_for_slug(slug) == "internal"
 
 
 def test_scope_changes_no_other_slug():
@@ -76,7 +79,9 @@ def test_scope_changes_no_other_slug():
 
 def test_internal_slugs_narrow_under_bank_scope():
     # What the footnote counts and what its drill-through lists are one set.
-    assert internal_slugs_for_scope("bank") == frozenset({"self_transfer"})
+    assert internal_slugs_for_scope("bank") == frozenset(
+        {"self_transfer", "passthrough", "personal_loan"}
+    )
     assert internal_slugs_for_scope() == INTERNAL_SLUGS
     assert internal_slugs_for_scope(None) == INTERNAL_SLUGS
 

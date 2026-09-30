@@ -143,7 +143,9 @@ async def categorize_one(
         return "llm"
 
     active_slugs = [
-        s for s in (await get_active_slugs(session)) if s != "self_transfer"
+        s
+        for s in (await get_active_slugs(session))
+        if s not in {"self_transfer", "passthrough", "personal_loan"}
     ]
     examples = await get_similar_examples(
         session, counterparty=txn.counterparty, direction=txn.direction, limit=5

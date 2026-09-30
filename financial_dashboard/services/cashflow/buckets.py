@@ -36,14 +36,27 @@ logger = logging.getLogger(__name__)
 # of a slug that vocabulary already names.
 TRANSFERS_IN_SLUG = REPAYMENT_SLUG
 SELF_TRANSFER_SLUG = "self_transfer"
+# Money that enters and leaves on behalf of someone else. It is not the owner's.
+PASSTHROUGH_SLUG = "passthrough"
+# A loan from a person, and the owner paying it back. It moves debt, not wealth.
+PERSONAL_LOAN_SLUG = "personal_loan"
 # Family members' spending routed through the owner's cards, and the repayments.
 FAMILY_SLUG = "family"
 # Credits that reduce spend rather than count as income.
 CONTRA_EXPENSE_SLUGS = frozenset({"refund", "cashback_rewards", "reimbursement"})
-INTERNAL_SLUGS = frozenset({SELF_TRANSFER_SLUG, CREDIT_CARD_PAYMENT_SLUG})
-# Over the bank, a card bill is spend, so the only movement left that is internal
-# to the perimeter is money the owner sent themselves.
-BANK_INTERNAL_SLUGS = frozenset({SELF_TRANSFER_SLUG})
+INTERNAL_SLUGS = frozenset(
+    {
+        SELF_TRANSFER_SLUG,
+        PASSTHROUGH_SLUG,
+        PERSONAL_LOAN_SLUG,
+        CREDIT_CARD_PAYMENT_SLUG,
+    }
+)
+# Over the bank, a card bill is spend, so the only movements left that are
+# internal to the perimeter are self-transfers, passthrough money and personal loans.
+BANK_INTERNAL_SLUGS = frozenset(
+    {SELF_TRANSFER_SLUG, PASSTHROUGH_SLUG, PERSONAL_LOAN_SLUG}
+)
 
 # Re-homings out of the income guard, so the report shows earnings rather than
 # every credit: refund and cashback_rewards are money back on a purchase, so they
