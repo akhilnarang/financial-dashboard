@@ -187,7 +187,12 @@ async def test_orchestrator_renews_lease_between_provider_tool_rounds(session):
 
 
 @pytest.mark.anyio
-async def test_multi_transaction_query_queues_individually_mapped_results(session):
+@pytest.mark.parametrize("rows", [1, 2])
+async def test_multi_transaction_query_queues_individually_mapped_results(
+    session, rows
+):
+    # A single row must also get its own card. The answer text must not be
+    # bound to a row that it does not show.
     transactions = [
         Transaction(
             bank="test",
@@ -196,7 +201,7 @@ async def test_multi_transaction_query_queues_individually_mapped_results(sessio
             amount=amount,
             counterparty=counterparty,
         )
-        for amount, counterparty in [(10, "ONE"), (20, "TWO")]
+        for amount, counterparty in [(10, "ONE"), (20, "TWO")][:rows]
     ]
     interaction = AuditInteraction(
         inbound_chat_id=7,
@@ -241,11 +246,10 @@ async def test_multi_transaction_query_queues_individually_mapped_results(sessio
     )
     assert [delivery.transaction_id for delivery in deliveries] == [
         None,
-        transactions[0].id,
-        transactions[1].id,
+        *(transaction.id for transaction in transactions),
     ]
-    assert "#1" in deliveries[1].text
-    assert "#2" in deliveries[2].text
+    for delivery, transaction in zip(deliveries[1:], transactions, strict=True):
+        assert f"#{transaction.id}" in delivery.text
     await session.refresh(interaction)
     assert interaction.outcome == "query_result"
     assert interaction.model_input_json is not None

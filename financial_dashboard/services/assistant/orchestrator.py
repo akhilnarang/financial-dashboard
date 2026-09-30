@@ -1012,9 +1012,6 @@ async def _queue_result(
     ):
         raise RuntimeError("assistant processing lease was lost")
 
-    mapped_transaction_id = transaction_id
-    if mapped_transaction_id is None and len(result.transaction_ids) == 1:
-        mapped_transaction_id = result.transaction_ids[0]
     chunks = split_plain_text(response_text, limit=4000)
     delivery_ids: list[int] = []
     for ordinal, chunk in enumerate(chunks):
@@ -1023,7 +1020,7 @@ async def _queue_result(
             text=chunk,
             ordinal=ordinal,
             interaction_id=interaction_id,
-            transaction_id=mapped_transaction_id,
+            transaction_id=transaction_id,
             parse_mode=None,
         )
         session.add(delivery)
@@ -1069,7 +1066,9 @@ async def _queue_result(
                     separators=(",", ":"),
                 )
         delivery_ids.append(delivery.id)
-    if transaction_id is None and len(result.transaction_ids) > 1:
+    # Each row read gets its own card. A reply then targets a row that the
+    # user can see, never a row that the answer text does not show.
+    if transaction_id is None and result.transaction_ids:
         for transaction_result_id in result.transaction_ids:
             transaction_result = await session.get(Transaction, transaction_result_id)
             if transaction_result is None:
