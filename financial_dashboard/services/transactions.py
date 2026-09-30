@@ -14,6 +14,11 @@ from financial_dashboard.services.cc_disambiguation import (
 logger = logging.getLogger(__name__)
 
 
+class NoteResult(NamedTuple):
+    ok: bool
+    note: str | None
+
+
 class RelinkError(Exception):
     """Raised when a manual relink request can't be honored."""
 
@@ -36,14 +41,25 @@ async def update_transaction_note(
     session: AsyncSession,
     txn_id: int,
     note: str,
-) -> tuple[bool, str | None]:
-    cleaned = note.strip()
+) -> NoteResult:
+    result = await update_transaction_note_no_commit(session, txn_id, note)
+    if result[0]:
+        await session.commit()
+        # Preserve the public API's historical clear response (empty string)
+        # while the stored value and no-commit mutation snapshot remain NULL.
+        return NoteResult(ok=True, note=note.strip())
+    return result
+
+
+async def update_transaction_note_no_commit(
+    session: AsyncSession, txn_id: int, note: str
+) -> NoteResult:
     txn = await session.get(Transaction, txn_id)
     if not txn:
-        return False, None
+        return NoteResult(ok=False, note=None)
+    cleaned = note.strip()
     txn.note = cleaned or None
-    await session.commit()
-    return True, cleaned
+    return NoteResult(ok=True, note=cleaned or None)
 
 
 class ExcludeResult(NamedTuple):
@@ -62,11 +78,19 @@ async def set_transaction_excluded(
     does not toggle. The row keeps its category and every other view. Only the
     cashflow report reads this flag. ``ok`` is False when no such row exists.
     """
+    result = await set_transaction_excluded_no_commit(session, txn_id, excluded)
+    if result.ok:
+        await session.commit()
+    return result
+
+
+async def set_transaction_excluded_no_commit(
+    session: AsyncSession, txn_id: int, excluded: bool
+) -> ExcludeResult:
     txn = await session.get(Transaction, txn_id)
     if txn is None:
         return ExcludeResult(ok=False, exclude_from_cashflow=False)
     txn.exclude_from_cashflow = excluded
-    await session.commit()
     return ExcludeResult(ok=True, exclude_from_cashflow=excluded)
 
 

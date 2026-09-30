@@ -14,6 +14,13 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import StatementUpload, Transaction
+from financial_dashboard.services.assistant.message_context import (
+    move_transaction_references,
+)
+from financial_dashboard.services.categorization.decision_lifecycle import (
+    supersede_active_decisions,
+)
+from financial_dashboard.services.categorization.engine import requeue_after_enrichment
 from financial_dashboard.services.statements.cc import (
     parse_cc_amount,
     parse_cc_date,
@@ -190,6 +197,17 @@ async def answer(
             return SettlementResult("stale", None)
 
         _merge(entry, target, upload.id)
+        if target.attachment_path is None:
+            target.attachment_path = recorded.attachment_path
+        elif recorded.attachment_path is not None:
+            logger.warning(
+                "Settlement dropped receipt %s of transaction %s",
+                recorded.attachment_path,
+                recorded.id,
+            )
+        await supersede_active_decisions(session, recorded.id)
+        await move_transaction_references(session, recorded.id, target.id)
+        await requeue_after_enrichment(session, target)
 
         await session.delete(recorded)
         entry["imported_txn_id"] = target.id

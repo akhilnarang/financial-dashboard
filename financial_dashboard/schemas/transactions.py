@@ -125,6 +125,8 @@ class TransactionDetailResponse(TransactionRead):
     raw_description_truncated: bool
     note: str | None
     note_truncated: bool
+    attachment_path: str | None
+    has_attachment: bool
     category_confidence: float | None
     category_model: str | None
     category_input_hash: str | None

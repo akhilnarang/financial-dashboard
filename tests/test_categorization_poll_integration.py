@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 import pytest
 
 from financial_dashboard.services import fetch as fetch_mod
@@ -5,8 +7,12 @@ from financial_dashboard.services import fetch as fetch_mod
 pytestmark = pytest.mark.anyio
 
 
-async def test_run_categorization_cycle_invokes_all(monkeypatch):
+async def test_run_categorization_cycle_invokes_all(monkeypatch, session):
     calls = []
+
+    @asynccontextmanager
+    async def test_session():
+        yield session
 
     async def fake_rule(**k):
         calls.append("rule")
@@ -27,6 +33,7 @@ async def test_run_categorization_cycle_invokes_all(monkeypatch):
     monkeypatch.setattr(fetch_mod, "run_rule_sweep", fake_rule)
     monkeypatch.setattr(fetch_mod, "run_llm_sweep", fake_llm)
     monkeypatch.setattr(fetch_mod, "run_review_notify", fake_notify)
+    monkeypatch.setattr(fetch_mod, "async_session", test_session)
 
     await fetch_mod.run_categorization_cycle()
     assert calls == ["refresh", "rule", "llm", "notify"]

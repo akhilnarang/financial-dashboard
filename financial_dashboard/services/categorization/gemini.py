@@ -25,6 +25,18 @@ _RESPONSE_SCHEMA: dict[str, object] = {
         "category": {"type": "string"},
         "confidence": {"type": "number"},
         "reason": {"type": "string"},
+        "candidates": {
+            "type": "array",
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["category", "confidence"],
+            },
+        },
     },
     "required": ["category", "confidence", "reason"],
 }

@@ -13,6 +13,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from financial_dashboard.db import Account, Base, StatementUpload, Transaction
+from financial_dashboard.db.models import (
+    AuditInteraction,
+    TelegramConversation,
+    TelegramMessageContext,
+)
 from financial_dashboard.services.statement_settlement import (
     HeldRow,
     MatchedRow,
@@ -149,6 +154,32 @@ async def test_a_fold_states_what_the_statement_states(maker):
     async with maker() as session:
         alert = await session.get(Transaction, 1)
         alert.transaction_date = datetime.date(2026, 4, 6)
+        recorded = await session.get(Transaction, 2)
+        recorded.attachment_path = "receipt.jpg"
+        session.add(
+            TelegramMessageContext(
+                chat_id=7,
+                message_id=1,
+                transaction_id=2,
+                context_kind="transaction_notification",
+            )
+        )
+        session.add(
+            AuditInteraction(
+                inbound_chat_id=7, trigger="reply", status="claimed", transaction_id=2
+            )
+        )
+        session.add(
+            TelegramConversation(
+                chat_id=7,
+                started_by="reply",
+                transaction_id=2,
+                pending_confirmation_json=json.dumps(
+                    {"action": {"kind": "merchant_rule", "transaction_id": 2}}
+                ),
+                pending_confirmation_kind="merchant_rule",
+            )
+        )
         await session.commit()
 
     async with maker() as session:
@@ -162,6 +193,18 @@ async def test_a_fold_states_what_the_statement_states(maker):
         datetime.date(2026, 4, 7),
         NARRATION,
     )
+    # SQLite can reuse id 2. A reply to the old message must reach the survivor.
+    async with maker() as session:
+        context = await session.scalar(select(TelegramMessageContext))
+        queued = await session.scalar(select(AuditInteraction))
+        conversation = await session.scalar(select(TelegramConversation))
+    assert (context.transaction_id, queued.transaction_id, row.attachment_path) == (
+        1,
+        1,
+        "receipt.jpg",
+    )
+    # A later "yes" must not apply an action that names the deleted id.
+    assert conversation.pending_confirmation_json is None
 
 
 async def test_only_the_row_the_prompt_showed_is_folded_once(maker):

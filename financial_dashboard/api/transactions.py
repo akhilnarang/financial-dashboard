@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Annotated
 
 from fastapi import APIRouter, Path, Query
+from fastapi.responses import FileResponse
 
 from financial_dashboard.api.query import validate_date_range
 from financial_dashboard.core.deps import AsyncSessionDep
@@ -32,6 +33,11 @@ from financial_dashboard.services.transactions import (
     set_transaction_excluded,
     update_transaction_category,
     update_transaction_note,
+)
+from financial_dashboard.services.transaction_attachments import (
+    AttachmentError,
+    detect_attachment_type,
+    resolve_attachment_path,
 )
 
 router = APIRouter()
@@ -106,6 +112,33 @@ async def transaction_detail(
         return transaction
 
     raise NotFoundException(detail="Transaction not found")
+
+
+@router.get("/transactions/{txn_id}/attachment")
+async def transaction_attachment(
+    txn_id: Annotated[DatabaseId, Path()],
+    session: AsyncSessionDep,
+) -> FileResponse:
+    """Serve one stored receipt through the API's normal auth dependency."""
+    from financial_dashboard.db import Transaction
+
+    transaction = await session.get(Transaction, txn_id)
+    if transaction is None or transaction.attachment_path is None:
+        raise NotFoundException(detail="Transaction attachment not found")
+    try:
+        target = resolve_attachment_path(transaction.attachment_path)
+        with target.open("rb") as stored:
+            media_type, suffix = detect_attachment_type(stored.read(16))
+    except (AttachmentError, OSError) as exc:
+        raise NotFoundException(detail="Transaction attachment not found") from exc
+    disposition = "inline" if media_type.startswith("image/") else "attachment"
+    filename = f"transaction-{txn_id}-receipt{suffix}"
+    return FileResponse(
+        target,
+        media_type=media_type,
+        filename=filename,
+        content_disposition_type=disposition,
+    )
 
 
 @router.post("/transactions/{txn_id}/note")

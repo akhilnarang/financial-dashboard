@@ -1,4 +1,5 @@
 # tests/test_categorization_sweep.py
+import json
 from decimal import Decimal
 
 import pytest
@@ -52,7 +53,38 @@ async def test_rule_sweep_categorizes_interest_rows(memdb):
         assert row.category_method == "rule"
 
 
-async def test_rule_sweep_marks_unmatched_pending_and_terminates(memdb):
+@pytest.mark.parametrize("prompt", ["sent", "failed", "assistant", "assistant_failed"])
+async def test_sweeps_retry_review_once_after_vocabulary_changes(
+    memdb, monkeypatch, prompt
+):
+    prompt_failed = prompt in ("failed", "assistant_failed")
+    from sqlalchemy import select
+
+    from financial_dashboard.db.models import (
+        AuditInteraction,
+        Category,
+        CategoryReviewDecision,
+        TelegramOutboundDelivery,
+    )
+    from financial_dashboard.services import settings
+    from financial_dashboard.services.categorization import engine, llm
+
+    monkeypatch.setitem(settings._cache, "category_vocab_version", "1")
+    monkeypatch.setitem(settings._cache, "categorization.enabled", "true")
+    monkeypatch.setattr(sweep, "get_active_llm_key", lambda: "test-key")
+    # Each run returns the same categories with a slightly different confidence.
+    runs = iter([0.40, 0.41])
+
+    async def classify(**kwargs):
+        confidence = next(runs)
+        return llm.LlmResult(
+            "groceries",
+            confidence,
+            "ambiguous",
+            (llm.LlmCandidate("groceries", confidence), llm.LlmCandidate("food", 0.2)),
+        )
+
+    monkeypatch.setattr(engine, "_llm_classify", classify)
     # An unmatched row becomes 'pending_llm' after the rule sweep, and a second
     # sweep finds zero never-touched rows (returns 0) — this is what lets the
     # backfill loop terminate with full coverage instead of re-evaluating forever.
@@ -76,36 +108,90 @@ async def test_rule_sweep_marks_unmatched_pending_and_terminates(memdb):
     assert second == 0  # nothing left untouched → backfill loop would terminate
 
     async with memdb() as s:
-        from sqlalchemy import select
-
         row = (await s.execute(select(Transaction))).scalars().one()
         assert row.category_method == "pending_llm"
         assert row.category is None
 
-
-def test_needs_llm_eligibility_guard():
-    """The re-check that closes the select→process window: eligible for the LLM
-    pass on never-evaluated / pending_llm / prior-'unknown' rows, but never on a
-    manual (or already-finalised) row — so a manual set mid-batch isn't clobbered."""
-    from financial_dashboard.db.models import Transaction
-
-    def txn(method, category=None):
-        return Transaction(
-            bank="b",
-            email_type="x",
-            direction="debit",
-            amount=Decimal("1"),
-            category_method=method,
-            category=category,
+    assert await sweep.run_llm_sweep() == 1
+    assert await sweep.run_llm_sweep() == 0
+    async with memdb() as s:
+        row = (await s.scalars(select(Transaction))).one()
+        assert row.category == "expense"
+        assert row.review_status == "pending"
+        row.review_status = "notified"
+        s.add(Category(slug="groceries", active=True))
+        decision = await s.scalar(select(CategoryReviewDecision))
+        # Another transaction's prompt failed. It must not look like this
+        # row's prompt.
+        other = CategoryReviewDecision(
+            transaction_id=row.id + 1, category_input_hash="other", candidates_json="[]"
         )
-
-    assert sweep._needs_llm(txn(None)) is True
-    assert sweep._needs_llm(txn("pending_llm")) is True
-    assert sweep._needs_llm(txn("llm", "unknown")) is True  # stale-unknown reprocess
-    # authoritative / finalised → never touched
-    assert sweep._needs_llm(txn("manual", "gift")) is False
-    assert sweep._needs_llm(txn("rule", "interest")) is False
-    assert sweep._needs_llm(txn("llm", "groceries")) is False
+        s.add(other)
+        await s.flush()
+        s.add(
+            TelegramOutboundDelivery(
+                category_review_decision_id=other.id,
+                transaction_id=row.id + 1,
+                recipient_chat_id=7,
+                text="Needs a category",
+                delivery_token="other-dead-prompt",
+                status="abandoned",
+            )
+        )
+        owner = {"category_review_decision_id": decision.id}
+        if prompt.startswith("assistant"):
+            # An assistant proposal stores its candidates with "slug" keys.
+            # The interaction that made it owns its delivery.
+            decision.candidates_json = json.dumps(
+                [
+                    {"slug": "groceries", "reason": "r", "confidence": 0.4},
+                    {"slug": "food", "reason": "r", "confidence": 0.2},
+                ]
+            )
+            interaction = AuditInteraction(
+                inbound_chat_id=7, trigger="reply", status="delivery_failed"
+            )
+            s.add(interaction)
+            await s.flush()
+            decision.source_interaction_id = interaction.id
+            owner = {"interaction_id": interaction.id}
+        if prompt_failed:
+            s.add(
+                TelegramOutboundDelivery(
+                    **owner,
+                    transaction_id=row.id,
+                    recipient_chat_id=7,
+                    text="Needs a category",
+                    delivery_token="dead-prompt",
+                    status="abandoned",
+                )
+            )
+        await s.commit()
+    monkeypatch.setitem(settings._cache, "category_vocab_version", "2")
+    assert await sweep.run_llm_sweep() == 1
+    assert await sweep.run_llm_sweep() == 0
+    async with memdb() as s:
+        row = (await s.scalars(select(Transaction))).one()
+        assert row.category == "expense"
+        # The same candidates reuse a sent prompt. A prompt that was never
+        # sent must be sent again.
+        assert row.review_status == ("pending" if prompt_failed else "notified")
+        assert row.category_vocab_version == 2
+        decisions = (
+            await s.scalars(
+                select(CategoryReviewDecision).where(
+                    CategoryReviewDecision.transaction_id == row.id
+                )
+            )
+        ).all()
+        assert [decision.status for decision in decisions] == (
+            ["superseded", "active"] if prompt_failed else ["active"]
+        )
+        row.category_method = "manual"
+        row.category_vocab_version = 1
+        row.review_status = "notified"
+        await s.commit()
+    assert await sweep.run_llm_sweep() == 0
 
 
 async def test_review_notify_links_id_and_escapes_fields(memdb, monkeypatch):

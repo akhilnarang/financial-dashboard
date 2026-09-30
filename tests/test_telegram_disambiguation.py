@@ -162,7 +162,12 @@ async def test_sms_duplicate_callback_rejects_wrong_chat(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_sms_duplicate_double_tap_loser_sees_already_resolved(monkeypatch):
+@pytest.mark.parametrize("late_tap", [False, True])
+async def test_sms_duplicate_double_tap_loser_sees_already_resolved(
+    monkeypatch, late_tap
+):
+    from telegram.error import BadRequest
+
     from financial_dashboard.services.sms_duplicate_resolution import (
         SmsDuplicateResolutionResult,
     )
@@ -171,7 +176,11 @@ async def test_sms_duplicate_double_tap_loser_sees_already_resolved(monkeypatch)
     query = MagicMock()
     query.data = "smsdup:v1:n:17"
     query.message.chat.id = 12345
-    query.answer = AsyncMock()
+    # Telegram rejects the answer to a tap replayed after a restart. The
+    # committed result must still reach the chat.
+    query.answer = AsyncMock(
+        side_effect=BadRequest("Query is too old") if late_tap else None
+    )
     query.edit_message_text = AsyncMock()
     update = MagicMock()
     update.callback_query = query
