@@ -4,11 +4,11 @@ import datetime
 import logging
 from decimal import Decimal
 from typing import NamedTuple
-from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from financial_dashboard.core.dates import IST, email_received_at_ist
 from financial_dashboard.db import (
     Account,
     BankStatementUpload,
@@ -67,8 +67,6 @@ def _serialize_datetime(value: datetime.datetime | None) -> str | None:
     return value.isoformat()
 
 
-_IST = ZoneInfo("Asia/Kolkata")
-
 # Email types known to emit transaction time in 12-hour format with no
 # AM/PM marker. Defined in services/parser_quirks because the same set
 # also gates the SMS-side alias-merge in services/txn_merge.
@@ -88,18 +86,6 @@ _RECEIVED_AT_FUTURE_TOLERANCE = datetime.timedelta(minutes=5)
 # at which point the data is unrecoverable from the email alone and we
 # leave the parsed time as-is.
 _RECEIVED_AT_PAST_LIMIT = datetime.timedelta(hours=12)
-
-
-def _received_at_ist(received_at: datetime.datetime) -> datetime.datetime:
-    """Convert an email Date header to IST.
-
-    Get the date and the time from ONE conversion to IST. An email that
-    arrives immediately after midnight IST has a different IST date than its
-    UTC date. A header with an unknown zone gives no time zone. Use IST.
-    """
-    if received_at.tzinfo is None:
-        return received_at.replace(tzinfo=_IST)
-    return received_at.astimezone(_IST)
 
 
 def _disambiguate_am_pm(
@@ -142,11 +128,11 @@ def _disambiguate_am_pm(
         # Body already on a 24-hour clock (hour > 12); unambiguous.
         return parsed_time
 
-    received_ist = _received_at_ist(received_at)
+    received_ist = email_received_at_ist(received_at)
 
     best: tuple[datetime.timedelta, datetime.time] | None = None
     for cand_time in candidates:
-        cand_dt = datetime.datetime.combine(transaction_date, cand_time, tzinfo=_IST)
+        cand_dt = datetime.datetime.combine(transaction_date, cand_time, tzinfo=IST)
         delta = cand_dt - received_ist
         # Reject candidates too far after the email arrived — the
         # transaction can't be in the email's future.
@@ -197,7 +183,7 @@ def _process_email_full(bank: str, raw_bytes: bytes) -> ProcessedEmailParse:
 
     transaction_date = txn.transaction_date
     received_at = _parse_email_date(raw_bytes)
-    received_ist = _received_at_ist(received_at) if received_at else None
+    received_ist = email_received_at_ist(received_at) if received_at else None
     if transaction_date is None and received_ist is not None:
         transaction_date = received_ist.date()
 
