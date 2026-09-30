@@ -200,7 +200,7 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
         data_type="bool",
         category="Categorization",
         label="Enable LLM Categorization",
-        description="Run the Gemini fallback for transactions the rules can't classify",
+        description="Use the LLM for transactions the rules can't classify",
     ),
     "categorization.confidence_threshold": SettingDef(
         default="0.6",

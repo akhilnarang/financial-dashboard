@@ -311,7 +311,6 @@ async def test_uncertain_merchant_uses_public_search_then_reconsiders(monkeypatc
         examples=[],
         active_slugs=["groceries", "dining"],
         api_key="secret-key",
-        # Search follows the endpoint, not one model name.
         model="gpt-6-luna",
         base_url="",
         reasoning_effort="medium",
