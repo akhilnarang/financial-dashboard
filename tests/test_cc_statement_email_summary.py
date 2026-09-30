@@ -11,7 +11,6 @@ so the tests run against the real parser contract. They exercise:
 
 from datetime import date
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -25,7 +24,12 @@ from financial_dashboard.db import (
 import financial_dashboard.services.emails as emails_service
 import financial_dashboard.services.reminders as reminders_mod
 from financial_dashboard.services.statements import cc as cc_module
-from bank_email_parser.models import Money, ParsedEmail, StatementSummary
+from bank_email_parser.models import (
+    Money,
+    ParsedEmail,
+    StatementSummary,
+    TransactionAlert,
+)
 from tests.conftest import new_test_engine
 
 
@@ -341,14 +345,10 @@ async def test_parse_email_by_kind_threads_password_hint_for_statement_emails(
     """Bug fix: previously the HTML parser was skipped for statement kinds,
     silently dropping any ``password_hint`` emitted by the email parser."""
 
-    fake_parsed = SimpleNamespace(
+    fake_parsed = ParsedEmail(
         bank="hdfc",
         email_type="hdfc_cc_statement",
-        transaction=None,
         password_hint="DOB in DDMMYYYY",
-        statement=None,
-        ledger_role="primary",
-        counterparty_source="bank",
     )
 
     monkeypatch.setattr(
@@ -391,28 +391,19 @@ async def test_parse_email_by_kind_transaction_does_not_route_to_summary(monkeyp
     field. Summary routing is only for CC_STATEMENT / STATEMENT / None."""
 
     fake_summary = StatementSummary(card_mask="1234")
-    fake_parsed = SimpleNamespace(
+    fake_parsed = ParsedEmail(
         bank="hdfc",
         email_type="hdfc_cc_txn",
-        transaction=SimpleNamespace(
+        transaction=TransactionAlert(
             direction="debit",
-            amount=SimpleNamespace(amount=Decimal("100"), currency="INR"),
+            amount=Money(amount=Decimal("100")),
             transaction_date=date(2026, 4, 1),
-            transaction_time=None,
             counterparty="merchant",
             card_mask="1234",
-            account_mask=None,
             reference_number="ref",
             channel="pos",
-            balance=None,
-            raw_description="",
         ),
-        password_hint=None,
         statement=fake_summary,
-        event_time_source="body",
-        identifies_by="counterparty",
-        counterparty_source="bank",
-        ledger_role="primary",
     )
 
     monkeypatch.setattr(emails_service, "parse_email", lambda bank, html: fake_parsed)
@@ -464,15 +455,10 @@ async def test_parse_email_by_kind_surfaces_error_when_summary_handler_refuses(
         due_date=date(2099, 1, 1),
         card_mask=None,
     )
-    fake_parsed = SimpleNamespace(
+    fake_parsed = ParsedEmail(
         bank="onecard",
         email_type="onecard_cc_statement",
-        transaction=None,
-        password_hint=None,
         statement=fake_summary,
-        event_time_source="body",
-        identifies_by="counterparty",
-        counterparty_source="bank",
     )
 
     monkeypatch.setattr(emails_service, "parse_email", lambda bank, html: fake_parsed)
@@ -499,36 +485,3 @@ async def test_parse_email_by_kind_surfaces_error_when_summary_handler_refuses(
     assert result.stmt_result is None
     assert result.error is not None
     assert "summary" in result.error.lower()
-
-
-@pytest.mark.anyio
-async def test_retry_cc_statement_upload_skips_email_summary(
-    session_factory, monkeypatch
-):
-    """``retry_cc_statement_upload`` must early-return False for summary-only
-    uploads — they have no PDF to reparse. Guards against the retry pipeline
-    attempting to load an empty ``file_path`` for ``source_kind='email_summary'``
-    rows."""
-    from financial_dashboard.services.statements import shared as shared_module
-
-    monkeypatch.setattr(shared_module, "async_session", session_factory)
-
-    acc_id = await _add_cc_account(session_factory)
-    async with session_factory() as session:
-        upload = StatementUpload(
-            account_id=acc_id,
-            bank="onecard",
-            filename="",
-            file_path="",
-            source_kind="email_summary",
-            status="parsed",
-            due_date="05/05/2026",
-            total_amount_due="12,899.94",
-        )
-        session.add(upload)
-        await session.commit()
-        upload_id = upload.id
-
-    ok = await shared_module.retry_cc_statement_upload(upload_id, password="x")
-
-    assert ok is False

@@ -62,10 +62,8 @@ async def test_update_category_assigns_clears_and_rejects(session: AsyncSession)
         await update_transaction_category(session, txn.id, "123")
 
 
-async def test_manual_assign_rejects_unknown_slug_unless_created(
-    session: AsyncSession,
-):
-    """A typo must not mint a junk category. create=True adds a new one."""
+async def test_manual_assign_rejects_unknown_slug(session: AsyncSession):
+    """A typo must not mint a junk category."""
     await ensure_category(session, "groceries")
     txn = await _txn(session)
 
@@ -74,10 +72,6 @@ async def test_manual_assign_rejects_unknown_slug_unless_created(
     assert txn.category is None
     assert "grocieis" not in await get_active_slugs(session)
     assert await assign_category_manual(session, 9999, "groceries") == (False, None)
-
-    ok, slug = await assign_category_manual(session, txn.id, "Pet Care", create=True)
-    assert ok is True and slug == "pet_care"
-    assert "pet_care" in await get_active_slugs(session)
 
 
 async def test_inactive_category_is_manual_only(session: AsyncSession):

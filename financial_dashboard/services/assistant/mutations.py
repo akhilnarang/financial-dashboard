@@ -431,7 +431,6 @@ async def _apply_transaction_changes(
             txn.id,
             cast(str, category),
             actor="telegram_assistant",
-            create=False,
             direction_policy=direction_policy,
             preserve_decision_id=consumed_decision_id,
         )

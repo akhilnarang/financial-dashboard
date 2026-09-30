@@ -757,7 +757,8 @@ async def test_reparse_applies_the_name_rule(
         counterparty_source="user_alias",
     )
     _stub_parser_with_role(monkeypatch, txn_data, ledger_role="primary")
-    await _post_reparse(session_maker, email_id)
+    r = await _post_reparse(session_maker, email_id)
+    assert r.status_code == 200, r.text
 
     async with session_maker() as s:
         row = (await s.execute(select(Transaction))).scalars().one()

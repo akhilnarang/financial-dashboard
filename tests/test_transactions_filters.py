@@ -314,13 +314,11 @@ async def test_paging_and_sorting_keep_every_drill_filter(client, session):
     assert _count_rows(r.text) == 50  # a full first page, so pagination renders
 
     hrefs = [html.unescape(h) for h in re.findall(r'href="([^"]+)"', r.text)]
-    for marker in ("page=2", "sort=amount"):
-        links = [h for h in hrefs if marker in h]
-        assert links, f"no {marker} link rendered"
-        assert all("counterparty=&" in h or h.endswith("counterparty=") for h in links)
-        assert all("scope=bank" in h for h in links)
-
     page_two = await client.get(next(h for h in hrefs if "page=2" in h))
     assert _count_rows(page_two.text) == 5  # 55 matching rows - a full page of 50
-    for decoy in ("999.00", "998.00", "997.00"):
-        assert decoy not in _transaction_rows_html(page_two.text)
+    # The link sorts by amount descending, so a lost filter puts the decoys first.
+    by_amount = await client.get(next(h for h in hrefs if "sort=amount" in h))
+    assert _count_rows(by_amount.text) == 50
+    for listing in (page_two.text, by_amount.text):
+        for decoy in ("999.00", "998.00", "997.00"):
+            assert decoy not in _transaction_rows_html(listing)

@@ -38,7 +38,6 @@ from financial_dashboard.services.statements.bank import (
 )
 from financial_dashboard.services.statements.shared import (
     retry_bank_statement_upload,
-    retry_cc_statement_upload,
 )
 from financial_dashboard.services.statements.skip_summary import import_skip_summary
 from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
@@ -215,8 +214,6 @@ async def bank_statement_retry(
             session,
             account_id,
             password,
-            retry_cc_upload=retry_cc_statement_upload,
-            retry_bank_upload=retry_bank_statement_upload,
         )
 
     return RedirectResponse(url=f"/statements/bank/{upload_id}", status_code=303)

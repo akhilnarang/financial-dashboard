@@ -405,12 +405,3 @@ class GmailProvider:
             existing_remote_ids=existing_remote_ids,
             last_synced_at=source.last_synced_at,
         )
-
-    async def fetch_single(self, source, remote_id: str) -> bytes | None:
-        creds = decrypt_credentials(source.credentials)
-        return await asyncio.to_thread(
-            _fetch_gmail_single_sync,
-            creds.get("user", ""),
-            creds.get("app_password", ""),
-            remote_id,
-        )

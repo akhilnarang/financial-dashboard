@@ -366,18 +366,15 @@ class InvestmentLot(Base):
     penny). Today the only CAS source that satisfies this is a mutual-fund
     purchase/switch_in transaction whose ``units`` + ``nav`` + ``amount`` +
     ``date`` + ``isin`` are all present. Value-only holdings and demat
-    movements (CAS carries no cost for them) are excluded and reported as
-    diagnostics by :mod:`financial_dashboard.services.investments`; they are
-    never fabricated into a lot here. Acquisition dates and cost basis are
+    movements (CAS carries no cost for them) are excluded; they are never
+    fabricated into a lot here. Acquisition dates and cost basis are
     never derived from a current market value.
 
     Re-ingestion of the same CAS period deletes the prior upload (and its lots)
     first. ``source_occurrence`` preserves source multiplicity when two
     otherwise identical acquisition facts occur in one statement; the unique
     key prevents retrying normalization from inserting that occurrence twice.
-    Cross-upload overlap is intentionally retained here as source provenance
-    and canonicalized by :mod:`financial_dashboard.services.investments` at
-    read time.
+    Cross-upload overlap is retained here as source provenance.
     """
 
     __tablename__ = "investment_lots"

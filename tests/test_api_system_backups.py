@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from financial_dashboard.api import router as api_router
+from financial_dashboard.api import get_router as get_api_router
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.services import system_backups
 
@@ -37,7 +37,7 @@ async def _api_client(session: AsyncSession) -> AsyncIterator[AsyncClient]:
         yield session
 
     app.dependency_overrides[get_session] = override_session
-    app.include_router(api_router)
+    app.include_router(get_api_router(paisa_enabled=True))
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:

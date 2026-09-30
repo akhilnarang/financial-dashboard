@@ -130,7 +130,7 @@ async def test_double_startup_starts_one_task(factory):
     await rt.shutdown()
 
 
-async def test_manager_does_not_mark_runtime_running_when_coordinator_start_fails(
+async def test_coordinator_start_failure_propagates_and_manager_isolates_it(
     factory, monkeypatch
 ):
     coordinator = PaisaCoordinator(session_factory=factory)
@@ -151,8 +151,8 @@ async def test_manager_does_not_mark_runtime_running_when_coordinator_start_fail
     await manager.startup_all()
 
     assert runtime.coordinator is coordinator
-    status = {item.id: item for item in manager.status()}
-    assert status["paisa"].running is False
+    with pytest.raises(RuntimeError, match="coordinator start failed"):
+        await runtime.startup()
 
 
 # --------------------------------------------------------------------------- #

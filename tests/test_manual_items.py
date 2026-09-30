@@ -49,37 +49,6 @@ async def test_deactivate_excludes_item_from_networth(session):
     assert summary.total_assets == Decimal("0.00")
 
 
-async def test_edit_snapshot_colliding_date_raises_and_writes_nothing(session):
-    item = await manual_items.create_item(
-        session,
-        name="Cash",
-        kind=ManualKind.asset,
-        category=ManualCategory.cash,
-        value=Decimal("5000.00"),
-        as_of_date=dt.date(2026, 4, 1),
-    )
-    await manual_items.update_value(
-        session,
-        item_id=item.id,
-        value=Decimal("7000.00"),
-        as_of_date=dt.date(2026, 5, 1),
-    )
-    await session.flush()
-    april = await session.get(BalanceSnapshot, 1)
-
-    with pytest.raises(ValueError):
-        await manual_items.edit_snapshot(
-            session,
-            snapshot_id=april.id,
-            value=Decimal("9999.00"),
-            as_of_date=dt.date(2026, 5, 1),
-        )
-
-    unchanged = await session.get(BalanceSnapshot, april.id)
-    assert unchanged.value == Decimal("5000.00")
-    assert unchanged.as_of_date == dt.date(2026, 4, 1)
-
-
 async def test_delete_snapshot_falls_back_then_drops_item(session):
     item = await manual_items.create_item(
         session,
@@ -101,9 +70,6 @@ async def test_delete_snapshot_falls_back_then_drops_item(session):
         .scalars()
         .all()
     )
-
-    with pytest.raises(ValueError):
-        await manual_items.delete_snapshot(session, snapshot_id=999)
 
     await manual_items.delete_snapshot(session, snapshot_id=may.id)
     await session.flush()

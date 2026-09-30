@@ -86,7 +86,6 @@ def create_app() -> FastAPI:
         StaticFiles(directory=Path(__file__).resolve().parent / "static"),
         name="static",
     )
-    app.state.paisa_enabled = settings.paisa_enabled
     app.include_router(get_api_router(paisa_enabled=settings.paisa_enabled))
     app.include_router(get_router(paisa_enabled=settings.paisa_enabled))
     return app

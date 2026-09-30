@@ -404,9 +404,8 @@ async def test_single_reparse_retains_sms_enrichment_on_none(session_maker):
 
 @pytest.mark.anyio
 async def test_reparse_does_not_steal_row_claimed_by_another_email(session_maker):
-    """If the matched cross-channel row is already attached to a DIFFERENT
-    email, reparsing a second email must NOT steal that link — it inserts
-    its own row. (Guards against orphaning the first email.)"""
+    """A fuzzy candidate that another email owns is not a match. The second
+    email inserts its own row. Thus neither email is orphaned."""
     async with session_maker() as session:
         rule = _hdfc_rule()
         session.add(rule)
@@ -434,6 +433,74 @@ async def test_reparse_does_not_steal_row_claimed_by_another_email(session_maker
         rows = (await s.execute(select(Transaction))).scalars().all()
         # Email A keeps its row; email B gets its own. Neither orphaned.
         assert sorted(r.email_id for r in rows) == sorted([email_a_id, email_b_id])
+
+
+@pytest.mark.anyio
+async def test_reparse_ref_hit_does_not_steal_row_of_another_email(session_maker):
+    """An exact reference hit returns a match even when another email owns the
+    row. The reparse must not move that row to the second email."""
+    raw = _kotak_digital_eml(amount="7777.00", txn_id="999000111222")
+    txn_data = _process_email_full("kotak", raw).txn_data
+    async with session_maker() as session:
+        rule = FetchRule(
+            provider="gmail",
+            sender="no-reply@kotak.com",
+            bank="kotak",
+            enabled=True,
+            email_kind="transaction",
+        )
+        session.add(rule)
+        await session.flush()
+        emails = [
+            Email(
+                provider="gmail",
+                message_id=f"test-kotak-digital-{name}",
+                sender="no-reply@kotak.com",
+                subject="Transaction Successful",
+                received_at=datetime.datetime(
+                    2026, 6, 9, 12, 14, 7, tzinfo=datetime.UTC
+                ),
+                status=status,
+                rule_id=rule.id,
+            )
+            for name, status in (("A", "parsed"), ("B", "failed"))
+        ]
+        session.add_all(emails)
+        await session.flush()
+        session.add(
+            Transaction(
+                bank="kotak",
+                email_type="kotak_digital_transaction",
+                direction=txn_data["direction"],
+                amount=txn_data["amount"],
+                currency="INR",
+                transaction_date=txn_data["transaction_date"],
+                reference_number=txn_data["reference_number"],
+                source="email",
+                email_id=emails[0].id,
+            )
+        )
+        await session.commit()
+        email_a_id, email_b_id = emails[0].id, emails[1].id
+
+    app = FastAPI()
+    app.include_router(get_web_router())
+
+    async def _override():
+        async with session_maker() as s:
+            yield s
+
+    app.dependency_overrides[get_session] = _override
+    with _reparse_patches(raw):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await client.post(f"/emails/{email_b_id}/reparse")
+
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert [r.email_id for r in rows] == [email_a_id]
+        assert (await s.get(Email, email_b_id)).status == "skipped"
 
 
 @pytest.mark.anyio

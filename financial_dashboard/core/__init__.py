@@ -5,7 +5,6 @@ from .crypto import (
     encrypt_credentials as encrypt_credentials,
 )
 from .dates import (
-    format_ddmmyyyy as format_ddmmyyyy,
     parse_date as parse_date,
     parse_datetime as parse_datetime,
 )
@@ -20,7 +19,6 @@ __all__ = [
     "check_credentials",
     "decrypt_credentials",
     "encrypt_credentials",
-    "format_ddmmyyyy",
     "format_inr_compact",
     "get_templates",
     "http_basic",

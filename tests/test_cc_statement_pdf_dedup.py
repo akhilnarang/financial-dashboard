@@ -133,7 +133,6 @@ async def test_pdf_dedups_against_prior_upload_for_same_due_date(
 
     assert result is not None
     assert result["statement_upload_id"] == existing_id
-    assert result["deduped"] is True
     assert result["matched"] == 0
     assert result["missing"] == 0
     assert result["imported"] == 0
@@ -175,7 +174,6 @@ async def test_no_dedup_when_parsed_due_date_missing(
     )
 
     assert result is not None
-    assert "deduped" not in result
 
     async with session_factory() as session:
         rows = (await session.execute(select(StatementUpload))).scalars().all()

@@ -18,7 +18,6 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.deps import get_session
-from financial_dashboard.extensions import enabled_builtin_extensions
 from financial_dashboard.schemas.extensions import (
     ExtensionAuditResponse,
     ExtensionErrorResponse,
@@ -40,25 +39,12 @@ logger = logging.getLogger(__name__)
 framework_router = APIRouter(prefix="/extensions")
 
 
-def _manifests(request: Request):
-    """The registered extension manifests.
-
-    Reads from ``app.state.extension_manager`` when the lifespan has run, and
-    falls back to ``BUILTIN_EXTENSIONS`` otherwise (e.g. in route-level tests
-    that build the app without the lifespan). This is the documented
-    legitimate form of ``getattr(request.app.state, ...)``.
-    """
-    manager = getattr(request.app.state, "extension_manager", None)
-    if manager is not None:
-        return manager.all()
-    paisa_enabled = getattr(request.app.state, "paisa_enabled", True)
-    return enabled_builtin_extensions(paisa_enabled=paisa_enabled)
-
-
 @framework_router.get("", response_model=ExtensionListResponse)
 async def list_extensions(request: Request) -> ExtensionListResponse:
     return ExtensionListResponse(
-        extensions=[surface.extension_info(m) for m in _manifests(request)]
+        extensions=[
+            surface.extension_info(m) for m in request.app.state.extension_manager.all()
+        ]
     )
 
 
@@ -234,7 +220,3 @@ def get_router(*, paisa_enabled: bool) -> APIRouter:
         paisa_parent.include_router(paisa_router)
         aggregate.include_router(paisa_parent)
     return aggregate
-
-
-# Backwards-compatible full router for domain-level tests and direct imports.
-router = get_router(paisa_enabled=True)

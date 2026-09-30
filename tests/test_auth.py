@@ -14,7 +14,7 @@ from financial_dashboard.config import Settings
 from financial_dashboard.core.deps import get_session, verify_credentials
 from financial_dashboard.core.security import check_credentials
 from financial_dashboard.db import Transaction
-from financial_dashboard.api import router as api_router
+from financial_dashboard.api import get_router as get_api_router
 from financial_dashboard.config import settings as app_settings
 
 
@@ -112,7 +112,7 @@ async def test_transaction_attachment_route_uses_global_auth(
         yield session
 
     app.dependency_overrides[get_session] = _override_session
-    app.include_router(api_router)
+    app.include_router(get_api_router(paisa_enabled=True))
     auth_settings = _make_settings("admin", "pass")
     with patch("financial_dashboard.core.security.settings", auth_settings):
         async with AsyncClient(

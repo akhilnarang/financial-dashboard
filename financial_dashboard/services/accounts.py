@@ -62,9 +62,6 @@ async def retry_password_required_statements(
     session: AsyncSession,
     account_id: int,
     password: str,
-    *,
-    retry_cc_upload=retry_cc_statement_upload,
-    retry_bank_upload=retry_bank_statement_upload,
 ) -> dict:
     result = {"cc_retried": 0, "bank_retried": 0, "cc_failed": 0, "bank_failed": 0}
     cc_ids = (
@@ -94,7 +91,7 @@ async def retry_password_required_statements(
 
     for upload_id in cc_ids:
         try:
-            ok = await retry_cc_upload(upload_id, password)
+            ok = await retry_cc_statement_upload(upload_id, password)
         except Exception as exc:
             ok = False
             logger.warning(
@@ -107,7 +104,7 @@ async def retry_password_required_statements(
 
     for upload_id in bank_ids:
         try:
-            ok = await retry_bank_upload(upload_id, password)
+            ok = await retry_bank_statement_upload(upload_id, password)
         except Exception as exc:
             ok = False
             logger.warning(

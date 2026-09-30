@@ -94,8 +94,6 @@ def make_delivery(
 async def claim_delivery(
     session: AsyncSession,
     delivery_id: int,
-    *,
-    lease: datetime.timedelta = DELIVERY_LEASE,
 ) -> DeliveryClaim:
     """Use compare-and-swap to claim pending or stale unknown/delivering delivery work."""
     token = secrets.token_urlsafe(24)
@@ -123,7 +121,7 @@ async def claim_delivery(
             .values(
                 status="delivering",
                 worker_token=token,
-                delivery_lease_until=now + lease,
+                delivery_lease_until=now + DELIVERY_LEASE,
                 delivery_attempts=TelegramOutboundDelivery.delivery_attempts + 1,
                 last_attempt_at=now,
             )

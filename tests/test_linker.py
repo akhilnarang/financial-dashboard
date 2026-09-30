@@ -18,7 +18,6 @@ from financial_dashboard.db import Account, Card, Transaction
 from financial_dashboard.services.linker import (
     build_link_context,
     link_transaction,
-    relink_orphans,
 )
 
 
@@ -306,7 +305,7 @@ async def test_unreadable_mask_is_rejected_not_silently_flattened(session):
 
 # ---------------------------------------------------------------------------
 # Ambiguity refusal: two CARDS sharing the matched suffix must not be guessed.
-# Already-linked short-circuit, and the batch relink_orphans convenience.
+# Already-linked short-circuit.
 # ---------------------------------------------------------------------------
 
 
@@ -336,6 +335,30 @@ async def test_card_mask_ambiguous_refuses_to_link(session):
 
 
 @pytest.mark.anyio
+async def test_account_mask_ambiguous_refuses_to_link(session):
+    """An account mask that matches two accounts of one bank leaves the row
+    unlinked. The linker does not guess."""
+    session.add_all(
+        [
+            Account(
+                bank="hdfc", type="bank_account", label="A", account_number="11115678"
+            ),
+            Account(
+                bank="hdfc", type="bank_account", label="B", account_number="22225678"
+            ),
+        ]
+    )
+    await session.flush()
+    txn = _txn(bank="hdfc", account_mask="XX678")
+    session.add(txn)
+    await session.flush()
+
+    ctx = await build_link_context(session)
+    assert link_transaction(ctx, txn) is False
+    assert txn.account_id is None
+
+
+@pytest.mark.anyio
 async def test_link_transaction_already_linked_short_circuits(session):
     """An already-linked transaction is left untouched — link_transaction
     returns True immediately and does not re-resolve (so a manually-set
@@ -352,7 +375,8 @@ async def test_link_transaction_already_linked_short_circuits(session):
     session.add(decoy)
     await session.flush()
 
-    txn = _txn(bank="icici")
+    # The mask resolves to the decoy. Only the short-circuit keeps acct.
+    txn = _txn(bank="icici", account_mask="XX5678")
     txn.account_id = acct.id  # manually linked
     txn.card_id = None
     session.add(txn)
@@ -363,34 +387,3 @@ async def test_link_transaction_already_linked_short_circuits(session):
     # Untouched — not re-pointed at the decoy.
     assert txn.account_id == acct.id
     assert txn.card_id is None
-
-
-@pytest.mark.anyio
-async def test_relink_orphans_links_unlinked_and_counts_remaining(session):
-    """relink_orphans walks every unlinked transaction, links what it can, and
-    reports (linked, remaining). A mask it can resolve gets linked; an
-    ambiguous mask is left as a remaining orphan."""
-    resolved = Account(
-        bank="icici", type="bank_account", label="ICICI", account_number="000000005678"
-    )
-    ambig_a = Account(
-        bank="hdfc", type="bank_account", label="HDFC A", account_number="11115678"
-    )
-    ambig_b = Account(
-        bank="hdfc", type="bank_account", label="HDFC B", account_number="22225678"
-    )
-    session.add_all([resolved, ambig_a, ambig_b])
-    await session.flush()
-
-    # `linkable` resolves uniquely to the single ICICI account; `ambiguous`
-    # matches BOTH HDFC accounts on the same trailing digits → refused.
-    linkable = _txn(bank="icici", account_mask="XX678")
-    ambiguous = _txn(bank="hdfc", account_mask="XX678")
-    session.add_all([linkable, ambiguous])
-    await session.flush()
-
-    linked, remaining = await relink_orphans(session)
-    assert linked == 1
-    assert remaining == 1
-    assert linkable.account_id == resolved.id
-    assert ambiguous.account_id is None

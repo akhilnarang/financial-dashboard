@@ -766,3 +766,7 @@ async def test_process_sms_row_enriched_relinks_when_mask_filled(session, monkey
     await session.refresh(existing)
     assert existing.account_id == acct.id
     assert existing.card_id == card.id
+    assert outcome.enrichment_notification is not None
+    assert outcome.enrichment_notification[2]["account_label"] == (
+        "HDFC Savings - HDFC Debit"
+    )

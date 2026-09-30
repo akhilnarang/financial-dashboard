@@ -1,7 +1,7 @@
 """Cross-cutting invariants of the cashflow report, over a rich seeded DB.
 
 ``test_cashflow_report.py`` tests one figure per case. This file checks that
-every total, footnote and line count equals a direct query over the same rows.
+every total, footnote and line count equals a hand-computed sum over the seed.
 A bucket that drops a row or counts one twice breaks the equality.
 """
 
@@ -9,27 +9,12 @@ import datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import Transaction
-from financial_dashboard.services.cashflow.buckets import (
-    BUCKET_BY_SLUG,
-    INCOME_BUCKET,
-    INVESTMENT_BUCKET,
-    TRANSFERS_IN_SLUG,
-    bucket_for_slug,
-)
 from financial_dashboard.services.cashflow.report import (
-    BLANK_COUNTERPARTY,
-    NON_INR,
-    UNCATEGORIZED,
     cashflow_summary,
     cashflow_trend,
-)
-from financial_dashboard.services.cashflow.scope import (
-    BANK_SCOPE,
-    UNACCOUNTED_SCOPE,
 )
 from tests.conftest import (
     MISSING_ACCOUNT_ID,
@@ -44,18 +29,6 @@ D = Decimal
 JUN = datetime.date(2026, 6, 1)
 JUL = datetime.date(2026, 7, 1)
 JUN_END = datetime.date(2026, 6, 30)
-IN_RANGE = Transaction.transaction_date.between(JUN, JUN_END)
-
-# The un-aggregated signed-flow expression. ``report.SIGNED_FLOW`` is already
-# wrapped in ``func.sum`` for the report's ``GROUP BY`` queries; the invariants
-# below compose their own aggregate, so they need the inner expression.
-SIGNED = case(
-    (Transaction.direction == "credit", Transaction.amount),
-    else_=-Transaction.amount,
-)
-# A NULL currency is an INR row whose default did not backfill, so the bucket
-# clauses treat it as INR; the parity queries here must do the same.
-INR_OR_NULL = Transaction.currency.is_(None) | (Transaction.currency == "INR")
 
 
 async def _add(session: AsyncSession, **kw) -> Transaction:
@@ -87,8 +60,8 @@ async def _seed_rich_population(session: AsyncSession) -> None:
     fee reversal), investment contributions and redemptions, internal
     self-transfers, card swipes, card credits, unaccounted rows, NULL/blank/
     whitespace/unknown/unmapped categories, blank counterparties, INR/NULL/
-    non-INR currencies, undated rows, out-of-range rows, and a row on a
-    debit_card (the other bank-side account type).
+    non-INR currencies, undated rows, an excluded row, out-of-range rows, and a
+    row on a debit_card (the other bank-side account type).
     """
     card = await card_account(session)
     debit_card = await ensure_account(session, 7, "debit_card")
@@ -236,6 +209,15 @@ async def _seed_rich_population(session: AsyncSession) -> None:
         account_id=weird,
     )
 
+    # --- excluded row: in no figure but the Excluded footnote ---
+    await _add(
+        session,
+        direction="debit",
+        amount=D("999"),
+        category="groceries",
+        exclude_from_cashflow=True,
+    )
+
     # --- out-of-range rows: in scope and bucketable, but not in this range ---
     await _add(
         session,
@@ -253,115 +235,72 @@ async def _seed_rich_population(session: AsyncSession) -> None:
     )
 
 
-async def _count(session: AsyncSession, *where) -> int:
-    return (await session.execute(select(func.count()).where(*where))).scalar_one()
-
-
-async def _signed_sum(session: AsyncSession, *where) -> Decimal:
-    return D(
-        (await session.execute(select(func.sum(SIGNED)).where(*where))).scalar() or 0
-    )
-
-
 async def test_every_figure_equals_a_direct_sum_over_its_rows(session: AsyncSession):
-    """Each total, footnote, line count and trend month is the direct sum or
-    count over the rows it selects. A bucket that drops a row or counts one
-    twice breaks the equality.
+    """Each total, footnote, line count and trend month equals a sum over the
+    seed, computed by hand. A bucket that drops a row or counts one twice
+    breaks the equality.
 
-    Under the bank scope a credit_card_payment debit is expense, so the expense
-    slugs are the scope-flipped set.
+    Under the bank scope a credit_card_payment debit is expense.
     """
     await _seed_rich_population(session)
     s = await cashflow_summary(session, JUN, JUN_END)
-    headline = (IN_RANGE, BANK_SCOPE, INR_OR_NULL)
 
-    income = Transaction.category.in_(tuple(INCOME_BUCKET))
-    assert s.income.total == await _signed_sum(session, *headline, income)
-    assert s.income.count == await _count(session, *headline, income)
+    # Salary 1000 + interest 50 + other_income 30.
+    assert (s.income.total, s.income.count) == (D("1080"), 3)
+    assert {ln.slug: (ln.total, ln.count) for ln in s.income.lines} == {
+        "salary": (D("1000"), 1),
+        "interest": (D("50"), 1),
+        "other_income": (D("30"), 1),
+    }
 
-    expense = Transaction.category.in_(
-        tuple(
-            slug
-            for slug in BUCKET_BY_SLUG
-            if bucket_for_slug(slug, scope="bank") == "expense"
-        )
+    # 300 + 120 + (80 - 30) - 50 - 20 + 500 + 60 + 70.
+    assert (s.expense.total, s.expense.count) == (D("1030"), 9)
+    assert {ln.slug: (ln.total, ln.count) for ln in s.expense.lines} == {
+        "credit_card_payment": (D("500"), 1),
+        "groceries": (D("300"), 1),
+        "dining": (D("120"), 1),
+        "utilities": (D("70"), 1),
+        "transport": (D("60"), 1),
+        "fees_charges": (D("50"), 2),
+        "refund": (D("-50"), 1),
+        "cashback_rewards": (D("-20"), 1),
+    }
+
+    # Blank and whitespace counterparties collapse into one line.
+    assert (s.transfers_in.total, s.transfers_in.count) == (D("300"), 2)
+    assert {ln.counterparty: ln.count for ln in s.transfers_in.lines} == {
+        "MOM": 1,
+        None: 1,
+    }
+
+    # Contribution 100 less redemptions 40 and 15.
+    assert (s.investment.net, s.investment.count) == (D("45"), 3)
+    assert {(ln.slug, ln.kind): ln.count for ln in s.investment.lines} == {
+        ("investment", "contribution"): 1,
+        ("investment_redemption", "redemption"): 1,
+        ("investment", "redemption"): 1,
+    }
+
+    # Uncategorized applies no currency clause, so the USD 7 is in it.
+    assert (s.uncategorized.total, s.uncategorized.count) == (D("-172"), 6)
+
+    assert s.net_cash_retained == D("305")
+
+    f = s.footnotes
+    assert (f.internal_count, f.internal_gross, f.internal_net) == (
+        2,
+        D("900"),
+        D("-500"),
     )
-    assert s.expense.total == -(await _signed_sum(session, *headline, expense))
-    assert s.expense.count == await _count(session, *headline, expense)
-
-    repay = Transaction.category == TRANSFERS_IN_SLUG
-    assert s.transfers_in.total == await _signed_sum(session, *headline, repay)
-    assert s.transfers_in.count == await _count(session, *headline, repay)
-
-    invest = Transaction.category.in_(tuple(INVESTMENT_BUCKET))
-    assert s.investment.net == -(await _signed_sum(session, *headline, invest))
-    assert s.investment.count == await _count(session, *headline, invest)
-
-    # Uncategorized applies no currency clause.
-    assert s.uncategorized.total == await _signed_sum(
-        session, IN_RANGE, BANK_SCOPE, UNCATEGORIZED
+    assert f.non_inr_count == 2
+    assert (f.undated_count, f.undated_net) == (1, D("-40"))
+    # -111 + 222 - 30.
+    assert (f.unaccounted_count, f.unaccounted_net) == (3, D("81"))
+    assert (f.excluded_count, f.excluded_gross, f.excluded_net) == (
+        1,
+        D("999"),
+        D("-999"),
     )
-    assert s.uncategorized.count == await _count(
-        session, IN_RANGE, BANK_SCOPE, UNCATEGORIZED
-    )
-
-    assert s.net_cash_retained == (
-        s.income.total + s.transfers_in.total - s.expense.total - s.investment.net
-    )
-
-    # Under the bank scope only self_transfer is internal.
-    internal_count, internal_gross = (
-        await session.execute(
-            select(func.count(), func.sum(Transaction.amount)).where(
-                IN_RANGE, BANK_SCOPE, Transaction.category == "self_transfer"
-            )
-        )
-    ).one()
-    assert s.footnotes.internal_count == internal_count
-    assert s.footnotes.internal_gross == D(internal_gross or 0)
-
-    assert s.footnotes.non_inr_count == await _count(
-        session, IN_RANGE, BANK_SCOPE, NON_INR
-    )
-
-    # Undated rows are counted over every scope and range.
-    undated = Transaction.transaction_date.is_(None)
-    assert s.footnotes.undated_count == await _count(session, undated)
-    assert s.footnotes.undated_net == await _signed_sum(session, undated)
-
-    assert s.footnotes.unaccounted_count == await _count(
-        session, IN_RANGE, UNACCOUNTED_SCOPE
-    )
-    assert s.footnotes.unaccounted_net == await _signed_sum(
-        session, IN_RANGE, UNACCOUNTED_SCOPE
-    )
-
-    for ln in [*s.income.lines, *s.expense.lines]:
-        n = await _count(session, *headline, Transaction.category == ln.slug)
-        assert ln.count == n, ln.slug
-
-    # The investment bucket splits a slug by direction.
-    for ln in s.investment.lines:
-        direction = "debit" if ln.kind == "contribution" else "credit"
-        n = await _count(
-            session,
-            *headline,
-            Transaction.category == ln.slug,
-            Transaction.direction == direction,
-        )
-        assert ln.count == n, f"{ln.slug}/{ln.kind}"
-
-    # Transfers-in lines are per counterparty; blank and whitespace collapse.
-    for ln in s.transfers_in.lines:
-        clause = (
-            BLANK_COUNTERPARTY
-            if ln.counterparty is None
-            else Transaction.counterparty == ln.counterparty
-        )
-        n = await _count(
-            session, *headline, Transaction.category == TRANSFERS_IN_SLUG, clause
-        )
-        assert ln.count == n, ln.counterparty
 
     today = datetime.date(2026, 6, 15)
     pts = await cashflow_trend(session, months=1, today=today)
@@ -371,9 +310,4 @@ async def test_every_figure_equals_a_direct_sum_over_its_rows(session: AsyncSess
     assert jun_trend.income == jun_summary.income.total
     assert jun_trend.expense == jun_summary.expense.total
     assert jun_trend.net_invested == jun_summary.investment.net
-    assert jun_trend.salary_count == await _count(
-        session,
-        Transaction.transaction_date.between(JUN, today),
-        BANK_SCOPE,
-        Transaction.category == "salary",
-    )
+    assert jun_trend.salary_count == 1

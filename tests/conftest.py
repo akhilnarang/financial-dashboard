@@ -18,9 +18,10 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import StaticPool
 
 import financial_dashboard
-from financial_dashboard.api import router as api_router
+from financial_dashboard.api import get_router as get_api_router
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.db.models import Account, Base
+from financial_dashboard.services.extensions import bootstrap_extensions
 from financial_dashboard.web import get_router
 
 collect_ignore_glob = ["test_paisa_*", "test_synth_*"]
@@ -147,13 +148,18 @@ async def client(session):
     page loads would 404 here and a renamed or deleted module would still pass.
     """
     app = FastAPI()
+    app.state.extension_manager = bootstrap_extensions(
+        session_factory=async_sessionmaker(
+            session.bind, class_=AsyncSession, expire_on_commit=False
+        )
+    )
 
     async def _override_session():
         yield session
 
     app.dependency_overrides[get_session] = _override_session
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-    app.include_router(api_router)
+    app.include_router(get_api_router(paisa_enabled=True))
     app.include_router(get_router())
 
     async with AsyncClient(

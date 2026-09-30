@@ -1121,20 +1121,13 @@ def is_duplicate_transaction_error(exc: IntegrityError) -> bool:
 
     The single canonical classifier for the whole ingestion/merge layer —
     imported by ``services/emails.py`` so the live-poll and merge paths can't
-    drift apart. Accepts every message shape SQLite emits for the
-    ``uq_transactions_ref`` partial unique index on
-    ``(bank, reference_number, direction)``: the named-index form, the legacy
-    ``uq_transaction_dedup`` name (kept for back-compat with older DBs), and
-    the generic ``UNIQUE constraint failed: transactions.…`` text. There is no
-    other unique constraint on the transactions table, so the generic clause
-    can only ever be the ref index in practice.
+    drift apart. SQLite does not name the index in the message. It names the
+    columns: ``UNIQUE constraint failed: transactions.…``. The ref index is
+    the only unique constraint on the transactions table, so this text can
+    only come from it.
     """
     message = str(exc.orig)
-    return (
-        "uq_transactions_ref" in message
-        or "uq_transaction_dedup" in message
-        or ("UNIQUE constraint failed:" in message and "transactions." in message)
-    )
+    return "UNIQUE constraint failed:" in message and "transactions." in message
 
 
 async def merge_transaction(

@@ -291,49 +291,6 @@ async def test_projection_writes_no_core_rows(session):
     assert len(lots) == 1
 
 
-async def test_core_service_reports_lot_exclusion_reasons(session):
-    """Lot-classification exclusions live on the CORE service, not the projection.
-
-    Paisa projects CAS as an authoritative aggregate that *includes* these
-    holdings' value, so surfacing them as projection "exclusions" would imply
-    value was omitted. The reasons remain available from the investment service
-    for the dashboard's own investment surface.
-    """
-    from financial_dashboard.services.investments import get_incomplete_reasons
-
-    await _bank_and_snapshot(session)
-    await _upload_with_lots(
-        session,
-        transactions=[
-            _mf_purchase_raw(),
-            _mf_purchase_raw(
-                source_ref="mf/2", nav=None, amount=None, reference="TXN002"
-            ),
-            {
-                "scope": "demat",
-                "source_ref": "d/1",
-                "date": "2026-02-01",
-                "description": "Equity",
-                "isin": "INE000A01019",
-                "transaction_type": "buy",
-                "quantity": "5",
-                "reference": "DP1",
-            },
-        ],
-        lots=[],
-    )
-
-    reasons = {excl.reason for excl in await get_incomplete_reasons(session)}
-
-    assert "not_mutual_fund" in reasons
-    assert "missing_lot_facts" in reasons
-
-    # The projection itself reports only its own policy diagnostics.
-    report = await project(session, _config(project_investments=True))
-    assert "not_mutual_fund" not in report.investment_excluded
-    assert "missing_lot_facts" not in report.investment_excluded
-
-
 async def _upload_with_lots(session, transactions, lots, *, payload_extra=None):
     import json
 

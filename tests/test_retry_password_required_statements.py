@@ -17,7 +17,6 @@ from financial_dashboard.db import (
     StatementUpload,
 )
 from financial_dashboard.services import accounts as accounts_module
-from financial_dashboard.services.statements import shared as statements_shared
 from financial_dashboard.services.statements.dates import cc_stmt_date_range
 from financial_dashboard.web import bank_statements as bank_routes
 from financial_dashboard.web import statements as cc_routes
@@ -29,7 +28,6 @@ async def session_factory(monkeypatch):
     """Swap request/session factories for an in-memory DB."""
     engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    monkeypatch.setattr(statements_shared, "async_session", maker)
     monkeypatch.setattr(core_deps, "async_session", maker)
     yield maker
     await engine.dispose()
@@ -69,7 +67,7 @@ async def _seed_account_with_uploads(
 
 @pytest.mark.anyio
 async def test_coordinator_retries_password_required_only_and_counts_failures(
-    session_factory,
+    session_factory, monkeypatch
 ):
     """Other statuses are skipped. A helper that returns False or raises
     counts as failed, and a raise does not abort the loop."""
@@ -81,13 +79,11 @@ async def test_coordinator_retries_password_required_only_and_counts_failures(
 
     cc_helper = AsyncMock(side_effect=[RuntimeError("boom"), True])
     bank_helper = AsyncMock(return_value=False)
+    monkeypatch.setattr(accounts_module, "retry_cc_statement_upload", cc_helper)
+    monkeypatch.setattr(accounts_module, "retry_bank_statement_upload", bank_helper)
     async with session_factory() as session:
         result = await accounts_module.retry_password_required_statements(
-            session,
-            account_id,
-            "secret",
-            retry_cc_upload=cc_helper,
-            retry_bank_upload=bank_helper,
+            session, account_id, "secret"
         )
 
     assert cc_helper.await_count == 2
@@ -177,7 +173,8 @@ async def test_cc_retry_saves_password_and_unlocks_siblings_only_on_success(
     bank_helper = _password_gated_helper(session_factory, BankStatementUpload)
     with (
         patch.object(cc_routes, "retry_cc_statement_upload", cc_helper),
-        patch.object(cc_routes, "retry_bank_statement_upload", bank_helper),
+        patch.object(accounts_module, "retry_cc_statement_upload", cc_helper),
+        patch.object(accounts_module, "retry_bank_statement_upload", bank_helper),
     ):
         async with AsyncClient(
             transport=ASGITransport(app=create_app()), base_url="http://test"

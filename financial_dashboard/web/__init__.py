@@ -45,8 +45,4 @@ def get_router(*, paisa_enabled: bool = True) -> APIRouter:
     return router
 
 
-# Backwards-compatible full router for direct imports.
-router = get_router(paisa_enabled=True)
-
-
-__all__ = ["get_router", "router"]
+__all__ = ["get_router"]

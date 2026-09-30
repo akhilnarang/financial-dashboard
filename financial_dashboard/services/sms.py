@@ -1,12 +1,9 @@
 """SMS ingest service.
 
-Two entry points:
-
-- ``ingest_sms(session, payload)`` — public, commits internally.
-- ``_ingest_sms_no_commit(session, payload)`` — used by ``POST /api/sms``,
-  which wraps the raw insert + the parse/merge pipeline in one outer
-  transaction so a parse crash can't leave a permanent ``pending`` row
-  that the dedup constraint then blocks from ever being re-POSTed.
+``POST /api/sms`` calls ``_ingest_sms_no_commit``. The caller wraps the raw
+insert and the parse/merge pipeline in one outer transaction. A parse crash
+then cannot leave a permanent ``pending`` row that the dedup constraint
+blocks from a re-POST.
 """
 
 from typing import NamedTuple
@@ -56,11 +53,3 @@ async def _ingest_sms_no_commit(
             )
         return SmsIngestResult(existing, False)
     return SmsIngestResult(row, True)
-
-
-async def ingest_sms(
-    session: AsyncSession, payload: SmsIngestRequest
-) -> SmsIngestResult:
-    """Persist an SMS payload (commits its own transaction)."""
-    async with session.begin():
-        return await _ingest_sms_no_commit(session, payload)

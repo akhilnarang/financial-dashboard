@@ -78,7 +78,7 @@ Every transaction is auto-linked to an Account (and optionally a Card) using a f
 3. **account_mask -> accounts table** — for savings/current account masks.
 4. **bank-only fallback** — links to the sole account for a bank, but only when exactly one account exists (avoids silent misattribution when a bank has both savings and CC accounts).
 
-Linking is performed inline during polling and in batch via the `relink_orphans()` utility.
+Linking is performed inline during polling.
 
 ### Encrypted Credential Storage
 - Email source credentials (Gmail app password, Fastmail API token) are encrypted with Fernet before storage.

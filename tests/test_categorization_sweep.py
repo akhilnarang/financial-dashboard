@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.services.telegram as tg
 from financial_dashboard.db.models import Transaction
-from financial_dashboard.services.categorization import backfill, sweep
+from financial_dashboard.services.categorization import sweep
 from tests.conftest import new_test_engine
 
 pytestmark = pytest.mark.anyio
@@ -255,35 +255,13 @@ async def test_failed_send_is_retried_until_the_cap(memdb, telegram_send, monkey
     monkeypatch.setattr(tg, "_send_with_retry", failing_send)
     txn_id = await _seed_pending(memdb)
 
-    for expected in (1, 2, 3):
-        await sweep.run_review_notify(max_attempts=3)
+    for expected in range(1, sweep._MAX_NOTIFY_ATTEMPTS + 1):
+        await sweep.run_review_notify()
         async with memdb() as s:
             txn = await s.get(Transaction, txn_id)
         assert txn.review_status == "pending"
         assert txn.notify_attempts == expected
         assert txn.last_notified_at is None
 
-    assert await sweep.run_review_notify(max_attempts=3) == 0
-    assert attempts["count"] == 3
-
-
-async def test_backfill_runs_rules_then_llm(monkeypatch):
-    order = []
-
-    async def fake_rule(**k):
-        order.append("rule")
-        return 0
-
-    async def fake_llm(**k):
-        order.append("llm")
-        return 0
-
-    monkeypatch.setattr(backfill, "run_rule_sweep", fake_rule)
-    monkeypatch.setattr(backfill, "run_llm_sweep", fake_llm)
-
-    assert await backfill.run_backfill(batch_size=50) == (0, 0)
-    assert order == ["rule", "llm"]
-
-    order.clear()
-    await backfill.run_backfill(rules_only=True)
-    assert order == ["rule"]
+    assert await sweep.run_review_notify() == 0
+    assert attempts["count"] == sweep._MAX_NOTIFY_ATTEMPTS

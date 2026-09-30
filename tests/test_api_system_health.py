@@ -10,13 +10,6 @@ from financial_dashboard.services import database as database_service
 pytestmark = pytest.mark.anyio
 
 
-@pytest.fixture(autouse=True)
-def _reset_quick_check_cache():
-    database_service._reset_quick_check_cache()
-    yield
-    database_service._reset_quick_check_cache()
-
-
 class _ScalarResult:
     def __init__(self, value: object):
         self._value = value
