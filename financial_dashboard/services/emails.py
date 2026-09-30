@@ -90,6 +90,18 @@ _RECEIVED_AT_FUTURE_TOLERANCE = datetime.timedelta(minutes=5)
 _RECEIVED_AT_PAST_LIMIT = datetime.timedelta(hours=12)
 
 
+def _received_at_ist(received_at: datetime.datetime) -> datetime.datetime:
+    """Convert an email Date header to IST.
+
+    Get the date and the time from ONE conversion to IST. An email that
+    arrives immediately after midnight IST has a different IST date than its
+    UTC date. A header with an unknown zone gives no time zone. Use IST.
+    """
+    if received_at.tzinfo is None:
+        return received_at.replace(tzinfo=_IST)
+    return received_at.astimezone(_IST)
+
+
 def _disambiguate_am_pm(
     parsed_time: datetime.time,
     transaction_date: datetime.date | None,
@@ -130,12 +142,7 @@ def _disambiguate_am_pm(
         # Body already on a 24-hour clock (hour > 12); unambiguous.
         return parsed_time
 
-    if received_at.tzinfo is None:
-        # Defensive: _parse_email_date returns aware datetimes, but if a
-        # caller hands us a naive one, treat it as IST wall-time.
-        received_ist = received_at.replace(tzinfo=_IST)
-    else:
-        received_ist = received_at.astimezone(_IST)
+    received_ist = _received_at_ist(received_at)
 
     best: tuple[datetime.timedelta, datetime.time] | None = None
     for cand_time in candidates:
@@ -190,33 +197,21 @@ def _process_email_full(bank: str, raw_bytes: bytes) -> ProcessedEmailParse:
 
     transaction_date = txn.transaction_date
     received_at = _parse_email_date(raw_bytes)
-    if transaction_date is None and received_at is not None:
-        transaction_date = received_at.date()
+    received_ist = _received_at_ist(received_at) if received_at else None
+    if transaction_date is None and received_ist is not None:
+        transaction_date = received_ist.date()
 
     transaction_time = txn.transaction_time
     time_is_received_time = False
     if (
         transaction_time is None
-        and received_at is not None
+        and received_ist is not None
         and parsed.event_time_source == "message_arrival"
     ):
         # The bank sends this email at the moment of the transaction. Thus the
-        # arrival time replaces the time that the body does not contain. Get
-        # the date and the time from ONE conversion to IST. An email that
-        # arrives immediately after midnight IST has a different IST date than
-        # its UTC date. Two separate conversions can thus give two different
-        # moments.
-        if received_at.tzinfo is None:
-            # A Date header with an unknown zone gives no time zone. Use IST.
-            received_ist = received_at.replace(tzinfo=_IST)
-        else:
-            received_ist = received_at.astimezone(_IST)
+        # arrival time replaces the time that the body does not contain.
         transaction_time = received_ist.time().replace(microsecond=0)
         time_is_received_time = True
-        if txn.transaction_date is None:
-            # Replace the date only if the body has none. A date from the body
-            # is correct. Do not move it to agree with the arrival time.
-            transaction_date = received_ist.date()
     elif (
         transaction_time is not None
         and parsed.email_type in _AMBIGUOUS_12H_TIME_EMAIL_TYPES
