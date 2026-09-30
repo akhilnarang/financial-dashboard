@@ -364,7 +364,7 @@ differences within run-to-run variation do not establish a speedup or slowdown.
 
 While you work, run the test files that cover what you changed. Run the
 whole suite once before you finish, and let CI catch the rest. The full
-suite takes about two minutes, so a run after every edit wastes them.
+suite takes under a minute, so run it before you finish, not after every edit.
 
 Run all of these before finishing a refactor:
 
