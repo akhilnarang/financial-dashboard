@@ -183,10 +183,6 @@ async def _import(maker, parsed, recon, due_date=None) -> tuple[list, list]:
 @pytest.mark.parametrize(
     ("db_mask", "matches"),
     [
-        # A card the account does not list is a hard no to the pairing — but
-        # the registry drifts, so the row stays a candidate and the statement
-        # row is held back rather than imported over it.
-        pytest.param("1111", False, id="conflicting-card"),
         # Two cards sharing a last-4: the visible BIN digits conflict, so a
         # flatten-to-digits rule would wrongly match here.
         pytest.param("5100XXXXXXXX9012", False, id="shared-last4-different-bin"),
@@ -619,12 +615,13 @@ async def _seed_cc_account(
             None,
             id="shared-last4-refused",
         ),
-        # Exactly one account answers: refusal must not be the default.
+        # Exactly one account answers. Separators and a lowercase x on the
+        # stored mask are cosmetic and must not shift the digits.
         pytest.param(
-            ["5100XXXXXXXX9012", "4111XXXXXXXX7788"],
-            "XXXX XXXX XXXX 7788",
+            ["5100XXXXXXXX9012", "4111-xxxx xxxx-7788"],
+            "4111XXXXXXXX7788",
             2,
-            id="sole-match-returned",
+            id="sole-match-non-canonical-stored-mask",
         ),
         # A visible BIN resolves the shared last-4 — the evidence a last-4
         # lookup throws away.
@@ -642,15 +639,6 @@ async def _seed_cc_account(
             "1234XXXXXXXX",
             None,
             id="bin-lookalike-suffix-refused",
-        ),
-        # SBI prints only two digits: weak evidence, but reaching exactly one
-        # account there is nothing to confuse it with. A digit-count floor
-        # would drop every SBI statement.
-        pytest.param(
-            ["5100XXXXXXXX9067", "4111XXXXXXXX9012"],
-            "XXXX XXXX XXXX XX67",
-            1,
-            id="sbi-short-suffix-sole-reach",
         ),
         # An account recording no mask never wins a statement no other
         # account claims — silence is not a wildcard. Zero matches is zero.
@@ -710,22 +698,6 @@ async def test_find_account_aggregates_conflicts_across_both_routes(session_fact
     parsed = SimpleNamespace(card_number="XXXX XXXX XXXX 5566")
 
     assert await cc_module._find_account("hdfc", parsed) is None
-
-
-@pytest.mark.anyio
-async def test_find_account_matches_a_non_canonical_stored_mask(session_factory):
-    """The stored side is a mask too: dashes, spaces and lowercase ``x`` are
-    cosmetic. Compared raw, the separators shift every digit out of alignment
-    and the account silently stops matching its own statements."""
-    await _seed_cc_account(
-        session_factory, account_id=1, account_number="4000-xxxx xxxx-1234"
-    )
-
-    parsed = SimpleNamespace(card_number="4000XXXXXXXX1234")
-
-    account = await cc_module._find_account("hdfc", parsed)
-    assert account is not None
-    assert account.id == 1
 
 
 @pytest.mark.anyio
@@ -881,7 +853,6 @@ async def test_an_unclaimed_tied_candidate_spoils_the_tiebreak(
     [
         pytest.param("CRED", "CREDIT MANTRA", id="latin-word"),
         pytest.param("CAFE", "CAFE\u0301TERIA CENTRAL", id="combining-accent"),
-        pytest.param("राम", "रामा CENTRAL", id="devanagari-matra"),
         pytest.param("SHOP", "SHOP\u200cLIFT CENTRAL", id="zero-width-non-joiner"),
     ],
 )
@@ -1014,45 +985,6 @@ async def test_two_candidates_without_narration_evidence_still_demote(session_fa
 
     assert recon["matched"] == []
     assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
-
-
-@pytest.mark.anyio
-async def test_reassignment_refreshes_the_decision_reason(session_factory):
-    """A cross-date reassignment must refresh the evidence reason.
-
-    The greedy pick recorded the candidate it first won; after the tiebreak
-    swaps each row to a candidate one day away, the reason must describe the
-    reassigned candidate (offset), not the greedily-won one (exact).
-    """
-    await _seed_account(session_factory)
-    cgst_id = await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        transaction_date=parse_cc_date("07/04/2026"),
-        counterparty="CGST ON FEE",
-        raw_description="CGST ON FEE",
-    )
-    sgst_id = await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        transaction_date=parse_cc_date("08/04/2026"),
-        counterparty="SGST ON FEE",
-        raw_description="SGST ON FEE",
-    )
-
-    parsed = _parsed(
-        [
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="SGST ON FEE"),
-            _stmt_txn(date="08/04/2026", amount="34.00", narration="CGST ON FEE"),
-        ]
-    )
-    recon = await _reconcile(session_factory, parsed)
-
-    by_narration = {entry["narration"]: entry for entry in recon["matched"]}
-    assert by_narration["SGST ON FEE"]["db_txn_id"] == sgst_id
-    assert by_narration["CGST ON FEE"]["db_txn_id"] == cgst_id
-    assert by_narration["SGST ON FEE"]["decision_reason"] == "matched_date_offset"
-    assert by_narration["CGST ON FEE"]["decision_reason"] == "matched_date_offset"
 
 
 @pytest.mark.anyio

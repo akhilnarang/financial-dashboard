@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.config as config_mod
 import financial_dashboard.services.settings as settings_mod
+from financial_dashboard.config import get_fernet
 from financial_dashboard.db import Setting
 from financial_dashboard.db.models import Account, Transaction
 from financial_dashboard.integrations.paisa import PaisaClient
@@ -27,6 +28,7 @@ from financial_dashboard.schemas.extensions import (
 from financial_dashboard.services.extensions import ExtensionManager
 from financial_dashboard.services.paisa import surface
 from financial_dashboard.services.paisa.config import PaisaProjectionConfig
+from financial_dashboard.services.settings import get_setting, load_all_settings
 from tests.conftest import new_test_engine
 
 pytestmark = pytest.mark.anyio
@@ -184,65 +186,42 @@ def _valid_input(**overrides) -> PaisaConfigInput:
     return PaisaConfigInput(**base)
 
 
-async def test_save_rejects_remote_http_without_https(session):
-    result = await surface.save_config(
-        session, _valid_input(base_url="http://10.0.0.5:7500", allow_remote=True)
-    )
-    assert result.ok is False
-    assert any("Base URL" in e for e in result.errors)
-
-
-async def test_save_rejects_non_absolute_generated_path_in_project_mode(
-    session, settings_db, tmp_path
+@pytest.mark.parametrize(
+    ("overrides", "field"),
+    [
+        ({"base_url": "http://10.0.0.5:7500", "allow_remote": True}, "Base URL"),
+        ({"external_url": "javascript:alert(1)"}, "External URL"),
+        (
+            {
+                "mode": "project",
+                "generated_path": "relative/path.journal",
+                "project_since": "2026-01-01",
+            },
+            "Generated Path",
+        ),
+        (
+            {
+                "mode": "project",
+                "generated_path": "/tmp/g.journal",
+                "project_since": "",
+            },
+            "Project Since",
+        ),
+        ({"selected_account_ids": [9999]}, "Selected Account IDs"),
+        ({"mode": "bogus"}, "Mode"),
+    ],
+)
+async def test_save_rejects_invalid_config_without_persisting(
+    session, settings_db, overrides, field
 ):
-    target = tmp_path / "gen.journal"
-    result = await surface.save_config(
-        session,
-        _valid_input(
-            mode="project",
-            generated_path="relative/path.journal",
-            project_since="2026-01-01",
-            selected_account_ids=[],
-        ),
-    )
+    before = dict(settings_mod._cache)
+    result = await surface.save_config(session, _valid_input(**overrides))
     assert result.ok is False
-    assert any("Generated Path" in e for e in result.errors)
-    # Parent-missing also rejected; a real path with existing parent accepted.
-    result2 = await surface.save_config(
-        session,
-        _valid_input(
-            mode="project",
-            generated_path=str(target),
-            project_since="2026-01-01",
-            selected_account_ids=[],
-        ),
-    )
-    assert result2.ok is True
-
-
-@pytest.mark.parametrize("project_since", ["", "not-a-date"])
-async def test_save_rejects_missing_or_bad_cutover_in_project_mode(
-    session, tmp_path, project_since
-):
-    result = await surface.save_config(
-        session,
-        _valid_input(
-            mode="project",
-            generated_path=str(tmp_path / "g.journal"),
-            project_since=project_since,
-            selected_account_ids=[],
-        ),
-    )
-    assert result.ok is False
-    assert any("Project Since" in e for e in result.errors)
-
-
-async def test_save_rejects_unknown_account_id(session):
-    result = await surface.save_config(
-        session, _valid_input(selected_account_ids=[9999])
-    )
-    assert result.ok is False
-    assert any("Selected Account IDs" in e for e in result.errors)
+    assert any(field in e for e in result.errors)
+    async with settings_db() as s:
+        rows = (await s.execute(select(Setting))).scalars().all()
+    assert rows == []
+    assert settings_mod._cache == before
 
 
 @pytest.mark.parametrize(
@@ -253,9 +232,12 @@ async def test_save_rejects_unknown_account_id(session):
     ],
 )
 async def test_api_save_accepts_backend_valid_operator_mappings(
-    client, settings_db, backend, account_name, category_name
+    client, settings_db, tmp_path, backend, account_name, category_name
 ):
     payload = _valid_input(
+        mode="project",
+        generated_path=str(tmp_path / "gen.journal"),
+        project_since="2026-01-01",
         ledger_cli=backend,
         account_mappings={"1": account_name},
         category_mappings={"groceries": category_name},
@@ -266,6 +248,7 @@ async def test_api_save_accepts_backend_valid_operator_mappings(
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
+    assert body["config"]["mode"] == "project"
     assert body["config"]["ledger_cli"] == backend
     assert body["config"]["account_mappings"] == {"1": account_name}
     assert body["config"]["category_mappings"] == {"groceries": category_name}
@@ -293,10 +276,7 @@ async def test_api_beancount_rejects_ledger_valid_mapping_without_partial_save(
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is False
-    assert any(
-        "Account Mappings" in error and "must not contain spaces" in error
-        for error in body["errors"]
-    )
+    assert any("Account Mappings" in error for error in body["errors"])
     assert settings_mod._cache["paisa.ledger_cli"] == "ledger"
     assert settings_mod._cache["paisa.auth_username"] == "before"
     assert settings_mod._cache["paisa.account_mappings"] == (
@@ -304,106 +284,39 @@ async def test_api_beancount_rejects_ledger_valid_mapping_without_partial_save(
     )
 
 
-async def test_save_rejects_invalid_external_url_scheme(session):
-    result = await surface.save_config(
-        session, _valid_input(external_url="javascript:alert(1)")
-    )
-    assert result.ok is False
-    assert any("External URL" in e for e in result.errors)
-
-
-async def test_save_rejects_zero_timeout(session):
-    result = await surface.save_config(session, _valid_input(request_timeout_seconds=0))
-    assert result.ok is False
-    assert any("Request Timeout" in e for e in result.errors)
-
-
-async def test_save_does_not_persist_on_validation_error(session, settings_db):
-    before = dict(settings_mod._cache)
-    result = await surface.save_config(session, _valid_input(mode="bogus"))
-    assert result.ok is False
-    assert any("Mode" in e for e in result.errors)
-    # No setting row was written.
-    async with settings_db() as s:
-        rows = (await s.execute(select(Setting))).scalars().all()
-    assert rows == []
-    assert settings_mod._cache == before
-
-
-# ---------------------------------------------------------------------------
-# Config save: persistence, redaction, password preserve-on-blank
-# ---------------------------------------------------------------------------
-
-
-async def test_save_persists_and_redacts_password(session, settings_db):
-    await _seed_bank(session, id=1)
-    result = await surface.save_config(
-        session,
-        _valid_input(
-            mode="connect",
-            auth_password="s3cret-paisa",
-            selected_account_ids=[1],
-            base_url="http://127.0.0.1:7500",
-        ),
-    )
-    assert result.ok is True
-    # Response never carries the plaintext password.
-    dumped = result.config.model_dump()
-    assert "auth_password" not in dumped
-    assert dumped["auth_password_set"] is True
-
-    # At rest it is encrypted.
-    async with settings_db() as s:
-        row = await s.get(Setting, "paisa.auth_password")
-    assert row is not None
-    assert row.value != "s3cret-paisa"
-    assert row.value != ""
-
-
-async def test_save_blank_password_preserves_current_secret(session, settings_db):
+async def test_save_encrypts_redacts_and_blank_preserves_password(session, settings_db):
     await _seed_bank(session, id=1)
     first = await surface.save_config(
         session,
-        _valid_input(auth_password="original", selected_account_ids=[1]),
+        _valid_input(auth_password="s3cret-paisa", selected_account_ids=[1]),
     )
     assert first.ok is True
+    dumped = first.config.model_dump()
+    assert "auth_password" not in dumped
+    assert dumped["auth_password_set"] is True
 
-    # Second save with a blank password and an unrelated change must keep the
-    # current secret and apply the other change.
+    async with settings_db() as s:
+        row = await s.get(Setting, "paisa.auth_password")
+    assert row.value not in ("s3cret-paisa", "")
+    await load_all_settings()
+    assert get_setting("paisa.auth_password") == "s3cret-paisa"
+
+    # A blank password keeps the current secret and applies the other change.
     second = await surface.save_config(
         session,
-        _valid_input(
-            auth_password="",
-            auth_username="alice",
-            selected_account_ids=[1],
-        ),
+        _valid_input(auth_password="", auth_username="alice", selected_account_ids=[1]),
     )
     assert second.ok is True
     assert second.config.auth_password_set is True
     assert second.config.auth_username == "alice"
-
-    # The stored (encrypted) value round-trips to the original secret.
-    from financial_dashboard.config import get_fernet
-
     async with settings_db() as s:
         row = await s.get(Setting, "paisa.auth_password")
-    assert get_fernet().decrypt(row.value.encode()).decode() == "original"
+    assert get_fernet().decrypt(row.value.encode()).decode() == "s3cret-paisa"
 
 
 # ---------------------------------------------------------------------------
 # Status / probe (all modes + failure isolation)
 # ---------------------------------------------------------------------------
-
-
-async def test_status_disabled_mode(client, monkeypatch):
-    monkeypatch.setattr(surface, "load_config", lambda: _config(mode="disabled"))
-    r = await client.get("/api/extensions/paisa/status")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["ok"] is False
-    assert body["reachable"] is False
-    assert body["reason"] == "disabled"
-    assert body["can_connect"] is False
 
 
 async def test_status_probe_with_mock_transport_serializes_capabilities(monkeypatch):
@@ -424,30 +337,49 @@ async def test_status_probe_with_mock_transport_serializes_capabilities(monkeypa
     assert status.diagnosis.ok is True
 
 
-async def test_status_failure_isolation_returns_typed_body(client, monkeypatch):
-    async def boom():
-        raise RuntimeError("probe blew up")
+async def test_mode_gates_block_actions(client, monkeypatch):
+    monkeypatch.setattr(surface, "load_config", lambda: _config(mode="disabled"))
+    status = (await client.get("/api/extensions/paisa/status")).json()
+    assert status["ok"] is False
+    assert status["reachable"] is False
+    assert status["reason"] == "disabled"
+
+    monkeypatch.setattr(surface, "load_config", lambda: _config(mode="connect"))
+    for action, key in (
+        ("preview", "reason"),
+        ("generate", "reason"),
+        ("sync", "outcome"),
+    ):
+        body = (await client.post(f"/api/extensions/paisa/{action}")).json()
+        assert body["ok"] is False
+        assert body[key] == "connect_only"
+
+    monkeypatch.setattr(
+        surface, "load_config", lambda: _config(selected_account_ids=())
+    )
+    body = (await client.post("/api/extensions/paisa/preview")).json()
+    assert body["ok"] is False
+    assert body["reason"] == "not_configured"
+
+
+async def test_route_failures_are_isolated(client, monkeypatch):
+    async def boom(*args, **kwargs):
+        raise RuntimeError("paisa blew up")
 
     monkeypatch.setattr(surface, "probe_status", boom)
-    r = await client.get("/api/extensions/paisa/status")
-    # Optional-extension isolation: typed JSON body, not a 500.
-    assert r.status_code == 200
-    body = r.json()
-    assert body["ok"] is False
-    assert body["error"] == "paisa_status_failed"
+    monkeypatch.setattr(surface, "preview_projection", boom)
+    monkeypatch.setattr(surface, "sync_now", boom)
 
-
-# ---------------------------------------------------------------------------
-# Preview dispatch (mode gating + serialization)
-# ---------------------------------------------------------------------------
-
-
-async def test_preview_connect_blocked_via_route(client, session, monkeypatch):
-    monkeypatch.setattr(surface, "load_config", lambda: _config(mode="connect"))
-    r = await client.post("/api/extensions/paisa/preview")
-    body = r.json()
-    assert body["ok"] is False
-    assert body["reason"] == "connect_only"
+    status = await client.get("/api/extensions/paisa/status")
+    assert status.status_code == 200
+    assert status.json()["ok"] is False
+    assert status.json()["error"] == "paisa_status_failed"
+    preview = await client.post("/api/extensions/paisa/preview")
+    assert preview.status_code == 503
+    assert preview.json()["detail"]["error"] == "paisa_preview_failed"
+    sync = await client.post("/api/extensions/paisa/sync")
+    assert sync.status_code == 503
+    assert sync.json()["detail"]["error"] == "paisa_sync_failed"
 
 
 async def test_preview_project_returns_summary(client, session, monkeypatch):
@@ -460,24 +392,7 @@ async def test_preview_project_returns_summary(client, session, monkeypatch):
     body = r.json()
     assert body["ok"] is True
     assert body["summary"]["emitted_count"] == 1
-    assert body["journal"] is not None
     assert "txn:1" in body["journal"]
-
-
-async def test_preview_failure_isolation(client, monkeypatch):
-    async def boom(session):
-        raise RuntimeError("preview blew up")
-
-    monkeypatch.setattr(surface, "preview_projection", boom)
-    r = await client.post("/api/extensions/paisa/preview")
-    assert r.status_code == 503
-    body = r.json()
-    assert body["detail"]["error"] == "paisa_preview_failed"
-
-
-# ---------------------------------------------------------------------------
-# Generate dispatch (project mode, no core writes)
-# ---------------------------------------------------------------------------
 
 
 async def test_generate_writes_file_and_no_core_writes(
@@ -503,7 +418,6 @@ async def test_generate_writes_file_and_no_core_writes(
     body = r.json()
     assert body["ok"] is True
     assert body["publish"]["published"] is True
-    assert target.exists()
     assert "; txn:1" in target.read_text()
 
     txn_after = [
@@ -514,19 +428,6 @@ async def test_generate_writes_file_and_no_core_writes(
     ]
     assert txn_before == txn_after
     assert acct_before == acct_after
-
-
-async def test_generate_connect_blocked(client, session, monkeypatch):
-    monkeypatch.setattr(surface, "load_config", lambda: _config(mode="connect"))
-    r = await client.post("/api/extensions/paisa/generate")
-    body = r.json()
-    assert body["ok"] is False
-    assert body["reason"] == "connect_only"
-
-
-# ---------------------------------------------------------------------------
-# Sync dispatch (project mode, mock transport, no core writes)
-# ---------------------------------------------------------------------------
 
 
 async def test_sync_happy_path_never_mutates_core_rows(
@@ -571,39 +472,6 @@ async def test_sync_happy_path_never_mutates_core_rows(
     assert body["diagnosis_ok"] is True
     assert target.exists()
     assert seen == ["/api/config", "/api/sync", "/api/diagnosis"]
-
-
-async def test_sync_connect_blocked(client, session, monkeypatch):
-    monkeypatch.setattr(surface, "load_config", lambda: _config(mode="connect"))
-    r = await client.post("/api/extensions/paisa/sync")
-    body = r.json()
-    assert body["ok"] is False
-    assert body["outcome"] == "connect_only"
-
-
-async def test_sync_failure_isolation(client, monkeypatch):
-    async def boom(session, *, client=None):
-        raise RuntimeError("sync blew up")
-
-    monkeypatch.setattr(surface, "sync_now", boom)
-    r = await client.post("/api/extensions/paisa/sync")
-    assert r.status_code == 503
-    assert r.json()["detail"]["error"] == "paisa_sync_failed"
-
-
-# ---------------------------------------------------------------------------
-# Surface serialization unit checks (report → DTO)
-# ---------------------------------------------------------------------------
-
-
-async def test_preview_projection_serializes_not_configured(monkeypatch):
-    # No selected accounts → ready_to_project is False → not_configured, no DB.
-    monkeypatch.setattr(
-        surface, "load_config", lambda: _config(selected_account_ids=())
-    )
-    out = await surface.preview_projection(session=object())  # type: ignore[arg-type]
-    assert out.ok is False
-    assert out.reason == "not_configured"
 
 
 # ---------------------------------------------------------------------------

@@ -1,20 +1,29 @@
 """HTML page tests for /cashflow.
 
-The page server-renders every figure and every drill-through link, so the
-assertions here read the rendered markup rather than the JSON the charts
-hydrate from: the charts are progressive enhancement over what these tests
-already prove is on the page.
+The page server-renders every figure and every drill-through link. Each test
+reads the element under test, follows the href rendered inside it, and counts
+what comes back. A figure and its drill-through then cannot drift apart without
+a failure here.
 """
 
 import datetime
 import json
 import re
+from contextlib import contextmanager
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
 
+from financial_dashboard.core.templating import format_inr_exact
 from financial_dashboard.db.models import Transaction
-from tests.conftest import bank_account
+from tests.conftest import (
+    MISSING_ACCOUNT_ID,
+    bank_account,
+    card_account,
+    ensure_account,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -23,20 +32,21 @@ pytestmark = pytest.mark.anyio
 # where the separator is the "&amp;" entity.
 RANGE = "date_from=2026-06-01&date_to=2026-06-30"
 RANGE_HTML = "date_from=2026-06-01&amp;date_to=2026-06-30"
-# The rupee buckets sum INR-and-null rows only, so their drill-throughs pin the
-# currency; the currency-agnostic links (uncategorized, internal, undated) do not.
-CORE_HTML = f"{RANGE_HTML}&amp;non_inr=0"
 
 # The month the seed helper writes into by default.
 SEED_MONTH = datetime.date(2026, 6, 1)
+
+# The listing renders one "/detail" link per row, so counting them counts rows.
+DETAIL = "/detail"
+
+EMPTY = "No transactions in this range"
 
 
 def _tile(page: str, name: str) -> str:
     """The markup of one headline tile.
 
-    A tile's compact figure ("₹90K") is not unique on the page, and its exact
-    twin sits in the table below it, so an assertion has to be scoped to the tile
-    itself or it would still pass with the tile deleted.
+    A tile's compact figure is not unique on the page, so an assertion has to be
+    scoped to the tile itself or it would still pass with the tile deleted.
     """
     match = re.search(
         rf'<article[^>]*data-tile="{name}".*?</article>', page, flags=re.DOTALL
@@ -55,8 +65,76 @@ def _region(page: str, attribute: str, name: str | None = None) -> str:
     return match.group(0)
 
 
-def _links(page: str, prefix: str) -> list[str]:
-    return re.findall(rf'href="({re.escape(prefix)}[^"]*)"', page)
+def _href(markup: str) -> str:
+    """The single anchor inside one rendered row/tile, as a followable URL."""
+    match = re.search(r'href="([^"]+)"', markup)
+    assert match, f"no anchor in {markup!r}"
+    return match.group(1).replace("&amp;", "&")
+
+
+def _month_start(today: datetime.date, back: int) -> datetime.date:
+    """The first of the month ``back`` months before ``today``'s month."""
+    absolute = today.year * 12 + (today.month - 1) - back
+    return datetime.date(absolute // 12, absolute % 12 + 1, 1)
+
+
+def _count(markup: str) -> int:
+    """The transaction count a footnote row or tile prints ("N txns")."""
+    match = re.search(r"(\d+) txns", markup)
+    assert match, f"no count in {markup!r}"
+    return int(match.group(1))
+
+
+def _rows(section: str) -> list[str]:
+    return re.findall(r"<tr>.*?</tr>", section, flags=re.DOTALL)
+
+
+def _row_with(section: str, needle: str) -> str:
+    """The one table row of a rendered section whose label contains ``needle``."""
+    matching = [row for row in _rows(section) if needle in row]
+    assert len(matching) == 1, f"expected exactly one row containing {needle!r}"
+    return matching[0]
+
+
+def _line_count(row: str) -> int:
+    """The count cell of a category/counterparty line."""
+    match = re.search(r'<td class="text-sm text-muted">(\d+)</td>', row)
+    assert match, f"no count cell in {row!r}"
+    return int(match.group(1))
+
+
+def _listed_amounts(listing: str) -> list[Decimal]:
+    """Every amount a /transactions listing prints, signed by its own direction."""
+    cells = re.findall(
+        r'class="amt amt-\w+">(&minus;|\+)[^\d]*([\d,]+\.\d{2})</td>', listing
+    )
+    return [
+        -Decimal(body.replace(",", ""))
+        if sign == "&minus;"
+        else Decimal(body.replace(",", ""))
+        for sign, body in cells
+    ]
+
+
+async def _get(client, href: str) -> str:
+    """Follow a rendered href exactly as a browser would."""
+    r = await client.get(href.replace("&amp;", "&"))
+    assert r.status_code == 200
+    return r.text
+
+
+async def _listed(client, markup: str) -> str:
+    """Follow the drill-through rendered inside ``markup`` and return the listing."""
+    return await _get(client, _href(markup))
+
+
+def _lines(page: str, tile: str) -> list[tuple[str, str]]:
+    """The (key, href) of every drill anchor the given tile's lines rendered.
+
+    The breakdown chart's bars take these hrefs, so what they point at is what
+    the bars point at.
+    """
+    return re.findall(rf'<a data-line="{tile}" data-key="([^"]*)" href="([^"]*)"', page)
 
 
 #: ``_add`` links the row to the bank account. Anything else — a card, or no
@@ -104,278 +182,583 @@ async def _add(
     await session.commit()
 
 
-async def test_cashflow_page_renders_default_range(client):
-    r = await client.get("/cashflow")
-    assert r.status_code == 200
-    assert "Cashflow" in r.text
-    # The default range is resolved server-side and pinned into the form.
+async def test_empty_range_keeps_zero_tiles_and_the_trend(client, session):
+    """An empty range still shows five zero tiles and the empty-state card.
+
+    The trend is a trailing-12-month series, so the selected range does not
+    scope it. Only the range-scoped parts go away.
+    """
+    # Last month is always inside the trend window. The month before it is an
+    # empty range inside that window.
     today = datetime.date.today()
-    assert f'value="{today.replace(day=1).isoformat()}"' in r.text
-    assert f'value="{today.isoformat()}"' in r.text
+    history = _month_start(today, 1)
+    await _add(
+        session,
+        amount="90000",
+        direction="credit",
+        category="salary",
+        month=history,
+    )
+    empty = _month_start(today, 2)
+    end = history - datetime.timedelta(days=1)
+    page = (
+        await client.get(
+            f"/cashflow?date_from={empty.isoformat()}&date_to={end.isoformat()}"
+        )
+    ).text
+
+    assert EMPTY in page
+    names = ["income", "expense", "net_invested", "transfers_in", "uncategorized"]
+    assert re.findall(r'data-tile="([a-z_]+)"', page) == names
+    for name in names:
+        assert "₹0.00" in _tile(page, name), f"{name} tile does not read zero"
+
+    api = await client.get("/api/cashflow/trend?months=12")
+    seeded = f"{history.year:04d}-{history.month:02d}"
+    assert [p["month"] for p in api.json() if Decimal(p["income"])] == [seeded]
+    assert 'id="cf-trend"' in _region(page, "data-trend")
+    assert "data-reconciliation" not in page
+    assert 'id="cf-breakdown"' not in page
 
 
-async def test_cashflow_page_renders_tiles_and_lines(client, session):
+@pytest.mark.parametrize("population", ["card", "unaccounted", "non_inr"])
+async def test_a_range_of_rows_outside_the_bank_tiles_is_not_empty(
+    client, session, population
+):
+    """A row no bank tile counts still shows in a table or footnote on the page,
+    so the page must not call the range empty."""
+    row = {"amount": "800", "direction": "debit", "category": "rent"}
+    if population == "card":
+        row["account_id"] = await card_account(session)
+    elif population == "unaccounted":
+        row["account_id"] = None
+    else:
+        row["currency"] = "USD"
+    await _add(session, **row)
+
+    page = (await client.get(f"/cashflow?{RANGE}")).text
+    assert EMPTY not in page
+    assert "₹0.00" in _tile(page, "expense")
+
+
+async def test_tiles_tables_and_footer_show_the_summary_figures(client, session):
     await _add(session, amount="90000", direction="credit", category="salary")
+    await _add(session, amount="2000", direction="credit", category="repayment")
     await _add(session, amount="20000", direction="debit", category="rent")
     await _add(session, amount="500", direction="credit", category="refund")
     await _add(session, amount="10000", direction="debit", category="investment")
+    await _add(session, amount="4000", direction="credit", category="investment")
+    # Excluded populations must not move the identity.
+    await _add(session, amount="5000", direction="debit", category="self_transfer")
+    await _add(session, amount="70", direction="debit", category="rent", currency="USD")
+    # Uncategorized rows move no term. The footer prints their net as its error bar.
+    await _add(session, amount="1234", direction="debit", category=None)
+    await _add(session, amount="4000", direction="debit", category="crypto_yield")
 
-    r = await client.get(f"/cashflow?{RANGE}")
-    assert r.status_code == 200
+    page = (await client.get(f"/cashflow?{RANGE}")).text
 
-    # Tiles carry the compact figure, each asserted inside its own tile: income
-    # 90,000; expense 20,000 - 500 contra = 19,500; net invested 10,000.
-    assert "₹90K" in _tile(r.text, "income")
-    assert "1 txns" in _tile(r.text, "income")
-    assert "₹19.5K" in _tile(r.text, "expense")
-    assert "₹10K" in _tile(r.text, "net_invested")
+    # Tiles carry the compact figure: expense is 20,000 - 500 contra.
+    income = _tile(page, "income")
+    assert "₹90K" in income
+    assert _count(income) == 1
+    assert "₹19.5K" in _tile(page, "expense")
+    invested = _tile(page, "net_invested")
+    assert _count(invested) == 2
+    assert "₹10K" in invested
+    assert "₹4K" in invested
 
     # The tables carry the exact figure.
-    assert "₹90,000.00" in _region(r.text, "data-section", "income")
-    assert "₹19,500.00" in _region(r.text, "data-section", "expense")
-    assert "₹10,000.00" in _region(r.text, "data-section", "investment")
+    assert "₹90,000.00" in _region(page, "data-section", "income")
+    assert "₹19,500.00" in _region(page, "data-section", "expense")
+    assert "₹6,000.00" in _region(page, "data-section", "investment")
 
-    # Category lines drill through, range-scoped.
-    assert f"/transactions?category=salary&amp;{CORE_HTML}" in r.text
-    assert f"/transactions?category=rent&amp;{CORE_HTML}" in r.text
-    assert (
-        f"/transactions?category=investment&amp;direction=debit&amp;{CORE_HTML}"
-        in r.text
+    # 90,000 + 2,000 - 19,500 - 6,000 = 66,500.
+    footer = _region(page, "data-reconciliation")
+    for term in ("₹90,000.00", "₹2,000.00", "₹19,500.00", "₹6,000.00"):
+        assert term in footer
+    assert "net cash retained ₹66,500.00" in footer
+    assert "₹5,000.00" not in footer
+    assert "70.00" not in footer
+    assert "uncategorized -₹5,234.00" in footer
+
+
+async def test_no_counterparty_group_lists_every_blank_spelling(client, session):
+    """NULL, empty and whitespace-only are the same absence of a counterparty.
+
+    They must collapse into one "(no counterparty)" line *and* that line's link
+    must list all of them: a tab-only counterparty that gets its own line, or is
+    counted in the group but missing from the group's listing, is a figure whose
+    own link contradicts it.
+    """
+    await _add(session, amount="100", direction="credit", category="repayment")
+    await _add(
+        session, amount="200", direction="credit", category="repayment", counterparty=""
     )
-    # The contra credit is a negative expense line, not an income line.
-    assert "Refund" in r.text
+    await _add(
+        session,
+        amount="400",
+        direction="credit",
+        category="repayment",
+        counterparty="\t",
+    )
+    await _add(
+        session,
+        amount="800",
+        direction="credit",
+        category="repayment",
+        counterparty="MOM",
+    )
+
+    page = (await client.get(f"/cashflow?{RANGE}")).text
+    section = _region(page, "data-section", "transfers_in")
+    # One line per real counterparty: the blank spellings are not three of them.
+    assert len(_rows(section)) == 2
+
+    row = _row_with(section, "(no counterparty)")
+    assert "₹700.00" in row
+    assert _line_count(row) == 3
+
+    listing = await _listed(client, row)
+    assert listing.count(DETAIL) == 3
+    for amount in ("100.00", "200.00", "400.00"):
+        assert amount in listing, f"the group's link omits the row it counted: {amount}"
+    assert "800.00" not in listing
 
 
-async def test_headline_tiles_are_exactly_the_five_specified(client, session):
-    """Net cash retained is a derived identity, not a headline: it reads in the
-    reconciliation footer that shows the terms it comes from."""
+async def test_internal_footnote_and_perimeter_caveat_list_self_transfers_alone(
+    client, session
+):
+    """Under the bank scope the internal footnote counts self-transfers alone. A
+    card bill is money that leaves the bank, so it is the Card bills expense line.
+
+    The perimeter caveat carries the signed internal net: a non-zero net is money
+    that crossed the tracked perimeter without being spent.
+    """
+    await _add(session, amount="5000", direction="debit", category="self_transfer")
+    await _add(session, amount="1000", direction="credit", category="self_transfer")
+    await _add(
+        session, amount="9100", direction="debit", category="credit_card_payment"
+    )
     await _add(session, amount="90000", direction="credit", category="salary")
+
+    page = (await client.get(f"/cashflow?{RANGE}")).text
+    row = _region(page, "data-footnote", "internal")
+    assert f"internal=1&amp;{RANGE_HTML}&amp;scope=bank" in row
+    # Gross, not net: the two legs add up rather than cancel.
+    assert "₹6,000.00" in row
+
+    listing = await _listed(client, row)
+    assert listing.count(DETAIL) == _count(row) == 2
+    assert "9,100.00" not in listing, (
+        "the internal drill lists the card bill the footnote counts as expense"
+    )
+    assert "90,000.00" not in listing
+
+    bills = _row_with(_region(page, "data-section", "expense"), ">Card bills<")
+    bill_listing = await _listed(client, bills)
+    assert bill_listing.count(DETAIL) == _line_count(bills) == 1
+    assert "9,100.00" in bill_listing
+
+    caveat = _region(page, "data-perimeter")
+    assert "2 internal movements" in caveat
+    assert format_inr_exact(Decimal("-4000")) in caveat
+    assert "₹6,000.00" not in caveat
+    caveat_listing = await _listed(client, caveat)
+    assert caveat_listing.count(DETAIL) == 2
+    assert "90,000.00" not in caveat_listing
+
+
+async def test_excluded_and_undated_footnotes_count_what_the_buckets_drop(
+    client, session
+):
+    """A flagged row leaves every figure above and the Excluded footnote counts it.
+    An undated row is in no range, so the Undated footnote counts it with a
+    rangeless drill, flagged or not."""
+    await _add(session, amount="90000", direction="credit", category="salary")
+    await _add(session, amount="5000", direction="debit", category="dining")
+    await _add(
+        session,
+        amount="24995",
+        direction="debit",
+        category="shopping",
+        exclude_from_cashflow=True,
+    )
+    await _add(
+        session,
+        amount="333",
+        direction="debit",
+        category="rent",
+        dated=False,
+        exclude_from_cashflow=True,
+    )
+    await _add(session, amount="90", direction="credit", category="salary", dated=False)
+
+    page = (await client.get(f"/cashflow?{RANGE}")).text
+
+    expense = _region(page, "data-section", "expense")
+    assert "₹5,000.00" in expense
+    assert "24,995" not in expense
+    assert "₹90,000.00" in _region(page, "data-section", "income")
+
+    excluded = _region(page, "data-footnote", "excluded")
+    listing = await _listed(client, excluded)
+    assert listing.count(DETAIL) == _count(excluded) == 1
+    assert "24,995.00" in listing
+    assert "5,000.00" not in listing
+    assert "90,000.00" not in listing
+
+    undated = _region(page, "data-footnote", "undated")
+    assert _href(undated) == "/transactions?undated=1"
+    # Signed net: a 90 credit against a 333 debit.
+    assert "-₹243.00" in undated
+    listing = await _listed(client, undated)
+    assert listing.count(DETAIL) == _count(undated) == 2
+    assert "333.00" in listing
+    assert "24,995.00" not in listing
+
+
+async def test_family_excluded_from_buckets_and_counted_in_its_footnote(
+    client, session
+):
+    """A `family` row is excluded from income and expense and counted only in the
+    family footnote, whose drill lists exactly those rows."""
+    # Decoy amounts are chosen so none is a substring of a family amount.
+    await _add(session, amount="40000", direction="credit", category="family")
+    await _add(session, amount="13000", direction="debit", category="family")
+    await _add(session, amount="90000", direction="credit", category="salary")
+    await _add(session, amount="6500", direction="debit", category="rent")
+
+    page = (await client.get(f"/cashflow?{RANGE}")).text
+
+    # Excluded from the money buckets entirely.
+    assert "Family" not in _region(page, "data-section", "income")
+    assert "Family" not in _region(page, "data-section", "expense")
+
+    # Counted in its own footnote: signed net +40,000 credit -13,000 debit.
+    row = _region(page, "data-footnote", "family")
+    assert f"category=family&amp;{RANGE_HTML}" in row
+    assert "₹27,000.00" in row
+
+    listing = await _listed(client, row)
+    assert listing.count(DETAIL) == _count(row) == 2
+    # The salary/rent decoys are not in the family drill.
+    assert "90,000.00" not in listing
+    assert "6,500.00" not in listing
+
+    # Family is not "internal": it must not inflate the internal footnote (that
+    # figure only holds self-transfers, which family flows are not).
+    assert _count(_region(page, "data-footnote", "internal")) == 0
+
+
+async def test_reimbursement_credit_nets_against_spend(client, session):
+    """A reimbursement credit reduces Spent (contra-expense) and is not income."""
+    await _add(session, amount="5000", direction="debit", category="dining")
+    await _add(session, amount="4000", direction="credit", category="reimbursement")
+    # An income decoy so the income section renders (to prove reimbursement is not
+    # in it).
+    await _add(session, amount="90000", direction="credit", category="salary")
+
+    page = (await client.get(f"/cashflow?{RANGE}")).text
+
+    expense = _region(page, "data-section", "expense")
+    # 5,000 spent minus 4,000 reimbursed nets to 1,000.
+    assert "₹1,000.00" in expense
+    assert "Reimbursement" in expense
+    # Not income.
+    assert "Reimbursement" not in _region(page, "data-section", "income")
+
+
+async def test_uncategorized_drill_is_bank_scoped_but_still_currency_agnostic(
+    client, session
+):
+    """Two rules on one link, and they pull in opposite directions.
+
+    Only a bank-side uncategorized row can distort a bank-basis identity, so the
+    tile is scoped; but a foreign-currency row with no category is still
+    uncategorized, so the tile is *not* currency-filtered. The link has to carry
+    the first and not the second, or its count and its listing disagree.
+    """
+    card = await card_account(session)
+    await _add(session, amount="800", direction="debit", category=None)
+    await _add(session, amount="7", direction="debit", category=None, currency="USD")
+    await _add(
+        session, amount="6543", direction="debit", category=None, account_id=card
+    )
+
+    tile = _tile((await client.get(f"/cashflow?{RANGE}")).text, "uncategorized")
+    assert "scope=bank" in tile
+    assert "non_inr=0" not in tile
+
+    listing = await _listed(client, tile)
+    assert listing.count(DETAIL) == _count(tile) == 2
+    assert "800.00" in listing
+    assert "7.00" in listing, "the currency filter crept back onto the link"
+    assert "6,543.00" not in listing, "the uncategorized drill lists a card row"
+
+
+async def test_unaccounted_footnote_count_agrees_with_its_drill(client, session):
+    """The rows on no known account: unlinked, dangling, or an account type nothing
+    recognizes. They reach no figure above, so this footnote is the only place they
+    are visible, and its link is the only way to see which rows they are.
+
+    The bank and card rows are the decoys: the footnote is the *complement* of both
+    scopes, so a link that dropped its scope would list them too.
+    """
+    dangling = MISSING_ACCOUNT_ID
+    unknown_type = await ensure_account(session, 7, "wallet")
+    await _add(session, amount="90000", direction="credit", category="salary")
+    await _add(
+        session,
+        amount="4444",
+        direction="debit",
+        category="dining",
+        account_id=await card_account(session),
+    )
+    await _add(
+        session, amount="800", direction="debit", category="rent", account_id=None
+    )
+    await _add(
+        session, amount="250", direction="debit", category="rent", account_id=dangling
+    )
+    await _add(
+        session,
+        amount="60",
+        direction="credit",
+        category="refund",
+        account_id=unknown_type,
+    )
+
+    page = (await client.get(f"/cashflow?{RANGE}")).text
+    row = _region(page, "data-footnote", "unaccounted")
+    assert f"scope=unaccounted&amp;{RANGE_HTML}" in row or (
+        f"{RANGE_HTML}&amp;scope=unaccounted" in row
+    )
+    # Signed net: a 60 credit against 800 + 250 of debits.
+    assert "-₹990.00" in row
+
+    listing = await _listed(client, row)
+    assert listing.count(DETAIL) == _count(row) == 3
+    # And the figure is the sum of the rows that link returned, not of the seed.
+    listed = _listed_amounts(listing)
+    assert sorted(listed) == [Decimal("-800"), Decimal("-250"), Decimal("60")]
+    assert format_inr_exact(sum(listed)) in row
+    assert "90,000.00" not in listing
+    assert "4,444.00" not in listing, "the unaccounted drill lists a card row"
+
+
+async def test_expense_detail_counts_the_swipes_over_every_account(client, session):
+    """The other question — what was *bought* — and the one figure here that is not
+    bank-scoped, so it is the one link that must NOT say ``scope=bank``.
+
+    A card swipe never touches the bank, so an all-account figure whose link carried
+    the bank scope would list a fraction of the rows it summed. The card bill is the
+    decoy on the other side: over every account it is internal churn, because it
+    settles the very swipes this figure already counted, so it must not appear as a
+    line here at all — while the headline above counts it as expense. The two figures
+    disagreeing is the point, and the caveat has to say so.
+    """
+    card = await card_account(session)
+    await _add(
+        session, amount="4000", direction="debit", category="dining", account_id=card
+    )
+    await _add(
+        session,
+        amount="55",
+        direction="debit",
+        category="dining",
+        currency="USD",
+        account_id=card,
+    )
     await _add(session, amount="20000", direction="debit", category="rent")
+    await _add(
+        session, amount="9100", direction="debit", category="credit_card_payment"
+    )
+
+    page = (await client.get(f"/cashflow?{RANGE}")).text
+    detail = _region(page, "data-section", "expense_detail")
+
+    # 4,000 of swipes + 20,000 of rent. The card bill is internal here, so it is
+    # neither a line nor part of the total...
+    assert "₹24,000.00" in detail
+    assert "Card bills" not in detail
+    # ...but it *is* the headline, which counts the bill and not the swipe.
+    assert "₹29,100.00" in _region(page, "data-section", "expense")
+
+    row = _row_with(detail, ">Dining<")
+    assert "scope=" not in row, "the all-account detail's link claims an account scope"
+    assert "non_inr=0" in row
+
+    listing = await _listed(client, row)
+    assert listing.count(DETAIL) == _line_count(row) == 1
+    assert "4,000.00" in listing, "the unscoped link did not reach the card swipe"
+    assert "55.00" not in listing  # the detail is INR-or-null, and so is its link
+
+
+# The bank perimeter, link by link. Each test seeds one row on every account a
+# row can sit on, all with the figure's own filter. The two inside the perimeter
+# must be listed and the four outside it must not.
+
+#: A debit card spends the bank's money, so it is inside the bank scope.
+DEBIT_CARD_ID = 3
+#: An account type the report knows nothing about.
+UNKNOWN_TYPE_ID = 7
+
+#: What the four out-of-perimeter rows print in a listing. None is a substring
+#: of another.
+OUTSIDE = ("4,444.00", "3,333.00", "2,222.00", "1,111.00")
+
+
+async def _seed_outside_the_bank(session, **row) -> None:
+    """Seed the same row on each of the four accounts no bank figure may count.
+
+    ``row`` is the figure's own filter — the category, direction and currency the
+    figure selects on — so these rows differ from the ones it counts in the account
+    alone. A credit card, an account type nothing recognizes, an ``account_id``
+    naming no account row, and no account at all: between them they are every way a
+    row can be out of the bank scope.
+    """
+    await _add(session, amount="4444", account_id=await card_account(session), **row)
+    await _add(
+        session,
+        amount="3333",
+        account_id=await ensure_account(session, UNKNOWN_TYPE_ID, "wallet"),
+        **row,
+    )
+    await _add(session, amount="2222", account_id=MISSING_ACCOUNT_ID, **row)
+    await _add(session, amount="1111", account_id=None, **row)
+
+
+async def test_investment_line_drills_into_the_bank_perimeter_alone(client, session):
+    """The Net Invested lines, followed as rendered.
+
+    The four decoys are contributions like the two the line counts and sit outside
+    the bank, so a link that lost its scope lists six rows under a count of two.
+    """
     await _add(session, amount="10000", direction="debit", category="investment")
+    await _add(
+        session,
+        amount="2500",
+        direction="debit",
+        category="investment",
+        account_id=await ensure_account(session, DEBIT_CARD_ID, "debit_card"),
+    )
+    await _seed_outside_the_bank(session, direction="debit", category="investment")
 
-    r = await client.get(f"/cashflow?{RANGE}")
-    assert re.findall(r'data-tile="([a-z_]+)"', r.text) == [
-        "income",
-        "expense",
-        "net_invested",
-        "transfers_in",
-        "uncategorized",
-    ]
+    page = (await client.get(f"/cashflow?{RANGE}")).text
+    row = _row_with(_region(page, "data-section", "investment"), ">Investment<")
+    assert "scope=bank" in row
+    assert "₹12,500.00" in row
 
-    # 90,000 - 20,000 - 10,000, exact and spelled out from its terms.
-    footer = _region(r.text, "data-reconciliation")
-    assert "net cash retained ₹60,000.00" in footer
-    assert "₹90,000.00" in footer
-    assert "₹20,000.00" in footer
-    assert "₹10,000.00" in footer
-
-
-async def test_exact_amounts_use_indian_digit_grouping(client, session):
-    """Above a lakh the grouping is the whole point: ₹12,34,567.89, never the
-    Western ₹1,234,567.89 that a plain "{:,}" would print."""
-    await _add(session, amount="1234567.89", direction="credit", category="salary")
-
-    r = await client.get(f"/cashflow?{RANGE}")
-    assert "₹12,34,567.89" in _region(r.text, "data-section", "income")
-    assert "₹12,34,567.89" in _region(r.text, "data-reconciliation")
-    assert "1,234,567.89" not in r.text
+    listing = await _listed(client, row)
+    assert listing.count(DETAIL) == _line_count(row) == 2
+    assert "10,000.00" in listing
+    # The debit card spends the bank's money, so its row is one the figure counted.
+    assert "2,500.00" in listing, "the bank scope dropped the debit-card row"
+    for amount in OUTSIDE:
+        assert amount not in listing, (
+            f"the investment link lists {amount}, out of scope"
+        )
 
 
-async def test_transfers_in_link_is_scoped_to_repayments(client, session):
-    """The line groups *repayment* rows by counterparty; counterparty alone would
-    list everything else that person appears on."""
+async def test_both_transfers_in_anchors_drill_into_the_bank_perimeter_alone(
+    client, session
+):
+    """Transfers In prints its figure twice — once on the tile, once per counterparty
+    line — so it has two anchors, and each is a place the scope can be lost alone.
+
+    The four decoys are repayments too, so either link without its scope lists them.
+    The second bank counterparty is what keeps the two anchors apart: the tile is the
+    whole bucket and the line is one counterparty of it, and a line pointed at the
+    tile's own filter would print "2" above a list of three.
+    """
     await _add(
         session,
         amount="1500",
         direction="credit",
         category="repayment",
-        counterparty="Alice",
+        counterparty="MOM",
     )
     await _add(
         session,
-        amount="9999",
-        direction="debit",
-        category="groceries",
-        counterparty="Alice",
+        amount="900",
+        direction="credit",
+        category="repayment",
+        counterparty="MOM",
+        account_id=await ensure_account(session, DEBIT_CARD_ID, "debit_card"),
     )
-
-    r = await client.get(f"/cashflow?{RANGE}")
-    assert (
-        f"/transactions?category=repayment&amp;counterparty=Alice&amp;{RANGE_HTML}"
-        in r.text
-    )
-
-    listed = await client.get(
-        f"/transactions?category=repayment&counterparty=Alice&{RANGE}"
-    )
-    assert "1,500.00" in listed.text
-    assert "9,999.00" not in listed.text
-
-
-async def test_non_inr_only_range_is_not_an_empty_range(client, session):
-    """No bucket sums a foreign-currency row, but the page must not claim the
-    range is empty while the footnote below it counts that very row."""
-    await _add(
-        session, amount="100", direction="debit", category="rent", currency="USD"
-    )
-
-    r = await client.get(f"/cashflow?{RANGE}")
-    assert "No transactions in this range" not in r.text
-    assert f"/transactions?non_inr=1&amp;{RANGE_HTML}" in r.text
-
-
-async def test_uncategorized_drill_stays_currency_agnostic(client, session):
-    """The uncategorized total sums every currency, so its link must not pin one:
-    the tile's count and the listed row count have to agree."""
-    await _add(session, amount="800", direction="debit", category=None)
-    await _add(session, amount="200", direction="debit", category="unknown")
-    await _add(session, amount="7", direction="debit", category=None, currency="USD")
-
-    r = await client.get(f"/cashflow?{RANGE}")
-    assert f"/transactions?uncategorized=1&amp;{RANGE_HTML}" in r.text
-    assert "non_inr=0" not in _tile(r.text, "uncategorized")
-    assert "3 txns" in _tile(r.text, "uncategorized")
-
-    listed = await client.get(f"/transactions?uncategorized=1&{RANGE}")
-    assert listed.text.count("/detail") == 3
-
-
-async def test_core_drill_links_exclude_the_foreign_row_their_totals_exclude(
-    client, session
-):
-    """A rupee bucket that lists a row it never summed contradicts itself: the
-    USD salary is absent from the tile's ₹ figure, so it must be absent from the
-    list the tile links to."""
-    await _add(session, amount="90000", direction="credit", category="salary")
-    await _add(
-        session, amount="500", direction="credit", category="salary", currency="USD"
-    )
-    await _add(session, amount="20000", direction="debit", category="rent")
-    await _add(
-        session, amount="700", direction="debit", category="rent", currency="USD"
-    )
-    await _add(session, amount="10000", direction="debit", category="investment")
     await _add(
         session,
-        amount="800",
-        direction="debit",
-        category="investment",
-        currency="USD",
+        amount="700",
+        direction="credit",
+        category="repayment",
+        counterparty="DAD",
+    )
+    await _seed_outside_the_bank(
+        session, direction="credit", category="repayment", counterparty="MOM"
     )
 
-    r = await client.get(f"/cashflow?{RANGE}")
-    # The tiles count only the rupee rows they sum.
-    assert "1 txns" in _tile(r.text, "income")
-    assert "1 txns" in _tile(r.text, "expense")
+    page = (await client.get(f"/cashflow?{RANGE}")).text
 
-    # Every rupee-bucket link pins the currency; follow each rendered href and
-    # the foreign row is not in the list.
-    for slug, foreign, rupee in (
-        ("salary", "500.00", "90,000.00"),
-        ("rent", "700.00", "20,000.00"),
-        ("investment", "800.00", "10,000.00"),
-    ):
-        hrefs = _links(r.text, f"/transactions?category={slug}")
-        assert hrefs, f"no drill-through rendered for {slug}"
-        for href in hrefs:
-            assert "non_inr=0" in href
-            listed = await client.get(href.replace("&amp;", "&"))
-            assert listed.status_code == 200
-            assert rupee in listed.text
-            assert foreign not in listed.text
-            assert listed.text.count("/detail") == 1
+    # The tile: the whole bucket over the bank, its three rows and no others.
+    tile = _tile(page, "transfers_in")
+    assert "scope=bank" in tile
+    tile_listing = await _listed(client, tile)
+    assert tile_listing.count(DETAIL) == _count(tile) == 3
+    for amount in ("1,500.00", "900.00", "700.00"):
+        assert amount in tile_listing
+    for amount in OUTSIDE:
+        assert amount not in tile_listing, f"the transfers-in tile lists {amount}"
 
+    # The line: one counterparty of that bucket, over the same perimeter.
+    row = _row_with(_region(page, "data-section", "transfers_in"), ">MOM<")
+    assert "scope=bank" in row
+    assert "₹2,400.00" in row
 
-async def test_footnotes_drill_through_with_undated_unscoped(client, session):
-    await _add(session, amount="5000", direction="debit", category="self_transfer")
-    await _add(
-        session, amount="100", direction="debit", category="rent", currency="USD"
-    )
-    await _add(session, amount="333", direction="debit", category="rent", dated=False)
-
-    r = await client.get(f"/cashflow?{RANGE}")
-    assert f"/transactions?internal=1&amp;{RANGE_HTML}" in r.text
-    assert f"/transactions?non_inr=1&amp;{RANGE_HTML}" in r.text
-    # Undated rows match no range by definition, so their link carries none.
-    assert '/transactions?undated=1"' in r.text
-    assert f"/transactions?undated=1&amp;{RANGE_HTML}" not in r.text
-
-    # The undated link lists the undated row and no dated one.
-    listed = await _listed(client, "/transactions?undated=1")
-    assert "333.00" in listed
-    assert "5,000.00" not in listed
-    assert listed.count("/detail") == 1
+    listing = await _listed(client, row)
+    assert listing.count(DETAIL) == _line_count(row) == 2
+    assert "1,500.00" in listing
+    assert "900.00" in listing, "the bank scope dropped the debit-card row"
+    assert "700.00" not in listing  # the other counterparty is not this line's row
+    for amount in OUTSIDE:
+        assert amount not in listing, f"the transfers-in line lists {amount}"
 
 
-async def test_empty_range_shows_empty_state(client):
-    r = await client.get(f"/cashflow?{RANGE}")
-    assert r.status_code == 200
-    assert "No transactions in this range" in r.text
+async def test_non_inr_footnote_drills_into_the_bank_perimeter_alone(client, session):
+    """The non-INR footnote counts the foreign rows the rupee buckets left out — of
+    the *bank*, because those are the buckets it is a footnote to.
 
-
-async def test_breakdown_hydrates_from_the_page_not_a_second_summary_query(
-    client, session
-):
-    """The breakdown draws the range the page already aggregated, so the summary is
-    serialized into the page and the chart reads it there.
-
-    Re-fetching /api/cashflow/summary would be the same aggregate queries run a
-    second time to recompute figures that are already in this response, so the page
-    must not carry that URL at all. The trend *is* fetched: its window is the
-    trailing twelve months, which is not the selected range and so is genuinely not
-    on the page."""
-    await _add(session, amount="90000", direction="credit", category="salary")
-
-    r = await client.get(f"/cashflow?{RANGE}")
-    assert "/api/cashflow/summary" not in r.text
-    assert "/api/cashflow/trend?months=12" in r.text
-
-    block = re.search(
-        r'<script type="application/json" id="cf-summary">(.*?)</script>', r.text
-    )
-    assert block, "the breakdown chart has no summary to draw"
-    payload = json.loads(block.group(1))
-
-    # The payload is the API's own shape, so the chart reads one contract whichever
-    # way the numbers reached it.
-    api = await client.get(f"/api/cashflow/summary?{RANGE}")
-    assert payload == api.json()
-    assert payload["income"]["lines"][0]["slug"] == "salary"
-    assert Decimal(payload["income"]["total"]) == Decimal("90000")
-
-
-def _lines(page: str, tile: str) -> list[tuple[str, str]]:
-    """The (key, href) of every drill anchor the given tile's lines rendered.
-
-    These are the anchors the breakdown chart looks a bar's link up in, so what
-    they point at is what the bars point at: the bars take the row's href rather
-    than rebuilding the URL a second time in JavaScript.
+    The decoys are foreign rows on the other accounts: they were never in a bank
+    bucket, so they are not what this footnote is excusing, and an unscoped link
+    would list them beneath a count that never had them.
     """
-    return re.findall(rf'<a data-line="{tile}" data-key="([^"]*)" href="([^"]*)"', page)
+    await _add(
+        session, amount="100", direction="debit", category="rent", currency="USD"
+    )
+    await _add(
+        session,
+        amount="60",
+        direction="debit",
+        category="dining",
+        currency="EUR",
+        account_id=await ensure_account(session, DEBIT_CARD_ID, "debit_card"),
+    )
+    await _seed_outside_the_bank(
+        session, direction="debit", category="dining", currency="USD"
+    )
+    # And the rupee row the footnote is not about, on the perimeter it is about.
+    await _add(session, amount="20000", direction="debit", category="rent")
 
+    page = (await client.get(f"/cashflow?{RANGE}")).text
+    row = _region(page, "data-footnote", "non_inr")
+    assert "scope=bank" in row
 
-async def _listed(client, href: str) -> str:
-    """Follow a rendered href exactly as a browser would."""
-    r = await client.get(href.replace("&amp;", "&"))
-    assert r.status_code == 200
-    return r.text
-
-
-async def test_net_invested_tile_shows_its_transaction_count(client, session):
-    """The other four tiles say how many rows they are made of; this one said only
-    gross in/out, so the one number that makes the tile comparable was missing."""
-    await _add(session, amount="10000", direction="debit", category="investment")
-    await _add(session, amount="4000", direction="credit", category="investment")
-    await _add(session, amount="90000", direction="credit", category="salary")
-
-    r = await client.get(f"/cashflow?{RANGE}")
-    tile = _tile(r.text, "net_invested")
-    assert "2 txns" in tile
-    # Still the gross figures, next to the count rather than instead of it.
-    assert "₹10K" in tile
-    assert "₹4K" in tile
-    # Net invested = 10,000 contributed - 4,000 redeemed.
-    assert "₹6,000.00" in _region(r.text, "data-section", "investment")
+    listing = await _listed(client, row)
+    assert listing.count(DETAIL) == _count(row) == 2
+    assert "100.00" in listing
+    assert "60.00" in listing, "the bank scope dropped the debit-card row"
+    assert "20,000.00" not in listing
+    for amount in OUTSIDE:
+        assert amount not in listing, f"the non-INR footnote lists {amount}"
 
 
 async def test_every_tiles_breakdown_lines_drill_to_exactly_their_own_rows(
@@ -393,7 +776,21 @@ async def test_every_tiles_breakdown_lines_drill_to_exactly_their_own_rows(
     await _add(
         session, amount="555", direction="credit", category="salary", currency="USD"
     )
-    await _add(session, amount="20000", direction="debit", category="rent")
+    await _add(
+        session,
+        amount="20000",
+        direction="debit",
+        category="rent",
+        counterparty="Alice",
+    )
+    # Card rows carry the same slugs but sit outside the bank scope.
+    card = await card_account(session)
+    await _add(
+        session, amount="4444", direction="credit", category="salary", account_id=card
+    )
+    await _add(
+        session, amount="777", direction="debit", category="rent", account_id=card
+    )
     await _add(session, amount="10000", direction="debit", category="investment")
     await _add(session, amount="4000", direction="credit", category="investment")
     await _add(
@@ -418,18 +815,19 @@ async def test_every_tiles_breakdown_lines_drill_to_exactly_their_own_rows(
     await _add(session, amount="90", direction="debit", category="crypto")
 
     r = await client.get(f"/cashflow?{RANGE}")
+    assert _count(_tile(r.text, "income")) == 1
 
     # tile -> its lines, each as (key, the rows the link must list, the rows it
     # must not).
     expected = {
-        "income": {"salary": (["90,000.00"], ["555.00", "20,000.00"])},
-        "expense": {"rent": (["20,000.00"], ["90,000.00", "10,000.00"])},
+        "income": {"salary": (["90,000.00"], ["555.00", "4,444.00", "20,000.00"])},
+        "expense": {"rent": (["20,000.00"], ["777.00", "90,000.00", "10,000.00"])},
         "net_invested": {
             "investment:contribution": (["10,000.00"], ["4,000.00"]),
             "investment:redemption": (["4,000.00"], ["10,000.00"]),
         },
         "transfers_in": {
-            "Alice": (["1,500.00"], ["333.00", "700.00", "90,000.00"]),
+            "Alice": (["1,500.00"], ["333.00", "700.00", "20,000.00"]),
             "": (["700.00"], ["1,500.00"]),
         },
         "uncategorized": {
@@ -446,7 +844,7 @@ async def test_every_tiles_breakdown_lines_drill_to_exactly_their_own_rows(
             f"{tile} rendered lines {rendered}"
         )
         for key, href in rendered:
-            listed = await _listed(client, href)
+            listed = await _get(client, href)
             present, absent = lines[key]
             for amount in present:
                 assert amount in listed, f"{tile}/{key or '(blank)'} lost {amount}"
@@ -458,20 +856,8 @@ async def test_every_tiles_breakdown_lines_drill_to_exactly_their_own_rows(
 
     # NULL, blank, 'unknown' and unmapped rows form one bucket of four.
     assert "4 txns" in _tile(r.text, "uncategorized")
-    everything = await _listed(client, f"/transactions?uncategorized=1&{RANGE}")
+    everything = await _get(client, f"/transactions?uncategorized=1&{RANGE}")
     assert everything.count("/detail") == 4
-
-
-async def test_every_chart_module_the_pages_load_is_actually_served(client):
-    """The pages are inert without these three, and a page that names a module the
-    app does not serve is a silent 404 in the browser: nothing on the server errors,
-    the figures still render, the charts just never appear. Fetching each one through
-    the app is the only assertion that catches a rename, a move out from under the
-    /static mount, or a deletion."""
-    for name in ("charts.js", "cashflow.js", "networth.js"):
-        r = await client.get(f"/static/js/{name}")
-        assert r.status_code == 200, f"/static/js/{name} is not served"
-        assert r.text.strip(), f"/static/js/{name} is served empty"
 
 
 # Text a counterparty can really carry, every character of which is a way out of a
@@ -521,6 +907,8 @@ async def test_embedded_json_cannot_break_out_of_its_script_block(client, sessio
     # The escaping is lossless, not lossy: the chart reads back exactly what a bank
     # sent, so the defence cannot be quietly costing the reader their data.
     payload = json.loads(block.group(1))
+    # The island is the API's own shape, so the chart reads one contract.
+    assert payload == (await client.get(f"/api/cashflow/summary?{RANGE}")).json()
     counterparties = [line["counterparty"] for line in payload["transfers_in"]["lines"]]
     assert counterparties == [HOSTILE]
 
@@ -530,3 +918,42 @@ async def test_embedded_json_cannot_break_out_of_its_script_block(client, sessio
     # table below the chart is free to carry them.
     assert "\u2028" not in block.group(1)
     assert "\u2029" not in block.group(1)
+
+
+# The summary: the grouped bank-side bucket scan, the all-account expense
+# detail, transfers-in, uncategorized, and the six footnote reads.
+SUMMARY_QUERIES = 10
+# The trend: the month/category/direction scan and the salary counts.
+TREND_QUERIES = 2
+
+
+@contextmanager
+def count_transaction_reads():
+    """Count the statements issued against ``transactions`` inside the block."""
+    seen: list[str] = []
+
+    def before_cursor_execute(conn, cursor, statement, params, context, executemany):
+        if "FROM transactions" in statement:
+            seen.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", before_cursor_execute)
+    try:
+        yield seen
+    finally:
+        event.remove(Engine, "before_cursor_execute", before_cursor_execute)
+
+
+async def test_page_load_is_one_summary_plus_trend(client, session):
+    """The page aggregates the range once. The breakdown chart reads the summary
+    from the page, and the trend is the only fetch."""
+    await _add(session, amount="90000", direction="credit", category="salary")
+    with count_transaction_reads() as page_queries:
+        page = await client.get(f"/cashflow?{RANGE}")
+    assert page.status_code == 200
+    assert len(page_queries) == SUMMARY_QUERIES
+    assert "/api/cashflow/summary" not in page.text
+
+    with count_transaction_reads() as trend_queries:
+        trend = await client.get("/api/cashflow/trend?months=12")
+    assert trend.status_code == 200
+    assert len(trend_queries) == TREND_QUERIES

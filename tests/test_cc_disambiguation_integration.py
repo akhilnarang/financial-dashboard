@@ -162,51 +162,6 @@ async def _seed_three_indusind_ccs_with_statements(
 
 
 @pytest.mark.anyio
-async def test_maskless_indusind_cc_payment_resolves_via_amount(session_maker):
-    """The matching-total CC account (b) receives the txn link, and
-    its statement gets marked fully paid by check_payment_received."""
-    a_id, b_id, c_id, email_id = await _seed_three_indusind_ccs_with_statements(
-        session_maker, target_total="133.00"
-    )
-
-    raw = _indusind_payment_eml("133.00")
-    with (
-        patch(
-            "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
-        ),
-        patch(
-            "financial_dashboard.web.emails.should_notify_transactions",
-            return_value=False,
-        ),
-    ):
-        app = _build_test_app(session_maker)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            r = await client.post(f"/emails/{email_id}/reparse")
-            assert r.status_code == 200, r.text
-
-    async with session_maker() as s:
-        txn = (await s.execute(select(Transaction))).scalars().one()
-        assert txn.direction == "credit"
-        assert txn.amount == Decimal("133")
-        assert txn.account_id == b_id  # ← the matching-total CC
-
-        uploads = {
-            u.account_id: u
-            for u in (await s.execute(select(StatementUpload))).scalars().all()
-        }
-        # Account b's statement was fully paid by check_payment_received.
-        assert uploads[b_id].payment_status == PaymentStatus.PAID
-        assert uploads[b_id].payment_paid_amount == Decimal("133")
-        # Other accounts' statements untouched — both a and c.
-        for other_id in (a_id, c_id):
-            assert uploads[other_id].payment_status == PaymentStatus.UNPAID
-            assert uploads[other_id].payment_paid_amount == Decimal("0")
-
-
-@pytest.mark.anyio
 async def test_maskless_indusind_cc_payment_with_no_match_stays_unlinked(
     session_maker,
 ):
@@ -308,7 +263,7 @@ async def test_reparse_upserts_existing_attached_transaction(session_maker):
     """Reparsing an email that already has an attached transaction must
     update the existing row (and relink), not create a duplicate. The
     user's intended workflow for fixing a historical orphan."""
-    a_id, b_id, _c_id, email_id = await _seed_three_indusind_ccs_with_statements(
+    a_id, b_id, c_id, email_id = await _seed_three_indusind_ccs_with_statements(
         session_maker, target_total="133.00"
     )
 
@@ -362,7 +317,10 @@ async def test_reparse_upserts_existing_attached_transaction(session_maker):
             for u in (await s.execute(select(StatementUpload))).scalars().all()
         }
         assert ups[b_id].payment_status == PaymentStatus.PAID
-        assert ups[a_id].payment_status == PaymentStatus.UNPAID
+        assert ups[b_id].payment_paid_amount == Decimal("133")
+        for other_id in (a_id, c_id):
+            assert ups[other_id].payment_status == PaymentStatus.UNPAID
+            assert ups[other_id].payment_paid_amount == Decimal("0")
 
 
 def _icici_reversal_eml(amount: str, card_last4: str) -> bytes:

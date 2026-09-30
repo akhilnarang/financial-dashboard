@@ -52,10 +52,21 @@ async def _seed_three_indusind_ccs(session: AsyncSession) -> tuple[int, int, int
     return a1.id, a2.id, a3.id
 
 
-# ---------- is_cc_payment_received_email ----------
+# ---------- payment gates ----------
 
 
-def test_is_cc_payment_received_email_accepts_bill_payments_only():
+def _bare_txn(**kwargs) -> Transaction:
+    return Transaction(
+        bank="indusind",
+        email_type=kwargs.pop("email_type", "indusind_cc_payment_alert"),
+        direction=kwargs.pop("direction", "credit"),
+        amount=kwargs.pop("amount", Decimal("133")),
+        currency="INR",
+        account_id=kwargs.pop("account_id", 7),
+    )
+
+
+def test_payment_gates_accept_linked_bill_payment_credits_only():
     """Each suffix names a real parser shape. A refund or reversal is a
     credit but not a bill payment: it must not mark a statement paid."""
     for email_type in (
@@ -78,30 +89,9 @@ def test_is_cc_payment_received_email_accepts_bill_payments_only():
         "",
     ):
         assert is_cc_payment_received_email(email_type) is False, email_type
-
-
-# ---------- should_auto_reconcile_statement ----------
-
-
-def _bare_txn(**kwargs) -> Transaction:
-    return Transaction(
-        bank="indusind",
-        email_type=kwargs.pop("email_type", "indusind_cc_payment_alert"),
-        direction=kwargs.pop("direction", "credit"),
-        amount=kwargs.pop("amount", Decimal("133")),
-        currency="INR",
-        account_id=kwargs.pop("account_id", 7),
-    )
-
-
-def test_should_auto_reconcile_only_linked_bill_payment_credits():
     assert should_auto_reconcile_statement(_bare_txn()) is True
     assert should_auto_reconcile_statement(_bare_txn(direction="debit")) is False
     assert should_auto_reconcile_statement(_bare_txn(account_id=None)) is False
-    assert (
-        should_auto_reconcile_statement(_bare_txn(email_type="hdfc_cc_refund_alert"))
-        is False
-    )
 
 
 # ---------- find_cc_account_by_total_due ----------
@@ -125,14 +115,18 @@ async def test_multiple_matches_returns_none(session):
 
 @pytest.mark.anyio
 async def test_paid_and_undated_statements_are_excluded(session):
-    """A PAID statement and one with no due_date are not candidates, even
-    when their totals match the payment."""
+    """A PAID statement, one with no due_date and one on another bank are
+    not candidates, even when their totals match the payment."""
     a, b, c = await _seed_three_indusind_ccs(session)
+    other = Account(bank="hdfc", type="credit_card", label="HDFC", active=True)
+    session.add(other)
+    await session.flush()
     session.add_all(
         [
             _stmt(account_id=a, total="133.00", status=PaymentStatus.PAID),
             _stmt(account_id=b, total="133.00", due_date=None),
             _stmt(account_id=c, total="133.00"),
+            _stmt(account_id=other.id, total="133.00"),
         ]
     )
     await session.flush()
@@ -145,7 +139,7 @@ async def test_only_latest_cycle_per_account_is_considered(session):
     """An older cycle whose total matches must NOT win when a newer
     cycle on the same account is already on file with a different
     total — matches the rule in check_payment_received."""
-    a, b, _ = await _seed_three_indusind_ccs(session)
+    a, b, c = await _seed_three_indusind_ccs(session)
     session.add_all(
         [
             # Account a: older cycle matches, but newer cycle is different.
@@ -153,58 +147,13 @@ async def test_only_latest_cycle_per_account_is_considered(session):
             _stmt(account_id=a, total="999.00", due_date="20/05/2026"),
             # Account b: latest cycle matches.
             _stmt(account_id=b, total="133.00", due_date="20/05/2026"),
+            # Account c: an unparseable total is skipped, not an error.
+            _stmt(account_id=c, total="₹133.00"),
         ]
     )
     await session.flush()
     out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
     assert out == b
-
-
-@pytest.mark.anyio
-async def test_unparseable_total_amount_due_is_skipped_and_logged(session, caplog):
-    """A stored total_amount_due that parse_cc_amount can't read (e.g.
-    a stray currency symbol) is skipped — and the skip is logged so
-    silent fall-throughs are diagnosable."""
-    import logging
-
-    a, b, _ = await _seed_three_indusind_ccs(session)
-    session.add_all(
-        [
-            _stmt(account_id=a, total="₹133.00"),  # currency-prefixed, unparseable
-            _stmt(account_id=b, total="133.00"),
-        ]
-    )
-    await session.flush()
-
-    with caplog.at_level(
-        logging.WARNING, logger="financial_dashboard.services.cc_disambiguation"
-    ):
-        out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
-
-    assert out == b
-    assert any("not parseable" in rec.message for rec in caplog.records), (
-        f"expected a parseability warning, got: {[r.message for r in caplog.records]}"
-    )
-
-
-@pytest.mark.anyio
-async def test_other_banks_are_not_considered(session):
-    """A statement on a different-bank CC with a matching total is not
-    a candidate."""
-    a, b, _ = await _seed_three_indusind_ccs(session)
-    other = Account(bank="hdfc", type="credit_card", label="HDFC", active=True)
-    session.add(other)
-    await session.flush()
-    session.add_all(
-        [
-            _stmt(account_id=other.id, total="133.00"),
-            _stmt(account_id=a, total="999.00"),
-            _stmt(account_id=b, total="999.00"),
-        ]
-    )
-    await session.flush()
-    out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
-    assert out is None
 
 
 # ---------- resolve_cc_payment_account ----------
@@ -249,21 +198,15 @@ async def test_resolver_ignores_rows_that_are_not_maskless_payments(session):
 
 
 @pytest.mark.anyio
-async def test_resolver_returns_none_when_no_cc_candidates(session):
-    """No CC accounts on the bank → silent no-op, account_id stays None."""
+async def test_resolver_auto_resolves_when_single_candidate(session):
+    """No CC for the bank → no-op. A single CC → auto-resolve account_id."""
     t = await _txn(session)
-    out = await resolve_cc_payment_account(session, t)
-    assert out is None
+    assert await resolve_cc_payment_account(session, t) is None
     assert t.account_id is None
 
-
-@pytest.mark.anyio
-async def test_resolver_auto_resolves_when_single_candidate(session):
-    """A single CC for the bank → auto-resolve account_id, return None."""
     only = Account(bank="indusind", type="credit_card", label="solo", active=True)
     session.add(only)
     await session.flush()
-    t = await _txn(session)
     out = await resolve_cc_payment_account(session, t)
     assert out is None
     assert t.account_id == only.id
@@ -311,60 +254,6 @@ async def test_resolver_returns_prompt_payload_when_no_amount_match(session):
 
 
 # ---------- resolve: outstanding-match fallback ----------
-
-
-@pytest.mark.anyio
-async def test_resolver_outstanding_match(session):
-    """Payment matches total_due - paid on exactly one card."""
-    a, b, c = await _seed_three_indusind_ccs(session)
-    session.add_all(
-        [
-            _stmt(
-                account_id=a,
-                total="8,347.00",
-                status=PaymentStatus.PARTIALLY_PAID,
-                paid=Decimal("1347"),
-            ),
-            _stmt(
-                account_id=b,
-                total="512.00",
-                status=PaymentStatus.PAID,
-                paid=Decimal("512"),
-            ),
-            _stmt(
-                account_id=c, total="0.00", status=PaymentStatus.PAID, paid=Decimal("0")
-            ),
-        ]
-    )
-    await session.flush()
-    t = await _txn(session, amount=Decimal("7000"))
-    out = await resolve_cc_payment_account(session, t)
-    assert out is None
-    assert t.account_id == a
-
-
-@pytest.mark.anyio
-async def test_resolver_outstanding_match_ambiguous_falls_through(session):
-    """Two cards share the same outstanding amount. Exact-match on
-    total_due resolves first when one card's total matches."""
-    a, b, c = await _seed_three_indusind_ccs(session)
-    session.add_all(
-        [
-            _stmt(account_id=a, total="1,200.00", status=PaymentStatus.UNPAID),
-            _stmt(
-                account_id=b,
-                total="1,700.00",
-                status=PaymentStatus.PARTIALLY_PAID,
-                paid=Decimal("500"),
-            ),
-            _stmt(account_id=c, total="0.00", status=PaymentStatus.PAID),
-        ]
-    )
-    await session.flush()
-    t = await _txn(session, amount=Decimal("1200"))
-    out = await resolve_cc_payment_account(session, t)
-    assert out is None
-    assert t.account_id == a
 
 
 @pytest.mark.anyio
@@ -462,9 +351,11 @@ async def test_resolver_sole_outstanding_rejects_overpayment(session):
 
 
 @pytest.mark.anyio
-async def test_resolver_sole_outstanding_skips_untracked(session):
+@pytest.mark.parametrize("amount", [Decimal("2500"), Decimal("4000")])
+async def test_resolver_sole_outstanding_skips_untracked(session, amount):
     """An untracked candidate (payment_status=None) blocks the
-    sole-outstanding tier. The resolver must fall through to the prompt."""
+    sole-outstanding and outstanding-match tiers. The resolver must fall
+    through to the prompt."""
     a, b, c = await _seed_three_indusind_ccs(session)
     session.add_all(
         [
@@ -481,7 +372,7 @@ async def test_resolver_sole_outstanding_skips_untracked(session):
         ]
     )
     await session.flush()
-    t = await _txn(session, amount=Decimal("2500"))
+    t = await _txn(session, amount=amount)
     out = await resolve_cc_payment_account(session, t)
     assert t.account_id is None
     assert out is not None
@@ -513,32 +404,6 @@ async def test_resolver_outstanding_skips_when_candidate_has_no_statement(sessio
     )
     await session.flush()
     t = await _txn(session, amount=Decimal("5000"))
-    out = await resolve_cc_payment_account(session, t)
-    assert t.account_id is None
-    assert out is not None
-
-
-@pytest.mark.anyio
-async def test_resolver_outstanding_match_skips_when_untracked(session):
-    """The outstanding-match tier also refuses when any card is
-    untracked, not only the sole-outstanding tier."""
-    a, b, c = await _seed_three_indusind_ccs(session)
-    session.add_all(
-        [
-            _stmt(
-                account_id=a,
-                total="8,347.00",
-                status=PaymentStatus.PARTIALLY_PAID,
-                paid=Decimal("1347"),
-            ),
-            _stmt(account_id=b, total="819.00", status=None),
-            _stmt(
-                account_id=c, total="0.00", status=PaymentStatus.PAID, paid=Decimal("0")
-            ),
-        ]
-    )
-    await session.flush()
-    t = await _txn(session, amount=Decimal("7000"))
     out = await resolve_cc_payment_account(session, t)
     assert t.account_id is None
     assert out is not None

@@ -13,7 +13,6 @@ import re
 from decimal import Decimal
 from urllib.parse import parse_qs, urlsplit
 
-import httpx
 import pytest
 from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -21,7 +20,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 import financial_dashboard.config as config_mod
 import financial_dashboard.services.settings as settings_mod
 from financial_dashboard.db.models import Account, ManualItem, Transaction
-from financial_dashboard.integrations.paisa import PaisaClient
 from financial_dashboard.services.extensions import ExtensionManager
 from financial_dashboard.services.paisa import surface
 from financial_dashboard.services.paisa.config import PaisaProjectionConfig
@@ -131,10 +129,11 @@ async def test_paisa_page_renders_accounts_mappings_and_actions(client, session)
     assert "/extensions/paisa/sync" in text
 
 
-async def test_paisa_page_prominently_names_incomplete_networth_scope(
+async def test_paisa_page_names_networth_scope_and_preview_diagnostics(
     client, session, monkeypatch
 ):
     await _seed_bank(session, id=1)
+    await _seed_txn(session, 1)
     session.add(
         ManualItem(
             id=9,
@@ -154,6 +153,8 @@ async def test_paisa_page_prominently_names_incomplete_networth_scope(
     assert "Incomplete — Paisa is not a full native net-worth view." in response.text
     assert "1 outside projection" in response.text
     assert "9: Private Property" in response.text
+    assert "Preview Diagnostics" in response.text
+    assert "1 entry" in response.text or "1 entries" in response.text
 
 
 @pytest.mark.parametrize(
@@ -194,25 +195,14 @@ async def test_paisa_setup_include_uses_backend_syntax_and_html_escaping(
     assert "<unsafe>" not in match.group(1)
 
 
-async def test_paisa_page_shows_preview_diagnostics_in_project_mode(
-    client, session, monkeypatch
-):
-    await _seed_bank(session)
-    await _seed_txn(session, 1)
-    monkeypatch.setattr(
-        surface, "load_config", lambda: _config(selected_account_ids=(1,))
-    )
-    r = await client.get("/extensions/paisa")
-    assert "Preview Diagnostics" in r.text
-    assert "1 entry" in r.text or "1 entries" in r.text
-
-
 # ---------------------------------------------------------------------------
 # Safe external deep link
 # ---------------------------------------------------------------------------
 
 
-async def test_safe_link_falls_back_to_base_url_and_rejects_javascript(monkeypatch):
+async def test_safe_link_falls_back_to_base_url_and_rejects_javascript(
+    client, monkeypatch
+):
     monkeypatch.setattr(
         surface,
         "load_config",
@@ -229,6 +219,9 @@ async def test_safe_link_falls_back_to_base_url_and_rejects_javascript(monkeypat
         ),
     )
     assert surface.safe_link() == "https://paisa.example.com/"
+    page = (await client.get("/extensions/paisa")).text
+    assert 'href="https://paisa.example.com/"' in page
+    assert 'rel="noopener"' in page
 
     # Both candidates disallowed → no link rendered.
     monkeypatch.setattr(
@@ -241,42 +234,45 @@ async def test_safe_link_falls_back_to_base_url_and_rejects_javascript(monkeypat
     assert surface.safe_link() == ""
 
 
-async def test_paisa_page_renders_open_link_when_safe(client, monkeypatch):
-    monkeypatch.setattr(surface, "safe_link", lambda: "https://paisa.example.com/")
-    r = await client.get("/extensions/paisa")
-    assert 'href="https://paisa.example.com/"' in r.text
-    assert 'target="_blank"' in r.text
-    assert 'rel="noopener"' in r.text
-
-
 # ---------------------------------------------------------------------------
 # PRG config save
 # ---------------------------------------------------------------------------
 
 
-async def test_config_save_valid_redirects_with_flash(client, session, settings_db):
+async def test_config_save_persists_form_rows_and_redirects(
+    client, session, settings_db
+):
     await _seed_bank(session, id=1)
     await session.commit()
     form = {
         "mode": "connect",
         "base_url": "http://127.0.0.1:7500",
-        "external_url": "",
-        "allow_remote": "",
-        "auth_username": "",
         "auth_password": "new-secret",
-        "generated_path": "",
-        "project_since": "",
         "request_timeout_seconds": "15",
-        "non_inr_policy": "skip",
         "selected_account_ids": ["1"],
-        "account_mapping_key": [""],
-        "account_mapping_value": [""],
-        "category_mapping_key": [""],
-        "category_mapping_value": [""],
+        "account_mapping_key": ["1", ""],
+        "account_mapping_value": ["Assets:Bank:HDFC:Main", ""],
+        "category_mapping_key": ["groceries"],
+        "category_mapping_value": ["Expenses:Food"],
+        "project_investments": "true",
     }
     r = await client.post("/extensions/paisa", data=form, follow_redirects=False)
     assert r.status_code == 303
     assert "saved=1" in r.headers["location"]
+    assert settings_mod._cache.get("paisa.account_mappings") == (
+        '{"1": "Assets:Bank:HDFC:Main"}'
+    )
+    assert (
+        settings_mod._cache.get("paisa.category_mappings")
+        == '{"groceries": "Expenses:Food"}'
+    )
+    assert settings_mod._cache.get("paisa.project_investments") == "true"
+
+    # An absent checkbox saves "false".
+    form.pop("project_investments")
+    r2 = await client.post("/extensions/paisa", data=form, follow_redirects=False)
+    assert r2.status_code == 303
+    assert settings_mod._cache.get("paisa.project_investments") == "false"
 
 
 async def test_config_save_invalid_rerenders_with_errors(client, session):
@@ -296,135 +292,11 @@ async def test_config_save_invalid_rerenders_with_errors(client, session):
     # 422 re-render with validation errors (not a redirect, not a 500).
     assert r.status_code == 422
     assert "Validation errors" in r.text
-    assert "Mode" in r.text
-
-
-async def test_config_save_mappings_parsed_from_rows(client, session, settings_db):
-    await _seed_bank(session, id=1)
-    await session.commit()
-    form = {
-        "mode": "connect",
-        "base_url": "http://127.0.0.1:7500",
-        "request_timeout_seconds": "15",
-        "selected_account_ids": ["1"],
-        "account_mapping_key": ["1", ""],
-        "account_mapping_value": ["Assets:Bank:HDFC:Main", ""],
-        "category_mapping_key": ["groceries"],
-        "category_mapping_value": ["Expenses:Food"],
-    }
-    r = await client.post("/extensions/paisa", data=form, follow_redirects=False)
-    assert r.status_code == 303
-    assert settings_mod._cache.get("paisa.account_mappings") == (
-        '{"1": "Assets:Bank:HDFC:Main"}'
-    )
-    assert (
-        settings_mod._cache.get("paisa.category_mappings")
-        == '{"groceries": "Expenses:Food"}'
-    )
-
-
-async def test_web_save_rejects_beancount_invalid_account_mapping(client, settings_db):
-    form = {
-        "mode": "connect",
-        "base_url": "http://127.0.0.1:7500",
-        "auth_username": "must-not-save",
-        "request_timeout_seconds": "15",
-        "ledger_cli": "beancount",
-        "account_mapping_key": ["1"],
-        "account_mapping_value": ["Asset:Bank:SavingsAccount"],
-        "category_mapping_key": ["groceries"],
-        "category_mapping_value": ["Expenses:FoodAndDining"],
-    }
-
-    response = await client.post("/extensions/paisa", data=form, follow_redirects=False)
-
-    assert response.status_code == 422
-    assert "Account Mappings" in response.text
-    assert "beancount root" in response.text
-    assert "paisa.ledger_cli" not in settings_mod._cache
-    assert "paisa.auth_username" not in settings_mod._cache
-
-
-async def test_config_save_project_investments_checkbox(client, session, settings_db):
-    """The project_investments checkbox maps to the setting: checked → 'true',
-    absent → 'false'."""
-    await _seed_bank(session, id=1)
-    await session.commit()
-    form = {
-        "mode": "connect",
-        "base_url": "http://127.0.0.1:7500",
-        "request_timeout_seconds": "15",
-        "selected_account_ids": ["1"],
-        "project_investments": "true",
-    }
-    r = await client.post("/extensions/paisa", data=form, follow_redirects=False)
-    assert r.status_code == 303
-    assert settings_mod._cache.get("paisa.project_investments") == "true"
-
-    # Absent checkbox → 'false'.
-    form.pop("project_investments")
-    r2 = await client.post("/extensions/paisa", data=form, follow_redirects=False)
-    assert r2.status_code == 303
-    assert settings_mod._cache.get("paisa.project_investments") == "false"
 
 
 # ---------------------------------------------------------------------------
 # Generate / sync PRG actions
 # ---------------------------------------------------------------------------
-
-
-async def test_generate_action_redirects_with_flash(
-    client, session, tmp_path, monkeypatch
-):
-    await _seed_bank(session)
-    await _seed_txn(session, 1)
-    await session.commit()
-    target = tmp_path / "gen.journal"
-    monkeypatch.setattr(
-        surface,
-        "load_config",
-        lambda: _config(selected_account_ids=(1,), generated_path=str(target)),
-    )
-    r = await client.post("/extensions/paisa/generate", follow_redirects=False)
-    assert r.status_code == 303
-    assert "generated=1" in r.headers["location"]
-    assert target.exists()
-
-
-async def test_sync_action_redirects_with_synced(
-    client, session, tmp_path, monkeypatch
-):
-    await _seed_bank(session)
-    await _seed_txn(session, 1)
-    await session.commit()
-    target = tmp_path / "gen.journal"
-    monkeypatch.setattr(
-        surface,
-        "load_config",
-        lambda: _config(selected_account_ids=(1,), generated_path=str(target)),
-    )
-
-    def handler(req: httpx.Request) -> httpx.Response:
-        if req.url.path == "/api/config":
-            return httpx.Response(200, json={"config": {"ledger_cli": "ledger"}})
-        if req.url.path == "/api/sync":
-            return httpx.Response(200, json={"success": True})
-        if req.url.path == "/api/diagnosis":
-            return httpx.Response(200, json={"issues": []})
-        return httpx.Response(404)
-
-    from financial_dashboard.services.paisa import orchestrator
-
-    monkeypatch.setattr(
-        orchestrator,
-        "_build_client",
-        lambda cfg: PaisaClient(
-            base_url="http://127.0.0.1:7500", transport=httpx.MockTransport(handler)
-        ),
-    )
-    r = await client.post("/extensions/paisa/sync", follow_redirects=False)
-    assert r.status_code == 303
-    assert "synced=1" in r.headers["location"]
 
 
 async def test_sync_action_failure_redirects_with_outcome(client, session, monkeypatch):
@@ -443,16 +315,6 @@ async def test_sync_action_failure_redirects_with_outcome(client, session, monke
     r = await client.post("/extensions/paisa/sync", follow_redirects=False)
     assert r.status_code == 303
     assert "outcome=readonly" in r.headers["location"]
-
-
-async def test_sync_action_isolation_on_exception(client, monkeypatch):
-    async def boom(session, *, client=None):
-        raise RuntimeError("sync blew up")
-
-    monkeypatch.setattr(surface, "sync_now", boom)
-    r = await client.post("/extensions/paisa/sync", follow_redirects=False)
-    assert r.status_code == 303
-    assert "error=" in r.headers["location"]
 
 
 # ---------------------------------------------------------------------------
@@ -481,20 +343,6 @@ async def test_generate_action_error_flash_is_url_encoded(client, monkeypatch):
     assert " " not in query
     assert "<img>" not in query
     assert parse_qs(urlsplit(location).query)["error"] == [msg]
-
-
-async def test_generate_action_blocked_redirects_with_reason(client, monkeypatch):
-    monkeypatch.setattr(surface, "load_config", lambda: _config(mode="connect"))
-    r = await client.post("/extensions/paisa/generate", follow_redirects=False)
-    assert r.status_code == 303
-    query = parse_qs(urlsplit(r.headers["location"]).query)
-    assert query["error"] == ["connect_only"]
-    assert "generated" not in query
-
-
-# ---------------------------------------------------------------------------
-# Page scripts: no innerHTML for dynamic text
-# ---------------------------------------------------------------------------
 
 
 async def test_paisa_page_scripts_never_inject_dynamic_text_as_html(client):

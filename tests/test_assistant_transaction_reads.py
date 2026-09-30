@@ -28,29 +28,16 @@ def _transaction(**overrides: object) -> Transaction:
 
 
 @pytest.mark.anyio
-async def test_get_transaction_redacts_private_identifiers_and_misses_as_none(session):
+async def test_get_transaction_redacts_identifiers_carries_review_gate_and_misses_as_none(
+    session,
+):
     settings_service._cache["categorization.hidden_identifiers"] = "Alice"
     transaction = _transaction(
         raw_description="merchant metadata",
         reference_number="123456789",
         note="lunch with Alice",
+        review_status="pending",
     )
-    session.add(transaction)
-    await session.flush()
-
-    result = await get_transaction(session, transaction.id)
-
-    assert result is not None
-    assert result.id == transaction.id
-    assert result.counterparty == "PUREBERRYSMUMBAI"
-    assert result.reference_number == "[redacted-num]"
-    assert result.note == "lunch with [redacted-name]"
-    assert await get_transaction(session, 404) is None
-
-
-@pytest.mark.anyio
-async def test_get_transaction_includes_saved_review_gate(session):
-    transaction = _transaction(review_status="pending")
     session.add(transaction)
     await session.flush()
     session.add(
@@ -66,7 +53,12 @@ async def test_get_transaction_includes_saved_review_gate(session):
     result = await get_transaction(session, transaction.id)
 
     assert result is not None
+    assert result.id == transaction.id
+    assert result.counterparty == "PUREBERRYSMUMBAI"
+    assert result.reference_number == "[redacted-num]"
+    assert result.note == "lunch with [redacted-name]"
     assert result.review_gate_reason == "confidence 0.42 below 0.60"
+    assert await get_transaction(session, 404) is None
 
 
 @pytest.mark.anyio

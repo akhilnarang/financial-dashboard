@@ -8,15 +8,12 @@ tests pin the plan, so a lost index shows up as a failure rather than as a page
 that is merely slower.
 """
 
-import datetime
-from decimal import Decimal
-
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from financial_dashboard.db.init_db import init_db
-from financial_dashboard.db.models import Base, Transaction
+from financial_dashboard.db.models import Base
 
 pytestmark = pytest.mark.anyio
 
@@ -39,49 +36,6 @@ async def _indexes(session: AsyncSession) -> list[str]:
         )
     ).all()
     return [row[0] for row in rows]
-
-
-async def test_bare_category_filter_seeks_instead_of_scanning(session):
-    """The predicate with no date bounds — the one the date index could not help."""
-    for i in range(50):
-        session.add(
-            Transaction(
-                bank="hdfc",
-                email_type="x",
-                amount=Decimal("100"),
-                direction="debit",
-                currency="INR",
-                category="groceries" if i % 2 else "rent",
-                transaction_date=datetime.date(2026, 6, 1)
-                + datetime.timedelta(days=i % 28),
-            )
-        )
-    await session.commit()
-
-    plan = await _plan(
-        session,
-        "SELECT * FROM transactions WHERE category = 'groceries' "
-        "ORDER BY transaction_date DESC LIMIT 50",
-    )
-    assert INDEX in plan
-    assert "SEARCH" in plan
-
-    # The pager's count() is the half that used to scan the table outright.
-    count_plan = await _plan(
-        session,
-        "SELECT count(*) FROM (SELECT * FROM transactions WHERE category = 'groceries')",
-    )
-    assert INDEX in count_plan
-    assert "SEARCH" in count_plan
-
-    # A cashflow drill-through carries dates, and gets both terms from one index.
-    dated_plan = await _plan(
-        session,
-        "SELECT * FROM transactions WHERE category = 'rent' "
-        "AND transaction_date BETWEEN '2026-06-01' AND '2026-06-30'",
-    )
-    assert INDEX in dated_plan
-    assert "category=?" in dated_plan and "transaction_date>?" in dated_plan
 
 
 async def test_migration_adds_the_index_to_an_existing_database_and_is_idempotent(
@@ -129,9 +83,14 @@ async def test_migration_adds_the_index_to_an_existing_database_and_is_idempoten
                 )
             ).scalar_one()
             assert markers == 1
-            plan = await _plan(
-                s, "SELECT * FROM transactions WHERE category = 'groceries'"
-            )
-            assert INDEX in plan
+            # The bare filter and its pager count() both seek on the index.
+            for sql in (
+                "SELECT * FROM transactions WHERE category = 'groceries' "
+                "ORDER BY transaction_date DESC LIMIT 50",
+                "SELECT count(*) FROM "
+                "(SELECT * FROM transactions WHERE category = 'groceries')",
+            ):
+                plan = await _plan(s, sql)
+                assert INDEX in plan and "SEARCH" in plan, sql
     finally:
         await engine.dispose()

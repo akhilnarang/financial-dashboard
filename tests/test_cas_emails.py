@@ -41,166 +41,100 @@ def _set_cas_cache(*, enabled: bool, pan: str):
     settings_mod._cache["cas_pan"] = pan
 
 
-async def test_ensure_disables_when_toggle_off(session):
+async def _auto_rules(session):
+    result = await session.execute(
+        select(FetchRule).where(FetchRule.auto_managed.is_(True)).order_by(FetchRule.id)
+    )
+    return result.scalars().all()
+
+
+async def test_ensure_cas_fetch_rules_tracks_sources_cooldown_and_toggle(session):
+    _set_cas_cache(enabled=True, pan="ABCDE1234F")
     src = await _source(session)
-    rule = FetchRule(
+    gone = await _source(session, label="Inactive")
+    gone_rule = FetchRule(
         provider="gmail",
-        source_id=src.id,
+        source_id=gone.id,
         sender=cas_emails.CAS_SENDERS[0].address,
         bank="cas_nsdl",
         email_kind=EmailKind.CAS_STATEMENT.value,
         enabled=True,
         auto_managed=True,
     )
-    session.add(rule)
+    session.add(gone_rule)
+    gone.active = False
     await session.flush()
-
-    _set_cas_cache(enabled=False, pan="ABCDE1234F")
-    await cas_emails.ensure_cas_fetch_rules(session)
-
-    await session.refresh(rule)
-    assert rule.enabled is False
-
-
-async def test_ensure_creates_and_enables_per_active_source(session):
-    src = await _source(session)
-    _set_cas_cache(enabled=True, pan="ABCDE1234F")
 
     # A second run must not add rules.
     for _ in range(2):
         await cas_emails.ensure_cas_fetch_rules(session)
         await session.flush()
 
-    rules = (
-        (
-            await session.execute(
-                select(FetchRule).where(FetchRule.auto_managed.is_(True))
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert len(rules) == 2
-    senders = {rule.sender for rule in rules}
-    assert senders == {s.address for s in cas_emails.CAS_SENDERS}
-    assert all(rule.enabled for rule in rules)
-    assert all(rule.source_id == src.id for rule in rules)
+    rules = [rule for rule in await _auto_rules(session) if rule is not gone_rule]
+    assert {rule.sender for rule in rules} == {
+        s.address for s in cas_emails.CAS_SENDERS
+    }
+    assert all(rule.enabled and rule.source_id == src.id for rule in rules)
     assert all(rule.email_kind == EmailKind.CAS_STATEMENT.value for rule in rules)
+    assert gone_rule.enabled is False
 
-
-async def test_ensure_disables_rules_for_inactive_sources(session):
-    src = await _source(session)
-    rule = FetchRule(
-        provider="gmail",
-        source_id=src.id,
-        sender=cas_emails.CAS_SENDERS[0].address,
-        bank="cas_nsdl",
-        email_kind=EmailKind.CAS_STATEMENT.value,
-        enabled=True,
-        auto_managed=True,
-    )
-    session.add(rule)
-    await session.flush()
-
-    src.active = False
-    await session.flush()
-
-    _set_cas_cache(enabled=True, pan="ABCDE1234F")
-    await cas_emails.ensure_cas_fetch_rules(session)
-
-    await session.refresh(rule)
-    assert rule.enabled is False
-
-
-async def test_per_source_cooldown_handles_naive_timestamps(session):
-    """SQLite's DATETIME column drops tzinfo on read-back, so a UTC-aware
-    write surfaces as naive on the next session. ensure_cas_fetch_rules must
-    tolerate that, or the cooldown comparison raises
-    `can't subtract offset-naive and offset-aware datetimes` and crashes
-    the whole poll loop."""
-    src = await _source(session)
-    # Simulate the SQLite read-back: a naive datetime, value within cooldown.
+    # SQLite reads the poll stamp back naive. The cooldown must still apply.
     src.cas_last_polled_at = dt.datetime.utcnow() - dt.timedelta(hours=2)
     await session.flush()
-
-    _set_cas_cache(enabled=True, pan="ABCDE1234F")
     await cas_emails.ensure_cas_fetch_rules(session)
-    await session.flush()
+    assert not any(rule.enabled for rule in rules)
 
-    rules = (
-        (
-            await session.execute(
-                select(FetchRule).where(FetchRule.auto_managed.is_(True))
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert len(rules) == 2
-    assert all(rule.enabled is False for rule in rules)
-
-
-async def test_per_source_cooldown_enables_after_24h(session):
-    src = await _source(session)
-    src.cas_last_polled_at = dt.datetime.now(dt.UTC) - dt.timedelta(hours=25)
-    await session.flush()
-
-    _set_cas_cache(enabled=True, pan="ABCDE1234F")
+    src.cas_last_polled_at = dt.datetime.utcnow() - dt.timedelta(hours=25)
     await cas_emails.ensure_cas_fetch_rules(session)
-    await session.flush()
-
-    rules = (
-        (
-            await session.execute(
-                select(FetchRule).where(FetchRule.auto_managed.is_(True))
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert all(rule.enabled is True for rule in rules)
+    assert all(rule.enabled for rule in rules)
+    _set_cas_cache(enabled=False, pan="ABCDE1234F")
+    await cas_emails.ensure_cas_fetch_rules(session)
+    assert not any(rule.enabled for rule in await _auto_rules(session))
 
 
-async def test_process_cas_email_happy_path(session, cas_statement_payload, tmp_path):
+async def test_process_cas_email_ingests_or_surfaces_ingest_error(
+    session, cas_statement_payload, tmp_path
+):
     _set_cas_cache(enabled=True, pan="ABCDE1234F")
     src = await _source(session)
-
-    fake_pdf_bytes = b"%PDF-1.4 fake"
+    payload = dict(cas_statement_payload)
 
     class FakeCasStatement:
         def model_dump(self, mode="json"):
-            return cas_statement_payload
+            return payload
 
-    with (
-        patch(
-            "financial_dashboard.services.statements.cc.extract_pdf_from_email",
-            return_value=[("example_cas.pdf", fake_pdf_bytes)],
-        ),
-        patch(
-            "financial_dashboard.integrations.parsers.parse_cas_pdf",
-            return_value=FakeCasStatement(),
-        ),
-        patch(
-            "financial_dashboard.services.cas_emails.STATEMENTS_DIR",
-            tmp_path,
-        ),
-    ):
-        result, error = await cas_emails.process_cas_email(
-            session, b"raw", source_id=src.id, log_ref="msg-1"
-        )
+    async def _process(log_ref):
+        with (
+            patch(
+                "financial_dashboard.services.statements.cc.extract_pdf_from_email",
+                return_value=[("example_cas.pdf", b"%PDF-1.4 fake")],
+            ),
+            patch(
+                "financial_dashboard.integrations.parsers.parse_cas_pdf",
+                return_value=FakeCasStatement(),
+            ),
+            patch("financial_dashboard.services.cas_emails.STATEMENTS_DIR", tmp_path),
+        ):
+            return await cas_emails.process_cas_email(
+                session, b"raw", source_id=src.id, log_ref=log_ref
+            )
 
+    payload["summary"] = {**payload["summary"], "grand_total": None}
+    result, error = await _process("msg-bad")
+    assert result is None
+    assert "grand_total" in error
+    assert (await session.execute(select(CasUpload))).scalars().all() == []
+
+    payload["summary"] = cas_statement_payload["summary"]
+    result, error = await _process("msg-good")
     assert error is None
-    assert result is not None
-    cas_upload_id = result["cas_upload_id"]
-    upload = await session.get(CasUpload, cas_upload_id)
-    assert upload is not None
+    upload = await session.get(CasUpload, result["cas_upload_id"])
     assert upload.grand_total == Decimal("200000.00")
-
     snapshots = (
         (
             await session.execute(
                 select(BalanceSnapshot).where(
-                    BalanceSnapshot.cas_upload_id == cas_upload_id
+                    BalanceSnapshot.cas_upload_id == upload.id
                 )
             )
         )
@@ -304,42 +238,6 @@ async def test_cas_cooldown_stamped_only_on_fetch_success(monkeypatch, fetch_ok)
 
     await engine.dispose()
     holder.close()
-
-
-async def test_process_cas_email_surfaces_specific_ingest_error(
-    session, cas_statement_payload, tmp_path
-):
-    _set_cas_cache(enabled=True, pan="ABCDE1234F")
-    src = await _source(session)
-    cas_statement_payload["summary"]["grand_total"] = None  # triggers CasIngestError
-
-    fake_pdf_bytes = b"%PDF-1.4 fake"
-
-    class FakeCasStatement:
-        def model_dump(self, mode="json"):
-            return cas_statement_payload
-
-    with (
-        patch(
-            "financial_dashboard.services.statements.cc.extract_pdf_from_email",
-            return_value=[("example_cas.pdf", fake_pdf_bytes)],
-        ),
-        patch(
-            "financial_dashboard.integrations.parsers.parse_cas_pdf",
-            return_value=FakeCasStatement(),
-        ),
-        patch(
-            "financial_dashboard.services.cas_emails.STATEMENTS_DIR",
-            tmp_path,
-        ),
-    ):
-        result, error = await cas_emails.process_cas_email(
-            session, b"raw", source_id=src.id, log_ref="msg-4"
-        )
-
-    assert result is None
-    assert error is not None
-    assert "grand_total" in error
 
 
 def test_extract_pdf_handles_text_plain_attachment_with_pdf_filename():

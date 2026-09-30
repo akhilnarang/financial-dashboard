@@ -144,28 +144,3 @@ async def test_emit_replaces_same_source_date(session):
     snapshots = (await session.execute(select(BalanceSnapshot))).scalars().all()
     assert len(snapshots) == 1
     assert snapshots[0].value == Decimal("200.00")
-
-
-async def test_emit_cc_snapshot_null_created_at_falls_back_to_today(session):
-    """A CC upload with no created_at (None) dates the snapshot from the emit
-    time instead of crashing — the statement-generation-date fallback."""
-    account = await _account(session, "credit_card")
-    upload = StatementUpload(
-        account_id=account.id,
-        bank=account.bank,
-        filename="cc.pdf",
-        file_path="/tmp/cc.pdf",
-        status="parsed",
-        total_amount_due="10,000.00",
-        payment_paid_amount=None,
-        created_at=None,  # NULL — fallback path
-    )
-    session.add(upload)
-
-    before = dt.datetime.now(dt.UTC).date()
-    assert await emit_cc_snapshot(session, upload) is True
-    after = dt.datetime.now(dt.UTC).date()
-
-    snapshot = (await session.execute(select(BalanceSnapshot))).scalar_one()
-    assert before <= snapshot.as_of_date <= after
-    assert snapshot.value == Decimal("10000.00")

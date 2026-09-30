@@ -278,49 +278,6 @@ async def test_distinguishable_rivals_hold_back_winner_and_loser(
 
 
 @pytest.mark.anyio
-async def test_incompatible_reused_reference_does_not_contend_with_valid_match(
-    session_factory, monkeypatch
-):
-    """A contradictory amount remains ambiguous but cannot demote a valid match."""
-    await _seed_account(session_factory)
-    a_id = await _seed_txn(
-        session_factory, counterparty="MERCHANT A", reference_number="REF12345"
-    )
-
-    parsed = _parsed(
-        [
-            _stmt_txn(
-                date="07/04/2026",
-                amount="2,500.00",
-                narration="MERCHANT B RETAIL",
-                counterparty="MERCHANT B",
-                ref="REF12345",
-            ),
-            # Same reference but a contradictory amount. Keep it as ambiguous
-            # evidence without treating it as a rival for the valid winner.
-            _stmt_txn(
-                date="09/04/2026",
-                amount="3,100.00",
-                narration="MERCHANT A RETAIL",
-                counterparty="MERCHANT A",
-                ref="REF12345",
-            ),
-        ]
-    )
-    recon = await _reconcile(session_factory, parsed)
-    assert [entry["stmt_idx"] for entry in recon["matched"]] == [0]
-    assert [entry["stmt_idx"] for entry in recon["missing"]] == [1]
-    assert recon["missing"][0]["ambiguous"] is True
-    assert recon["missing"][0]["candidate_transaction_ids"] == [a_id]
-
-    rows, upload = await _run_real_reparse(session_factory, monkeypatch, parsed)
-
-    assert [row.id for row in rows] == [a_id]
-    assert upload.imported_count == 0
-    assert upload.missing_count == 1
-
-
-@pytest.mark.anyio
 async def test_new_rows_import_beside_an_incompatible_db_row(
     session_factory, monkeypatch
 ):

@@ -40,24 +40,6 @@ def _f(cp=None, raw=None, channel=None, direction="debit"):
     }
 
 
-# ---------------------------------------------------------------------------
-# match_rules engine with merchant_rules in config
-# ---------------------------------------------------------------------------
-
-
-def test_match_rules_hits_and_misses():
-    cfg = default_rule_config()._replace(
-        merchant_rules=(
-            ("billco", "bill_payment"),
-            ("investco", "investment"),
-        )
-    )
-    r = match_rules(_f(cp="BILLCO LIMITED"), cfg)
-    assert r is not None and r.slug == "bill_payment"
-    assert r.confidence == 0.9
-    assert match_rules(_f(cp="UNKNOWN MERCHANT XYZ"), cfg) is None
-
-
 def test_cc_spend_guard_blocks_cc_payment_rule_only_on_spend_narration():
     """A 'spent on ... Credit Card' narration must NOT be labelled
     credit_card_payment even when a cc-payment merchant pattern matches."""
@@ -105,35 +87,23 @@ async def test_load_merchant_rules_order_drives_first_match(session: AsyncSessio
 # ---------------------------------------------------------------------------
 
 
-async def test_add_merchant_rule_inserts_and_strips(session: AsyncSession):
-    await ensure_category(session, "expense")
-    result = await add_merchant_rule(session, "  My Merchant  ", "expense")
-    assert result is True
-    await session.flush()
-
-    rules = await list_merchant_rules(session)
-    patterns = [r.pattern for r in rules]
-    assert "my merchant" in patterns  # lowercased + stripped
-
-
-async def test_add_merchant_rule_rejects_unknown_category(session: AsyncSession):
-    # valid slug format, but not in the categories vocabulary -> rejected (typo guard)
-    with pytest.raises(ValueError, match="Unknown category"):
-        await add_merchant_rule(session, "somemerchant", "dinng")
-
-
-async def test_add_merchant_rule_upsert_updates_category(session: AsyncSession):
+async def test_add_merchant_rule_normalizes_upserts_and_rejects_unknown_category(
+    session: AsyncSession,
+):
     await ensure_category(session, "expense")
     await ensure_category(session, "salary")
-    await add_merchant_rule(session, "acme corp", "expense", priority=100)
+    assert await add_merchant_rule(session, "  Acme Corp  ", "expense") is True
     await session.flush()
     await add_merchant_rule(session, "acme corp", "salary", priority=50)
     await session.flush()
 
-    rules = await list_merchant_rules(session)
-    acme = next(r for r in rules if r.pattern == "acme corp")
-    assert acme.category == "salary"
-    assert acme.priority == 50
+    rules = [r for r in await list_merchant_rules(session) if r.pattern == "acme corp"]
+    assert len(rules) == 1
+    assert rules[0].category == "salary" and rules[0].priority == 50
+
+    # A valid slug that is not in the vocabulary is a typo.
+    with pytest.raises(ValueError):
+        await add_merchant_rule(session, "somemerchant", "dinng")
 
 
 # ---------------------------------------------------------------------------

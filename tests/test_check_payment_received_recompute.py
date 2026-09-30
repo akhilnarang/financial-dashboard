@@ -148,35 +148,15 @@ async def test_refund_credit_excluded(session_maker):
 
 
 async def test_cycle_scope_excludes_before_includes_on_or_after(session_maker):
-    """A payment dated BEFORE the cycle's created_at date is excluded; one on
-    the same calendar day is included; one after is included."""
+    """A payment dated before the cycle's created_at date is excluded. One on
+    the same calendar day or after is included. A NULL-date payment whose own
+    created_at predates the cycle must not leak into this or any later cycle."""
     async with session_maker() as s:
         account = await _cc_account(s)
         await _upload(s, account)
-        # Before cycle start (created_at date is 2026-05-10).
         s.add(_credit(account, "111.00", txn_date=dt.date(2026, 5, 9)))
-        # Same calendar day as created_at.
         s.add(_credit(account, "1000.00", txn_date=dt.date(2026, 5, 10)))
-        # After cycle start.
         s.add(_credit(account, "2000.00", txn_date=dt.date(2026, 5, 20)))
-        await s.commit()
-        account_id = account.id
-
-    await check_payment_received(1, account_id, Decimal("1000.00"))
-
-    async with session_maker() as s:
-        upload = (await s.execute(select(StatementUpload))).scalar_one()
-        assert upload.payment_paid_amount == Decimal("3000.00")
-
-
-async def test_null_date_row_from_prior_cycle_does_not_leak(session_maker):
-    """A NULL transaction_date payment whose own created_at predates the
-    cycle must NOT be summed in — otherwise one old NULL-date row would be
-    counted into this cycle and every later one."""
-    async with session_maker() as s:
-        account = await _cc_account(s)
-        await _upload(s, account, total_due="10000.00")
-        # NULL-date payment created well before this statement's cycle start.
         s.add(
             _credit(
                 account,
@@ -185,8 +165,6 @@ async def test_null_date_row_from_prior_cycle_does_not_leak(session_maker):
                 created_at=dt.datetime(2026, 4, 1, tzinfo=dt.UTC),
             )
         )
-        # A real in-cycle payment.
-        s.add(_credit(account, "1000.00", txn_date=dt.date(2026, 5, 12)))
         await s.commit()
         account_id = account.id
 
@@ -194,8 +172,7 @@ async def test_null_date_row_from_prior_cycle_does_not_leak(session_maker):
 
     async with session_maker() as s:
         upload = (await s.execute(select(StatementUpload))).scalar_one()
-        # Only the in-cycle 1000 counts; the stale NULL-date 5000 is excluded.
-        assert upload.payment_paid_amount == Decimal("1000.00")
+        assert upload.payment_paid_amount == Decimal("3000.00")
 
 
 async def test_dated_payment_split_at_due_date_boundary(session_maker):
@@ -319,36 +296,11 @@ async def test_late_ingested_statement_no_double_count(session_maker):
         assert p1 + p2 == Decimal("5000.00")  # counted once, not in both
 
 
-async def test_null_date_payment_within_old_cycle_counts_in_old_only(session_maker):
-    """A date-less payment whose created_at falls before the next statement
-    belongs to the old cycle only. The later statement must neither drop it from
-    the old cycle nor pull it into the new one."""
-    async with session_maker() as s:
-        account = await _cc_account(s)
-        old = await _upload(s, account, created_at=CYCLE_CREATED)
-        newer = await _upload(s, account, created_at=NEXT_CYCLE_CREATED)
-        s.add(
-            _credit(
-                account,
-                "1500.00",
-                txn_date=None,
-                created_at=dt.datetime(2026, 5, 12, tzinfo=dt.UTC),
-            )
-        )
-        await s.flush()
-
-        old_paid = await recompute_cc_payment_state(s, old)
-        newer_paid = await recompute_cc_payment_state(s, newer)
-        assert old_paid == Decimal("1500.00")
-        assert newer_paid == Decimal("0.00")
-
-
-async def test_null_date_payment_after_due_boundary_counts_in_new_only(
+async def test_null_date_payment_placed_by_created_at_against_due_boundary(
     session_maker,
 ):
-    """A date-less payment is placed by its created_at against the same due-date
-    boundary. One created after the earlier bill's due date belongs to the new
-    cycle only — never both."""
+    """A date-less payment is placed by its created_at against the earlier
+    bill's due date. It counts in exactly one cycle, never both."""
     async with session_maker() as s:
         account = await _cc_account(s)
         old = await _upload(s, account, due="25/06/2026", created_at=CYCLE_CREATED)
@@ -360,15 +312,21 @@ async def test_null_date_payment_after_due_boundary_counts_in_new_only(
                 account,
                 "1500.00",
                 txn_date=None,
+                created_at=dt.datetime(2026, 5, 12, tzinfo=dt.UTC),
+            )
+        )
+        s.add(
+            _credit(
+                account,
+                "700.00",
+                txn_date=None,
                 created_at=dt.datetime(2026, 6, 27, tzinfo=dt.UTC),
             )
         )
         await s.flush()
 
-        old_paid = await recompute_cc_payment_state(s, old)
-        newer_paid = await recompute_cc_payment_state(s, newer)
-        assert old_paid == Decimal("0.00")
-        assert newer_paid == Decimal("1500.00")
+        assert await recompute_cc_payment_state(s, old) == Decimal("1500.00")
+        assert await recompute_cc_payment_state(s, newer) == Decimal("700.00")
 
 
 async def test_recompute_unpaid_when_zero_flag(session_maker):
@@ -465,45 +423,6 @@ async def _enable_telegram(monkeypatch):
     )
 
 
-async def test_notification_fires_after_commit_with_persisted_state(
-    session_maker, monkeypatch
-):
-    """The payment-received notification must fire only AFTER commit: when the
-    stub runs, the committed state is already durable in the DB."""
-    await _enable_telegram(monkeypatch)
-
-    async with session_maker() as s:
-        account = await _cc_account(s)
-        await _upload(s, account, total_due="10000.00")
-        s.add(_credit(account, "4000.00"))
-        await s.commit()
-        account_id = account.id
-
-    observed: dict[str, object] = {}
-
-    async def _stub(label, bank, credit, total_paid, due, chat_id):
-        # Read the DB in a brand-new session: if commit already happened, the
-        # recomputed paid amount is visible here.
-        async with session_maker() as s:
-            upload = (await s.execute(select(StatementUpload))).scalar_one()
-            observed["persisted_paid"] = upload.payment_paid_amount
-        observed["args"] = (label, bank, credit, total_paid, due, chat_id)
-
-    monkeypatch.setattr(reminders_module, "_send_payment_received_notification", _stub)
-
-    assert await check_payment_received(1, account_id, Decimal("4000.00")) is False
-
-    assert observed["persisted_paid"] == Decimal("4000.00")
-    assert observed["args"] == (
-        "Test CC",
-        "Test Bank",
-        Decimal("4000.00"),
-        Decimal("4000.00"),
-        Decimal("10000.00"),
-        123456,
-    )
-
-
 async def test_notification_not_sent_when_commit_fails(session_maker, monkeypatch):
     """If session.commit raises, the notification stub must NEVER be called —
     no false 'payment received' message on a failed commit."""
@@ -538,8 +457,12 @@ async def test_notification_not_sent_when_commit_fails(session_maker, monkeypatc
     assert sent["called"] is False
 
 
-async def test_partial_then_full(session_maker):
-    """sum < due -> PARTIALLY_PAID (no paid_at); sum >= due -> PAID + paid_at."""
+async def test_partial_then_full_notifies_after_commit(session_maker, monkeypatch):
+    """sum < due -> PARTIALLY_PAID (no paid_at); sum >= due -> PAID + paid_at.
+    The payment-received notification fires only after commit, so the stub
+    reads the persisted paid amount in a fresh session."""
+    await _enable_telegram(monkeypatch)
+
     async with session_maker() as s:
         account = await _cc_account(s)
         await _upload(s, account, total_due="10000.00")
@@ -547,7 +470,26 @@ async def test_partial_then_full(session_maker):
         await s.commit()
         account_id = account.id
 
+    observed: dict[str, object] = {}
+
+    async def _stub(label, bank, credit, total_paid, due, chat_id):
+        async with session_maker() as s:
+            upload = (await s.execute(select(StatementUpload))).scalar_one()
+            observed["persisted_paid"] = upload.payment_paid_amount
+        observed["args"] = (label, bank, credit, total_paid, due, chat_id)
+
+    monkeypatch.setattr(reminders_module, "_send_payment_received_notification", _stub)
+
     assert await check_payment_received(1, account_id, Decimal("4000.00")) is False
+    assert observed["persisted_paid"] == Decimal("4000.00")
+    assert observed["args"] == (
+        "Test CC",
+        "Test Bank",
+        Decimal("4000.00"),
+        Decimal("4000.00"),
+        Decimal("10000.00"),
+        123456,
+    )
     async with session_maker() as s:
         upload = (await s.execute(select(StatementUpload))).scalar_one()
         assert upload.payment_status == PaymentStatus.PARTIALLY_PAID

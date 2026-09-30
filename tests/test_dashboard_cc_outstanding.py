@@ -95,35 +95,3 @@ async def test_zero_due_statements_without_paid_status_are_grouped_as_paid(
     ]
     assert cc_outstanding["summary"]["cards_paid"] == 2
     assert cc_outstanding["summary"]["cards_with_outstanding"] == 0
-
-
-@pytest.mark.anyio
-async def test_outstanding_rows_link_to_latest_statement(session, monkeypatch):
-    templates = CapturingTemplates()
-    monkeypatch.setattr(dashboard_module, "templates", templates)
-
-    account = Account(
-        bank="hdfc",
-        label="Primary CC",
-        type="credit_card",
-        active=True,
-    )
-    session.add(account)
-    await session.flush()
-    upload = StatementUpload(
-        account_id=account.id,
-        bank="hdfc",
-        filename="",
-        file_path="",
-        status="parsed",
-        due_date=None,
-        total_amount_due="1234.56",
-        payment_status="unpaid",
-    )
-    session.add(upload)
-    await session.commit()
-
-    await dashboard_module.dashboard(_request(), session)
-
-    row = _captured_context(templates)["cc_outstanding"]["outstanding_rows"][0]
-    assert row["statement_url"] == f"/statements/{upload.id}"

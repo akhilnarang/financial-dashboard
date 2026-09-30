@@ -15,17 +15,12 @@ from financial_dashboard.services.transaction_attachments import (
 )
 
 
-def test_detect_attachment_type_uses_file_signature():
+def test_attachment_type_and_path_reject_unsafe_input(tmp_path, monkeypatch):
     assert detect_attachment_type(b"%PDF-1.7\n") == ("application/pdf", ".pdf")
-    assert detect_attachment_type(b"\x89PNG\r\n\x1a\nrest") == (
-        "image/png",
-        ".png",
-    )
+    assert detect_attachment_type(b"\x89PNG\r\n\x1a\nrest") == ("image/png", ".png")
     with pytest.raises(AttachmentError):
         detect_attachment_type(b"not really a pdf")
 
-
-def test_resolve_attachment_path_rejects_traversal(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "transaction_attachment_root", str(tmp_path))
     with pytest.raises(AttachmentError):
         resolve_attachment_path("../outside.pdf")

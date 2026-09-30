@@ -1,16 +1,69 @@
-"""Tests for /sms web routes."""
+"""Tests for the SMS ingest API and the /sms web routes."""
 
 import datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import select
 
-from financial_dashboard.db import SmsMessage
+from financial_dashboard.db import SmsMessage, Transaction
+
+
+def _ingest_json(**overrides) -> dict:
+    payload = {
+        "bank": "HDFC",
+        "sender": "VK-HDFCBK",
+        "body": "Sent Rs.500 from A/c XX1234 to ...",
+        "received_at": "2026-05-02T14:23:11+05:30",
+    }
+    payload.update(overrides)
+    return payload
 
 
 @pytest.mark.anyio
-async def test_reparse_single_pending_sms_returns_200(session, client):
+async def test_post_sms_stores_trimmed_row_and_dedups_without_bank(client, session):
+    first = await client.post(
+        "/api/sms", json=_ingest_json(bank="  HDFC  ", sender="\tVK-HDFCBK\n")
+    )
+    # The dedup key omits the bank, and a duplicate does not update the row.
+    duplicate = await client.post("/api/sms", json=_ingest_json(bank="ICICI"))
+    other = await client.post("/api/sms", json=_ingest_json(body="A different body"))
+
+    assert (first.status_code, duplicate.status_code, other.status_code) == (
+        201,
+        204,
+        201,
+    )
+    assert first.content == duplicate.content == b""
+    rows = (
+        (await session.execute(select(SmsMessage).order_by(SmsMessage.id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2
+    assert (rows[0].bank, rows[0].sender) == ("HDFC", "VK-HDFCBK")
+    assert rows[0].received_at.replace(tzinfo=datetime.UTC) == datetime.datetime(
+        2026, 5, 2, 8, 53, 11, tzinfo=datetime.UTC
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "mutation",
+    [{"sender": "   "}, {"received_at": "2026-05-02T14:23:11"}],
+    ids=["blank_sender", "naive_received_at"],
+)
+async def test_post_sms_invalid_returns_422(client, session, mutation):
+    r = await client.post("/api/sms", json=_ingest_json(**mutation))
+    assert r.status_code == 422
+    assert (await session.execute(select(SmsMessage))).scalars().all() == []
+
+
+@pytest.mark.anyio
+async def test_reparse_single_sms_creates_row_or_rejects_non_transaction(
+    session, client
+):
     sms = SmsMessage(
         bank="hdfc",
         sender="VK-HDFCBK",
@@ -18,30 +71,33 @@ async def test_reparse_single_pending_sms_returns_200(session, client):
         received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
         status="pending",
     )
-    session.add(sms)
+    otp = SmsMessage(
+        bank="hdfc",
+        sender="VK-HDFCBK",
+        body="OTP for your transaction is 123456. Valid 5 mins.",
+        received_at=datetime.datetime(2026, 5, 2, 8, 54, 0, tzinfo=datetime.UTC),
+        status="pending",
+    )
+    session.add_all([sms, otp])
     await session.commit()
 
     resp = await client.post(f"/sms/{sms.id}/reparse")
     assert resp.status_code == 200
     data = resp.json()
     assert data["new_status"] == "parsed"
-    assert data["txn_id"] is not None
-
-
-@pytest.mark.anyio
-async def test_reparse_single_otp_sms_returns_422(session, client):
-    sms = SmsMessage(
-        bank="hdfc",
-        sender="VK-HDFCBK",
-        body="OTP for your transaction is 123456. Valid 5 mins.",
-        received_at=datetime.datetime(2026, 5, 2, 8, 53, 0, tzinfo=datetime.UTC),
-        status="pending",
+    txn = await session.get(Transaction, data["txn_id"])
+    assert (txn.direction, txn.amount, txn.transaction_date) == (
+        "debit",
+        Decimal("500"),
+        datetime.date(2026, 5, 2),
     )
-    session.add(sms)
-    await session.commit()
+    assert txn.card_mask is not None
+    await session.refresh(sms)
+    assert (sms.status, sms.transaction_id) == ("parsed", txn.id)
 
-    resp = await client.post(f"/sms/{sms.id}/reparse")
+    resp = await client.post(f"/sms/{otp.id}/reparse")
     assert resp.status_code == 422
+    assert len((await session.execute(select(Transaction))).scalars().all()) == 1
 
 
 @pytest.mark.anyio
@@ -49,8 +105,6 @@ async def test_reparse_force_new_creates_row_for_deferred_sms(session, client):
     """A [dup-defer] SMS reparsed with ?force_new=true must create a real
     transaction (manual confirmation that it's a genuine second charge),
     bypassing the matcher that would DEFER it again."""
-    from financial_dashboard.db import Transaction
-
     # A pre-existing balance-less ICICI CC row the incoming SMS collides with.
     existing = Transaction(
         bank="icici",
@@ -189,4 +243,5 @@ async def test_reparse_maskless_multi_card_dispatches_disambiguation_prompt(
     prompt_mock.assert_awaited_once()
     payload = prompt_mock.await_args.args[0]
     assert set(payload["candidate_account_ids"]) == {a.id, b.id}
-    assert payload["txn_id"] is not None
+    txn = await session.get(Transaction, payload["txn_id"])
+    assert txn.account_id is None

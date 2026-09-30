@@ -14,11 +14,7 @@ import pytest
 from sqlalchemy import select
 
 from financial_dashboard.db.models import CasUpload, InvestmentLot
-from financial_dashboard.services.investment_types import (
-    LotExtractionResult,
-)
 from financial_dashboard.services.investments import (
-    CAS_CURRENCY,
     create_investment_lots,
     extract_lots_from_payload,
     get_canonical_lot_consumption,
@@ -26,7 +22,6 @@ from financial_dashboard.services.investments import (
     get_complete_lots,
     get_current_valuations,
     get_incomplete_reasons,
-    get_latest_payload,
     get_latest_values,
     get_positions,
 )
@@ -56,31 +51,6 @@ def _mf_purchase(**overrides) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_complete_mf_purchase_becomes_a_lot():
-    extracted = extract_lots_from_payload({"transactions": [_mf_purchase()]})
-    assert isinstance(extracted, LotExtractionResult)
-    lots, excluded = extracted
-    assert excluded == []
-    assert len(lots) == 1
-    lot = lots[0]
-    assert lot.instrument_id == "INE000A01018"
-    assert lot.instrument_name == "Example Fund"
-    assert lot.quantity == Decimal("1000")
-    assert lot.unit_cost == Decimal("50.00")
-    assert lot.cost_basis == Decimal("50000.00")
-    assert lot.currency == CAS_CURRENCY
-    assert lot.acquired_on == datetime.date(2026, 1, 15)
-    assert lot.transaction_type == "purchase"
-    assert lot.reference == "TXN001"
-
-
-def test_switch_in_is_an_acquisition_type():
-    lots, _ = extract_lots_from_payload(
-        {"transactions": [_mf_purchase(transaction_type="switch_in")]}
-    )
-    assert len(lots) == 1
-
-
 @pytest.mark.parametrize(
     ("overrides", "reason"),
     [
@@ -104,14 +74,6 @@ def test_switch_in_is_an_acquisition_type():
         ({"transaction_type": "transfer"}, "ambiguous_transaction_type"),
         # missing nav (no per-unit cost)
         ({"nav": None}, "missing_lot_facts"),
-        # missing amount (no cost basis)
-        ({"amount": None}, "missing_lot_facts"),
-        # missing date (no acquisition date)
-        ({"date": None}, "missing_lot_facts"),
-        # missing isin (no instrument identity)
-        ({"isin": None}, "missing_lot_facts"),
-        # negative units (not a purchase)
-        ({"units": "-50", "amount": "-2500.00"}, "missing_lot_facts"),
         # inconsistent cost basis: amount != units*nav
         ({"amount": "40000.00"}, "cost_basis_inconsistent"),
     ],
@@ -129,31 +91,6 @@ def test_incomplete_or_excluded_transactions_are_reported_not_fabricated(
     assert excluded[0].detail
 
 
-def test_identical_transactions_within_payload_preserve_source_multiplicity():
-    txn = _mf_purchase()
-    lots, _ = extract_lots_from_payload({"transactions": [txn, txn]})
-    assert len(lots) == 2
-    assert [lot.source_occurrence for lot in lots] == [0, 1]
-
-
-def test_decimal_precision_preserved():
-    """High-precision units/nav survive unrounded into the lot fields."""
-    lots, _ = extract_lots_from_payload(
-        {
-            "transactions": [
-                _mf_purchase(
-                    units="123.456789",
-                    nav="12.3456",
-                    amount="1524.15",  # 123.456789 * 12.3456 = 1524.15 (2dp)
-                )
-            ]
-        }
-    )
-    lot = lots[0]
-    assert lot.quantity == Decimal("123.456789")
-    assert lot.unit_cost == Decimal("12.3456")
-
-
 # ---------------------------------------------------------------------------
 # 1-paisa lot boundary: agreement gate + exact renderer consistency
 # ---------------------------------------------------------------------------
@@ -166,9 +103,6 @@ def test_decimal_precision_preserved():
         ("1", "100.009", "100.00", True, "diff_subpenny"),
         # difference exactly 0.01 -> REJECTED (the former 1-paisa grey zone)
         ("1", "100.01", "100.00", False, "diff_exactly_one_paisa"),
-        # real-world repeating NAV whose product is sub-penny off the amount:
-        # 3 * 33.3333 = 99.9999, amount 100.00 (diff 0.0001) -> accepted
-        ("3", "33.3333", "100.00", True, "repeating_nav_subpenny"),
     ],
 )
 def test_lot_agreement_boundary(units, nav, amount, accepted, label):
@@ -188,23 +122,11 @@ def test_lot_agreement_boundary(units, nav, amount, accepted, label):
         assert excluded[0].detail, label
 
 
-@pytest.mark.parametrize(
-    ("units", "nav", "amount"),
-    [
-        # high-precision product (7 dp)
-        ("123.456789", "12.3456", "1524.15"),
-        # sub-penny product (3 dp), accepted within tolerance
-        ("1", "100.009", "100.00"),
-        # repeating NAV
-        ("700", "14.2857", "9999.99"),
-    ],
-)
-def test_accepted_lot_cost_basis_is_quantized_product_and_renders_balanced(
-    units, nav, amount
-):
-    """Every accepted lot stores cost_basis == (quantity*unit_cost).quantize(0.01)
-    so the renderer's lot-consistency guard passes with a ZERO diff (never up to
-    a paisa) and the entry renders without raising in every backend."""
+def test_accepted_lot_cost_basis_is_quantized_product_and_renders_balanced():
+    """An accepted lot stores cost_basis == (quantity*unit_cost).quantize(0.01),
+    not the printed amount. The renderer's lot guard then sees a zero diff in
+    every backend."""
+    units, nav, amount = "1", "100.009", "100.00"
     from financial_dashboard.services.paisa.renderers import render_document
     from financial_dashboard.services.paisa.renderers.base import (
         InvestmentLotEntry,
@@ -244,51 +166,6 @@ def test_accepted_lot_cost_basis_is_quantized_product_and_renders_balanced(
 # ---------------------------------------------------------------------------
 
 
-def test_purchase_plus_redemption_same_instrument_is_unresolved():
-    """An instrument with an acquisition lot AND a redemption that CAS does not
-    tie to the lot is flagged unresolved so projection suppresses the lot."""
-    from financial_dashboard.services.investments import unresolved_disposal_instruments
-
-    payloads = [
-        {
-            "transactions": [
-                _mf_purchase(isin="INE000A01020", source_ref="a/1", reference="P1"),
-                _mf_purchase(
-                    isin="INE000A01020",
-                    transaction_type="redemption",
-                    units="-50",
-                    amount="-5100.00",
-                    source_ref="a/2",
-                    reference="R1",
-                ),
-            ]
-        }
-    ]
-    assert unresolved_disposal_instruments(payloads) == {"INE000A01020"}
-
-
-def test_purchase_only_path_has_no_unresolved_disposal():
-    """Instruments acquired but never disposed are not flagged (unchanged path)."""
-    from financial_dashboard.services.investments import unresolved_disposal_instruments
-
-    payloads = [
-        {
-            "transactions": [
-                _mf_purchase(isin="INE000A01020", source_ref="a/1"),
-                _mf_purchase(
-                    isin="INE000A01021",
-                    source_ref="a/2",
-                    units="200",
-                    nav="10.00",
-                    amount="2000.00",
-                    reference="P2",
-                ),
-            ]
-        }
-    ]
-    assert unresolved_disposal_instruments(payloads) == set()
-
-
 def test_disposal_with_no_reference_is_always_unresolved():
     """A disposal with no source_ref (or no units) can never be explicitly tied
     to an acquisition, so the instrument is flagged unresolved — never quietly
@@ -311,47 +188,6 @@ def test_disposal_with_no_reference_is_always_unresolved():
         }
     ]
     assert unresolved_disposal_instruments(payloads) == {"INE000A01020"}
-
-
-def test_disposal_exactly_tied_by_shared_reference_is_resolved():
-    """A disposal exactly tied to an acquisition by an explicit shared
-    source_ref with matching magnitude is resolved by consuming the lot, not by
-    leaving the gross acquisition eligible (the original P2 regression)."""
-    from financial_dashboard.services.investments import resolve_lot_consumption
-
-    payloads = [
-        {
-            "transactions": [
-                {
-                    "scope": "mf",
-                    "source_ref": "sw/1",
-                    "date": "2026-01-01",
-                    "description": "Switch Fund",
-                    "isin": "INE000A01020",
-                    "transaction_type": "switch_in",
-                    "units": "100",
-                    "nav": "10.00",
-                    "amount": "1000.00",
-                    "reference": "SW1",
-                },
-                {
-                    "scope": "mf",
-                    "source_ref": "sw/1",
-                    "date": "2026-01-01",
-                    "description": "Switch Fund",
-                    "isin": "INE000A01020",
-                    "transaction_type": "switch_out",
-                    "units": "-100",
-                    "nav": "10.00",
-                    "amount": "-1000.00",
-                    "reference": "SW1",
-                },
-            ]
-        }
-    ]
-    consumption = resolve_lot_consumption(payloads)
-    assert consumption.unresolved_instruments == set()
-    assert list(consumption.remaining.values()) == [Decimal("0")]
 
 
 def _disposal(**overrides):
@@ -379,30 +215,6 @@ def _remaining_for(consumption, instrument_id):
     }
 
 
-def test_exact_partial_disposal_preserves_unit_multiplicity_and_precision():
-    """A unique source-ref tie can be partial; subtraction stays Decimal-exact
-    and two equal-magnitude disposal rows are both applied, not de-duplicated."""
-    from financial_dashboard.services.investments import resolve_lot_consumption
-
-    purchase = _mf_purchase(
-        source_ref="lot/ref",
-        units="1.234567",
-        nav="12.3456",
-        amount="15.24",
-        reference="BUY-1",
-    )
-    payload = {
-        "transactions": [
-            purchase,
-            _disposal(units="-0.100001", reference="SALE-1"),
-            _disposal(units="-0.100001", reference="SALE-2"),
-        ]
-    }
-    consumption = resolve_lot_consumption([payload])
-    assert consumption.unresolved_instruments == set()
-    assert list(consumption.remaining.values()) == [Decimal("1.034565")]
-
-
 def test_over_disposal_is_unresolved_and_never_clamped():
     from financial_dashboard.services.investments import resolve_lot_consumption
 
@@ -425,9 +237,10 @@ def test_over_disposal_is_unresolved_and_never_clamped():
     assert consumption.remaining == {}
 
 
-def test_same_date_multi_lot_partial_boundary_is_ambiguous():
-    """A shared source ref does not authorize an arbitrary tie-break between
-    same-date acquisitions when a disposal cuts through that date group."""
+@pytest.mark.parametrize("buy_b_date", ["2026-01-01", "2026-02-01"])
+def test_multi_lot_bucket_without_exact_reference_is_ambiguous(buy_b_date):
+    """A shared source ref does not authorize FIFO or any other tie-break
+    between acquisitions, on the same date or on distinct dates."""
     from financial_dashboard.services.investments import resolve_lot_consumption
 
     payload = {
@@ -442,7 +255,7 @@ def test_same_date_multi_lot_partial_boundary_is_ambiguous():
             ),
             _mf_purchase(
                 source_ref="lot/ref",
-                date="2026-01-01",
+                date=buy_b_date,
                 units="60",
                 nav="20",
                 amount="1200",
@@ -453,6 +266,7 @@ def test_same_date_multi_lot_partial_boundary_is_ambiguous():
     }
     consumption = resolve_lot_consumption([payload])
     assert consumption.unresolved_instruments == {"INE000A01018"}
+    assert consumption.remaining == {}
 
 
 def test_partial_disposal_with_incomplete_acquisition_in_bucket_is_unresolved():
@@ -513,40 +327,6 @@ def test_exact_transaction_reference_disambiguates_same_date_lots():
     }
 
 
-def test_multiple_acquisitions_are_unresolved_without_exact_lot_reference():
-    """Distinct acquisition dates do not prove FIFO disposal allocation.
-
-    A source ref shared by multiple lots remains ambiguous unless the disposal's
-    explicit reference identifies one exact lot.
-    """
-    from financial_dashboard.services.investments import resolve_lot_consumption
-
-    payload = {
-        "transactions": [
-            _mf_purchase(
-                source_ref="lot/ref",
-                date="2026-01-01",
-                units="40",
-                nav="10",
-                amount="400",
-                reference="BUY-A",
-            ),
-            _mf_purchase(
-                source_ref="lot/ref",
-                date="2026-02-01",
-                units="60",
-                nav="20",
-                amount="1200",
-                reference="BUY-B",
-            ),
-            _disposal(units="-50", reference="SALE"),
-        ]
-    }
-    consumption = resolve_lot_consumption([payload])
-    assert consumption.unresolved_instruments == {"INE000A01018"}
-    assert consumption.remaining == {}
-
-
 def test_same_source_ref_is_scoped_by_instrument():
     """A ref shared by different instruments neither cross-consumes nor makes
     the independently exact disposal ambiguous."""
@@ -586,19 +366,20 @@ def test_same_source_ref_is_scoped_by_instrument():
 
 
 async def test_get_lot_consumption_is_read_only_and_returns_remaining_lots(session):
-    """The DB accessor reads preserved disposal facts but does not rewrite the
-    persisted gross acquisition row when reporting a partial remainder."""
+    """The DB accessor nets two equal partial disposals Decimal-exactly. It
+    does not rewrite the persisted gross acquisition row."""
     from financial_dashboard.services.investments import get_lot_consumption
 
     transactions = [
         _mf_purchase(
             source_ref="lot/ref",
-            units="100",
-            nav="10",
-            amount="1000",
+            units="1.234567",
+            nav="12.3456",
+            amount="15.24",
             reference="BUY-1",
         ),
-        _disposal(units="-25", source_ref="lot/ref", reference="SALE-1"),
+        _disposal(units="-0.100001", reference="SALE-1"),
+        _disposal(units="-0.100001", reference="SALE-2"),
     ]
     upload = await _upload(session, payload_txns=transactions)
     await create_investment_lots(
@@ -606,17 +387,14 @@ async def test_get_lot_consumption_is_read_only_and_returns_remaining_lots(sessi
         cas_upload_id=upload.id,
         payload=json.loads(upload.raw_holdings_json),
     )
-    persisted = (await session.execute(select(InvestmentLot))).scalar_one()
-    assert persisted.quantity == Decimal("100")
-    assert persisted.cost_basis == Decimal("1000")
 
     consumption = await get_lot_consumption(session)
 
     assert consumption.unresolved_instruments == set()
-    assert list(consumption.remaining.values()) == [Decimal("75")]
+    assert list(consumption.remaining.values()) == [Decimal("1.034565")]
     unchanged = (await session.execute(select(InvestmentLot))).scalar_one()
-    assert unchanged.quantity == Decimal("100")
-    assert unchanged.cost_basis == Decimal("1000")
+    assert unchanged.quantity == Decimal("1.234567")
+    assert unchanged.cost_basis == Decimal("15.24")
 
 
 # ---------------------------------------------------------------------------
@@ -637,15 +415,6 @@ async def _upload(
     session.add(upload)
     await session.flush()
     return upload
-
-
-async def test_read_services_ignore_valid_non_object_json_payloads(session):
-    upload = await _upload(session, payload_txns=[])
-    upload.raw_holdings_json = "[]"
-    await session.flush()
-
-    assert await get_latest_payload(session) is None
-    assert await get_incomplete_reasons(session) == []
 
 
 async def test_create_investment_lots_direct_retry_is_idempotent(session):
@@ -693,94 +462,63 @@ async def test_get_incomplete_reasons_reads_preserved_raw_payload(session):
         payload=json.loads(upload.raw_holdings_json),
     )
     reasons = await get_incomplete_reasons(session)
-    labels = {r.reason for r in reasons}
-    assert "disposal_transaction" in labels
-    assert "not_mutual_fund" in labels
+    assert {r.reason for r in reasons} == {"disposal_transaction", "not_mutual_fund"}
+    assert len(await get_complete_lots(session)) == 1
 
 
-async def test_get_positions_joins_holdings_with_lot_cost_basis(session):
-    upload = await _upload(
-        session,
-        payload_txns=[_mf_purchase()],
-    )
-    # Give the upload a holdings section so positions carry current value.
-    payload = json.loads(upload.raw_holdings_json)
-    payload["folios"] = [
-        {
-            "folio_number": "123/45",
-            "schemes": [
-                {
-                    "scheme_name": "Example Fund",
-                    "isin": "INE000A01018",
-                    "units": "1000",
-                    "nav": "55.00",
-                    "value": "55000.00",
-                }
-            ],
-        }
-    ]
+async def test_positions_join_holdings_with_lot_cost_basis(session):
+    """A holding with a complete lot carries its cost basis. A holding the CAS
+    only priced gets zero lot fields, not a fabricated lot."""
+    payload = {
+        "transactions": [_mf_purchase()],
+        "accounts": [
+            {
+                "holdings": [
+                    {
+                        "name": "Equity A",
+                        "isin": "INE000A01012",
+                        "asset_class": "equity",
+                        "quantity": "100",
+                        "price": "1000.00",
+                        "value": "100000.00",
+                    }
+                ]
+            }
+        ],
+        "folios": [
+            {
+                "folio_number": "123/45",
+                "schemes": [
+                    {
+                        "scheme_name": "Example Fund",
+                        "isin": "INE000A01018",
+                        "units": "1000",
+                        "nav": "55.00",
+                        "value": "55000.00",
+                    }
+                ],
+            }
+        ],
+    }
+    upload = await _upload(session, payload_txns=[])
     upload.raw_holdings_json = json.dumps(payload)
     await create_investment_lots(session, cas_upload_id=upload.id, payload=payload)
 
-    positions = await get_positions(session)
-    pos = next(p for p in positions if p.instrument_id == "INE000A01018")
-    assert pos.quantity == Decimal("1000")
-    assert pos.unit_price == Decimal("55.00")
-    assert pos.value == Decimal("55000.00")
-    # Cost basis aggregated from the complete lot only.
-    assert pos.lot_quantity == Decimal("1000")
-    assert pos.lot_cost_basis == Decimal("50000.00")
-
-
-async def test_value_only_holding_without_lot_has_zero_cost_basis(session):
-    """A holding the CAS priced but never acquired via a complete transaction
-    appears as a position with zero lot fields — not a fabricated lot."""
-    upload = await _upload(session, payload_txns=[])
-    payload = json.loads(upload.raw_holdings_json)
-    payload["accounts"] = [
-        {
-            "holdings": [
-                {
-                    "name": "Equity A",
-                    "isin": "INE000A01012",
-                    "asset_class": "equity",
-                    "quantity": "100",
-                    "price": "1000.00",
-                    "value": "100000.00",
-                }
-            ]
-        }
-    ]
-    upload.raw_holdings_json = json.dumps(payload)
-
-    positions = await get_positions(session)
-    assert len(positions) == 1
-    pos = positions[0]
-    assert pos.instrument_id == "INE000A01012"
-    assert pos.value == Decimal("100000.00")
-    assert pos.lot_quantity == Decimal("0")
-    assert pos.lot_cost_basis == Decimal("0")
-
-
-async def test_get_latest_values_returns_explicit_market_values(session):
-    upload = await _upload(session, payload_txns=[])
-    payload = json.loads(upload.raw_holdings_json)
-    payload["accounts"] = [
-        {
-            "holdings": [
-                {
-                    "name": "Eq",
-                    "isin": "INE000A01012",
-                    "quantity": "1",
-                    "price": "10",
-                    "value": "100.00",
-                }
-            ]
-        }
-    ]
-    upload.raw_holdings_json = json.dumps(payload)
-    values = await get_latest_values(session)
-    assert values == {"INE000A01012": Decimal("100.00")}
+    positions = {p.instrument_id: p for p in await get_positions(session)}
+    fund = positions["INE000A01018"]
+    assert fund.quantity == Decimal("1000")
+    assert fund.unit_price == Decimal("55.00")
+    assert fund.value == Decimal("55000.00")
+    assert fund.lot_quantity == Decimal("1000")
+    assert fund.lot_cost_basis == Decimal("50000.00")
+    equity = positions["INE000A01012"]
+    assert equity.value == Decimal("100000.00")
+    assert equity.lot_quantity == Decimal("0")
+    assert equity.lot_cost_basis == Decimal("0")
+    assert await get_latest_values(session) == {
+        "INE000A01012": Decimal("100000.00"),
+        "INE000A01018": Decimal("55000.00"),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -18,19 +18,16 @@ from financial_dashboard.api import router as api_router
 from financial_dashboard.config import settings as app_settings
 
 
-class TestConfigValidation:
-    def test_auth_enabled_only_when_both_set(self):
-        assert not Settings(auth_username="", auth_password=SecretStr("")).auth_enabled
-        assert Settings(
-            auth_username="admin", auth_password=SecretStr("secret")
-        ).auth_enabled
-
-    def test_username_only_raises(self):
-        with pytest.raises(ValueError, match="both be set or both be empty"):
-            Settings(auth_username="admin", auth_password=SecretStr(""))
-        # Password-only must fail too. Else auth is silently off.
-        with pytest.raises(ValueError, match="both be set or both be empty"):
-            Settings(auth_username="", auth_password=SecretStr("secret"))
+def test_auth_requires_both_or_neither_credential():
+    assert not Settings(auth_username="", auth_password=SecretStr("")).auth_enabled
+    assert Settings(
+        auth_username="admin", auth_password=SecretStr("secret")
+    ).auth_enabled
+    # One credential alone must fail. Else auth is silently off.
+    with pytest.raises(ValueError):
+        Settings(auth_username="admin", auth_password=SecretStr(""))
+    with pytest.raises(ValueError):
+        Settings(auth_username="", auth_password=SecretStr("secret"))
 
 
 def _make_settings(username: str = "", password: str = "") -> Settings:
@@ -62,42 +59,35 @@ def _basic_auth_header(username: str, password: str) -> dict[str, str]:
 
 
 @pytest.mark.anyio
-class TestAuthIntegration:
-    async def test_auth_disabled_no_header(self):
-        with patch("financial_dashboard.core.security.settings", _make_settings()):
-            async with AsyncClient(
-                transport=ASGITransport(app=_build_app()), base_url="http://test"
-            ) as client:
-                r = await client.get("/")
-                assert r.status_code == 200
-                assert r.text == "ok"
+async def test_auth_disabled_allows_and_enabled_requires_matching_credentials():
+    transport = ASGITransport(app=_build_app())
+    with patch("financial_dashboard.core.security.settings", _make_settings()):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            open_response = await client.get("/")
+    assert open_response.status_code == 200
+    assert open_response.text == "ok"
 
-    async def test_auth_enabled_requires_matching_credentials(self):
-        # A colon in the password must not break Basic auth user:pass splitting.
-        with patch(
-            "financial_dashboard.core.security.settings",
-            _make_settings("admin", "p:a:s:s"),
-        ):
-            async with AsyncClient(
-                transport=ASGITransport(app=_build_app()), base_url="http://test"
-            ) as client:
-                missing = await client.get("/")
-                wrong = await client.get(
-                    "/", headers=_basic_auth_header("admin", "wrong")
-                )
-                wrong_user = await client.get(
-                    "/", headers=_basic_auth_header("wrong", "p:a:s:s")
-                )
-                allowed = await client.get(
-                    "/", headers=_basic_auth_header("admin", "p:a:s:s")
-                )
+    # A colon in the password must not break Basic auth user:pass splitting.
+    with patch(
+        "financial_dashboard.core.security.settings",
+        _make_settings("admin", "p:a:s:s"),
+    ):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            missing = await client.get("/")
+            wrong = await client.get("/", headers=_basic_auth_header("admin", "wrong"))
+            wrong_user = await client.get(
+                "/", headers=_basic_auth_header("wrong", "p:a:s:s")
+            )
+            allowed = await client.get(
+                "/", headers=_basic_auth_header("admin", "p:a:s:s")
+            )
 
-        assert missing.status_code == 401
-        assert missing.headers["www-authenticate"] == "Basic"
-        assert wrong.status_code == 401
-        assert wrong_user.status_code == 401
-        assert allowed.status_code == 200
-        assert allowed.text == "ok"
+    assert missing.status_code == 401
+    assert missing.headers["www-authenticate"] == "Basic"
+    assert wrong.status_code == 401
+    assert wrong_user.status_code == 401
+    assert allowed.status_code == 200
+    assert allowed.text == "ok"
 
 
 @pytest.mark.anyio

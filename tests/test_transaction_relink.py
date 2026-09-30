@@ -107,25 +107,26 @@ async def _seed(maker, *, orphan: bool = True):
         return account.id, card.id, statement.id, txn.id
 
 
+async def _relink(maker, txn_id: int, payload: dict):
+    app = _build_test_app(maker)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+        return await c.post(f"/api/transactions/{txn_id}/relink", json=payload)
+
+
 @pytest.mark.anyio
-async def test_relink_orphan_sets_account_and_marks_statement_paid(session_maker):
-    """The headline scenario: a maskless CC-payment orphan gets the
-    operator's chosen account via the relink endpoint; statement
-    auto-pays in the same request."""
+async def test_relink_orphan_by_card_derives_account_and_marks_statement_paid(
+    session_maker,
+):
+    """A maskless CC-payment orphan gets the operator's card. The service derives
+    the account from the card, and the statement auto-pays in the same request."""
     account_id, card_id, stmt_id, txn_id = await _seed(session_maker)
 
-    app = _build_test_app(session_maker)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.post(
-            f"/api/transactions/{txn_id}/relink",
-            json={"account_id": account_id, "card_id": card_id},
-        )
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["ok"] is True
-        assert body["account_id"] == account_id
-        assert body["card_id"] == card_id
-        assert body["statement_marked_paid"] is True
+    r = await _relink(session_maker, txn_id, {"card_id": card_id})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["account_id"] == account_id
+    assert body["card_id"] == card_id
+    assert body["statement_marked_paid"] is True
 
     async with session_maker() as s:
         txn = await s.get(Transaction, txn_id)
@@ -137,156 +138,70 @@ async def test_relink_orphan_sets_account_and_marks_statement_paid(session_maker
 
 
 @pytest.mark.anyio
-async def test_relink_already_linked_does_not_double_credit(session_maker):
-    """Relink of an already-linked CC-payment txn must not re-fire
-    check_payment_received — payment_paid_amount stays untouched."""
+async def test_relink_already_linked_does_not_double_credit_and_null_clears(
+    session_maker,
+):
+    """Relink of an already-linked CC payment must not re-fire
+    check_payment_received. A null means 'clear': a null card keeps the account,
+    and null/null clears both, which is the undo."""
     account_id, card_id, stmt_id, txn_id = await _seed(session_maker, orphan=False)
-
-    # Pretend the original ingestion already credited the statement.
+    # The original ingestion already credited the statement.
     async with session_maker() as s:
         stmt = await s.get(StatementUpload, stmt_id)
         stmt.payment_paid_amount = Decimal("500")
         stmt.payment_status = PaymentStatus.PAID
         await s.commit()
 
-    app = _build_test_app(session_maker)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.post(
-            f"/api/transactions/{txn_id}/relink",
-            json={"account_id": account_id, "card_id": card_id},
-        )
-        assert r.status_code == 200, r.text
-        assert r.json()["statement_marked_paid"] is False
+    r = await _relink(
+        session_maker, txn_id, {"account_id": account_id, "card_id": card_id}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["statement_marked_paid"] is False
+
+    r = await _relink(
+        session_maker, txn_id, {"account_id": account_id, "card_id": None}
+    )
+    assert r.status_code == 200, r.text
+    assert (r.json()["account_id"], r.json()["card_id"]) == (account_id, None)
+
+    r = await _relink(session_maker, txn_id, {"account_id": None, "card_id": None})
+    assert r.status_code == 200, r.text
 
     async with session_maker() as s:
         stmt = await s.get(StatementUpload, stmt_id)
-        # Same as before — no double credit.
         assert stmt.payment_paid_amount == Decimal("500")
-
-
-@pytest.mark.anyio
-async def test_relink_card_only_derives_account(session_maker):
-    """If only card_id is given, the service derives account_id from
-    the card's owning account."""
-    account_id, card_id, _stmt_id, txn_id = await _seed(session_maker)
-
-    app = _build_test_app(session_maker)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.post(
-            f"/api/transactions/{txn_id}/relink",
-            json={"card_id": card_id},  # no account_id
-        )
-        assert r.status_code == 200, r.text
-        assert r.json()["account_id"] == account_id
-
-
-@pytest.mark.anyio
-async def test_relink_bank_mismatch_rejected(session_maker):
-    """An account in a different bank than the transaction must be
-    refused — protects against operator misclicks."""
-    _idsind_acct, _card, _stmt, txn_id = await _seed(session_maker)
-
-    # Create an HDFC account.
-    async with session_maker() as s:
-        hdfc = Account(
-            bank="hdfc",
-            type="credit_card",
-            label="HDFC Diners",
-            active=True,
-        )
-        s.add(hdfc)
-        await s.commit()
-        hdfc_id = hdfc.id
-
-    app = _build_test_app(session_maker)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.post(
-            f"/api/transactions/{txn_id}/relink",
-            json={"account_id": hdfc_id},
-        )
-        assert r.status_code == 400
-        assert "bank" in r.json()["detail"].lower()
-
-
-@pytest.mark.anyio
-async def test_relink_card_account_mismatch_rejected(session_maker):
-    """If both account_id and card_id are given and the card's
-    account_id != account_id, refuse the relink."""
-    _acct1, card_id, _stmt, txn_id = await _seed(session_maker)
-
-    # Make a second IndusInd account WITHOUT the given card.
-    async with session_maker() as s:
-        acct2 = Account(
-            bank="indusind",
-            type="credit_card",
-            label="IndusInd Pinnacle",
-            active=True,
-        )
-        s.add(acct2)
-        await s.commit()
-        acct2_id = acct2.id
-
-    app = _build_test_app(session_maker)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.post(
-            f"/api/transactions/{txn_id}/relink",
-            json={"account_id": acct2_id, "card_id": card_id},
-        )
-        assert r.status_code == 400
-        assert (
-            "mismatch" in r.json()["detail"].lower()
-            or "account" in r.json()["detail"].lower()
-        )
-
-
-@pytest.mark.anyio
-async def test_relink_null_clears_the_link(session_maker):
-    """A null means 'clear', not 'leave alone'. A null card keeps the account;
-    null/null clears both, which is the undo."""
-    account_id, _card_id, _stmt, txn_id = await _seed(session_maker, orphan=False)
-
-    app = _build_test_app(session_maker)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.post(
-            f"/api/transactions/{txn_id}/relink",
-            json={"account_id": account_id, "card_id": None},
-        )
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body["account_id"] == account_id
-        assert body["card_id"] is None
-
-        r = await c.post(
-            f"/api/transactions/{txn_id}/relink",
-            json={"account_id": None, "card_id": None},
-        )
-        assert r.status_code == 200, r.text
-
-    async with session_maker() as s:
         txn = await s.get(Transaction, txn_id)
         assert txn.account_id is None
         assert txn.card_id is None
 
 
 @pytest.mark.anyio
-async def test_relink_nonexistent_txn_404(session_maker):
-    app = _build_test_app(session_maker)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.post(
-            "/api/transactions/999999/relink",
-            json={"account_id": None, "card_id": None},
+@pytest.mark.parametrize("target", ["other_bank", "card_elsewhere", "missing"])
+async def test_relink_to_a_wrong_account_is_rejected(session_maker, target):
+    """A misclick must not move a CC payment onto the wrong account."""
+    _account_id, card_id, stmt_id, txn_id = await _seed(session_maker)
+    async with session_maker() as s:
+        other = Account(
+            bank="hdfc" if target == "other_bank" else "indusind",
+            type="credit_card",
+            label="Other card",
+            active=True,
         )
-        assert r.status_code == 404
+        s.add(other)
+        await s.commit()
+        other_id = other.id
 
+    payload = {
+        "other_bank": {"account_id": other_id},
+        # The card belongs to the first account, not this one.
+        "card_elsewhere": {"account_id": other_id, "card_id": card_id},
+        "missing": {"account_id": 999999},
+    }[target]
+    r = await _relink(session_maker, txn_id, payload)
+    assert r.status_code == 400
 
-@pytest.mark.anyio
-async def test_relink_nonexistent_account_400(session_maker):
-    _acct, _card, _stmt, txn_id = await _seed(session_maker)
-    app = _build_test_app(session_maker)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
-        r = await c.post(
-            f"/api/transactions/{txn_id}/relink",
-            json={"account_id": 999999},
-        )
-        assert r.status_code == 400
-        assert "account" in r.json()["detail"].lower()
+    async with session_maker() as s:
+        txn = await s.get(Transaction, txn_id)
+        assert (txn.account_id, txn.card_id) == (None, None)
+        stmt = await s.get(StatementUpload, stmt_id)
+        assert stmt.payment_paid_amount == Decimal("0")

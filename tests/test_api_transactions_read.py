@@ -209,19 +209,16 @@ async def test_transaction_detail_returns_provenance_without_file_paths(
     assert body["may_affect_cc_payment_state"] is True
     assert "/private/synthetic.pdf" not in response.text
 
-
-async def test_transaction_detail_bounds_large_text_fields(client, session):
-    transaction, *_ = await _seed_transaction(session)
     transaction.raw_description = "R" * 50_001
     transaction.note = "N" * 50_001
     await session.commit()
-
     body = (await client.get(f"/api/transactions/{transaction.id}")).json()
-
     assert len(body["raw_description"]) == 50_000
     assert body["raw_description_truncated"] is True
     assert len(body["note"]) == 50_000
     assert body["note_truncated"] is True
+
+    assert (await client.get("/api/transactions/999999")).status_code == 404
 
 
 async def test_transaction_batch_preserves_requested_order_and_missing_ids(
@@ -267,9 +264,3 @@ async def test_transaction_batch_preserves_requested_order_and_missing_ids(
 async def test_transaction_reads_validate_bounds(client, path, method, payload):
     response = await client.request(method, path, json=payload)
     assert response.status_code == 422
-
-
-async def test_transaction_detail_returns_404(client):
-    response = await client.get("/api/transactions/999999")
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Transaction not found"}

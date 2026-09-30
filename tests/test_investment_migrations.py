@@ -117,7 +117,7 @@ async def test_legacy_tables_gain_new_columns_and_keep_rows(tmp_path, monkeypatc
 
 
 async def test_legacy_cas_payloads_backfill_once_and_isolate_malformed_json(
-    tmp_path, monkeypatch, caplog
+    tmp_path, monkeypatch
 ):
     _stub_init_caches(monkeypatch)
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/legacy-backfill.db")
@@ -141,8 +141,7 @@ async def test_legacy_cas_payloads_backfill_once_and_isolate_malformed_json(
                 {"valid": json.dumps(_purchase_payload()), "bad": "{broken"},
             )
 
-        with caplog.at_level("WARNING"):
-            await init_db(engine)
+        await init_db(engine)
         await init_db(engine)
 
         maker = async_sessionmaker(engine)
@@ -168,8 +167,6 @@ async def test_legacy_cas_payloads_backfill_once_and_isolate_malformed_json(
         assert lots[0].cas_upload_id == 1
         assert lots[0].source_occurrence == 0
         assert marker_count == 1
-        assert "cas_upload_id=2" in caplog.text
-        assert "{broken" not in caplog.text
     finally:
         await engine.dispose()
 

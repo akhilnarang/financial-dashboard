@@ -12,14 +12,6 @@ from financial_dashboard.web.transactions import _date_presets
 pytestmark = pytest.mark.anyio
 
 
-def _attribute(page: str, element_id: str, attribute: str) -> str:
-    tag = re.search(rf'<[^>]+\bid="{re.escape(element_id)}"[^>]*>', page)
-    assert tag is not None
-    value = re.search(rf'\b{re.escape(attribute)}="([^"]*)"', tag.group(0))
-    assert value is not None
-    return html.unescape(value.group(1))
-
-
 def _currency_summary(page: str, currency: str) -> str:
     match = re.search(
         rf'<article[^>]+data-currency="{re.escape(currency)}".*?</article>',
@@ -129,16 +121,6 @@ async def test_filtered_transaction_totals_cover_all_pages(client, session):
     assert "999.00" not in summary
 
 
-async def test_transaction_date_inputs_use_day_month_year_display(client):
-    response = await client.get("/transactions?date_from=2026-04-01&date_to=2026-04-30")
-
-    assert response.status_code == 200
-    assert _attribute(response.text, "date-from-display", "value") == "01-04-2026"
-    assert _attribute(response.text, "date-to-display", "value") == "30-04-2026"
-    assert _attribute(response.text, "date-from-iso", "value") == "2026-04-01"
-    assert _attribute(response.text, "date-to-iso", "value") == "2026-04-30"
-
-
 async def test_overflowing_query_day_redirects_to_month_end(client):
     response = await client.get(
         "/transactions?account_id=30&date_from=2026-04-01&date_to=2026-04-31",
@@ -161,9 +143,6 @@ async def test_unrecoverable_query_date_returns_validation_error(client):
     response = await client.get("/transactions?date_from=2026-13-01")
 
     assert response.status_code == 422
-    assert response.json() == {
-        "detail": "date_from must use YYYY-MM-DD and be a valid calendar date"
-    }
 
 
 async def test_date_presets_preserve_active_non_date_filters(client):

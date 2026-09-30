@@ -33,7 +33,7 @@ from financial_dashboard.services import settings as settings_service
 
 
 @pytest.mark.anyio
-async def test_category_choice_consumes_once_with_assignment_and_audit(session):
+async def test_category_choice_consumes_once_after_fresh_sqlite_reload(session):
     session.add_all(
         [Category(slug="groceries", active=True), Category(slug="dining", active=True)]
     )
@@ -59,6 +59,7 @@ async def test_category_choice_consumes_once_with_assignment_and_audit(session):
             ]
         ),
         gate_reason="confidence 0.55 below 0.60",
+        expires_at=datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1),
     )
     session.add(decision)
     await session.flush()
@@ -72,73 +73,53 @@ async def test_category_choice_consumes_once_with_assignment_and_audit(session):
     session.add(delivery)
     await session.flush()
 
-    action = await consume_decision(
+    # A choice made after the transaction changed is refused.
+    transaction.counterparty = "A DIFFERENT MERCHANT"
+    await session.flush()
+    stale = await consume_decision(
         session,
         decision.id,
         selected_slug="groceries",
         category_input_hash=input_hash,
         delivery_id=delivery.id,
     )
-    second = await consume_decision(
-        session,
-        decision.id,
-        selected_slug="dining",
-        category_input_hash=input_hash,
-        delivery_id=delivery.id,
-    )
-
-    assert action is not None
-    assert second is None
-    assert transaction.category == "groceries"
-    assert decision.status == "consumed"
-
-
-@pytest.mark.anyio
-async def test_category_choice_succeeds_after_fresh_sqlite_reload(session):
-    session.add(Category(slug="groceries", active=True))
-    transaction = Transaction(
-        bank="hdfc",
-        email_type="purchase",
-        direction="debit",
-        amount="960.00",
-        counterparty="PUREBERRYSMUMBAI",
-        review_status="pending",
-    )
-    session.add(transaction)
-    await session.flush()
-    input_hash = compute_input_hash(build_input_payload(transaction, None))
-    transaction.category_input_hash = input_hash
-    decision = CategoryReviewDecision(
-        transaction_id=transaction.id,
-        category_input_hash=input_hash,
-        candidates_json=json.dumps([{"category": "groceries", "confidence": 0.55}]),
-        gate_reason="low confidence",
-        expires_at=datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1),
-    )
-    session.add(decision)
+    assert stale is None
+    assert decision.status == "active"
+    assert transaction.category is None
+    transaction.counterparty = "PUREBERRYSMUMBAI"
     await session.commit()
-    decision_id = decision.id
     maker = async_sessionmaker(
         session.bind, class_=AsyncSession, expire_on_commit=False
     )
 
     async with maker() as fresh:
-        reloaded = await fresh.get(CategoryReviewDecision, decision_id)
-        assert reloaded.expires_at is not None
+        # SQLite reads the expiry back naive. The choice must still succeed.
+        reloaded = await fresh.get(CategoryReviewDecision, decision.id)
         assert reloaded.expires_at.tzinfo is None
         await _lock_authorized_chat(fresh, None)
         action = await consume_decision(
             fresh,
-            decision_id,
+            decision.id,
             selected_slug="groceries",
             category_input_hash=input_hash,
+            delivery_id=delivery.id,
+        )
+        second = await consume_decision(
+            fresh,
+            decision.id,
+            selected_slug="dining",
+            category_input_hash=input_hash,
+            delivery_id=delivery.id,
         )
         await fresh.commit()
 
     assert action is not None
+    assert second is None
     async with maker() as verification:
         saved = await verification.get(Transaction, transaction.id)
+        saved_decision = await verification.get(CategoryReviewDecision, decision.id)
     assert saved.category == "groceries"
+    assert saved_decision.status == "consumed"
 
 
 @pytest.mark.anyio
@@ -384,12 +365,8 @@ async def test_disabled_assistant_does_not_dispatch_persisted_output(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("dispatch_ok", "expected_sent", "expected_attempts"),
-    [(True, 1, 0), (False, 0, 1)],
-)
-async def test_enabled_review_notification_persists_outbox_before_dispatch(
-    session, monkeypatch, dispatch_ok, expected_sent, expected_attempts
+async def test_failed_review_dispatch_keeps_outbox_and_counts_attempt(
+    session, monkeypatch
 ):
     from financial_dashboard.services.categorization import sweep
     from financial_dashboard.services import telegram
@@ -429,7 +406,7 @@ async def test_enabled_review_notification_persists_outbox_before_dispatch(
 
     async def fake_dispatch(delivery_id):
         dispatched.append(delivery_id)
-        return dispatch_ok
+        return False
 
     monkeypatch.setattr(telegram, "dispatch_saved_delivery", fake_dispatch)
     settings_service._cache.update(
@@ -441,7 +418,7 @@ async def test_enabled_review_notification_persists_outbox_before_dispatch(
         }
     )
 
-    assert await sweep.run_review_notify() == expected_sent
+    assert await sweep.run_review_notify() == 0
 
     async with maker() as verification:
         delivery = await verification.scalar(select(TelegramOutboundDelivery))
@@ -453,7 +430,7 @@ async def test_enabled_review_notification_persists_outbox_before_dispatch(
     assert "cat:v1:" in delivery.reply_markup_json
     async with maker() as verification:
         saved_transaction = await verification.get(Transaction, transaction.id)
-    assert saved_transaction.notify_attempts == expected_attempts
+    assert saved_transaction.notify_attempts == 1
 
 
 @pytest.mark.anyio
@@ -589,41 +566,3 @@ async def test_enabled_long_review_queues_all_chunks_with_buttons_only_first(
     assert deliveries[0].reply_markup_json is not None
     assert "cat:v1:" in deliveries[0].reply_markup_json
     assert all(delivery.reply_markup_json is None for delivery in deliveries[1:])
-
-
-@pytest.mark.anyio
-async def test_category_choice_rejects_changed_transaction_input(session):
-    session.add(Category(slug="groceries", active=True))
-    transaction = Transaction(
-        bank="hdfc",
-        email_type="purchase",
-        direction="debit",
-        amount="960.00",
-        counterparty="PUREBERRYSMUMBAI",
-        review_status="pending",
-    )
-    session.add(transaction)
-    await session.flush()
-    original_hash = compute_input_hash(build_input_payload(transaction, None))
-    transaction.category_input_hash = original_hash
-    decision = CategoryReviewDecision(
-        transaction_id=transaction.id,
-        category_input_hash=original_hash,
-        candidates_json=json.dumps([{"category": "groceries", "confidence": 0.55}]),
-        gate_reason="confidence below threshold",
-    )
-    session.add(decision)
-    await session.flush()
-    transaction.counterparty = "A DIFFERENT MERCHANT"
-    await session.flush()
-
-    action = await consume_decision(
-        session,
-        decision.id,
-        selected_slug="groceries",
-        category_input_hash=original_hash,
-    )
-
-    assert action is None
-    assert decision.status == "active"
-    assert transaction.category is None

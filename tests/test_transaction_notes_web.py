@@ -99,25 +99,6 @@ async def _seed_transactions(
     return matched, imported
 
 
-async def test_transactions_page_escapes_note(client, session):
-    transaction = Transaction(
-        bank="hdfc",
-        email_type="test",
-        direction="debit",
-        amount=Decimal("10.00"),
-        category="rent",
-        note='<script>alert("list")</script>',
-    )
-    session.add(transaction)
-    await session.flush()
-
-    response = await client.get("/transactions")
-
-    assert response.status_code == 200
-    assert "&lt;script&gt;alert" in response.text
-    assert '<script>alert("list")</script>' not in response.text
-
-
 async def test_statement_pages_show_current_category_and_escaped_note(client, session):
     upload_kinds = (
         ("credit_card", StatementUpload, "/statements/{}"),
@@ -151,3 +132,8 @@ async def test_statement_pages_show_current_category_and_escaped_note(client, se
         assert "&lt;script&gt;alert" in response.text
         assert '<script>alert("matched")</script>' not in response.text
         assert "Imported note &amp; receipt" in response.text
+
+    listing = await client.get("/transactions")
+    assert listing.status_code == 200
+    assert "&lt;script&gt;alert" in listing.text
+    assert '<script>alert("matched")</script>' not in listing.text

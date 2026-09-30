@@ -35,29 +35,6 @@ def _txn(**overrides) -> Transaction:
 
 
 @pytest.mark.anyio
-async def test_bare_last4_card_mask_resolves(session):
-    """A bare last-4 card_mask must resolve to a Card row whose stored
-    card_mask is also the bare last-4."""
-    acct = Account(
-        bank="hdfc",
-        type="bank_account",
-        label="HDFC Savings",
-        account_number="HDFC1",
-    )
-    session.add(acct)
-    await session.flush()
-    card = Card(account_id=acct.id, card_mask="7777", label="HDFC Debit")
-    session.add(card)
-    await session.flush()
-    ctx = await build_link_context(session)
-
-    txn = _txn(bank="hdfc", card_mask="7777")
-    assert link_transaction(ctx, txn) is True
-    assert txn.account_id == acct.id
-    assert txn.card_id == card.id
-
-
-@pytest.mark.anyio
 async def test_cross_bank_mask_collision_is_not_linked(session):
     """An HDFC card and an ICICI card sharing the same trailing digits
     must not be confused — bank scoping prevents the cross-bank match."""

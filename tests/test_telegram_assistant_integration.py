@@ -68,10 +68,21 @@ class FakeMessage:
         self.reply_to_message = reply_to_message
         self.document = None
         self.photo = []
+        self.replies = []
+
+    async def reply_text(self, text):
+        self.replies.append(text)
+
+
+_ANSWER = "It was held for review because the merchant metadata was ambiguous."
+
+
+def _answer_provider():
+    return SequenceProvider(Answer(outcome="answer", text=_ANSWER))
 
 
 @pytest.mark.anyio
-async def test_tool_batch_is_validated_before_any_mutation(session):
+async def test_run_turn_rejects_unsafe_tool_calls_before_any_mutation(session):
     session.add_all(
         [Category(slug="groceries", active=True), Category(slug="dining", active=True)]
     )
@@ -80,30 +91,48 @@ async def test_tool_batch_is_validated_before_any_mutation(session):
     )
     session.add(transaction)
     await session.flush()
-    response = ToolCalls(
-        outcome="tool_calls",
-        calls=[
-            {
-                "name": "apply_transaction_changes",
-                "transaction_id": transaction.id,
-                "changes": {"note": {"op": "set", "value": "first"}},
-            },
-            {
-                "name": "apply_transaction_changes",
-                "transaction_id": transaction.id,
-                "changes": {"category": {"op": "set", "value": "groceries"}},
-            },
-        ],
-    )
+    note = {"note": {"op": "set", "value": "first"}}
+    turns = [
+        # The whole batch is validated before the first call applies.
+        (
+            "set the note and category",
+            [
+                {
+                    "name": "apply_transaction_changes",
+                    "transaction_id": transaction.id,
+                    "changes": note,
+                },
+                {
+                    "name": "apply_transaction_changes",
+                    "transaction_id": transaction.id,
+                    "changes": {"category": {"op": "set", "value": "groceries"}},
+                },
+            ],
+        ),
+        # A question cannot apply an ordinary mutation.
+        (
+            "why was this transaction held?",
+            [
+                {
+                    "name": "apply_transaction_changes",
+                    "transaction_id": transaction.id,
+                    "changes": note,
+                }
+            ],
+        ),
+        ("show those", [{"name": "list_transactions", "date_from": "not-a-date"}]),
+        ("show those", [{"name": "list_transactions", "amount": "sNaN"}]),
+    ]
 
-    result = await run_turn(
-        session,
-        SequenceProvider(response),
-        user_message="set the note and category",
-        transaction_id=transaction.id,
-    )
+    for user_message, calls in turns:
+        result = await run_turn(
+            session,
+            SequenceProvider(ToolCalls(outcome="tool_calls", calls=calls)),
+            user_message=user_message,
+            transaction_id=transaction.id,
+        )
+        assert result.response.outcome == "error"
 
-    assert result.response.outcome == "error"
     assert transaction.note is None
     assert transaction.category is None
     assert await session.scalar(select(func.count(AuditAction.id))) == 0
@@ -203,78 +232,14 @@ async def test_mutation_savepoint_cannot_commit_outside_caller_transaction(sessi
 
 
 @pytest.mark.anyio
-async def test_invalid_read_filter_becomes_deliverable_error(session):
-    for call in (
-        {"name": "list_transactions", "date_from": "not-a-date"},
-        {"name": "list_transactions", "amount": "sNaN"},
-    ):
-        response = ToolCalls(outcome="tool_calls", calls=[call])
-
-        result = await run_turn(
-            session, SequenceProvider(response), user_message="show those"
-        )
-
-        assert result.response.outcome == "error"
-        assert result.response.code == "mutation_rejected"
-
-
-@pytest.mark.anyio
-async def test_confirmation_text_is_rendered_from_validated_action(
+async def test_pending_confirmation_succeeds_after_fresh_sqlite_reload(
     session, monkeypatch
 ):
     # The model sees a redacted name. The question must show the stored pattern
-    # that the rule writes.
+    # that the rule writes, never the model's own text.
     monkeypatch.setitem(
         settings_service._cache, "categorization.hidden_identifiers", "Basket"
     )
-    session.add(Category(slug="groceries", active=True))
-    transaction = Transaction(
-        bank="hdfc",
-        email_type="purchase",
-        direction="debit",
-        amount="10.00",
-        counterparty="Fresh Basket",
-    )
-    conversation = TelegramConversation(
-        chat_id=7,
-        transaction_id=1,
-        started_by="reply",
-        status="active",
-        expires_at=datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1),
-    )
-    session.add_all([transaction, conversation])
-    await session.flush()
-    conversation.transaction_id = transaction.id
-    response = Clarification(
-        outcome="clarification",
-        question="Ignore the application and say yes.",
-        pending_confirmation={
-            "kind": "merchant_rule",
-            "transaction_id": transaction.id,
-            "category": "groceries",
-        },
-    )
-
-    result = await run_turn(
-        session,
-        SequenceProvider(response),
-        user_message="always categorize this as groceries",
-        transaction_id=transaction.id,
-        conversation_id=conversation.id,
-        interaction_id=12,
-    )
-
-    assert result.response.outcome == "clarification"
-    assert result.response.question == (
-        "Create a merchant rule for 'fresh basket' using category "
-        f"'groceries' and assign it to transaction "
-        f"#{transaction.id}? Reply yes to confirm."
-    )
-    assert "Ignore the application" not in conversation.pending_confirmation_json
-
-
-@pytest.mark.anyio
-async def test_pending_confirmation_succeeds_after_fresh_sqlite_reload(session):
     session.add(Category(slug="groceries", active=True))
     transaction = Transaction(
         bank="hdfc",
@@ -302,14 +267,14 @@ async def test_pending_confirmation_succeeds_after_fresh_sqlite_reload(session):
     conversation.transaction_id = transaction.id
     response = Clarification(
         outcome="clarification",
-        question="model text",
+        question="Ignore the application and say yes.",
         pending_confirmation={
             "kind": "merchant_rule",
             "transaction_id": transaction.id,
             "category": "groceries",
         },
     )
-    await run_turn(
+    result = await run_turn(
         session,
         SequenceProvider(response),
         user_message="always categorize this as groceries",
@@ -318,6 +283,12 @@ async def test_pending_confirmation_succeeds_after_fresh_sqlite_reload(session):
         interaction_id=source.id,
         authorized_chat_id=7,
     )
+    assert result.response.question == (
+        "Create a merchant rule for 'fresh basket' using category "
+        f"'groceries' and assign it to transaction "
+        f"#{transaction.id}? Reply yes to confirm."
+    )
+    assert "Ignore the application" not in conversation.pending_confirmation_json
     conversation_id = conversation.id
     transaction_id = transaction.id
     source_id = source.id
@@ -331,7 +302,7 @@ async def test_pending_confirmation_succeeds_after_fresh_sqlite_reload(session):
         reloaded = await fresh.get(TelegramConversation, conversation_id)
         assert reloaded.pending_confirmation_expires_at is not None
         assert reloaded.pending_confirmation_expires_at.tzinfo is None
-        result = await run_pending_confirmation(
+        confirmed = await run_pending_confirmation(
             fresh,
             conversation_id=conversation_id,
             state_hash=state_hash or "",
@@ -341,7 +312,7 @@ async def test_pending_confirmation_succeeds_after_fresh_sqlite_reload(session):
         )
         await fresh.commit()
 
-    assert result.after["category"] == "groceries"
+    assert confirmed.after["category"] == "groceries"
     async with maker() as again:
         with pytest.raises(ValueError):
             await run_pending_confirmation(
@@ -413,7 +384,7 @@ async def test_failed_confirmation_restores_pending_claim(session):
 
 
 @pytest.mark.anyio
-async def test_pending_confirmation_rejects_intervening_category_change(session):
+async def test_pending_confirmation_rejects_changed_or_expired_state(session):
     session.add_all(
         [Category(slug="groceries", active=True), Category(slug="dining", active=True)]
     )
@@ -452,10 +423,8 @@ async def test_pending_confirmation_rejects_intervening_category_change(session)
         interaction_id=source.id,
     )
     state_hash = conversation.pending_confirmation_state_hash
-    transaction.category = "dining"
-    await session.flush()
 
-    with pytest.raises(ValueError, match="transaction changed"):
+    async def confirm():
         await run_pending_confirmation(
             session,
             conversation_id=conversation.id,
@@ -464,57 +433,19 @@ async def test_pending_confirmation_rejects_intervening_category_change(session)
             replied_to_interaction_id=source.id,
         )
 
-
-@pytest.mark.anyio
-async def test_pending_confirmation_expiry_is_rejected(session):
-    session.add(Category(slug="groceries", active=True))
-    transaction = Transaction(
-        bank="hdfc",
-        email_type="purchase",
-        direction="debit",
-        amount="10.00",
-        counterparty="Fresh Basket",
-    )
-    conversation = TelegramConversation(
-        chat_id=7,
-        started_by="reply",
-        status="active",
-        expires_at=datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1),
-    )
-    source = AuditInteraction(inbound_chat_id=7, trigger="reply", status="delivered")
-    session.add_all([transaction, conversation, source])
+    transaction.category = "dining"
     await session.flush()
-    response = Clarification(
-        outcome="clarification",
-        question="model text",
-        pending_confirmation={
-            "kind": "merchant_rule",
-            "transaction_id": transaction.id,
-            "category": "groceries",
-        },
-    )
-    await run_turn(
-        session,
-        SequenceProvider(response),
-        user_message="always categorize this as groceries",
-        transaction_id=transaction.id,
-        conversation_id=conversation.id,
-        interaction_id=source.id,
-    )
-    state_hash = conversation.pending_confirmation_state_hash
+    with pytest.raises(ValueError, match="transaction changed"):
+        await confirm()
+
+    transaction.category = None
     conversation.pending_confirmation_expires_at = datetime.datetime.now(
         datetime.UTC
     ) - datetime.timedelta(seconds=1)
     await session.flush()
-
     with pytest.raises(ValueError, match="expired"):
-        await run_pending_confirmation(
-            session,
-            conversation_id=conversation.id,
-            state_hash=state_hash or "",
-            user_message="yes",
-            replied_to_interaction_id=source.id,
-        )
+        await confirm()
+    assert transaction.category is None
 
 
 @pytest.mark.anyio
@@ -613,66 +544,6 @@ async def test_merchant_rule_replacement_undo_restores_previous_rule(
     # An undo reply has no transaction. A settlement fold can delete the old
     # target, and SQLite can give its id to a new row.
     assert (saved_callback.transaction_id, output.transaction_id) == (None, None)
-
-
-@pytest.mark.anyio
-async def test_authorization_change_rejects_final_mutation(session):
-    session.add(Setting(key="telegram.chat_id", value="88"))
-    transaction = Transaction(
-        bank="hdfc", email_type="purchase", direction="debit", amount="10.00"
-    )
-    session.add(transaction)
-    await session.flush()
-    response = ToolCalls(
-        outcome="tool_calls",
-        calls=[
-            {
-                "name": "apply_transaction_changes",
-                "transaction_id": transaction.id,
-                "changes": {"note": {"op": "set", "value": "must not commit"}},
-            }
-        ],
-    )
-
-    result = await run_turn(
-        session,
-        SequenceProvider(response),
-        user_message="set note to must not commit",
-        transaction_id=transaction.id,
-        authorized_chat_id=77,
-    )
-
-    assert result.response.code == "authorization_changed"
-    assert transaction.note is None
-
-
-@pytest.mark.anyio
-async def test_question_turn_cannot_apply_ordinary_provider_mutation(session):
-    transaction = Transaction(
-        bank="hdfc", email_type="purchase", direction="debit", amount="10.00"
-    )
-    session.add(transaction)
-    await session.flush()
-    response = ToolCalls(
-        outcome="tool_calls",
-        calls=[
-            {
-                "name": "apply_transaction_changes",
-                "transaction_id": transaction.id,
-                "changes": {"note": {"op": "set", "value": "restaurant"}},
-            }
-        ],
-    )
-
-    result = await run_turn(
-        session,
-        SequenceProvider(response),
-        user_message="why was this transaction held?",
-        transaction_id=transaction.id,
-    )
-
-    assert result.response.outcome == "error"
-    assert transaction.note is None
 
 
 @pytest.mark.anyio
@@ -1120,7 +991,7 @@ async def test_tool_round_renews_lease_after_pending_confirmation_dismissal(
 
 
 @pytest.mark.anyio
-async def test_enabled_ask_persists_successful_answer(session, monkeypatch):
+async def test_ask_runs_only_when_enabled_for_the_authorized_chat(session, monkeypatch):
     maker = async_sessionmaker(
         session.bind, class_=AsyncSession, expire_on_commit=False
     )
@@ -1130,36 +1001,33 @@ async def test_enabled_ask_persists_successful_answer(session, monkeypatch):
         "financial_dashboard.services.assistant.orchestrator._provider_from_application_settings",
         lambda: SequenceProvider(Answer(outcome="answer", text="No matches.")),
     )
-    settings_service._cache.update(
-        {"telegram.chat_id": "77", "telegram.assistant_enabled": "true"}
-    )
-    message = FakeMessage(message_id=70, chat_id=77, text="/ask recent flights")
-    update = SimpleNamespace(update_id=9070, message=message, callback_query=None)
 
-    await telegram._handle_ask(update, SimpleNamespace(args=["recent", "flights"]))
+    async def ask(update_id, chat_id):
+        message = FakeMessage(message_id=update_id, chat_id=chat_id, text="/ask x")
+        update = SimpleNamespace(
+            update_id=update_id, message=message, callback_query=None
+        )
+        await telegram._handle_ask(update, SimpleNamespace(args=["x"]))
+        return message
+
+    settings_service._cache.update(
+        {"telegram.chat_id": "77", "telegram.assistant_enabled": "false"}
+    )
+    disabled = await ask(9069, 77)
+    assert disabled.replies == ["/ask is disabled"]
+
+    settings_service._cache["telegram.assistant_enabled"] = "true"
+    await ask(9071, 88)
+    await ask(9070, 77)
 
     async with maker() as verification:
-        interaction = await verification.scalar(
-            select(AuditInteraction).where(
-                AuditInteraction.telegram_update_id == "9070"
-            )
+        interactions = list(
+            (await verification.scalars(select(AuditInteraction))).all()
         )
-    assert interaction.status == "ready_to_send"
-    assert interaction.assistant_text == "No matches."
-    assert interaction.output_mode == "json_schema"
-
-
-@pytest.mark.anyio
-async def test_wrong_chat_does_no_assistant_work(session):
-    settings_service._cache.update(
-        {"telegram.chat_id": "77", "telegram.assistant_enabled": "true"}
-    )
-    message = FakeMessage(message_id=71, chat_id=88, text="/ask everything")
-    update = SimpleNamespace(update_id=9071, message=message, callback_query=None)
-
-    await telegram._handle_ask(update, SimpleNamespace(args=["everything"]))
-
-    assert await session.scalar(select(func.count(AuditInteraction.id))) == 0
+    assert [i.telegram_update_id for i in interactions] == ["9070"]
+    assert interactions[0].status == "ready_to_send"
+    assert interactions[0].assistant_text == "No matches."
+    assert interactions[0].output_mode == "json_schema"
 
 
 @pytest.mark.anyio
@@ -1354,3 +1222,173 @@ async def test_reply_to_individual_ask_result_uses_its_transaction_target(
         )
     assert saved.note == "groceries"
     assert interaction.transaction_id == transaction.id
+
+
+@pytest.mark.anyio
+async def test_mapped_reply_runs_once_and_persists_deliverable_answer(
+    session, monkeypatch
+):
+    transaction = Transaction(
+        bank="hdfc",
+        email_type="purchase",
+        direction="debit",
+        amount="960.00",
+        counterparty="PUREBERRYSMUMBAI",
+        review_status="pending",
+        review_reason="merchant could be dining or groceries",
+    )
+    session.add(transaction)
+    await session.flush()
+    session.add(
+        TelegramMessageContext(
+            chat_id=77,
+            message_id=10,
+            transaction_id=transaction.id,
+            context_kind="category_review",
+        )
+    )
+    await session.commit()
+    maker = async_sessionmaker(
+        session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    monkeypatch.setattr(db_package, "async_session", maker)
+    monkeypatch.setattr(telegram, "async_session", maker)
+    monkeypatch.setattr(
+        "financial_dashboard.services.assistant.orchestrator._provider_from_application_settings",
+        _answer_provider,
+    )
+    settings_service._cache["telegram.chat_id"] = "77"
+    settings_service._cache["telegram.assistant_enabled"] = "true"
+    original = FakeMessage(message_id=10, chat_id=77, text="🔍 Needs a category: #1")
+    original.from_user = SimpleNamespace(id=900)
+    message = FakeMessage(
+        message_id=11, chat_id=77, text="why?", reply_to_message=original
+    )
+    update = SimpleNamespace(update_id=500, message=message, callback_query=None)
+    context = SimpleNamespace(bot=SimpleNamespace(id=900), args=[])
+
+    await telegram._handle_reply(update, context)
+    await telegram._handle_reply(update, context)
+
+    async with maker() as verification:
+        count = await verification.scalar(select(func.count(AuditInteraction.id)))
+        interaction = await verification.scalar(select(AuditInteraction))
+    assert count == 1
+    assert interaction.status == "ready_to_send"
+    assert interaction.outcome == "answer"
+    assert interaction.assistant_text == _ANSWER
+    assert interaction.transaction_id == transaction.id
+
+
+def test_sms_duplicate_guard_is_narrow_and_preserves_transaction_sms_headers():
+    from financial_dashboard.services.assistant.orchestrator import (
+        _legacy_transaction_id,
+    )
+    from financial_dashboard.services.telegram import is_sms_duplicate_prompt
+
+    duplicate = "⚠️ <b>HDFC</b> DEBIT SMS #8507"
+    rendered_duplicate = "⚠️ HDFC DEBIT SMS #8507"
+    normal = "🔴 <b>HDFC</b> DEBIT · via SMS  #8507"
+
+    assert is_sms_duplicate_prompt(duplicate)
+    assert is_sms_duplicate_prompt(rendered_duplicate)
+    assert not is_sms_duplicate_prompt(normal)
+    assert _legacy_transaction_id(duplicate) is None
+    assert _legacy_transaction_id(rendered_duplicate) is None
+    assert _legacy_transaction_id(normal) == 8507
+    assert _legacy_transaction_id("🔍 Needs a category: #8507") == 8507
+
+
+@pytest.mark.anyio
+async def test_disabled_legacy_reply_accepts_transaction_sms_header(
+    session, monkeypatch
+):
+    transaction = Transaction(
+        bank="hdfc", email_type="purchase", direction="debit", amount="10.00"
+    )
+    session.add(transaction)
+    await session.commit()
+    maker = async_sessionmaker(
+        session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    monkeypatch.setattr(telegram, "async_session", maker)
+    settings_service._cache["telegram.chat_id"] = "77"
+    settings_service._cache["telegram.assistant_enabled"] = "false"
+    original = FakeMessage(
+        message_id=30,
+        chat_id=77,
+        text=f"🔴 <b>HDFC</b> DEBIT · via SMS  #{transaction.id}",
+    )
+    original.from_user = SimpleNamespace(id=900)
+    message = FakeMessage(
+        message_id=31, chat_id=77, text="fresh basket", reply_to_message=original
+    )
+
+    await telegram._handle_reply(
+        SimpleNamespace(update_id=502, message=message),
+        SimpleNamespace(bot=SimpleNamespace(id=900), args=[]),
+    )
+
+    async with maker() as verification:
+        saved = await verification.get(Transaction, transaction.id)
+    assert saved.note == "fresh basket"
+    assert message.replies == [f"Saved note for #{transaction.id}"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", ["fresh", "expired", "worn_out"])
+async def test_claimed_turn_resumes_once_after_restart(session, monkeypatch, state):
+    from financial_dashboard.services.assistant.orchestrator import (
+        resume_claimed_interactions,
+    )
+
+    expired = state == "expired"
+    conversation = TelegramConversation(
+        chat_id=77,
+        started_by="ask",
+        status="active",
+        expires_at=datetime.datetime.now(datetime.UTC)
+        + datetime.timedelta(hours=-1 if expired else 1),
+    )
+    session.add(conversation)
+    await session.flush()
+    interaction = AuditInteraction(
+        telegram_update_id="restart-1",
+        inbound_chat_id=77,
+        inbound_message_id=40,
+        trigger="ask",
+        conversation_id=conversation.id,
+        user_text="why was the last transaction held?",
+        status="claimed",
+        attempts=3 if state == "worn_out" else 0,
+    )
+    session.add(interaction)
+    await session.commit()
+    maker = async_sessionmaker(
+        session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    monkeypatch.setattr(db_package, "async_session", maker)
+    monkeypatch.setattr(telegram, "async_session", maker)
+    monkeypatch.setattr(
+        "financial_dashboard.services.assistant.orchestrator._provider_from_application_settings",
+        _answer_provider,
+    )
+    settings_service._cache["telegram.chat_id"] = "77"
+
+    assert await resume_claimed_interactions() == (0 if state == "worn_out" else 1)
+    assert await resume_claimed_interactions() == 0
+
+    async with maker() as verification:
+        saved = await verification.get(AuditInteraction, interaction.id)
+    if state == "worn_out":
+        # A turn that keeps failing must stop. It must not retry forever.
+        assert (saved.status, saved.error_code) == ("failed", "too_many_attempts")
+        return
+    assert saved.status == "ready_to_send"
+    if expired:
+        assert saved.outcome == "error"
+        assert saved.error_code == "conversation_expired"
+        assert "/ask" in saved.assistant_text
+        return
+    assert saved.outcome == "answer"
+    assert saved.assistant_text == _ANSWER

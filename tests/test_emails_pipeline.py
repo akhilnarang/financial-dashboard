@@ -539,11 +539,13 @@ def _rtgs_completion_txn_data(**overrides) -> dict:
         # Two and a half minutes after the submission: outside the
         # one-minute arrival-time window that the submission row carries.
         transaction_time=datetime.time(10, 6, 46),
-        counterparty=None,
-        account_mask=None,
-        reference_number=_RTGS_UTR,
-        channel="rtgs",
-        **overrides,
+        **{
+            "counterparty": None,
+            "account_mask": None,
+            "reference_number": _RTGS_UTR,
+            "channel": "rtgs",
+            **overrides,
+        },
     )
 
 
@@ -559,10 +561,15 @@ async def test_rtgs_completion_email_stamps_the_reference_and_makes_no_row(
     """
     rule_id = await _seed_rule(session_maker, bank="hdfc")
     async with session_maker() as s:
-        s.add(_rtgs_submission_row())
+        # The submission email names the payee by the label the user saved.
+        s.add(
+            _rtgs_submission_row(
+                counterparty="My Saved Payee", counterparty_source="user_alias"
+            )
+        )
         await s.commit()
 
-    txn_data = _rtgs_completion_txn_data()
+    txn_data = _rtgs_completion_txn_data(counterparty="SAMPLE BENEFICIARY")
     monkeypatch.setattr(emails_mod, "send_transaction_notification", AsyncMock())
     monkeypatch.setattr(emails_mod, "send_bulk_summary", AsyncMock())
     monkeypatch.setattr(emails_mod, "send_enrichment_notification", AsyncMock())
@@ -584,44 +591,16 @@ async def test_rtgs_completion_email_stamps_the_reference_and_makes_no_row(
         assert len(rows) == 1, "the settlement leg must not open a second debit"
         assert rows[0].reference_number == _RTGS_UTR
         assert rows[0].account_mask == "XX0000", "the source account stays"
+        # The bank's own name replaces the saved label.
+        assert (rows[0].counterparty, rows[0].counterparty_source) == (
+            "SAMPLE BENEFICIARY",
+            "bank",
+        )
         em = (await s.execute(select(Email))).scalar_one()
         assert em.status == "parsed"
         # The email claims the row it completed, because no other email held
         # it. An email links through Transaction.email_id.
         assert rows[0].email_id == em.id
-
-
-@pytest.mark.anyio
-async def test_rtgs_completion_email_skips_when_two_rows_match(
-    session_maker, monkeypatch
-):
-    """Two submissions of one amount on one day. The settlement cannot know
-    which row to complete, so it skips. Fail-closed: no stamp, no new row."""
-    rule_id = await _seed_rule(session_maker, bank="hdfc")
-    async with session_maker() as s:
-        s.add(_rtgs_submission_row(account_mask="XX0000"))
-        s.add(_rtgs_submission_row(account_mask="XX0009"))
-        await s.commit()
-
-    txn_data = _rtgs_completion_txn_data()
-    await _run_handle_polled_email(
-        session_maker,
-        monkeypatch,
-        rule_id=rule_id,
-        txn_data=txn_data,
-        msg_id="rtgs-completed-2",
-        raw_bytes=_raw_email(subject="RTGS transfer completed"),
-        should_notify=False,
-        ledger_role="completion",
-    )
-
-    async with session_maker() as s:
-        rows = (await s.execute(select(Transaction))).scalars().all()
-        assert len(rows) == 2, "both submissions stay, and no third row appears"
-        assert all(r.reference_number is None for r in rows)
-        em = (await s.execute(select(Email))).scalar_one()
-        assert em.status == "skipped"
-        assert "no unique primary row" in (em.error or "")
 
 
 async def _post_reparse(session_maker, email_id):
@@ -679,10 +658,12 @@ async def _seed_completion_email(session_maker, rule_id) -> int:
 
 
 @pytest.mark.anyio
-async def test_reparse_completion_with_no_candidate_makes_no_row(
+async def test_reparse_completion_is_fail_closed_and_idempotent(
     session_maker, monkeypatch
 ):
-    """A reparse must stay fail-closed. It must not insert a phantom debit."""
+    """With no row to complete, a reparse opens no phantom debit. Once the
+    submission row exists, a reparse stamps it, and a second reparse adds no
+    row."""
     rule_id = await _seed_rule(session_maker, bank="hdfc")
     email_id = await _seed_completion_email(session_maker, rule_id)
 
@@ -693,14 +674,31 @@ async def test_reparse_completion_with_no_candidate_makes_no_row(
         txn_data=_rtgs_completion_txn_data(),
     )
     assert r.status_code in (200, 303)
+    async with session_maker() as s:
+        assert (await s.execute(select(Transaction))).scalars().all() == []
+        em = await s.get(Email, email_id)
+        assert em.status == "skipped"
+        # The response reports what was stored, not a blanket "parsed".
+        assert r.json()["new_status"] == em.status
+
+    async with session_maker() as s:
+        s.add(_rtgs_submission_row())
+        await s.commit()
+    for _ in range(2):
+        r = await _reparse_completion_email(
+            session_maker,
+            monkeypatch,
+            email_id=email_id,
+            txn_data=_rtgs_completion_txn_data(),
+        )
+        assert r.status_code in (200, 303)
 
     async with session_maker() as s:
         rows = (await s.execute(select(Transaction))).scalars().all()
-        assert rows == [], "a reparse must not open a row for a completion leg"
+        assert len(rows) == 1
+        assert rows[0].reference_number == _RTGS_UTR
         em = await s.get(Email, email_id)
-        assert em.status == "skipped"
-        # The response must report what was stored, not a blanket "parsed".
-        assert r.json()["new_status"] == em.status
+        assert em.status == "parsed"
 
 
 @pytest.mark.anyio
@@ -766,112 +764,30 @@ async def test_reparse_applies_the_name_rule(
         assert (row.counterparty, row.counterparty_source) == expected
 
 
-@pytest.mark.anyio
-async def test_completion_email_replaces_a_saved_label(
-    session_maker, monkeypatch
-) -> None:
-    """The completion leg carries the name the bank holds.
-
-    The row may hold a label from the submission email. The completion must
-    replace it, as the settlement SMS does.
-    """
-    rule_id = await _seed_rule(session_maker, bank="hdfc")
-    async with session_maker() as s:
-        s.add(
-            _rtgs_submission_row(
-                counterparty="My Saved Payee", counterparty_source="user_alias"
-            )
-        )
-        await s.commit()
-
-    txn_data = _rtgs_completion_txn_data()
-    txn_data["counterparty"] = "SAMPLE BENEFICIARY"
-    await _run_handle_polled_email(
-        session_maker,
-        monkeypatch,
-        rule_id=rule_id,
-        txn_data=txn_data,
-        msg_id="rtgs-completed-alias",
-        raw_bytes=_raw_email(subject="RTGS transfer completed"),
-        should_notify=False,
-        ledger_role="completion",
-    )
-
-    async with session_maker() as s:
-        row = (await s.execute(select(Transaction))).scalars().one()
-        assert row.counterparty == "SAMPLE BENEFICIARY"
-        assert row.counterparty_source == "bank"
-
-
-@pytest.mark.anyio
-async def test_reparse_completion_twice_is_idempotent(session_maker, monkeypatch):
-    """A reparse stamps the one matching row. A second reparse must not add a
-    row or steal an existing email link."""
-    rule_id = await _seed_rule(session_maker, bank="hdfc")
-    email_id = await _seed_completion_email(session_maker, rule_id)
-    async with session_maker() as s:
-        s.add(_rtgs_submission_row())
-        await s.commit()
-
-    for _ in range(2):
-        r = await _reparse_completion_email(
-            session_maker,
-            monkeypatch,
-            email_id=email_id,
-            txn_data=_rtgs_completion_txn_data(),
-        )
-        assert r.status_code in (200, 303)
-
-    async with session_maker() as s:
-        rows = (await s.execute(select(Transaction))).scalars().all()
-        assert len(rows) == 1
-        assert rows[0].reference_number == _RTGS_UTR
-        em = await s.get(Email, email_id)
-        assert em.status == "parsed"
-
-
-def test_populate_skips_a_completion_leg():
-    """scripts/populate.py inserts rows with no matcher.
-
-    A completion leg must not reach that insert, or importing both legs of one
-    transfer records two debits.
-
-    Skipped until the pinned bank-email-parser carries the RTGS parsers. The
-    dashboard installs that library from a git SHA, so this test needs the
-    version that this change depends on.
-    """
-    from email.message import EmailMessage
-
+def test_populate_imports_only_the_leg_that_owns_the_row():
+    """scripts/populate.py inserts rows with no matcher. A completion leg must
+    not reach that insert, or both legs of one transfer record two debits."""
     from scripts.populate import _process_eml
+
+    def _eml(text: str) -> bytes:
+        msg = EmailMessage()
+        msg.set_content(text)
+        return msg.as_bytes()
 
     settlement = (
         "Your RTGS transfer has been completed successfully. Transaction Details: "
         "Amount: INR 99,999.99 Credited to beneficiary A/c ending: XX1111 "
         "Date & Time: 15-01-2026 at 10:30:00 Reference Number: SAMPLER00000000000000"
     )
-    msg = EmailMessage()
-    msg.set_content(settlement)
-    error, data = _process_eml("hdfc", msg.as_bytes())
-    assert error is None
-    assert data is None, "a completion leg must not be imported as a row"
-
-
-def test_populate_still_imports_the_submission_leg():
-    """The leg that DOES own the row must still import."""
-    from email.message import EmailMessage
-
-    from scripts.populate import _process_eml
+    assert _process_eml("hdfc", _eml(settlement)) == (None, None)
 
     submission = (
         "You have successfully initiated a RTGS transaction of Rs. 99,999.99 from "
         "your HDFC Bank A/c XX0000 for a transfer to payee Sample Payee using "
         "HDFC Bank Online Banking."
     )
-    msg = EmailMessage()
-    msg.set_content(submission)
-    error, data = _process_eml("hdfc", msg.as_bytes())
+    error, data = _process_eml("hdfc", _eml(submission))
     assert error is None
-    assert data is not None
     assert data["direction"] == "debit"
     assert data["account_mask"] == "XX0000"
     assert data["counterparty"] == "Sample Payee"

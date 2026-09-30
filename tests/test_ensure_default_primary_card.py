@@ -41,26 +41,19 @@ async def test_seeds_primary_card_for_new_credit_card_account(session):
     assert cards[0].active is True
 
 
-async def test_skips_when_account_already_has_cards(session):
+async def test_skips_existing_cards_non_card_type_and_missing_number(session):
     account = await _account(session, type="credit_card", account_number="5678")
     session.add(
         Card(account_id=account.id, card_mask="XX5678", label="Other", is_primary=True)
     )
+    bank = await _account(session, type="bank_account", account_number="000111222")
+    no_number = await _account(session, type="credit_card", account_number=None)
     await session.flush()
 
-    assert await ensure_default_primary_card(session, account) is None
+    for target in (account, bank, no_number):
+        assert await ensure_default_primary_card(session, target) is None
     await session.flush()
 
     assert [c.card_mask for c in await _cards(session, account)] == ["XX5678"]
-
-
-async def test_skips_non_card_type_and_missing_account_number(session):
-    bank = await _account(session, type="bank_account", account_number="000111222")
-    no_number = await _account(session, type="credit_card", account_number=None)
-
-    assert await ensure_default_primary_card(session, bank) is None
-    assert await ensure_default_primary_card(session, no_number) is None
-    await session.flush()
-
     assert await _cards(session, bank) == []
     assert await _cards(session, no_number) == []

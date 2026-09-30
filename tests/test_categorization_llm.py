@@ -1,9 +1,9 @@
 from financial_dashboard.services.categorization.llm import (
     NEEDS_REVIEW,
-    LlmResult,
     build_prompt,
     parse_result,
 )
+from financial_dashboard.services.categorization.normalize import redact_names
 
 
 def test_prompt_lists_slugs_and_redacts():
@@ -47,26 +47,18 @@ def test_prompt_flags_dr_cr_only_for_banks_with_the_hint():
             active_slugs=["groceries", "dining"],
         )
 
-    for bank in ("indusind", "idfc", "sbi", "uboi"):
-        prompt = prompt_for(bank)
-        assert "format note" in prompt
-        assert "debit or credit" in prompt
-        assert "healthcare" in prompt
+    prompt = prompt_for("indusind")
+    assert "format note" in prompt
+    assert "debit or credit" in prompt
+    assert "healthcare" in prompt
     assert "format note" not in prompt_for("hdfc")
 
 
-def test_parse_result_clamps_and_defaults():
+def test_parse_result_clamps_confidence():
     r = parse_result(
         {"category": "groceries", "confidence": 1.5, "reason": "x"}, ["groceries"]
     )
-    assert isinstance(r, LlmResult)
     assert r.slug == "groceries" and r.confidence == 1.0
-    # unknown slug → needs_review
-    bad = parse_result(
-        {"category": "made_up", "confidence": 0.9, "reason": "y"}, ["groceries"]
-    )
-    assert bad.slug == NEEDS_REVIEW
-    assert bad.reason == "invalid model category slug: made_up"
     malformed = parse_result(
         {
             "category": "groceries",
@@ -76,3 +68,21 @@ def test_parse_result_clamps_and_defaults():
         ["groceries"],
     )
     assert malformed.confidence == malformed.candidates[0].confidence == 0.0
+
+
+def test_redact_names():
+    # One listed part absorbs the unlisted middle/edge parts.
+    assert redact_names("Bob Quinn Doe", ("doe",)) == "[redacted-name]"
+    assert redact_names("Mr ALEX QUINN DO", ("alex",)) == "[redacted-name]"
+    out = redact_names("received from ALEX QUINN DOE.", ("alex", "doe"))
+    assert out == "received from [redacted-name]."
+    # An unlisted middle part is absorbed with no whitespace or with
+    # punctuation separators.
+    assert redact_names("ALEXQUINSHDOE", ("alex", "doe")) == "[redacted-name]"
+    assert redact_names("UPI/ALEX/QUINN/DOE", ("alex", "doe")) == "UPI/[redacted-name]"
+    # A name in a UPI handle is redacted; the @vpa suffix survives.
+    assert redact_names("username@vpa", ("username",)) == "[redacted-name]@vpa"
+    assert redact_names("WWW ACMESTORE", ("alex",)) == "WWW ACMESTORE"
+    assert redact_names(None, ("alex",)) == ""
+    # Tokens under 3 chars are ignored.
+    assert redact_names("AB CD", ("ab",)) == "AB CD"

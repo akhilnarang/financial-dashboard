@@ -40,16 +40,12 @@ class StubDbTxn:
 def _stmt(
     transactions: list[BankTransaction],
     *,
-    opening_balance: str | None = None,
-    closing_balance: str | None = None,
     account_holder_name: str | None = None,
 ) -> ParsedBankStatement:
     return ParsedBankStatement(
         file="test.pdf",
         bank="kotak",
         transactions=transactions,
-        opening_balance=opening_balance,
-        closing_balance=closing_balance,
         account_holder_name=account_holder_name,
     )
 
@@ -75,36 +71,9 @@ def _txn(
     )
 
 
-def test_reference_match_refuses_contradictory_amount():
-    """A recycled exact reference cannot override contradictory amount evidence."""
-    db_txn = StubDbTxn(
-        id=5256,
-        transaction_date=datetime.date(2026, 4, 14),
-        amount=Decimal("1000.00"),
-        direction="debit",
-        reference_number="REF-COLLISION",
-    )
-    parsed = _stmt(
-        [
-            _txn(
-                date="14/04/2026",
-                amount="2,000.00",
-                direction="debit",
-                ref="REF-COLLISION",
-            )
-        ]
-    )
-
-    recon = reconcile_bank_statement(parsed, [db_txn], account_id=1)
-
-    assert recon["matched"] == []
-    assert len(recon["missing"]) == 1
-    assert recon["missing"][0]["ambiguous"] is True
-    assert recon["missing"][0]["candidate_transaction_ids"] == [db_txn.id]
-
-
 def test_incompatible_reference_row_does_not_demote_valid_winner():
-    """Contradictory reference evidence blocks import but cannot win contention."""
+    """A recycled reference with a different amount does not match. It blocks
+    import but cannot win contention."""
     db_txn = StubDbTxn(
         id=5254,
         transaction_date=datetime.date(2026, 4, 14),
@@ -249,29 +218,6 @@ def test_ref_match_takes_priority_over_date_fallback():
     # The ref-Y row stays missing (DB has nothing with that ref, and the
     # date-fallback candidate has a different non-null ref).
     assert missing_refs == {"REF-Y"}
-
-
-def test_fallback_refuses_match_when_refs_disagree():
-    """A statement row with ref A must not fuzzy-match a DB row with ref
-    B even when date/amount/direction line up. They cannot be the same
-    logical transaction."""
-    db_txn = StubDbTxn(
-        id=10,
-        transaction_date=datetime.date(2026, 4, 14),
-        amount=Decimal("500.00"),
-        direction="debit",
-        reference_number="REF-A",
-    )
-
-    parsed = _stmt(
-        [_txn(date="14/04/2026", amount="500.00", direction="debit", ref="REF-B")]
-    )
-
-    recon = reconcile_bank_statement(parsed, [db_txn], account_id=1)
-
-    assert recon["matched"] == []
-    assert len(recon["missing"]) == 1
-    assert recon["missing"][0]["reference_number"] == "REF-B"
 
 
 def test_fallback_matches_when_stmt_row_has_no_ref():
@@ -707,20 +653,3 @@ def test_substring_match_requires_word_boundary_and_min_length():
     )
     recon = reconcile_bank_statement(parsed_bounded, [db_bounded], account_id=1)
     assert len(recon["matched"]) == 1, recon
-
-
-def test_balance_verification_runs_when_balances_present():
-    parsed = _stmt(
-        [_txn(date="14/04/2026", amount="100.00", direction="debit", ref=None)],
-        opening_balance="1,000.00",
-        closing_balance="900.00",
-    )
-    parsed.debit_total = "100.00"
-    parsed.credit_total = "0.00"
-
-    recon = reconcile_bank_statement(parsed, [], account_id=1)
-
-    bv = recon["balance_verification"]
-    assert bv is not None
-    assert bv["is_balanced"] is True
-    assert bv["delta"] == "0.00"

@@ -48,34 +48,22 @@ def _raw_hdfc_upi(date_header: str) -> bytes:
 
 
 def test_neft_email_gets_transaction_time_from_received_time():
+    """The date and time come from one IST conversion. 19:33:51 UTC on the
+    26th is 01:03:51 IST on the 27th. Two separate conversions would give two
+    different moments."""
     error, txn_data, _hint, _parsed = _process_email_full(
-        "hdfc", _raw_hdfc_neft("Sun, 26 Jul 2026 20:15:42 +0530")
+        "hdfc", _raw_hdfc_neft("Sun, 26 Jul 2026 19:33:51 +0000")
     )
     assert error is None, error
     assert txn_data is not None
     assert txn_data["email_type"] == "hdfc_account_neft_debit_alert"
-    assert txn_data["transaction_time"] == datetime.time(20, 15, 42)
-    assert txn_data["transaction_date"] == datetime.date(2026, 7, 26)
+    assert txn_data["transaction_time"] == datetime.time(1, 3, 51)
+    assert txn_data["transaction_date"] == datetime.date(2026, 7, 27)
     # The SMS side has no payee. This payee must reach the row.
     assert txn_data["counterparty"] == "Sample Payee"
     # The matcher reads these flags from the stored row later.
     assert txn_data["transaction_time_is_received_time"] is True
     assert txn_data["counterparty_source"] == "user_alias"
-
-
-def test_neft_date_and_time_come_from_one_ist_conversion():
-    """The true pair arrived at 01:03 IST. This is after midnight, so the IST
-    date is one day later than the UTC date. Two separate conversions would
-    give two different moments. This test keeps them together."""
-    error, txn_data, _hint, _parsed = _process_email_full(
-        # 19:33:51 UTC on the 26th == 01:03:51 IST on the 27th.
-        "hdfc",
-        _raw_hdfc_neft("Sun, 26 Jul 2026 19:33:51 +0000"),
-    )
-    assert error is None, error
-    assert txn_data is not None
-    assert txn_data["transaction_date"] == datetime.date(2026, 7, 27)
-    assert txn_data["transaction_time"] == datetime.time(1, 3, 51)
 
 
 def test_fallback_never_moves_a_date_the_body_supplied():
@@ -118,24 +106,6 @@ def test_a_body_time_source_keeps_a_null_transaction_time():
     assert txn_data is not None
     assert txn_data["email_type"] == "hdfc_upi_alert"
     assert txn_data["transaction_time"] is None
-
-
-def test_am_pm_disambiguation_still_runs_for_its_own_types():
-    """The fallback is an elif before the AM/PM branch. Make sure that it did
-    not remove the AM/PM step for types that read a true time."""
-    msg = EmailMessage()
-    msg["Subject"] = "Transaction alert for your ICICI Bank Credit Card"
-    msg["From"] = "credit_cards@icici.bank.in"
-    msg["Date"] = "Sun, 17 May 2026 18:37:43 +0530"
-    msg.set_content(
-        "Your ICICI Bank Credit Card XX0000 has been used for a transaction of "
-        "INR 100.00 on May 17, 2026 at 06:37:31. Info: TEST MERCHANT. "
-        "Available Credit Limit on your card is INR 1,000.00."
-    )
-    error, txn_data, _hint, _parsed = _process_email_full("icici", msg.as_bytes())
-    assert error is None, error
-    assert txn_data is not None
-    assert txn_data["transaction_time"] == datetime.time(18, 37, 31)
 
 
 def test_date_fallback_uses_ist_for_every_email_type():

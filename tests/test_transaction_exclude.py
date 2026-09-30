@@ -62,10 +62,8 @@ async def test_set_and_clear_is_observable_and_idempotent(client, session):
     assert r.json() == {"ok": True, "exclude_from_cashflow": False}
     assert await _read_flag(client, txn_id) is False
 
-
-async def test_missing_transaction_is_404(client):
-    r = await client.post(
+    missing = await client.post(
         "/api/transactions/999999/exclude",
         json={"exclude_from_cashflow": True},
     )
-    assert r.status_code == 404
+    assert missing.status_code == 404

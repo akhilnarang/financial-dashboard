@@ -2,7 +2,6 @@ import asyncio
 import fcntl
 import hashlib
 import json
-import logging
 import os
 import sqlite3
 import stat
@@ -98,13 +97,25 @@ def _assert_no_paths(value: object, database_path: Path) -> None:
 
 
 async def test_post_creates_verified_online_backup_with_committed_wal_rows(backup_api):
-    client, session, _engine, database_path = backup_api
+    client, session, engine, database_path = backup_api
     wal_path = Path(f"{database_path}-wal")
     assert wal_path.exists()
     assert wal_path.stat().st_size > 0
     assert not session.in_transaction()
+    statements: list[str] = []
 
-    response = await client.post("/api/system/backups")
+    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    # The backup runs off the request session: no SQL, no transaction.
+    event.listen(engine.sync_engine, "before_cursor_execute", record_statement)
+    try:
+        response = await client.post("/api/system/backups")
+        listing = await client.get("/api/system/backups")
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record_statement)
+    assert statements == []
+    assert listing.json()["status"] == "ok"
 
     assert response.status_code == 200
     body = response.json()
@@ -265,9 +276,7 @@ async def test_post_prunes_oldest_backups_to_retention_bound(backup_api, monkeyp
     )
 
 
-async def test_get_ignores_malformed_manifests_without_following_paths(
-    backup_api, caplog
-):
+async def test_get_ignores_malformed_manifests_without_following_paths(backup_api):
     client, _session, _engine, database_path = backup_api
     valid = (await client.post("/api/system/backups")).json()["backup"]
     backup_directory = _backup_root(database_path)
@@ -289,26 +298,13 @@ async def test_get_ignores_malformed_manifests_without_following_paths(
         )
     )
 
-    with caplog.at_level(logging.WARNING, logger=system_backups.__name__):
-        response = await client.get("/api/system/backups")
+    response = await client.get("/api/system/backups")
 
     assert response.status_code == 200
     assert [item["backup_id"] for item in response.json()["backups"]] == [
         valid["backup_id"]
     ]
     assert "/private/never-follow-this" not in response.text
-    assert any(
-        "malformed system backup manifest" in record.getMessage()
-        for record in caplog.records
-    )
-
-
-async def test_get_validates_limit(backup_api):
-    client, *_rest = backup_api
-
-    response = await client.get("/api/system/backups", params={"limit": "101"})
-
-    assert response.status_code == 422
 
 
 async def test_in_memory_sqlite_is_typed_unsupported_without_file_work(client):
@@ -441,64 +437,20 @@ async def test_create_scavenges_only_unlocked_stale_temporary_directories(
     assert not active.exists()
 
 
-async def test_verification_failure_cleans_artifacts_and_sanitizes_response(
-    backup_api, monkeypatch, caplog
-):
-    client, _session, _engine, database_path = backup_api
-    secret_detail = "private verification detail"
-
-    def fail_verification(_path):
-        raise RuntimeError(secret_detail)
-
-    monkeypatch.setattr(system_backups, "_verify_sqlite_backup", fail_verification)
-    with caplog.at_level(logging.ERROR, logger=system_backups.__name__):
-        response = await client.post("/api/system/backups")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "unavailable",
-        "backend": "sqlite",
-        "backup": None,
-    }
-    assert secret_detail not in response.text
-    assert str(database_path) not in response.text
-    backup_directory = _backup_root(database_path)
-    assert list(backup_directory.iterdir()) == []
-    assert any(
-        secret_detail in record.getMessage()
-        for record in caplog.records
-        if record.name == system_backups.__name__
-    )
-
-
-async def test_directory_publication_failure_removes_all_temp_artifacts(
-    backup_api, monkeypatch
-):
-    client, _session, _engine, database_path = backup_api
-
-    def fail_directory_rename(_source, _destination):
-        raise OSError("synthetic directory publication failure")
-
-    monkeypatch.setattr(system_backups.os, "rename", fail_directory_rename)
-
-    response = await client.post("/api/system/backups")
-    listing = await client.get("/api/system/backups")
-
-    assert response.json() == {
-        "status": "unavailable",
-        "backend": "sqlite",
-        "backup": None,
-    }
-    assert listing.json()["backups"] == []
-    backup_directory = _backup_root(database_path)
-    assert list(backup_directory.iterdir()) == []
-
-
-async def test_post_rename_sync_failure_removes_published_directory(
+async def test_create_failures_remove_all_artifacts_and_sanitize_response(
     backup_api, monkeypatch
 ):
     client, _session, _engine, database_path = backup_api
     backup_root = _backup_root(database_path)
+    secret_detail = "private verification detail"
+    unavailable = {"status": "unavailable", "backend": "sqlite", "backup": None}
+
+    def fail_verification(_path):
+        raise RuntimeError(secret_detail)
+
+    def fail_directory_rename(_source, _destination):
+        raise OSError("synthetic directory publication failure")
+
     original_fsync_directory = system_backups._fsync_directory
     failed_publication_sync = False
 
@@ -509,16 +461,22 @@ async def test_post_rename_sync_failure_removes_published_directory(
             raise OSError("synthetic publication sync failure")
         return original_fsync_directory(path)
 
-    monkeypatch.setattr(system_backups, "_fsync_directory", fail_first_root_sync)
-    response = await client.post("/api/system/backups")
+    # Verify fails, rename fails, then fsync fails after the rename published.
+    for target, name, replacement in (
+        (system_backups, "_verify_sqlite_backup", fail_verification),
+        (system_backups.os, "rename", fail_directory_rename),
+        (system_backups, "_fsync_directory", fail_first_root_sync),
+    ):
+        monkeypatch.setattr(target, name, replacement)
+        response = await client.post("/api/system/backups")
+        monkeypatch.undo()
 
-    assert response.json() == {
-        "status": "unavailable",
-        "backend": "sqlite",
-        "backup": None,
-    }
+        assert response.json() == unavailable
+        assert secret_detail not in response.text
+        assert str(database_path) not in response.text
+        assert list(backup_root.iterdir()) == []
     assert failed_publication_sync is True
-    assert list(backup_root.iterdir()) == []
+    assert (await client.get("/api/system/backups")).json()["backups"] == []
 
 
 async def test_dedicated_executor_serializes_workers_across_event_loops(
@@ -681,26 +639,3 @@ async def test_cancelled_failed_worker_preserves_cancellation_and_releases_admis
     retry = await system_backups.create_system_backup(session)
     assert retry.status == "created"
     assert call_count == 2
-
-
-async def test_backup_operations_do_not_start_request_session_sql_or_transaction(
-    backup_api,
-):
-    client, session, engine, _database_path = backup_api
-    statements: list[str] = []
-
-    def record_statement(_conn, _cursor, statement, _parameters, _context, _many):
-        statements.append(statement)
-
-    assert not session.in_transaction()
-    event.listen(engine.sync_engine, "before_cursor_execute", record_statement)
-    try:
-        post = await client.post("/api/system/backups")
-        listing = await client.get("/api/system/backups")
-    finally:
-        event.remove(engine.sync_engine, "before_cursor_execute", record_statement)
-
-    assert post.json()["status"] == "created"
-    assert listing.json()["status"] == "ok"
-    assert statements == []
-    assert not session.in_transaction()

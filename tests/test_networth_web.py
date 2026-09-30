@@ -19,39 +19,9 @@ pytestmark = pytest.mark.anyio
 OVERSIZE_PDF = b"%PDF-" + b"x" * (10 * 1024 * 1024 + 1)
 
 
-async def test_networth_page_renders_current_figure(client, session):
-    upload = CasUpload(
-        portfolio_key="ABCDE1234F",
-        depository_source="cdsl",
-        investor_name="Example Investor",
-        statement_date=dt.date(2026, 4, 30),
-        grand_total=Decimal("200000.00"),
-        portfolio_ok=True,
-        raw_holdings_json="{}",
-    )
-    session.add(upload)
-    await session.flush()
-    session.add(
-        BalanceSnapshot(
-            cas_upload_id=upload.id,
-            portfolio_key=upload.portfolio_key,
-            kind=SnapshotKind.asset.value,
-            category=SnapshotCategory.investment.value,
-            as_of_date=dt.date(2026, 4, 30),
-            value=Decimal("200000.00"),
-            source=SnapshotSource.cas.value,
-        )
-    )
-    await session.commit()
-
-    response = await client.get("/networth")
-
-    assert response.status_code == 200
-    assert "Net Worth" in response.text
-    assert "2L" in response.text
-
-
-async def test_networth_page_flags_stale_and_unreconciled_sources(client, session):
+async def test_networth_page_renders_figure_and_flags_stale_and_unreconciled(
+    client, session
+):
     """A bank snapshot past the 45-day threshold shows as stale. An investment
     snapshot from a CAS that failed reconciliation shows as unreconciled."""
     account = Account(
@@ -62,7 +32,7 @@ async def test_networth_page_flags_stale_and_unreconciled_sources(client, sessio
         depository_source="cdsl",
         investor_name="Example Investor",
         statement_date=dt.date.today() - dt.timedelta(days=5),
-        grand_total=Decimal("50000.00"),
+        grand_total=Decimal("100000.00"),
         portfolio_ok=False,
         raw_holdings_json="{}",
     )
@@ -84,7 +54,7 @@ async def test_networth_page_flags_stale_and_unreconciled_sources(client, sessio
                 kind=SnapshotKind.asset.value,
                 category=SnapshotCategory.investment.value,
                 as_of_date=upload.statement_date,
-                value=Decimal("50000.00"),
+                value=Decimal("100000.00"),
                 source=SnapshotSource.cas.value,
             ),
         ]
@@ -94,34 +64,25 @@ async def test_networth_page_flags_stale_and_unreconciled_sources(client, sessio
     resp = await client.get("/networth")
 
     assert resp.status_code == 200
+    assert "2L" in resp.text
     assert "stale" in resp.text
     assert "unreconciled" in resp.text
 
 
 async def test_cas_upload_rejects_oversize_file(client):
-    response = await client.post(
-        "/cas/upload",
-        data={"password": "", "force_replace": "false"},
-        files={"file": ("big.pdf", OVERSIZE_PDF, "application/pdf")},
-        follow_redirects=False,
-    )
+    upload = {
+        "data": {"password": "", "force_replace": "false"},
+        "files": {"file": ("big.pdf", OVERSIZE_PDF, "application/pdf")},
+    }
+    html = await client.post("/cas/upload", follow_redirects=False, **upload)
+    assert html.status_code == 303
+    assert "error=" in html.headers["location"]
 
-    assert response.status_code == 303
-    assert "exceeds" in response.headers["location"].lower()
-
-
-async def test_api_cas_upload_rejects_oversize_file(client):
-    response = await client.post(
-        "/api/cas/upload",
-        data={"password": "", "force_replace": "false"},
-        files={"file": ("big.pdf", OVERSIZE_PDF, "application/pdf")},
-    )
-
-    assert response.status_code == 413
-    assert "10 MB" in response.json()["detail"]
+    api = await client.post("/api/cas/upload", **upload)
+    assert api.status_code == 413
 
 
-async def test_manual_edit_collision_shows_error_banner(client, session):
+async def test_manual_edit_collision_keeps_both_entries(client, session):
     item = await manual_items.create_item(
         session,
         name="Cash",
@@ -148,14 +109,28 @@ async def test_manual_edit_collision_shows_error_banner(client, session):
     resp = await client.post(
         f"/networth/manual/snapshot/{april.id}/edit",
         data={"value": "9999.00", "as_of_date": "2026-05-01"},
-        follow_redirects=True,
+        follow_redirects=False,
     )
 
-    assert resp.status_code == 200
-    assert "An entry already exists for that date" in resp.text
+    assert resp.status_code == 303
+    assert "error=" in resp.headers["location"]
+    session.expire_all()
+    values = (
+        await session.execute(
+            select(BalanceSnapshot.as_of_date, BalanceSnapshot.value).order_by(
+                BalanceSnapshot.as_of_date
+            )
+        )
+    ).all()
+    assert values == [
+        (dt.date(2026, 4, 1), Decimal("5000.00")),
+        (dt.date(2026, 5, 1), Decimal("7000.00")),
+    ]
 
 
-async def test_manual_delete_redirects_clean(client, session):
+async def test_manual_snapshot_delete_removes_it_and_rejects_unknown_id(
+    client, session
+):
     await manual_items.create_item(
         session,
         name="Cash",
@@ -170,21 +145,21 @@ async def test_manual_delete_redirects_clean(client, session):
     resp = await client.post(
         f"/networth/manual/snapshot/{snap.id}/delete", follow_redirects=False
     )
-
     assert resp.status_code == 303
     assert resp.headers["location"] == "/networth/manual"
+    session.expire_all()
+    assert (await session.execute(select(BalanceSnapshot))).first() is None
 
-
-async def test_manual_snapshot_delete_unknown_id_redirects_with_error(client):
-    resp = await client.post(
-        "/networth/manual/snapshot/999/delete", follow_redirects=False
+    again = await client.post(
+        f"/networth/manual/snapshot/{snap.id}/delete", follow_redirects=False
     )
+    assert again.status_code == 303
+    assert "error=" in again.headers["location"]
 
-    assert resp.status_code == 303
-    assert "error=" in resp.headers["location"]
 
-
-async def test_manual_page_renders_history_newest_first(client, session):
+async def test_manual_page_lists_history_newest_first_read_only_when_inactive(
+    client, session
+):
     item = await manual_items.create_item(
         session,
         name="Gold",
@@ -201,29 +176,14 @@ async def test_manual_page_renders_history_newest_first(client, session):
     )
     await session.commit()
 
-    resp = await client.get("/networth/manual")
-
-    assert resp.status_code == 200
-    body = resp.text
+    body = (await client.get("/networth/manual")).text
     assert body.index("01 May 2026") < body.index("01 Apr 2026")
-    assert "/delete" in body
+    assert "/snapshot/" in body
 
-
-async def test_inactive_item_history_has_no_edit_delete_forms(client, session):
-    item = await manual_items.create_item(
-        session,
-        name="Sold property",
-        kind=ManualKind.asset,
-        category=ManualCategory.property,
-        value=Decimal("1000000.00"),
-        as_of_date=dt.date(2026, 4, 1),
-    )
     await manual_items.deactivate(session, item_id=item.id)
     await session.commit()
 
-    resp = await client.get("/networth/manual")
-
-    assert resp.status_code == 200
-    # History date still shown (read-only), but no mutate forms for this item.
-    assert "01 Apr 2026" in resp.text
-    assert "/snapshot/" not in resp.text
+    body = (await client.get("/networth/manual")).text
+    # The history stays visible, with no forms that change it.
+    assert "01 Apr 2026" in body
+    assert "/snapshot/" not in body

@@ -22,11 +22,16 @@ from financial_dashboard.db.models import (
     AuditAction,
     AuditInteraction,
     CategoryReviewDecision,
+    MerchantRule,
+    TelegramOutboundDelivery,
     Transaction,
 )
+import financial_dashboard.services.categorization.merchant_rules as mr_mod
 from financial_dashboard.services.categorization import llm
-from financial_dashboard.services.categorization.merchant_rules import (
-    load_merchant_rules,
+from financial_dashboard.services.categorization.fewshot import get_similar_examples
+from financial_dashboard.services.categorization.hashing import (
+    build_input_payload,
+    compute_input_hash,
 )
 from financial_dashboard.services.categorization.vocabulary import ensure_category
 
@@ -34,49 +39,114 @@ pytestmark = pytest.mark.anyio
 
 
 # ---------------------------------------------------------------------------
-# Merchant rule lane
+# Rule lane
 # ---------------------------------------------------------------------------
 
 
-async def test_merchant_rule_fires_via_engine_without_touching_the_llm(
+async def test_confident_rule_skips_llm_supersedes_stale_review_and_cancels_buttons(
     session: AsyncSession, monkeypatch
 ):
-    """A seeded merchant rule wins via the rule path; the LLM classifier is
-    never called. The seam is ``engine._llm_classify`` — if it fires, the test
-    fails loudly, because the rule path is meant to short-circuit before it."""
-    await ensure_category(session, "dining")
-    # Seed a merchant rule and load the cache the rule pass reads from.
-    from financial_dashboard.db.models import MerchantRule
-
-    session.add(MerchantRule(pattern="dinerco", category="dining", priority=100))
-    await session.flush()
-    await load_merchant_rules(_session=session)
+    """A fee-reversal credit is stored as fees_charges via the rule path, which
+    never calls the LLM and never runs the polarity guard. The rule also
+    supersedes a stale review and cancels its Telegram buttons."""
 
     def fail_if_called(**kwargs):
-        raise AssertionError("LLM must not be called when a merchant rule fires")
+        raise AssertionError("LLM must not be called when a rule fires")
 
     monkeypatch.setattr(eng, "_llm_classify", fail_if_called)
-
     account = Account(bank="testbank", label="Savings", type="bank_account")
     session.add(account)
     await session.flush()
     txn = Transaction(
         bank="testbank",
-        email_type="x",
-        direction="debit",
-        amount=Decimal("50"),
-        counterparty="DINERCO",
-        raw_description="DINERCO MUMBAI",
+        email_type="testbank_misc_alert",
+        direction="credit",
+        amount=Decimal("10"),
+        counterparty="ACME BANK",
+        raw_description="Annual fee reversal credited",
         account_id=account.id,
+        review_status="pending",
     )
     session.add(txn)
     await session.flush()
+    source = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="reply",
+        status="ready_to_send",
+        outcome="clarification",
+    )
+    session.add(source)
+    await session.flush()
+    decision = CategoryReviewDecision(
+        transaction_id=txn.id,
+        source_interaction_id=source.id,
+        category_input_hash="stale",
+        candidates_json='[{"category": "interest"}]',
+        gate_reason="old review",
+    )
+    session.add(decision)
+    await session.flush()
+    delivery = TelegramOutboundDelivery(
+        interaction_id=source.id,
+        recipient_chat_id=7,
+        ordinal=0,
+        transaction_id=txn.id,
+        text="choose",
+        delivery_token="stale-button-token",
+        status="pending",
+    )
+    session.add(delivery)
+    await session.flush()
 
-    method = await eng.categorize_one(session, txn, use_llm=True)
-    assert method == "rule"
-    assert txn.category == "dining"
+    assert await eng.categorize_one(session, txn, use_llm=True) == "rule"
+
+    assert decision.status == "superseded"
+    assert delivery.status == "cancelled"
+    assert source.status == "delivery_failed"
+    assert source.outcome == "clarification"
+    assert txn.category == "fees_charges"
     assert txn.category_method == "rule"
     assert txn.category_model == "rules-v1"
+    assert txn.category_confidence == 0.9
+    assert txn.category_input_hash is not None
+
+
+async def test_merchant_rule_fires_via_engine_without_touching_the_llm(
+    session: AsyncSession, monkeypatch
+):
+    """A DB merchant rule loaded into the cache wins via the engine rule path."""
+    await ensure_category(session, "dining")
+    session.add(MerchantRule(pattern="dinerco", category="dining", priority=100))
+    await session.flush()
+    snapshot = list(mr_mod._cache)
+    try:
+        await mr_mod.load_merchant_rules(_session=session)
+
+        def fail_if_called(**kwargs):
+            raise AssertionError("LLM must not be called when a merchant rule fires")
+
+        monkeypatch.setattr(eng, "_llm_classify", fail_if_called)
+        account = Account(bank="testbank", label="Savings", type="bank_account")
+        session.add(account)
+        await session.flush()
+        txn = Transaction(
+            bank="testbank",
+            email_type="x",
+            direction="debit",
+            amount=Decimal("50"),
+            counterparty="DINERCO",
+            raw_description="DINERCO MUMBAI",
+            account_id=account.id,
+        )
+        session.add(txn)
+        await session.flush()
+
+        assert await eng.categorize_one(session, txn, use_llm=True) == "rule"
+        assert txn.category == "dining"
+        assert txn.category_method == "rule"
+    finally:
+        mr_mod._cache.clear()
+        mr_mod._cache.extend(snapshot)
 
 
 @pytest.mark.parametrize("manual_edit", [False, True])
@@ -295,3 +365,54 @@ async def test_empty_input_skips_the_llm_call(session: AsyncSession, monkeypatch
     assert txn.category_model == "empty-input"
     assert txn.category_confidence == 0.0
     assert txn.review_status is None
+
+
+async def test_fewshot_returns_same_direction_categorized_matches(
+    session: AsyncSession,
+):
+    for direction, category in (
+        ("debit", "groceries"),
+        ("credit", "refund"),
+        ("debit", None),
+    ):
+        session.add(
+            Transaction(
+                bank="testbank",
+                email_type="x",
+                amount=Decimal("10"),
+                direction=direction,
+                counterparty="ACME STORE",
+                category=category,
+                category_method="manual" if category else None,
+            )
+        )
+    await session.flush()
+
+    out = await get_similar_examples(
+        session, counterparty="acmestoremumbai", direction="debit", limit=5
+    )
+    assert len(out) == 1
+    assert out[0].category == "groceries"
+    assert out[0].direction == "debit"
+
+
+def test_input_hash_is_stable_and_ignores_outputs():
+    def txn(**kw):
+        base = dict(
+            bank="testbank",
+            email_type="x",
+            direction="debit",
+            amount=Decimal("10"),
+            currency="INR",
+            counterparty="ACME STORE",
+            channel="upi",
+            raw_description="ACME STORE MUMBAI",
+        )
+        base.update(kw)
+        return compute_input_hash(
+            build_input_payload(Transaction(**base), "bank_account")
+        )
+
+    # Outputs are not inputs: a stored category must not change the hash.
+    assert txn() == txn() == txn(category="x")
+    assert txn() != txn(direction="credit")

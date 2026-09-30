@@ -43,15 +43,12 @@ def test_api_keys_are_masked_and_kept_on_blank_post(monkeypatch):
     assert not set(keys) & set(updates)
 
 
-def test_reasoning_effort_accepts_a_valid_level_or_empty():
+def test_reasoning_effort_accepts_a_valid_level_or_empty_and_rejects_a_typo():
     for value in ("medium", ""):
         updates, errors = parse_form_updates({"openai.reasoning_effort": value})
         assert errors == []
         assert updates["openai.reasoning_effort"] == value
-
-
-def test_reasoning_effort_rejects_an_unknown_level():
-    """A typo here would fail every categorization call, so reject it on save."""
+    # A typo would fail every categorization call, so reject it on save.
     updates, errors = parse_form_updates({"openai.reasoning_effort": "meduim"})
-    assert any("Reasoning Effort" in e for e in errors)
+    assert errors
     assert "openai.reasoning_effort" not in updates

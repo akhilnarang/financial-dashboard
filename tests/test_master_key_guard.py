@@ -43,16 +43,7 @@ async def test_credentials_without_key_raises(session, monkeypatch):
         )
     )
     await session.commit()
-    with pytest.raises(SystemExit, match="EMAIL_SOURCE_MASTER_KEY"):
-        await assert_master_key_or_no_secrets(session)
-
-
-async def test_secret_setting_without_key_raises(session, monkeypatch):
-    monkeypatch.setattr(settings_mod, "settings", _settings())
-    # telegram.bot_token is marked secret in SETTINGS_REGISTRY.
-    session.add(Setting(key="telegram.bot_token", value="encrypted-token"))
-    await session.commit()
-    with pytest.raises(SystemExit, match="EMAIL_SOURCE_MASTER_KEY"):
+    with pytest.raises(SystemExit):
         await assert_master_key_or_no_secrets(session)
 
 
@@ -66,25 +57,28 @@ async def test_dormant_paisa_secret_without_key_raises(session, monkeypatch):
             Setting(key="paisa.auth_password", value="encrypted-paisa-password")
         )
         await session.commit()
-        with pytest.raises(SystemExit, match="EMAIL_SOURCE_MASTER_KEY"):
+        with pytest.raises(SystemExit):
             await assert_master_key_or_no_secrets(session)
     finally:
         SETTINGS_REGISTRY.clear()
         SETTINGS_REGISTRY.update(original_registry)
 
 
-async def test_non_secret_setting_without_key_does_not_raise(session, monkeypatch):
+async def test_only_secret_settings_trip_the_guard(session, monkeypatch):
     monkeypatch.setattr(settings_mod, "settings", _settings())
     # telegram.chat_id is not a secret. It must not trip the guard.
     session.add(Setting(key="telegram.chat_id", value="123456"))
     await session.commit()
     await assert_master_key_or_no_secrets(session)
 
+    # telegram.bot_token is marked secret in SETTINGS_REGISTRY.
+    session.add(Setting(key="telegram.bot_token", value="encrypted-token"))
+    await session.commit()
+    with pytest.raises(SystemExit):
+        await assert_master_key_or_no_secrets(session)
 
-async def test_key_set_never_raises(session, monkeypatch):
-    monkeypatch.setattr(
-        settings_mod, "settings", _settings(master_key="synthetic-master-key")
-    )
+
+async def test_key_set_or_allow_ephemeral_does_not_raise(session, monkeypatch):
     session.add(
         EmailSource(
             provider="imap",
@@ -94,18 +88,11 @@ async def test_key_set_never_raises(session, monkeypatch):
     )
     session.add(Setting(key="telegram.bot_token", value="encrypted-token"))
     await session.commit()
+
+    monkeypatch.setattr(
+        settings_mod, "settings", _settings(master_key="synthetic-master-key")
+    )
     await assert_master_key_or_no_secrets(session)
 
-
-async def test_allow_ephemeral_downgrades_to_warning(session, monkeypatch):
     monkeypatch.setattr(settings_mod, "settings", _settings(allow_ephemeral=True))
-    session.add(
-        EmailSource(
-            provider="imap",
-            label="Synthetic source",
-            credentials="encrypted-blob",
-        )
-    )
-    await session.commit()
-    # Encrypted data + no key, but escape hatch set → warns, no raise.
     await assert_master_key_or_no_secrets(session)

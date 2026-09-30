@@ -263,9 +263,10 @@ async def _signed_sum(session: AsyncSession, *where) -> Decimal:
     )
 
 
-async def test_headline_totals_equal_direct_source_row_sums(session: AsyncSession):
-    """Each headline total and count is the direct sum over the rows its bucket
-    selects. A bucket that drops a row or counts one twice breaks the equality.
+async def test_every_figure_equals_a_direct_sum_over_its_rows(session: AsyncSession):
+    """Each total, footnote, line count and trend month is the direct sum or
+    count over the rows it selects. A bucket that drops a row or counts one
+    twice breaks the equality.
 
     Under the bank scope a credit_card_payment debit is expense, so the expense
     slugs are the scope-flipped set.
@@ -308,12 +309,6 @@ async def test_headline_totals_equal_direct_source_row_sums(session: AsyncSessio
         s.income.total + s.transfers_in.total - s.expense.total - s.investment.net
     )
 
-
-async def test_footnotes_equal_direct_source_row_sums(session: AsyncSession):
-    """The footnotes count the rows the headline buckets leave out."""
-    await _seed_rich_population(session)
-    s = await cashflow_summary(session, JUN, JUN_END)
-
     # Under the bank scope only self_transfer is internal.
     internal_count, internal_gross = (
         await session.execute(
@@ -340,16 +335,6 @@ async def test_footnotes_equal_direct_source_row_sums(session: AsyncSession):
     assert s.footnotes.unaccounted_net == await _signed_sum(
         session, IN_RANGE, UNACCOUNTED_SCOPE
     )
-
-
-async def test_every_line_count_matches_its_drill_through_row_count(
-    session: AsyncSession,
-):
-    """A line count is the row count its drill-through link lists, so a tile
-    and the list behind it cannot drift apart."""
-    await _seed_rich_population(session)
-    s = await cashflow_summary(session, JUN, JUN_END)
-    headline = (IN_RANGE, BANK_SCOPE, INR_OR_NULL)
 
     for ln in [*s.income.lines, *s.expense.lines]:
         n = await _count(session, *headline, Transaction.category == ln.slug)
@@ -378,13 +363,6 @@ async def test_every_line_count_matches_its_drill_through_row_count(
         )
         assert ln.count == n, ln.counterparty
 
-
-async def test_each_trend_month_reconciles_with_its_own_summary(session: AsyncSession):
-    """A trend month shows the figures the summary gives for that month.
-
-    salary_count applies no currency clause, unlike the money series.
-    """
-    await _seed_rich_population(session)
     today = datetime.date(2026, 6, 15)
     pts = await cashflow_trend(session, months=1, today=today)
     jun_trend = next(p for p in pts if p.month == "2026-06")

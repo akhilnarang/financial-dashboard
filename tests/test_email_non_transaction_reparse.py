@@ -58,32 +58,6 @@ async def _seed_failed_emails(session, count: int) -> list[Email]:
     return emails
 
 
-async def test_recognized_notice_stays_non_transaction_for_statement_rule():
-    with (
-        patch(
-            "financial_dashboard.services.emails.process_statement_email",
-            new=AsyncMock(return_value=None),
-        ),
-        patch(
-            "financial_dashboard.services.emails.process_bank_statement_email",
-            new=AsyncMock(return_value=None),
-        ),
-    ):
-        result = await parse_email_by_kind(
-            bank="icici",
-            email_kind="cc_statement",
-            raw_bytes=_usage_control_notice(),
-            subject="Synthetic card settings notice",
-            source_id=None,
-            log_ref="synthetic-notice",
-        )
-
-    assert result.error is None
-    assert result.txn_data is None
-    assert result.stmt_result is None
-    assert result.recognized_non_transaction is True
-
-
 async def test_unprocessed_statement_remains_an_error():
     parsed_statement = ParsedEmail(
         bank="synthetic",

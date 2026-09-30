@@ -90,7 +90,8 @@ async def _get_upload(maker, upload_id):
 
 @pytest.mark.anyio
 async def test_settle_promotes_provisional_to_real_credit(maker):
-    """Settling a provisional SMS creates one real credit and moves paid."""
+    """Settling a provisional SMS creates one real credit and moves paid.
+    A repeated settle creates no second credit."""
     upload_id, acc_id = await _seed_open_statement(maker)
     sms_id = await _add_provisional_sms(maker, day=7)
 
@@ -102,13 +103,19 @@ async def test_settle_promotes_provisional_to_real_credit(maker):
         ("30,000.00", "1234")
     ]
 
-    # Promote via the same pipeline path the web handler uses.
-    async with maker() as session, session.begin():
-        sms = await session.get(SmsMessage, sms_id)
-        link_ctx = await build_link_context(session)
-        outcome = await process_sms_row(session, sms, link_ctx, settle_provisional=True)
+    async def _settle():
+        async with maker() as session, session.begin():
+            sms = await session.get(SmsMessage, sms_id)
+            link_ctx = await build_link_context(session)
+            return await process_sms_row(
+                session, sms, link_ctx, settle_provisional=True
+            )
+
+    outcome = await _settle()
     assert outcome.transaction_id is not None
     assert outcome.pending_payment_check is not None
+    # A second settle reuses the same credit.
+    assert (await _settle()).transaction_id == outcome.transaction_id
 
     # Fire the recompute hook (web handler does this post-commit).
     from financial_dashboard.services.reminders import check_payment_received
@@ -143,42 +150,6 @@ async def test_settle_promotes_provisional_to_real_credit(maker):
     assert len(view.settled) == 1
     assert view.settled[0].amount == "30,000.00"
     assert view.pending == []
-
-
-@pytest.mark.anyio
-async def test_settle_is_idempotent_on_linked_sms(maker):
-    """A second settle of an already-linked SMS makes no second credit."""
-    _, acc_id = await _seed_open_statement(maker)
-    sms_id = await _add_provisional_sms(maker, day=7)
-
-    async def _settle():
-        async with maker() as session, session.begin():
-            sms = await session.get(SmsMessage, sms_id)
-            link_ctx = await build_link_context(session)
-            return await process_sms_row(
-                session, sms, link_ctx, settle_provisional=True
-            )
-
-    first = await _settle()
-    assert first.transaction_id is not None
-    # A second settle reuses the same equal-balance credit.
-    second = await _settle()
-    assert second.transaction_id == first.transaction_id
-
-    async with maker() as session:
-        credits = (
-            (
-                await session.execute(
-                    select(Transaction).where(
-                        Transaction.account_id == acc_id,
-                        Transaction.direction == "credit",
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        assert len(credits) == 1
 
 
 async def _add_settled_credit(maker, acc_id, *, amount, day=8):

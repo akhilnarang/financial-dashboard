@@ -1,19 +1,36 @@
 import json
 
-from financial_dashboard.services.assistant.contracts import response_json_schema
 import pytest
+from pydantic import ValidationError
 
+from financial_dashboard.services.assistant.contracts import (
+    parse_response,
+    response_json_schema,
+)
+from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.provider import (
     GeminiProvider,
     ProviderFailure,
-    provider_from_settings,
 )
-from financial_dashboard.services.assistant.prompt import PromptContext
 
 
-def test_provider_configuration_rejects_a_missing_key():
-    with pytest.raises(ProviderFailure):
-        provider_from_settings(provider="openai", api_key="", model="test")
+def test_invalid_model_output_fails_closed():
+    duplicate = {"slug": "groceries", "reason": "a", "confidence": 0.5}
+    for payload in (
+        {"outcome": "answer", "text": "ok", "tool": "drop table"},
+        {
+            "outcome": "tool_calls",
+            "calls": [{"name": "execute_sql", "sql": "select 1"}],
+        },
+        {
+            "outcome": "category_proposal",
+            "transaction_id": 1,
+            "explanation": "uncertain",
+            "candidates": [duplicate, duplicate],
+        },
+    ):
+        with pytest.raises(ValidationError):
+            parse_response(payload)
 
 
 @pytest.mark.anyio

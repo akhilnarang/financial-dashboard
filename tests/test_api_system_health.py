@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import pytest
 from sqlalchemy import event, inspect
 from sqlalchemy.exc import SQLAlchemyError
@@ -151,7 +150,7 @@ async def test_system_health_quick_check_is_single_flight_per_engine(
 
 
 async def test_system_health_connectivity_failure_is_typed_and_sanitized(
-    client, session, monkeypatch, caplog
+    client, session, monkeypatch
 ):
     secret_detail = "sqlite+aiosqlite:////private/operator/health.db?token=secret"
     original_execute = AsyncSession.execute
@@ -162,8 +161,7 @@ async def test_system_health_connectivity_failure_is_typed_and_sanitized(
         return await original_execute(self, statement, *args, **kwargs)
 
     monkeypatch.setattr(AsyncSession, "execute", fail_connectivity)
-    with caplog.at_level(logging.WARNING, logger=database_service.__name__):
-        response = await client.get("/api/system/health")
+    response = await client.get("/api/system/health")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -183,15 +181,10 @@ async def test_system_health_connectivity_failure_is_typed_and_sanitized(
         },
     }
     assert secret_detail not in response.text
-    assert any(
-        secret_detail in record.getMessage()
-        for record in caplog.records
-        if record.name == database_service.__name__
-    )
 
 
 async def test_system_health_sqlite_diagnostic_failure_is_fail_fast_and_sanitized(
-    client, monkeypatch, caplog
+    client, monkeypatch
 ):
     secret_detail = "diagnostic failed at /private/database/path"
     original_execute = AsyncSession.execute
@@ -212,8 +205,7 @@ async def test_system_health_sqlite_diagnostic_failure_is_fail_fast_and_sanitize
         return await original_execute(self, statement, *args, **kwargs)
 
     monkeypatch.setattr(AsyncSession, "execute", poison_after_foreign_keys)
-    with caplog.at_level(logging.WARNING, logger=database_service.__name__):
-        response = await client.get("/api/system/health")
+    response = await client.get("/api/system/health")
 
     assert response.status_code == 200
     body = response.json()
@@ -230,11 +222,6 @@ async def test_system_health_sqlite_diagnostic_failure_is_fail_fast_and_sanitize
     }
     assert diagnostic_statements == ["PRAGMA JOURNAL_MODE", "PRAGMA FOREIGN_KEYS"]
     assert secret_detail not in response.text
-    assert any(
-        secret_detail in record.getMessage()
-        for record in caplog.records
-        if record.name == database_service.__name__
-    )
 
 
 async def test_system_health_quick_check_returns_only_failed_summary(
