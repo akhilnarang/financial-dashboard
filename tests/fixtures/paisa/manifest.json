@@ -2,23 +2,23 @@
   "artefacts": {
     "backends.meta.json": {
       "bytes": 379,
-      "sha256": "cfb6833889a177269e42b881fc70584e30c99248ce7438bd7095a41bed205f03"
+      "sha256": "d2ecd684786f7b67c995c7718906a97cfbe1904ad15262191c6e12ec50b7b530"
     },
     "beancount.journal": {
-      "bytes": 13452,
-      "sha256": "f85500ef1cb4f12708c0634a561e99363cede07c78771effd1d38be0a5b22442"
+      "bytes": 14465,
+      "sha256": "1f708c297829be3f3334164a1be6c6affdde6a2730150be0d50b0dd910e7dae1"
     },
     "dashboard-generated.ledger": {
-      "bytes": 12589,
-      "sha256": "5c04f766472a4301d6ed620ab3b8d5ca3c64d52b77562f39d6b2836eb9b5a13d"
+      "bytes": 13499,
+      "sha256": "e16fdcd5af6ffd896c99d94cb08a6373b903258c6373a32d1042209f0357c2f7"
     },
     "hledger.journal": {
-      "bytes": 13107,
-      "sha256": "cf8027e2bff932e00799a09b656452435f12fcced5588dc2826f401a599457a0"
+      "bytes": 14098,
+      "sha256": "0075929245841c9f446a5c907c3cceb1155bf8062222ed34cc335f05b3193272"
     },
     "ledger.journal": {
-      "bytes": 13107,
-      "sha256": "cf8027e2bff932e00799a09b656452435f12fcced5588dc2826f401a599457a0"
+      "bytes": 14098,
+      "sha256": "0075929245841c9f446a5c907c3cceb1155bf8062222ed34cc335f05b3193272"
     },
     "main.ledger": {
       "bytes": 366,
@@ -33,8 +33,8 @@
       "sha256": "2bd3b79f050dddc48245faf088a2108b6bed682315af85daf60566e913b2b7e6"
     },
     "user-authored.ledger": {
-      "bytes": 2125,
-      "sha256": "9696d59fe3da92c041c2eab77c6efb1d49d857ee2d037cbbdf496245d2cbedc9"
+      "bytes": 2246,
+      "sha256": "13889c19d00077750b20449d1e724a54113b1cb1899ca674fd9f526c1becce24"
     }
   },
   "as_of": "2026-07-15",
@@ -184,9 +184,9 @@
     "accounts": 9,
     "cards": 6,
     "cas_uploads": 3,
-    "categories": 38,
+    "categories": 42,
     "email_sources": 3,
-    "emails": 65,
+    "emails": 69,
     "extension_runs": 0,
     "extension_sync_state": 1,
     "fetch_rules": 6,
@@ -194,7 +194,7 @@
     "manual_items": 7,
     "sms_messages": 1,
     "statement_uploads": 5,
-    "transactions": 62
+    "transactions": 66
   },
   "generator_version": "1.4.1",
   "invariants": {
@@ -207,7 +207,7 @@
     "bulk_txn_id_base": 1000000,
     "fx_rate_count": 4,
     "journal_balanced": true,
-    "scenario_fingerprint": "d39243cfe4c4f4aa",
+    "scenario_fingerprint": "28d6a31ccd0ae6da",
     "stable_ids": true
   },
   "profile": "golden",

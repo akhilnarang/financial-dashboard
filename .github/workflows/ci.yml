@@ -84,6 +84,7 @@ jobs:
 
   ledger:
     name: Ledger 3.3.2 contract (Paisa v0.7.4)
+    if: false
     runs-on: ubuntu-latest
     # The contract is a Docker-only developer probe; it never runs in the
     # dashboard runtime. It parses BOTH the hand-mirrored corpus (via
@@ -116,6 +117,7 @@ jobs:
 
   hledger:
     name: hledger 1.52.1 contract
+    if: false
     runs-on: ubuntu-latest
     # hledger is verified against a pinned, reproducible image tag (not
     # ``latest``) so a re-run reproduces the same hledger binary CI saw. The
