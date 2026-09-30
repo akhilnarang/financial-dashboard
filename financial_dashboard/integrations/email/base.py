@@ -33,10 +33,6 @@ class EmailProvider(Protocol):
         existing_remote_ids: set[str],
     ) -> FetchSourceResult: ...
 
-    async def fetch_single(
-        self, source: EmailSource, remote_id: str
-    ) -> bytes | None: ...
-
 
 def get_provider(source: EmailSource) -> EmailProvider:
     # function-local: breaks cycle with integrations.email.imap_gmail and jmap_fastmail

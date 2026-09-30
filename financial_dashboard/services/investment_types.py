@@ -1,7 +1,7 @@
 """Typed values shared by investment transaction classification and consumers.
 
 These DTOs contain only source-derived CAS facts.  Keeping them independent of
-SQLAlchemy lets transaction classification and disposal allocation stay pure
+SQLAlchemy lets transaction classification stay pure
 and reusable by ingestion, diagnostics, and projection code.
 """
 
@@ -59,34 +59,3 @@ class CreateInvestmentLotsResult(NamedTuple):
 
     created: int
     exclusions: list[LotExclusion]
-
-
-class LotKey(NamedTuple):
-    """Stable source identity of one acquisition lot.
-
-    ``occurrence`` preserves multiplicity for the same source transaction
-    identity.  This compatibility key omits portfolio/cost facts; canonical
-    projection code uses its richer portfolio-scoped key.
-    """
-
-    instrument_id: str
-    source_ref: str
-    acquired_on: datetime.date
-    reference: str | None
-    occurrence: int
-
-
-class LotConsumption(NamedTuple):
-    """Read-only remaining-lot state derived from preserved CAS facts.
-
-    ``remaining`` contains only acquisition lots touched by deterministic
-    disposal allocation.  An absent key is untouched, zero means fully
-    consumed, and a positive value is the exact remaining quantity.
-
-    ``unresolved_instruments`` contains instruments for which at least one
-    disposal cannot be allocated without guessing.  Projection suppresses
-    every lot for such an instrument.
-    """
-
-    unresolved_instruments: set[str]
-    remaining: dict[LotKey, Decimal]

@@ -85,6 +85,7 @@ scripts/
   synth/                  Deterministic synthetic seed + offline Paisa 0.7.4
                            corpus generator (generate/load/verify/reset)
   paisa_contract.py       Optional Docker probe against ananthakumaran/paisa:v0.7.4
+  categorize_backfill.py  Drain the rule and LLM categorization sweeps by hand
 ```
 
 ## How to run

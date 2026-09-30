@@ -105,12 +105,6 @@ class UnprocessableEntityException(ApiException):
     status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
 
 
-class FailedDependencyException(ApiException):
-    """HTTP 424: an external resource required by the request is unavailable."""
-
-    status_code = status.HTTP_424_FAILED_DEPENDENCY
-
-
 class InternalServerException(ApiException):
     """HTTP 500: an internal resource disappeared or became inconsistent."""
 

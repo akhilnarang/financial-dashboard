@@ -30,7 +30,7 @@ def test_disabled_bootstrap_has_no_paisa_manifest_runtime_or_settings():
         )
 
         assert manager.all() == ()
-        assert manager.get_runtime("paisa") is None
+        assert "paisa" not in manager
         assert not any(key.startswith("paisa.") for key in SETTINGS_REGISTRY)
     finally:
         SETTINGS_REGISTRY.clear()

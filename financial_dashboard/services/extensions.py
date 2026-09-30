@@ -18,8 +18,6 @@ need periodic work ride the existing FetchService loop via
 """
 
 import logging
-from collections.abc import Iterator
-from typing import NamedTuple
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -33,15 +31,6 @@ from financial_dashboard.extensions import (
 logger = logging.getLogger(__name__)
 
 
-class ExtensionStatus(NamedTuple):
-    """Deterministic per-extension status snapshot for a status surface."""
-
-    id: str
-    display_name: str
-    has_runtime: bool
-    running: bool
-
-
 class ExtensionManager:
     """Holds the per-app ExtensionRegistry plus attached extension runtimes."""
 
@@ -50,8 +39,6 @@ class ExtensionManager:
             registry if registry is not None else ExtensionRegistry()
         )
         self._runtimes: dict[str, ExtensionRuntime] = {}
-        # extension_ids whose startup succeeded and shutdown has not yet run.
-        self._started: set[str] = set()
 
     # ------------------------------------------------------------------
     # Manifest accessors (backwards-compatible)
@@ -61,20 +48,11 @@ class ExtensionManager:
     def registry(self) -> ExtensionRegistry:
         return self._registry
 
-    def get(self, ext_id: str) -> ExtensionManifest | None:
-        return self._registry.get(ext_id)
-
     def all(self) -> tuple[ExtensionManifest, ...]:
         return self._registry.all()
 
     def __contains__(self, ext_id: object) -> bool:
         return ext_id in self._registry
-
-    def __iter__(self) -> Iterator[ExtensionManifest]:
-        return iter(self._registry)
-
-    def __len__(self) -> int:
-        return len(self._registry)
 
     # ------------------------------------------------------------------
     # Runtime registration
@@ -86,8 +64,7 @@ class ExtensionManager:
         ``ext_id`` must be a registered manifest id and ``runtime.extension_id``
         must match it, so a runtime can never be attached to the wrong manifest.
         A second runtime for the same id is rejected: silently replacing one
-        would lose lifecycle ownership of the original runtime and make the
-        manager's running status refer to the wrong object.
+        would lose lifecycle ownership of the original runtime.
         """
         if ext_id not in self._registry:
             raise ValueError(f"Cannot attach runtime: unknown extension {ext_id!r}")
@@ -105,15 +82,6 @@ class ExtensionManager:
             )
         self._runtimes[ext_id] = runtime
 
-    def get_runtime(self, ext_id: str) -> ExtensionRuntime | None:
-        return self._runtimes.get(ext_id)
-
-    def runtimes(self) -> tuple[ExtensionRuntime, ...]:
-        """Attached runtimes in deterministic (manifest registration) order."""
-        return tuple(
-            self._runtimes[m.id] for m in self._registry if m.id in self._runtimes
-        )
-
     # ------------------------------------------------------------------
     # Lifecycle (isolated per extension)
     # ------------------------------------------------------------------
@@ -122,7 +90,7 @@ class ExtensionManager:
         """Run ``startup`` on every attached runtime, in registration order.
 
         Failures are isolated: a raise in one extension is logged and the rest
-        still start. Only runtimes that started cleanly are marked running.
+        still start.
         """
         for manifest in self._registry:
             runtime = self._runtimes.get(manifest.id)
@@ -130,12 +98,11 @@ class ExtensionManager:
                 continue
             try:
                 await runtime.startup()
-                self._started.add(manifest.id)
             except Exception:
                 logger.exception("Extension %r startup failed; continuing", manifest.id)
 
     async def shutdown_all(self) -> None:
-        """Run ``shutdown`` on every attached runtime that started, best-effort.
+        """Run ``shutdown`` on every attached runtime, best-effort.
 
         Shutdown is always attempted for every runtime regardless of startup
         outcome (a runtime should tolerate shutdown-without-startup). Isolation
@@ -151,7 +118,6 @@ class ExtensionManager:
                 logger.exception(
                     "Extension %r shutdown failed; continuing", manifest.id
                 )
-        self._started.clear()
 
     async def after_fetch_cycle_all(self) -> None:
         """Invoke ``after_fetch_cycle`` once per attached runtime per cycle.
@@ -171,22 +137,6 @@ class ExtensionManager:
                 logger.exception(
                     "Extension %r after_fetch_cycle failed; continuing", manifest.id
                 )
-
-    # ------------------------------------------------------------------
-    # Deterministic status
-    # ------------------------------------------------------------------
-
-    def status(self) -> tuple[ExtensionStatus, ...]:
-        """A deterministic, manifest-ordered status snapshot for every extension."""
-        return tuple(
-            ExtensionStatus(
-                id=m.id,
-                display_name=m.display_name,
-                has_runtime=m.id in self._runtimes,
-                running=m.id in self._started,
-            )
-            for m in self._registry
-        )
 
 
 def bootstrap_extensions(
@@ -227,6 +177,5 @@ def _register_builtin_runtimes(
 
 __all__ = [
     "ExtensionManager",
-    "ExtensionStatus",
     "bootstrap_extensions",
 ]

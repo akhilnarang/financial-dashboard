@@ -15,7 +15,6 @@ from financial_dashboard.db import (
     Transaction,
 )
 from financial_dashboard.services.cc_disambiguation import (
-    find_cc_account_by_total_due,
     is_cc_payment_received_email,
     resolve_cc_payment_account,
     should_auto_reconcile_statement,
@@ -94,7 +93,7 @@ def test_payment_gates_accept_linked_bill_payment_credits_only():
     assert should_auto_reconcile_statement(_bare_txn(account_id=None)) is False
 
 
-# ---------- find_cc_account_by_total_due ----------
+# ---------- resolve: total-due match ----------
 
 
 @pytest.mark.anyio
@@ -109,8 +108,11 @@ async def test_multiple_matches_returns_none(session):
         ]
     )
     await session.flush()
-    out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
-    assert out is None
+    t = await _txn(session, amount=Decimal("133"))
+    out = await resolve_cc_payment_account(session, t)
+    assert t.account_id is None
+    assert out is not None
+    assert set(out["candidate_account_ids"]) == {a, b, c}
 
 
 @pytest.mark.anyio
@@ -130,8 +132,9 @@ async def test_paid_and_undated_statements_are_excluded(session):
         ]
     )
     await session.flush()
-    out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
-    assert out == c
+    t = await _txn(session, amount=Decimal("133"))
+    assert await resolve_cc_payment_account(session, t) is None
+    assert t.account_id == c
 
 
 @pytest.mark.anyio
@@ -152,8 +155,9 @@ async def test_only_latest_cycle_per_account_is_considered(session):
         ]
     )
     await session.flush()
-    out = await find_cc_account_by_total_due(session, "indusind", Decimal("133"))
-    assert out == b
+    t = await _txn(session, amount=Decimal("133"))
+    assert await resolve_cc_payment_account(session, t) is None
+    assert t.account_id == b
 
 
 # ---------- resolve_cc_payment_account ----------

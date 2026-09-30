@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 # systematic fault (bad key/model/quota), not one unlucky row.
 _MAX_CONSECUTIVE_FAILURES = 5
 
+# Stop retrying a review notification after this many failed sends.
+_MAX_NOTIFY_ATTEMPTS = 5
+
 
 def _needs_llm(txn: Transaction) -> bool:
     """Whether a row is still eligible for the LLM pass at write time.
@@ -112,11 +115,11 @@ async def run_llm_sweep(*, batch_limit: int = 100) -> int:
     return count
 
 
-async def run_review_notify(*, max_attempts: int = 5) -> int:
+async def run_review_notify() -> int:
     """Push rows flagged review_status='pending' to the Telegram review queue.
 
     Sends each pending transaction, marks it 'notified', and bumps
-    notify_attempts; a row is retried until it succeeds or hits max_attempts,
+    notify_attempts; a row is retried until it succeeds or hits _MAX_NOTIFY_ATTEMPTS,
     so a transient send failure never strands it. Returns the number sent;
     no-op (0) when Telegram isn't configured.
     """
@@ -139,7 +142,7 @@ async def run_review_notify(*, max_attempts: int = 5) -> int:
             .where(
                 Transaction.review_status == "pending",
                 (Transaction.notify_attempts.is_(None))
-                | (Transaction.notify_attempts < max_attempts),
+                | (Transaction.notify_attempts < _MAX_NOTIFY_ATTEMPTS),
             )
             .limit(50)
         )

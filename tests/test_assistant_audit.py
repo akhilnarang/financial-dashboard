@@ -19,7 +19,6 @@ from financial_dashboard.services.assistant.delivery import (
 )
 from financial_dashboard.services.assistant.evals import iter_audit_eval_rows
 from financial_dashboard.services.assistant.message_context import recover_ref_context
-from financial_dashboard.services.assistant.rendering import split_plain_text
 
 
 @pytest.mark.anyio
@@ -270,15 +269,6 @@ async def test_delivery_proof_rejects_unrelated_transaction_without_settling(ses
         transaction_id=10,
     )
     assert delivery.status == "pending"
-
-
-def test_split_plain_text_reserves_footer_on_every_chunk():
-    chunks = split_plain_text("one two three four", footer="Ref: token", limit=18)
-    assert len(chunks) > 1
-    assert all(len(chunk) <= 18 for chunk in chunks)
-    assert all(chunk.endswith("Ref: token") for chunk in chunks)
-    with pytest.raises(ValueError):
-        split_plain_text("hello", footer="x" * 20, limit=10)
 
 
 @pytest.mark.anyio

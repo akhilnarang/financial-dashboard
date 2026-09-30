@@ -137,8 +137,8 @@ async def test_retry_bank_parse_errors_set_status_by_kind(
 async def test_retry_bank_scopes_candidates_and_holds_back_contention(
     maker, statements_dir, monkeypatch, tmp_path
 ):
-    """A DB row far outside the statement period is not a candidate, so the
-    statement row imports. Two rows that claim one in-window DB row by
+    """A DB row far outside the statement period is not a candidate, even on
+    an exact reference. Two rows that claim one in-window DB row by
     reference are held back."""
     import financial_dashboard.services.statements.bank as bank_module
     from financial_dashboard.services.statements import shared as shared_module
@@ -158,7 +158,7 @@ async def test_retry_bank_scopes_candidates_and_holds_back_contention(
                     direction="debit",
                     amount=Decimal("1000.00"),
                     transaction_date=datetime.date(2026, 1, 5),
-                    reference_number="OLDFAR",
+                    reference_number="FARREF",
                 ),
                 Transaction(
                     account_id=acc_id,
@@ -178,6 +178,12 @@ async def test_retry_bank_scopes_candidates_and_holds_back_contention(
         statement_period_end="31/07/2026",
         transactions=[
             h.bank_txn(date="05/07/2026", amount="1,000.00", narration="JULY"),
+            h.bank_txn(
+                date="10/07/2026",
+                amount="1,000.00",
+                reference_number="FARREF",
+                narration="FAR",
+            ),
             h.bank_txn(
                 date="02/07/2026",
                 amount="500.00",
@@ -206,3 +212,8 @@ async def test_retry_bank_scopes_candidates_and_holds_back_contention(
         assert len(ambiguous) == 2
         txns = (await session.execute(select(Transaction))).scalars().all()
         assert len(txns) == 3
+        # The unique reference index blocks an import. The row must stay
+        # unmatched: out of scope, the far row is not a candidate.
+        far = next(e for e in recon["missing"] if e["narration"] == "FAR")
+        assert far["candidate_transaction_ids"] == []
+        assert far["duplicate"] is True

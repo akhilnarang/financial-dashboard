@@ -103,7 +103,9 @@ async def test_different_source_accounts_never_merge(session):
         outcome, row, _d = await merge_transaction(
             session,
             "email",
-            _email_txn(time=datetime.time(1, 5, 10), counterparty="Other Payee")
+            # 14s after the SMS: inside both time windows. Only the mask can
+            # divide the two events.
+            _email_txn(time=datetime.time(1, 4, 5), counterparty="Other Payee")
             | {"account_mask": "XX0002"},
             email_id=1,
         )
@@ -137,7 +139,8 @@ async def test_an_absent_mask_never_splits_a_true_pair(session):
 
 
 @pytest.mark.anyio
-async def test_matcher_does_not_merge_a_lone_email_minutes_away(session):
+@pytest.mark.parametrize("received_side", ["email", "sms"])
+async def test_matcher_does_not_merge_a_lone_email_minutes_away(session, received_side):
     """This is the worst condition for a supplied time. The email for
     payment A does not arrive, so the email slot of row A stays open. The
     email for a different payment B then arrives, and the SMS for B is also
@@ -146,17 +149,23 @@ async def test_matcher_does_not_merge_a_lone_email_minutes_away(session):
 
     An arrival time gives the time of the message and not the time of the
     event. Thus it gets a window of the measured size and not 10 minutes.
+    Each case sets the flag on one side only. Thus each side's window must
+    refuse the match alone.
     """
     async with session.begin():
         _o, first_row, _d = await merge_transaction(
-            session, "sms", _sms_txn(), sms_message_id=1
+            session,
+            "sms",
+            _sms_txn() | {"transaction_time_is_received_time": received_side == "sms"},
+            sms_message_id=1,
         )
 
     async with session.begin():
         outcome, row, _d = await merge_transaction(
             session,
             "email",
-            _email_txn(time=datetime.time(1, 7, 51), counterparty="Payee B"),
+            _email_txn(time=datetime.time(1, 7, 51), counterparty="Payee B")
+            | {"transaction_time_is_received_time": received_side == "email"},
             email_id=1,
         )
 

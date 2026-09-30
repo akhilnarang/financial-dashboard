@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.core.deps as core_deps
 import financial_dashboard.services.reminders as reminders_module
-from financial_dashboard.api import router as api_router
+from financial_dashboard.api import get_router as get_api_router
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.db import (
     Account,
@@ -44,7 +44,7 @@ async def session_maker(monkeypatch):
 
 def _build_test_app(maker):
     app = FastAPI()
-    app.include_router(api_router)
+    app.include_router(get_api_router(paisa_enabled=True))
 
     async def _override():
         async with maker() as s:

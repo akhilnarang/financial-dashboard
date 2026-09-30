@@ -340,9 +340,3 @@ class FastmailProvider:
             existing_remote_ids=existing_remote_ids,
             last_synced_at=source.last_synced_at,
         )
-
-    async def fetch_single(self, source, remote_id: str) -> bytes | None:
-        creds = decrypt_credentials(source.credentials)
-        return await asyncio.to_thread(
-            _fetch_fastmail_single_sync, creds.get("token", ""), remote_id
-        )

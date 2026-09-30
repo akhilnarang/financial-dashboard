@@ -46,7 +46,10 @@ from . import _helpers as h
 
 
 @pytest.mark.anyio
-async def test_cc_gates_return_none(maker, statements_dir):
+async def test_cc_gates_return_none(maker, statements_dir, monkeypatch):
+    monkeypatch.setattr(
+        cc_module, "_parse_pdf_bytes_sync", h.make_cc_parser(h.cc_parsed())
+    )
     await h.add_cc_account(maker)
     for subject in ("Your monthly offer", "Account statement for July 2026"):
         raw = h.email_with_pdf(subject=subject)
@@ -60,6 +63,9 @@ async def test_cc_gates_return_none(maker, statements_dir):
         "hdfc", msg.as_bytes(), "Credit card statement"
     )
     assert result is None
+
+    async with maker() as session:
+        assert (await session.execute(select(StatementUpload))).first() is None
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
-from financial_dashboard.extensions import enabled_builtin_extensions
 from financial_dashboard.schemas.extensions import PaisaConfigInput
 from financial_dashboard.services.paisa import surface
 from financial_dashboard.services.paisa.renderers.beancount import quote_string
@@ -33,20 +32,12 @@ paisa_router = APIRouter()
 _SETUP_PATH_PLACEHOLDER = "/absolute/path/to/financial-dashboard.journal"
 
 
-def _manifests(request: FastAPIRequest):
-    manager = getattr(request.app.state, "extension_manager", None)
-    if manager is not None:
-        return manager.all()
-    paisa_enabled = getattr(request.app.state, "paisa_enabled", True)
-    return enabled_builtin_extensions(paisa_enabled=paisa_enabled)
-
-
 @framework_router.get("/extensions", response_class=HTMLResponse)
 async def extensions_index(
     request: FastAPIRequest,
     session: AsyncSession = Depends(get_session),
 ):
-    manifests = _manifests(request)
+    manifests = request.app.state.extension_manager.all()
     extensions = [surface.extension_info(m) for m in manifests]
     return templates.TemplateResponse(
         request,
@@ -357,10 +348,6 @@ def get_router(*, paisa_enabled: bool) -> APIRouter:
     if paisa_enabled:
         aggregate.include_router(paisa_router)
     return aggregate
-
-
-# Backwards-compatible full router for domain-level tests and direct imports.
-router = get_router(paisa_enabled=True)
 
 
 def _short_error(exc: Exception) -> str:

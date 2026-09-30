@@ -181,8 +181,10 @@ async def test_reparse_all_pending_and_error(session, client):
     assert resp.status_code == 200
     data = resp.json()
     # good → processed; bad → still_error; skipped is not in the target set.
-    assert data["processed"] >= 1
-    assert data["still_error"] >= 1
+    assert data["processed"] == 1
+    assert data["still_error"] == 1
+    await session.refresh(good)
+    assert good.status == "parsed"
     # The "skipped" row stays untouched.
     await session.refresh(skipped)
     assert skipped.status == "skipped"

@@ -87,14 +87,6 @@ def parse_date(
     return parsed.date() if parsed else None
 
 
-def format_ddmmyyyy(value: date | datetime | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, datetime):
-        value = value.date()
-    return value.strftime("%d/%m/%Y")
-
-
 def email_received_at_ist(received_at: datetime) -> datetime:
     """Convert an email Date header to IST.
 

@@ -23,10 +23,6 @@ Public API:
        b. Outstanding match: amount == total_amount_due - payment_paid_amount.
        c. Sole outstanding: only one card has remaining balance > 0.
        d. All fail → Telegram disambiguation prompt.
-
-- ``find_cc_account_by_total_due(session, bank, amount, *, candidate_ids=...)``
-  remains exposed for tests and for callers that need the lower-level
-  amount-match step independently.
 """
 
 import logging
@@ -170,12 +166,11 @@ def _parse_outstanding(upload: StatementUpload) -> Decimal | None:
     return due - paid
 
 
-async def find_cc_account_by_total_due(
+async def _find_cc_account_by_total_due(
     session: AsyncSession,
     bank: str,
     amount: Decimal,
-    *,
-    candidate_ids: list[int] | None = None,
+    candidate_ids: list[int],
 ) -> int | None:
     """Resolve a maskless CC payment to a single account by matching
     ``amount`` against an active statement's ``total_amount_due``.
@@ -184,20 +179,12 @@ async def find_cc_account_by_total_due(
     ``bank`` has an active (unpaid/partially-paid/late) statement whose
     total matches ``amount`` exactly. Returns ``None`` on zero or
     multiple hits (caller falls back to outstanding-based fallbacks).
-
-    ``candidate_ids`` may be passed when the caller has already loaded
-    the CC candidate set (avoids a redundant DB query).
     """
     from financial_dashboard.services.reminders import (
         ACTIVE_STATUSES,
         latest_per_account,
     )
     from financial_dashboard.services.statements.cc import parse_cc_amount
-
-    if candidate_ids is None:
-        candidate_ids = [c.id for c in await _load_cc_candidates(session, bank)]
-    if len(candidate_ids) < 2:
-        return None
 
     uploads = (
         (
@@ -309,11 +296,8 @@ async def resolve_cc_payment_account(
         return None
 
     candidate_ids = [c.id for c in candidates]
-    amount_match = await find_cc_account_by_total_due(
-        session,
-        txn_row.bank,
-        txn_row.amount,
-        candidate_ids=candidate_ids,
+    amount_match = await _find_cc_account_by_total_due(
+        session, txn_row.bank, txn_row.amount, candidate_ids
     )
     if amount_match is not None:
         txn_row.account_id = amount_match

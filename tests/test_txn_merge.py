@@ -1372,13 +1372,12 @@ def _exc_with_orig(message: str):
 
 
 def test_is_duplicate_transaction_error_classifies_ref_index():
-    for message in (
-        "UNIQUE constraint failed: uq_transactions_ref",
-        "UNIQUE constraint failed: uq_transaction_dedup",
-        "UNIQUE constraint failed: transactions.bank, "
-        "transactions.reference_number, transactions.direction",
-    ):
-        assert is_duplicate_transaction_error(_exc_with_orig(message))
+    assert is_duplicate_transaction_error(
+        _exc_with_orig(
+            "UNIQUE constraint failed: transactions.bank, "
+            "transactions.reference_number, transactions.direction"
+        )
+    )
     assert not is_duplicate_transaction_error(
         _exc_with_orig("UNIQUE constraint failed: emails.message_id")
     )

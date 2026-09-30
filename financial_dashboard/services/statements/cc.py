@@ -1983,7 +1983,6 @@ async def process_statement_email(
                 "matched": 0,
                 "missing": 0,
                 "imported": 0,
-                "deduped": True,
             }
 
     # Reconcile

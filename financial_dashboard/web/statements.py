@@ -72,7 +72,6 @@ from financial_dashboard.services.statements.cc import (
     reconciliation_to_json,
 )
 from financial_dashboard.services.statements.shared import (
-    retry_bank_statement_upload,
     retry_cc_statement_upload,
 )
 from financial_dashboard.services.statements.skip_summary import import_skip_summary
@@ -467,8 +466,6 @@ async def statement_retry(
             session,
             account_id,
             password,
-            retry_cc_upload=retry_cc_statement_upload,
-            retry_bank_upload=retry_bank_statement_upload,
         )
 
     return RedirectResponse(url=f"/statements/{upload_id}", status_code=303)

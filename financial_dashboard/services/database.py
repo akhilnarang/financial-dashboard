@@ -216,11 +216,6 @@ def _busy_timeout(value: object | None) -> int | None:
     return value if type(value) is int and value >= 0 else None
 
 
-def _reset_quick_check_cache() -> None:
-    """Clear process-local quick-check state for test isolation."""
-    _quick_check_cache.clear()
-
-
 def _quick_check_cache_state(engine: Engine) -> _QuickCheckCacheState:
     """Return or create the quick-check cache associated with an Engine."""
     state = _quick_check_cache.get(engine)

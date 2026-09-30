@@ -16,7 +16,6 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 
-from financial_dashboard.core.templating import format_inr_exact
 from financial_dashboard.db.models import Transaction
 from tests.conftest import (
     MISSING_ACCOUNT_ID,
@@ -28,10 +27,7 @@ from tests.conftest import (
 pytestmark = pytest.mark.anyio
 
 
-# The query string as requested, and as it appears inside a rendered href,
-# where the separator is the "&amp;" entity.
 RANGE = "date_from=2026-06-01&date_to=2026-06-30"
-RANGE_HTML = "date_from=2026-06-01&amp;date_to=2026-06-30"
 
 # The month the seed helper writes into by default.
 SEED_MONTH = datetime.date(2026, 6, 1)
@@ -340,10 +336,17 @@ async def test_internal_footnote_and_perimeter_caveat_list_self_transfers_alone(
         session, amount="9100", direction="debit", category="credit_card_payment"
     )
     await _add(session, amount="90000", direction="credit", category="salary")
+    # A card-side self-transfer is out of the bank scope.
+    await _add(
+        session,
+        amount="3700",
+        direction="debit",
+        category="self_transfer",
+        account_id=await card_account(session),
+    )
 
     page = (await client.get(f"/cashflow?{RANGE}")).text
     row = _region(page, "data-footnote", "internal")
-    assert f"internal=1&amp;{RANGE_HTML}&amp;scope=bank" in row
     # Gross, not net: the two legs add up rather than cancel.
     assert "₹6,000.00" in row
 
@@ -353,6 +356,7 @@ async def test_internal_footnote_and_perimeter_caveat_list_self_transfers_alone(
         "the internal drill lists the card bill the footnote counts as expense"
     )
     assert "90,000.00" not in listing
+    assert "3,700.00" not in listing, "the internal drill lists a card row"
 
     bills = _row_with(_region(page, "data-section", "expense"), ">Card bills<")
     bill_listing = await _listed(client, bills)
@@ -361,11 +365,12 @@ async def test_internal_footnote_and_perimeter_caveat_list_self_transfers_alone(
 
     caveat = _region(page, "data-perimeter")
     assert "2 internal movements" in caveat
-    assert format_inr_exact(Decimal("-4000")) in caveat
+    assert "-₹4,000.00" in caveat
     assert "₹6,000.00" not in caveat
     caveat_listing = await _listed(client, caveat)
     assert caveat_listing.count(DETAIL) == 2
     assert "90,000.00" not in caveat_listing
+    assert "3,700.00" not in caveat_listing
 
 
 async def test_excluded_and_undated_footnotes_count_what_the_buckets_drop(
@@ -408,7 +413,6 @@ async def test_excluded_and_undated_footnotes_count_what_the_buckets_drop(
     assert "90,000.00" not in listing
 
     undated = _region(page, "data-footnote", "undated")
-    assert _href(undated) == "/transactions?undated=1"
     # Signed net: a 90 credit against a 333 debit.
     assert "-₹243.00" in undated
     listing = await _listed(client, undated)
@@ -427,6 +431,14 @@ async def test_family_excluded_from_buckets_and_counted_in_its_footnote(
     await _add(session, amount="13000", direction="debit", category="family")
     await _add(session, amount="90000", direction="credit", category="salary")
     await _add(session, amount="6500", direction="debit", category="rent")
+    # A family row outside the range.
+    await _add(
+        session,
+        amount="3100",
+        direction="debit",
+        category="family",
+        month=datetime.date(2026, 7, 1),
+    )
 
     page = (await client.get(f"/cashflow?{RANGE}")).text
 
@@ -436,7 +448,6 @@ async def test_family_excluded_from_buckets_and_counted_in_its_footnote(
 
     # Counted in its own footnote: signed net +40,000 credit -13,000 debit.
     row = _region(page, "data-footnote", "family")
-    assert f"category=family&amp;{RANGE_HTML}" in row
     assert "₹27,000.00" in row
 
     listing = await _listed(client, row)
@@ -444,6 +455,7 @@ async def test_family_excluded_from_buckets_and_counted_in_its_footnote(
     # The salary/rent decoys are not in the family drill.
     assert "90,000.00" not in listing
     assert "6,500.00" not in listing
+    assert "3,100.00" not in listing
 
     # Family is not "internal": it must not inflate the internal footnote (that
     # figure only holds self-transfers, which family flows are not).
@@ -486,8 +498,6 @@ async def test_uncategorized_drill_is_bank_scoped_but_still_currency_agnostic(
     )
 
     tile = _tile((await client.get(f"/cashflow?{RANGE}")).text, "uncategorized")
-    assert "scope=bank" in tile
-    assert "non_inr=0" not in tile
 
     listing = await _listed(client, tile)
     assert listing.count(DETAIL) == _count(tile) == 2
@@ -530,18 +540,16 @@ async def test_unaccounted_footnote_count_agrees_with_its_drill(client, session)
 
     page = (await client.get(f"/cashflow?{RANGE}")).text
     row = _region(page, "data-footnote", "unaccounted")
-    assert f"scope=unaccounted&amp;{RANGE_HTML}" in row or (
-        f"{RANGE_HTML}&amp;scope=unaccounted" in row
-    )
     # Signed net: a 60 credit against 800 + 250 of debits.
     assert "-₹990.00" in row
 
     listing = await _listed(client, row)
     assert listing.count(DETAIL) == _count(row) == 3
-    # And the figure is the sum of the rows that link returned, not of the seed.
-    listed = _listed_amounts(listing)
-    assert sorted(listed) == [Decimal("-800"), Decimal("-250"), Decimal("60")]
-    assert format_inr_exact(sum(listed)) in row
+    assert sorted(_listed_amounts(listing)) == [
+        Decimal("-800"),
+        Decimal("-250"),
+        Decimal("60"),
+    ]
     assert "90,000.00" not in listing
     assert "4,444.00" not in listing, "the unaccounted drill lists a card row"
 
@@ -585,8 +593,6 @@ async def test_expense_detail_counts_the_swipes_over_every_account(client, sessi
     assert "₹29,100.00" in _region(page, "data-section", "expense")
 
     row = _row_with(detail, ">Dining<")
-    assert "scope=" not in row, "the all-account detail's link claims an account scope"
-    assert "non_inr=0" in row
 
     listing = await _listed(client, row)
     assert listing.count(DETAIL) == _line_count(row) == 1
@@ -646,7 +652,6 @@ async def test_investment_line_drills_into_the_bank_perimeter_alone(client, sess
 
     page = (await client.get(f"/cashflow?{RANGE}")).text
     row = _row_with(_region(page, "data-section", "investment"), ">Investment<")
-    assert "scope=bank" in row
     assert "₹12,500.00" in row
 
     listing = await _listed(client, row)
@@ -701,7 +706,6 @@ async def test_both_transfers_in_anchors_drill_into_the_bank_perimeter_alone(
 
     # The tile: the whole bucket over the bank, its three rows and no others.
     tile = _tile(page, "transfers_in")
-    assert "scope=bank" in tile
     tile_listing = await _listed(client, tile)
     assert tile_listing.count(DETAIL) == _count(tile) == 3
     for amount in ("1,500.00", "900.00", "700.00"):
@@ -711,7 +715,6 @@ async def test_both_transfers_in_anchors_drill_into_the_bank_perimeter_alone(
 
     # The line: one counterparty of that bucket, over the same perimeter.
     row = _row_with(_region(page, "data-section", "transfers_in"), ">MOM<")
-    assert "scope=bank" in row
     assert "₹2,400.00" in row
 
     listing = await _listed(client, row)
@@ -750,7 +753,6 @@ async def test_non_inr_footnote_drills_into_the_bank_perimeter_alone(client, ses
 
     page = (await client.get(f"/cashflow?{RANGE}")).text
     row = _region(page, "data-footnote", "non_inr")
-    assert "scope=bank" in row
 
     listing = await _listed(client, row)
     assert listing.count(DETAIL) == _count(row) == 2

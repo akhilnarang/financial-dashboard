@@ -146,8 +146,23 @@ async def test_resolver_reports_already_resolved_from_reverse_link(
 async def test_resolver_rejects_target_drift(session, monkeypatch):
     _patch_parsers(monkeypatch, _parsed())
     sms_id, target_id = await _seed_deferred(session)
-    target = await session.get(Transaction, target_id)
-    target.amount = Decimal("300.00")
+    # A row with the SMS balance appears after the defer. The matcher now
+    # picks it, but the target itself stays compatible.
+    session.add(
+        Transaction(
+            bank="samplebank",
+            email_type="sample_debit_alert",
+            direction="debit",
+            amount=Decimal("246.80"),
+            currency="INR",
+            transaction_date=datetime.date(2026, 8, 12),
+            transaction_time=datetime.time(10, 15),
+            counterparty="Synthetic Shop",
+            balance=Decimal("5753.20"),
+            source="email",
+            email_id=43,
+        )
+    )
     await session.commit()
 
     with pytest.raises(SmsDuplicateResolutionError, match="no longer a compatible"):

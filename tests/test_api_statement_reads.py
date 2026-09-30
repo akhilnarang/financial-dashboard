@@ -130,11 +130,51 @@ async def _seed_statements(session):
 
 async def test_statement_lists_filter_redact_and_paginate(client, session):
     account, email, _, cc, bank, _, _ = await _seed_statements(session)
+    other_account = Account(bank="SyntheticBank", label="Other", type="credit_card")
+    other_email = Email(provider="synthetic", message_id="other", status="parsed")
+    session.add_all([other_account, other_email])
+    await session.flush()
+    match = {
+        "account_id": account.id,
+        "email_id": email.id,
+        "bank": "SyntheticBank",
+        "status": "partial_import",
+        "created_at": datetime.datetime(2030, 1, 3),
+    }
+    # Each decoy misses exactly one filter.
+    decoys = [
+        StatementUpload(
+            filename=f"decoy-{index}.pdf",
+            file_path=f"/private/decoy-{index}.pdf",
+            **(match | change),
+        )
+        for index, change in enumerate(
+            (
+                {"account_id": other_account.id},
+                {"email_id": other_email.id},
+                {"bank": "OtherBank"},
+                {"status": "parsed"},
+                {"created_at": datetime.datetime(2030, 1, 2)},
+                {"created_at": datetime.datetime(2030, 1, 4)},
+            )
+        )
+    ]
+    bank_decoy = BankStatementUpload(
+        account_id=account.id,
+        bank="SyntheticBank",
+        filename="d.pdf",
+        file_path="/private/d.pdf",
+        status="failed",
+    )
+    session.add_all([*decoys, bank_decoy])
+    await session.commit()
+
+    response = await client.get("/api/statements/cc", params={"statement_id": cc.id})
+    assert response.json()["total_count"] == 1
 
     response = await client.get(
         "/api/statements/cc",
         params={
-            "statement_id": cc.id,
             "account_id": account.id,
             "email_id": email.id,
             "bank": "syntheticbank",
@@ -148,6 +188,7 @@ async def test_statement_lists_filter_redact_and_paginate(client, session):
     body = response.json()
     assert body["total_count"] == 1
     item = body["items"][0]
+    assert item["id"] == cc.id
     assert item["card_mask"] == "XXXX9876"
     assert item["error"] == "C" * 1_000
     assert item["error_truncated"] is True
@@ -162,11 +203,13 @@ async def test_statement_lists_filter_redact_and_paginate(client, session):
 
     response = await client.get(
         "/api/statements/bank",
-        params={"statement_id": bank.id, "bank": "syntheticbank", "status": "imported"},
+        params={"bank": "syntheticbank", "status": "imported"},
     )
 
     assert response.status_code == 200, response.text
+    assert response.json()["total_count"] == 1
     item = response.json()["items"][0]
+    assert item["id"] == bank.id
     assert item["account_mask"] == "XXXX1234"
     assert item["opening_balance"] == "500.00"
     assert item["closing_balance"] == "600.00"
@@ -190,7 +233,7 @@ async def test_statement_lists_filter_redact_and_paginate(client, session):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["total_count"] == 4
+    assert body["total_count"] == 1 + len(decoys) + 3
     assert [item["id"] for item in body["items"]] == [rows[1].id, rows[0].id]
 
 

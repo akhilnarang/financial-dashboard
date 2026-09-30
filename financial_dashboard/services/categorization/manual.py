@@ -2,7 +2,6 @@
 
 from enum import StrEnum
 from difflib import SequenceMatcher
-import logging
 from typing import NamedTuple
 
 from sqlalchemy import select, text
@@ -23,7 +22,6 @@ from financial_dashboard.services.categorization.vocabulary import (
     ensure_category,
     get_vocab_version,
     is_valid_slug,
-    refresh_vocab_cache,
 )
 
 
@@ -44,9 +42,6 @@ class CategoryAssignment(NamedTuple):
 
     ok: bool
     slug: str | None
-
-
-logger = logging.getLogger(__name__)
 
 
 async def resolve_assistant_category_slug(
@@ -88,28 +83,15 @@ async def assign_category_manual(
     raw_category: str,
     *,
     actor: str = "user",
-    create: bool = False,
 ) -> CategoryAssignment:
     """Set a transaction's category by hand (authoritative; sweeps never override).
 
-    By default the slug must already exist in the controlled vocabulary — a typo
-    like 'goceries' is rejected rather than silently minting a junk category
-    (same guard as add_merchant_rule). Pass create=True to deliberately add a
-    brand-new category.
+    The slug must already exist in the controlled vocabulary. A typo like
+    'goceries' is rejected. It does not mint a junk category.
     """
-    result = await assign_category_no_commit(
-        session, txn_id, raw_category, actor=actor, create=create
-    )
+    result = await assign_category_no_commit(session, txn_id, raw_category, actor=actor)
     if result[0]:
         await session.commit()
-        if create:
-            try:
-                await refresh_vocab_cache(session)
-            except Exception:
-                logger.exception(
-                    "Category committed but vocabulary cache refresh failed; "
-                    "the fetch cycle will retry"
-                )
     return result
 
 
@@ -119,7 +101,6 @@ async def assign_category_no_commit(
     raw_category: str,
     *,
     actor: str = "user",
-    create: bool = False,
     direction_policy: CategoryDirectionPolicy = CategoryDirectionPolicy.EXPLICIT_MANUAL_OVERRIDE,
     preserve_decision_id: int | None = None,
 ) -> CategoryAssignment:
@@ -145,17 +126,16 @@ async def assign_category_no_commit(
     if not is_valid_slug(slug):
         return CategoryAssignment(False, None)
 
-    if not create:
-        existing_category = await session.scalar(
-            select(Category).where(Category.slug == slug)
-        )
-        if existing_category is None:
-            return CategoryAssignment(False, None)
-        if (
-            direction_policy == CategoryDirectionPolicy.INFERRED_STRICT
-            and not existing_category.active
-        ):
-            return CategoryAssignment(False, None)
+    existing_category = await session.scalar(
+        select(Category).where(Category.slug == slug)
+    )
+    if existing_category is None:
+        return CategoryAssignment(False, None)
+    if (
+        direction_policy == CategoryDirectionPolicy.INFERRED_STRICT
+        and not existing_category.active
+    ):
+        return CategoryAssignment(False, None)
 
     if direction_policy == CategoryDirectionPolicy.INFERRED_STRICT:
         account_type = None

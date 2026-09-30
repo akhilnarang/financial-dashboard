@@ -1,37 +1,13 @@
 """Email attachment locking protocol regressions."""
 
-from unittest.mock import AsyncMock, MagicMock
-
 import pytest
-from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from financial_dashboard.db import Base, Email, Transaction
+from financial_dashboard.db import Base, Transaction
 from financial_dashboard.services.email_attachments import (
     TransactionSlotConflict,
     claim_transaction_source_slot,
-    lock_email_for_attachment,
 )
-
-
-@pytest.mark.anyio
-async def test_row_locking_database_uses_email_select_for_update():
-    session = AsyncMock(spec=AsyncSession)
-    bind = MagicMock()
-    bind.dialect.name = "postgresql"
-    session.get_bind.return_value = bind
-    email = Email(id=42, provider="gmail", message_id="attachment-lock")
-    scalar_result = MagicMock()
-    scalar_result.one_or_none.return_value = email
-    session.scalars.return_value = scalar_result
-
-    locked = await lock_email_for_attachment(session, email.id)
-
-    assert locked is email
-    session.execute.assert_not_awaited()
-    statement = session.scalars.await_args.args[0]
-    compiled = str(statement.compile(dialect=postgresql.dialect()))
-    assert "FOR UPDATE" in compiled
 
 
 @pytest.mark.anyio

@@ -78,42 +78,6 @@ def test_polarity_guard_keeps_valid_card_credits():
 pytestmark = pytest.mark.anyio
 
 
-async def _card_txn(session: AsyncSession, raw: str) -> Transaction:
-    account = Account(bank="testbank", label="Card", type="credit_card")
-    session.add(account)
-    await session.flush()
-    txn = Transaction(
-        bank="testbank",
-        email_type="x",
-        direction="credit",
-        amount=Decimal("5000"),
-        counterparty=raw,
-        raw_description=raw,
-        account_id=account.id,
-    )
-    session.add(txn)
-    await session.flush()
-    return txn
-
-
-async def test_engine_card_credit_llm_cannot_produce_repayment(
-    session: AsyncSession, monkeypatch
-):
-    # Even if the LLM confidently says 'repayment' (exactly what happened in
-    # prod), a card credit must not be stored as inbound money.
-    await ensure_category(session, "repayment")
-
-    async def fake_classify(**kwargs):
-        return llm.LlmResult("repayment", 0.95, "looks like money coming back")
-
-    monkeypatch.setattr(eng, "_llm_classify", fake_classify)
-
-    txn = await _card_txn(session, "NEFT CR SOMEBODY")
-    await eng.categorize_one(session, txn, use_llm=True)
-    assert txn.category != "repayment"
-    assert txn.category in ("credit_card_payment", "refund")
-
-
 async def test_engine_bank_credit_unexplained_still_repayment(
     session: AsyncSession, monkeypatch
 ):

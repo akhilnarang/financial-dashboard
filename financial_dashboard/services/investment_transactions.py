@@ -1,24 +1,21 @@
-"""Pure CAS investment transaction classification and disposal allocation.
+"""Pure CAS investment transaction classification.
 
 This module deliberately knows nothing about SQLAlchemy.  It converts explicit
-CAS transaction facts into complete acquisition lots or stable exclusions, and
-conservatively nets disposals only when the source identifies an exact lot.
+CAS transaction facts into complete acquisition lots or stable exclusions.
 """
 
 import datetime
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
-from typing import NamedTuple
 
 from financial_dashboard.core.dates import parse_date
 from financial_dashboard.services.investment_types import (
     CompleteLot,
     LotClassificationResult,
-    LotConsumption,
     LotExclusion,
     LotExtractionResult,
-    LotKey,
 )
+
 
 # CAS is an Indian depository statement; every amount it prints is INR.  This
 # is a fact about the document, not a fabricated currency.
@@ -33,19 +30,6 @@ _LOT_AGREEMENT_TOLERANCE = Decimal("0.01")
 # lower-cased substrings.  Unknown values remain ambiguous rather than guessed.
 _ACQUISITION_TYPES = ("purchase", "switch_in", "switch-in", "buy", "allotment")
 _DISPOSAL_TYPES = ("redemption", "switch_out", "switch-out", "sell", "sold")
-
-
-class _AcquisitionFact(NamedTuple):
-    key: LotKey
-    quantity: Decimal
-
-
-class _DisposalFact(NamedTuple):
-    source_ref: str
-    quantity: Decimal | None
-    disposed_on: datetime.date | None
-    reference: str | None
-    order: int
 
 
 def _to_decimal(value) -> Decimal | None:
@@ -233,212 +217,3 @@ def extract_lots_from_payload(payload: dict) -> LotExtractionResult:
         elif exclusion is not None:
             exclusions.append(exclusion)
     return LotExtractionResult(lots=lots, exclusions=exclusions)
-
-
-def _txn_isin(raw: dict) -> str | None:
-    isin = raw.get("isin")
-    if isinstance(isin, str) and isin.strip():
-        return isin.strip().upper()
-    return None
-
-
-def _txn_is_disposal(raw: dict) -> bool:
-    """Whether a CAS transaction disposes units."""
-    ttype_raw = raw.get("transaction_type")
-    ttype = (
-        str(ttype_raw).strip().lower()
-        if isinstance(ttype_raw, str) and ttype_raw.strip()
-        else ""
-    )
-    return bool(ttype) and any(marker in ttype for marker in _DISPOSAL_TYPES)
-
-
-def _txn_is_acquisition(raw: dict) -> bool:
-    """Whether a CAS transaction acquires units."""
-    ttype_raw = raw.get("transaction_type")
-    ttype = (
-        str(ttype_raw).strip().lower()
-        if isinstance(ttype_raw, str) and ttype_raw.strip()
-        else ""
-    )
-    return bool(ttype) and any(marker in ttype for marker in _ACQUISITION_TYPES)
-
-
-def _normalized_ref(value) -> str:
-    return str(value).strip() if value is not None else ""
-
-
-def _normalized_reference(value) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    return value.strip()
-
-
-def _allocate_exact(
-    disposal: _DisposalFact,
-    acquisitions: list[_AcquisitionFact],
-    remaining: dict[LotKey, Decimal],
-) -> bool:
-    """Consume a disposal only when its source facts identify one lot."""
-    active = [lot for lot in acquisitions if remaining[lot.key] > 0]
-    if not active or disposal.quantity is None or disposal.quantity <= 0:
-        return False
-
-    if disposal.reference:
-        exact = [lot for lot in active if lot.key.reference == disposal.reference]
-        if len(exact) > 1:
-            return False
-        if len(exact) == 1:
-            lot = exact[0]
-            if (
-                disposal.disposed_on is not None
-                and lot.key.acquired_on > disposal.disposed_on
-            ):
-                return False
-            if disposal.quantity > remaining[lot.key]:
-                return False
-            remaining[lot.key] -= disposal.quantity
-            return True
-
-    eligible = [
-        lot
-        for lot in active
-        if disposal.disposed_on is None or lot.key.acquired_on <= disposal.disposed_on
-    ]
-    if len(eligible) != 1:
-        return False
-    lot = eligible[0]
-    if disposal.quantity > remaining[lot.key]:
-        return False
-    remaining[lot.key] -= disposal.quantity
-    return True
-
-
-def resolve_lot_consumption(payloads) -> LotConsumption:
-    """Conservatively net disposals from explicit CAS source facts.
-
-    Allocation is scoped by instrument and source reference.  An exact
-    transaction reference identifying one active acquisition wins; otherwise
-    the bucket must contain exactly one active acquisition.  Missing,
-    conflicting, future, or over-disposal facts mark the instrument unresolved
-    instead of inferring FIFO or another allocation policy.
-    """
-    acquisitions: dict[str, dict[str, list[_AcquisitionFact]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    disposals: dict[str, list[_DisposalFact]] = defaultdict(list)
-    ambiguous_acquisitions: dict[str, dict[str, set[str | None]]] = defaultdict(
-        lambda: defaultdict(set)
-    )
-    occurrences: dict[tuple[str, str, datetime.date, str | None], int] = defaultdict(
-        int
-    )
-    order = 0
-    for payload in payloads or ():
-        if not isinstance(payload, dict):
-            continue
-        for raw in payload.get("transactions") or []:
-            if not isinstance(raw, dict):
-                continue
-            isin = _txn_isin(raw)
-            if isin is None:
-                continue
-            order += 1
-            if _txn_is_disposal(raw):
-                units = _to_decimal(raw.get("units"))
-                date_raw = raw.get("date")
-                disposals[isin].append(
-                    _DisposalFact(
-                        source_ref=_normalized_ref(raw.get("source_ref")),
-                        quantity=abs(units) if units is not None else None,
-                        disposed_on=(
-                            parse_date(str(date_raw)) if date_raw is not None else None
-                        ),
-                        reference=_normalized_reference(raw.get("reference")),
-                        order=order,
-                    )
-                )
-                continue
-            if not _txn_is_acquisition(raw):
-                continue
-            lot, _exclusion = _classify_transaction(raw)
-            if lot is None:
-                ref = _normalized_ref(raw.get("source_ref"))
-                if ref:
-                    ambiguous_acquisitions[isin][ref].add(
-                        _normalized_reference(raw.get("reference"))
-                    )
-                continue
-            natural = (
-                lot.instrument_id,
-                _normalized_ref(lot.source_ref),
-                lot.acquired_on,
-                _normalized_reference(lot.reference),
-            )
-            occurrence = occurrences[natural]
-            occurrences[natural] += 1
-            key = LotKey(*natural, occurrence)
-            acquisitions[isin][key.source_ref].append(
-                _AcquisitionFact(key=key, quantity=lot.quantity)
-            )
-
-    unresolved: set[str] = set()
-    original: dict[LotKey, Decimal] = {
-        lot.key: lot.quantity
-        for by_ref in acquisitions.values()
-        for lots in by_ref.values()
-        for lot in lots
-    }
-    resolved_remaining = dict(original)
-
-    for isin, instrument_disposals in disposals.items():
-        by_ref = acquisitions.get(isin, {})
-        ordered = sorted(
-            instrument_disposals,
-            key=lambda disposal: (
-                disposal.disposed_on is None,
-                disposal.disposed_on or datetime.date.max,
-                disposal.order,
-            ),
-        )
-        for disposal in ordered:
-            if not disposal.source_ref or disposal.quantity is None:
-                unresolved.add(isin)
-                break
-            candidates = by_ref.get(disposal.source_ref, [])
-            ambiguous_references = ambiguous_acquisitions.get(isin, {}).get(
-                disposal.source_ref, set()
-            )
-            if ambiguous_references:
-                exact_complete = [
-                    lot
-                    for lot in candidates
-                    if resolved_remaining[lot.key] > 0
-                    and disposal.reference
-                    and lot.key.reference == disposal.reference
-                ]
-                if (
-                    disposal.reference is None
-                    or disposal.reference in ambiguous_references
-                    or len(exact_complete) != 1
-                ):
-                    unresolved.add(isin)
-                    break
-            if not _allocate_exact(disposal, candidates, resolved_remaining):
-                unresolved.add(isin)
-                break
-
-    remaining = {
-        key: quantity
-        for key, quantity in resolved_remaining.items()
-        if key.instrument_id not in unresolved and quantity != original[key]
-    }
-    return LotConsumption(
-        unresolved_instruments=unresolved,
-        remaining=remaining,
-    )
-
-
-def unresolved_disposal_instruments(payloads) -> set[str]:
-    """Return instrument ids with disposal history that needs guessing."""
-    return resolve_lot_consumption(payloads).unresolved_instruments
