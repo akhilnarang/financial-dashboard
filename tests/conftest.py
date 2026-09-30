@@ -13,6 +13,8 @@ from financial_dashboard.core.deps import get_session
 from financial_dashboard.db.models import Account, Base
 from financial_dashboard.web import get_router
 
+collect_ignore_glob = ["test_paisa_*", "test_synth_*"]
+
 STATIC_DIR = Path(financial_dashboard.__file__).resolve().parent / "static"
 
 
