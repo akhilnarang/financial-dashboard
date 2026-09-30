@@ -114,10 +114,13 @@ async def create_or_reuse_decision(
         .order_by(CategoryReviewDecision.id.desc())
         .limit(1)
     )
+    # Confidence shifts a little on every model run. The prompt only shows
+    # the categories, so compare those.
     if (
         existing is not None
         and existing.category_input_hash == txn.category_input_hash
-        and existing.candidates_json == encoded
+        and {c["category"] for c in json.loads(existing.candidates_json)}
+        == {c["category"] for c in candidates}
         and (existing.expires_at is None or as_utc(existing.expires_at) > now)
     ):
         return existing

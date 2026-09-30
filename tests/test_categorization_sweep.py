@@ -69,10 +69,17 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
     monkeypatch.setitem(settings._cache, "category_vocab_version", "1")
     monkeypatch.setitem(settings._cache, "categorization.enabled", "true")
     monkeypatch.setattr(sweep, "get_active_llm_key", lambda: "test-key")
-    result = llm.LlmResult(llm.NEEDS_REVIEW, 0.3, "ambiguous")
+    # Each run returns the same categories with a slightly different confidence.
+    runs = iter([0.40, 0.41])
 
     async def classify(**kwargs):
-        return result
+        confidence = next(runs)
+        return llm.LlmResult(
+            "groceries",
+            confidence,
+            "ambiguous",
+            (llm.LlmCandidate("groceries", confidence), llm.LlmCandidate("food", 0.2)),
+        )
 
     monkeypatch.setattr(engine, "_llm_classify", classify)
     # An unmatched row becomes 'pending_llm' after the rule sweep, and a second
