@@ -12,45 +12,50 @@
     Assets:Bank:KotakSalary                         2916.11 INR
     ; note: synthetic account_credit_cashback_rewards
 
-2026-05-20 * FAMILY    ; txn:53ffab8aa258
-    Expenses:Family                                 1232.17 INR
+2026-05-17 * GIVE CHARITY    ; txn:7d0b1749afe2
+    Expenses:Charity Gift                           2147.04 INR
+    Assets:Bank:HDFCSavings                         -2147.04 INR
+    ; note: synthetic account_debit_charity_gift
+
+2026-05-20 * INCOME TAX DEPT    ; txn:63d78834a3cf
+    Expenses:Tax                                    1232.17 INR
     Assets:Bank:KotakSalary                         -1232.17 INR
-    ; note: synthetic account_debit_family
+    ; note: synthetic account_debit_tax
 
 2026-05-21 * FREELANCE CLIENT    ; txn:50478a651ab6
     Income:Other Income                             -1486.77 INR
     Assets:Bank:KotakSalary                         1486.77 INR
     ; note: synthetic account_credit_other_income
 
-2026-05-22 * FUEL    ; txn:e007823b3dfb
-    Expenses:Fuel                                   4370.52 INR
+2026-05-22 * PERSONAL LOAN    ; txn:3ed130e8dfc5
+    Expenses:Personal Loan                          4370.52 INR
     Assets:Bank:HDFCSavings                         -4370.52 INR
-    ; note: synthetic account_debit_fuel
+    ; note: synthetic account_debit_personal_loan
 
-2026-05-27 * TUITION ACADEMY    ; txn:49d233510b90
-    Expenses:Education                              4054.67 INR
+2026-05-27 * CAR SERVICE CENTER    ; txn:c0fc1a55267d
+    Expenses:Car Maintenance                        4054.67 INR
     Assets:Bank:KotakSalary                         -4054.67 INR
-    ; note: synthetic account_debit_education
-
-2026-05-28 * ENTERTAINMENT    ; txn:fc864e8849e9
-    Expenses:Entertainment                          4585.03 INR
-    Assets:Bank:ICICISavings                        -4585.03 INR
-    ; note: synthetic account_debit_entertainment
-
-2026-05-30 * ELECTRICITY BOARD    ; txn:638377bc21e4
-    Expenses:Bill Payment                           503.39 INR
-    Assets:Bank:HDFCSavings                         -503.39 INR
-    ; note: synthetic account_debit_bill_payment
-
-2026-06-15 * CAR SERVICE CENTER    ; txn:22b3094a15bd
-    Expenses:Car Maintenance                        3272.40 INR
-    Assets:Bank:ICICISavings                        -3272.40 INR
     ; note: synthetic account_debit_car_maintenance
 
-2026-06-15 * GIFT SHOP    ; txn:2f67623f1eb9
-    Expenses:Gift                                   4677.22 INR
+2026-05-28 * FUEL    ; txn:8524249127e1
+    Expenses:Fuel                                   4585.03 INR
+    Assets:Bank:ICICISavings                        -4585.03 INR
+    ; note: synthetic account_debit_fuel
+
+2026-05-30 * PASSTHROUGH    ; txn:3e0703bae71c
+    Expenses:Passthrough                            503.39 INR
+    Assets:Bank:HDFCSavings                         -503.39 INR
+    ; note: synthetic account_debit_passthrough
+
+2026-06-15 * PROFESSIONAL SERVICES    ; txn:20fee901fe58
+    Expenses:Professional Services                  4677.22 INR
     Assets:Bank:ICICISavings                        -4677.22 INR
-    ; note: synthetic account_debit_gift
+    ; note: synthetic account_debit_professional_services
+
+2026-06-15 * ELECTRICITY BOARD    ; txn:3420bef341ef
+    Expenses:Bill Payment                           3272.40 INR
+    Assets:Bank:ICICISavings                        -3272.40 INR
+    ; note: synthetic account_debit_bill_payment
 
 2026-06-15 * WINDOW MERCHANT    ; txn:dc55bda5fbc7
     Expenses:Shopping                               1234.00 INR
@@ -67,6 +72,11 @@
     Assets:Bank:HDFCSavings                         -610.00 INR
     ; note: synthetic account_debit_upi
 
+2026-06-18 * REIMBURSEMENT    ; txn:21940489eb18
+    Expenses:Reimbursement                          1396.27 INR
+    Assets:Bank:ICICISavings                        -1396.27 INR
+    ; note: synthetic account_debit_reimbursement
+
 2026-06-18 * MANUAL CAT MERCHANT    ; txn:86572ca1f9ec
     Expenses:Shopping                               420.00 INR
     Assets:Bank:HDFCSavings                         -420.00 INR
@@ -76,6 +86,11 @@
     Liabilities:Card:HDFCMillenniaCC                4000.00 INR
     Assets:Bank:HDFCSavings                         -4000.00 INR
     ; note: synthetic account_debit_cc_payment
+
+2026-06-21 * GIFT SHOP    ; txn:556881d1f464
+    Expenses:Gift                                   3077.28 INR
+    Assets:Bank:HDFCSavings                         -3077.28 INR
+    ; note: synthetic account_debit_gift
 
 2026-06-21 * SPLIT MERCHANT A    ; txn:68ac9fcb35e8
     Expenses:Shopping                               300.00 INR
@@ -97,15 +112,15 @@
     Assets:Bank:KotakSalary                         -3698.44 INR
     ; note: synthetic account_debit_expense
 
-2026-06-24 * INCOME TAX REFUND    ; txn:4bd0ef8f82b3
-    Income:Tax Refund                               -4679.80 INR
-    Assets:Bank:HDFCSavings                         4679.80 INR
-    ; note: synthetic account_credit_tax_refund
+2026-06-24 * TUITION ACADEMY    ; txn:c9358b977541
+    Expenses:Education                              4679.80 INR
+    Assets:Bank:HDFCSavings                         -4679.80 INR
+    ; note: synthetic account_debit_education
 
-2026-06-25 * GIVE CHARITY    ; txn:0216a48e1949
-    Expenses:Charity Gift                           1990.12 INR
+2026-06-25 * SALON & SPA    ; txn:222ba5d2755f
+    Expenses:Personal Care                          1990.12 INR
     Assets:Bank:HDFCSavings                         -1990.12 INR
-    ; note: synthetic account_debit_charity_gift
+    ; note: synthetic account_debit_personal_care
 
 2026-06-26 * UNCATEGORIZED MERCHANT    ; txn:6eab70c9c1ec
     Expenses:Unknown                                77.00 INR
@@ -142,11 +157,6 @@
     Assets:Bank:HDFCSavings                         1499.00 INR
     ; note: synthetic account_credit_refund
 
-2026-07-03 * SALON & SPA    ; txn:1ee10d0922b6
-    Expenses:Personal Care                          2462.48 INR
-    Assets:Bank:HDFCSalary                          -2462.48 INR
-    ; note: synthetic account_debit_personal_care
-
 2026-07-03 * ELECTRICITY BOARD    ; txn:2129b62e576f
     Expenses:Utilities                              2361.51 INR
     Assets:Bank:HDFCSavings                         -2361.51 INR
@@ -166,6 +176,11 @@
     Liabilities:Card:HDFCMillenniaCC                7378.84 INR
     Assets:Bank:HDFCSavings                         -7378.84 INR
     ; note: synthetic account_credit_card_payment
+
+2026-07-03 * LOAN DEPARTMENT    ; txn:fbe49b4e32fc
+    Expenses:Emi Loan                               2462.48 INR
+    Assets:Bank:HDFCSalary                          -2462.48 INR
+    ; note: synthetic account_debit_emi_loan
 
 2026-07-04 * LANDLORD    ; txn:9ffdf7921ea3
     Expenses:Rent                                   24468.71 INR
@@ -187,25 +202,25 @@
     Liabilities:Card:HDFCMillenniaCC                -982.80 INR
     ; note: synthetic cc_debit_purchase
 
-2026-07-06 * INCOME TAX DEPT    ; txn:7962f0ae3587
-    Expenses:Tax                                    2782.17 INR
+2026-07-06 * ENTERTAINMENT    ; txn:e7dfd2ec2e5f
+    Expenses:Entertainment                          2782.17 INR
     Assets:Bank:HDFCSavings                         -2782.17 INR
-    ; note: synthetic account_debit_tax
+    ; note: synthetic account_debit_entertainment
 
 2026-07-07 * CC MERCHANT REFUND    ; txn:35a2936fec85
     Expenses:Shopping                               -750.00 INR
     Liabilities:Card:HDFCMillenniaCC                750.00 INR
     ; note: synthetic cc_credit_refund
 
+2026-07-07 * CAFE    ; txn:7d03af7f2f57
+    Expenses:Cafe                                   5672.47 INR
+    Assets:Bank:HDFCSavings                         -5672.47 INR
+    ; note: synthetic account_debit_cafe
+
 2026-07-07 * APOLLO PHARMACY    ; txn:8f89541e8452
     Expenses:Healthcare                             2147.19 INR
     Assets:Bank:HDFCSalary                          -2147.19 INR
     ; note: synthetic account_debit_upi
-
-2026-07-07 * LOAN DEPARTMENT    ; txn:ac74f4727000
-    Expenses:Emi Loan                               5672.47 INR
-    Assets:Bank:HDFCSavings                         -5672.47 INR
-    ; note: synthetic account_debit_emi_loan
 
 2026-07-09 * INSURER CO    ; txn:4862378765ed
     Expenses:Insurance:Medical Health Insurance Premium  18499.00 INR
@@ -217,15 +232,20 @@
     Assets:Bank:HDFCSavings                         -14058.73 INR
     ; note: synthetic account_credit_transfer
 
-2026-07-10 * REIMBURSEMENT    ; txn:4681c18e55a4
-    Expenses:Reimbursement                          5076.45 INR
-    Assets:Bank:HDFCSavings                         -5076.45 INR
-    ; note: synthetic account_debit_reimbursement
+2026-07-10 * FAMILY    ; txn:1b5d6f121041
+    Expenses:Family                                 5468.32 INR
+    Assets:Bank:HDFCSavings                         -5468.32 INR
+    ; note: synthetic account_debit_family
 
 2026-07-10 * SELF    ; txn:974f285e6137
     Assets:Bank:HDFCSalary                          14058.73 INR
     Assets:Bank:HDFCSavings                         -14058.73 INR
     ; note: synthetic account_debit_transfer
+
+2026-07-10 * INCOME TAX REFUND    ; txn:9f120c4f5777
+    Income:Tax Refund                               -5076.45 INR
+    Assets:Bank:HDFCSavings                         5076.45 INR
+    ; note: synthetic account_credit_tax_refund
 
 2026-07-11 * FUND HOUSE REDEMPTION    ; txn:a685e3b454c2
     Assets:Investments:Synthetic Fund               -15000.00 INR

@@ -16,6 +16,7 @@ account Equity:Opening Balances
 account Equity:Opening Balances:Investment
 account Equity:Unknown
 account Expenses:Bill Payment
+account Expenses:Cafe
 account Expenses:Car Maintenance
 account Expenses:Cash Withdrawal
 account Expenses:Charity Gift
@@ -32,7 +33,10 @@ account Expenses:Groceries
 account Expenses:Healthcare
 account Expenses:Insurance:Medical Health Insurance Premium
 account Expenses:Misc
+account Expenses:Passthrough
 account Expenses:Personal Care
+account Expenses:Personal Loan
+account Expenses:Professional Services
 account Expenses:Reimbursement
 account Expenses:Rent
 account Expenses:Shopping
