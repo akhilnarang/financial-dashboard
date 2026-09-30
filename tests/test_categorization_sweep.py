@@ -121,6 +121,23 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         row.review_status = "notified"
         s.add(Category(slug="groceries", active=True))
         decision = await s.scalar(select(CategoryReviewDecision))
+        # Another transaction's prompt failed. It must not look like this
+        # row's prompt.
+        other = CategoryReviewDecision(
+            transaction_id=row.id + 1, category_input_hash="other", candidates_json="[]"
+        )
+        s.add(other)
+        await s.flush()
+        s.add(
+            TelegramOutboundDelivery(
+                category_review_decision_id=other.id,
+                transaction_id=row.id + 1,
+                recipient_chat_id=7,
+                text="Needs a category",
+                delivery_token="other-dead-prompt",
+                status="abandoned",
+            )
+        )
         owner = {"category_review_decision_id": decision.id}
         if prompt.startswith("assistant"):
             # An assistant proposal stores its candidates with "slug" keys.
@@ -160,7 +177,13 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         # sent must be sent again.
         assert row.review_status == ("pending" if prompt_failed else "notified")
         assert row.category_vocab_version == 2
-        decisions = (await s.scalars(select(CategoryReviewDecision))).all()
+        decisions = (
+            await s.scalars(
+                select(CategoryReviewDecision).where(
+                    CategoryReviewDecision.transaction_id == row.id
+                )
+            )
+        ).all()
         assert [decision.status for decision in decisions] == (
             ["superseded", "active"] if prompt_failed else ["active"]
         )

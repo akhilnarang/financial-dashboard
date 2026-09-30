@@ -329,11 +329,10 @@ async def categorize_one(
     if active_decision is not None and await session.scalar(
         select(TelegramOutboundDelivery.id)
         .where(
-            (TelegramOutboundDelivery.category_review_decision_id == active_decision.id)
-            | (
-                TelegramOutboundDelivery.interaction_id
-                == active_decision.source_interaction_id
-            ),
+            TelegramOutboundDelivery.category_review_decision_id == active_decision.id
+            if active_decision.source_interaction_id is None
+            else TelegramOutboundDelivery.interaction_id
+            == active_decision.source_interaction_id,
             TelegramOutboundDelivery.status.in_(("abandoned", "cancelled")),
         )
         .limit(1)
