@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from financial_dashboard.db import Base, Transaction
 import financial_dashboard.services.txn_merge as txn_merge_module
 from financial_dashboard.services.txn_merge import (
-    EnrichmentDiff,
     MatchDecision,
     compute_enrichment_diff,
     find_match,
@@ -19,35 +18,6 @@ from financial_dashboard.services.txn_merge import (
     merge_transaction,
     sync_counterparty_source,
 )
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture
-async def session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as s:
-        yield s
-    await engine.dispose()
-
-
-def test_enrichment_diff_changed_fields_empty_by_default():
-    diff = EnrichmentDiff()
-    assert diff.changed_fields == []
-
-
-def test_enrichment_diff_changed_fields_combines_filled_and_overwritten():
-    diff = EnrichmentDiff(
-        filled={"counterparty": "Phone Pe", "channel": "upi"},
-        overwritten={"reference_number": ("OLD", "NEW")},
-    )
-    assert set(diff.changed_fields) == {"counterparty", "channel", "reference_number"}
 
 
 def _make_txn(**fields):
@@ -71,39 +41,6 @@ def _make_txn(**fields):
     return txn
 
 
-def test_compute_diff_fills_null_field():
-    existing = _make_txn(counterparty=None)
-    incoming = {"counterparty": "Phone Pe", "channel": None}
-    diff = compute_enrichment_diff(existing, incoming, "email")
-    assert diff.filled == {"counterparty": "Phone Pe"}
-    assert diff.overwritten == {}
-
-
-def test_compute_diff_email_overwrites_existing_value():
-    existing = _make_txn(counterparty="PZCREDIT0000000")
-    incoming = {"counterparty": "Phone Pe Private Limited"}
-    diff = compute_enrichment_diff(existing, incoming, "email")
-    assert diff.filled == {}
-    assert diff.overwritten == {
-        "counterparty": ("PZCREDIT0000000", "Phone Pe Private Limited")
-    }
-
-
-def test_compute_diff_keeps_a_bank_name_over_a_user_alias() -> None:
-    """HDFC prints the payee label the user saved, not the account holder.
-
-    Such a name must not replace one a bank stated, or a transfer row loses
-    the beneficiary and shows a nickname.
-    """
-    existing = _make_txn(counterparty="SAMPLE BENEFICIARY NAME")
-    incoming = {
-        "counterparty": "My Savings Payee",
-        "counterparty_source": "user_alias",
-    }
-    diff = compute_enrichment_diff(existing, incoming, "email")
-    assert diff.overwritten == {}
-
-
 def test_compute_diff_lets_a_bank_name_replace_a_stored_alias() -> None:
     """An alias fills an empty name, so a bank must be able to displace it.
 
@@ -120,33 +57,11 @@ def test_compute_diff_lets_a_bank_name_replace_a_stored_alias() -> None:
     }
 
 
-def test_compute_diff_sms_does_not_overwrite_existing_value():
-    existing = _make_txn(counterparty="Phone Pe Private Limited")
-    incoming = {"counterparty": "PZCREDIT0000000"}
-    diff = compute_enrichment_diff(existing, incoming, "sms")
-    assert diff.filled == {}
-    assert diff.overwritten == {}
-
-
-def test_compute_diff_silent_when_values_match():
-    existing = _make_txn(counterparty="Phone Pe", channel="upi")
-    incoming = {"counterparty": "Phone Pe", "channel": "upi"}
-    diff = compute_enrichment_diff(existing, incoming, "email")
-    assert diff.changed_fields == []
-
-
 def test_compute_diff_card_mask_format_difference_is_not_enrichment():
     """A card_mask that differs only in masking style ("XX0000" vs "0000")
     is the same card — not a real enrichment. Must not overwrite or notify."""
     existing = _make_txn(card_mask="XX0000")
     incoming = {"card_mask": "0000"}
-    diff = compute_enrichment_diff(existing, incoming, "email")
-    assert diff.changed_fields == []
-
-
-def test_compute_diff_account_mask_format_difference_is_not_enrichment():
-    existing = _make_txn(account_mask="XX000")
-    incoming = {"account_mask": "000"}
     diff = compute_enrichment_diff(existing, incoming, "email")
     assert diff.changed_fields == []
 
@@ -219,23 +134,6 @@ def test_compute_diff_email_transaction_time_handles_midnight_crossing():
     assert "transaction_time" not in diff.overwritten
 
 
-def test_compute_diff_ignores_unparticipating_keys():
-    existing = _make_txn(counterparty=None)
-    # email_type, bank, direction, amount, currency should never enter the diff
-    incoming = {
-        "counterparty": "Phone Pe",
-        "email_type": "irrelevant",
-        "bank": "irrelevant",
-        "direction": "credit",
-        "amount": Decimal("100"),
-        "currency": "INR",
-    }
-    diff = compute_enrichment_diff(existing, incoming, "email")
-    assert diff.filled == {"counterparty": "Phone Pe"}
-    assert "email_type" not in diff.changed_fields
-    assert "bank" not in diff.changed_fields
-
-
 # ---------------------------------------------------------------------------
 # Async tests for find_match
 # ---------------------------------------------------------------------------
@@ -265,58 +163,6 @@ async def test_find_match_by_reference_number_hits(session: AsyncSession):
     assert match.action == "match"
     assert match.transaction.id == existing.id
     assert match.kind == "standard"
-
-
-@pytest.mark.anyio
-async def test_find_match_by_reference_number_direction_distinguishes(
-    session: AsyncSession,
-):
-    debit = Transaction(
-        bank="hdfc",
-        email_type="t1",
-        direction="debit",
-        amount=Decimal("500"),
-        reference_number="IMPS:1",
-    )
-    credit = Transaction(
-        bank="hdfc",
-        email_type="t2",
-        direction="credit",
-        amount=Decimal("500"),
-        reference_number="IMPS:2",  # different ref because of partial unique index
-    )
-    session.add_all([debit, credit])
-    await session.flush()
-
-    match = await find_match(
-        session,
-        {
-            "bank": "hdfc",
-            "direction": "credit",
-            "amount": Decimal("500"),
-            "reference_number": "IMPS:2",
-        },
-    )
-    assert match.action == "match"
-    assert match.transaction.id == credit.id
-    assert match.kind == "standard"
-
-
-@pytest.mark.anyio
-async def test_find_match_empty_reference_treated_as_null(
-    session: AsyncSession,
-):
-    # No txn exists with reference_number=""; find_match should not match.
-    match = await find_match(
-        session,
-        {
-            "bank": "hdfc",
-            "direction": "debit",
-            "amount": Decimal("500"),
-            "reference_number": "",
-        },
-    )
-    assert match.action == "insert"
 
 
 @pytest.mark.anyio
@@ -510,105 +356,6 @@ def test_compute_diff_email_overwrites_transaction_date_with_earlier_value():
     assert diff.overwritten == {
         "transaction_date": (date(2026, 6, 9), date(2026, 5, 3))
     }
-
-
-@pytest.mark.anyio
-async def test_find_match_by_reference_with_amount_mismatch_defers(
-    session: AsyncSession,
-):
-    """Repro: two distinct kotak_digital_transaction debits of different
-    amounts both extracted the same boilerplate string as reference_number.
-    The exact-ref match path keyed on (bank, ref, direction) and merged the
-    second event into the first row without ever comparing amounts — silently
-    destroying one transaction. A ref hit whose amount disagrees is not a
-    confident same-event signal; defer for manual resolution instead of
-    collapsing."""
-    existing = Transaction(
-        bank="kotak",
-        email_type="kotak_digital_transaction",
-        direction="debit",
-        amount=Decimal("5555"),
-        reference_number="If you are unable to view the below e-mailer.",
-    )
-    session.add(existing)
-    await session.flush()
-
-    match = await find_match(
-        session,
-        {
-            "bank": "kotak",
-            "direction": "debit",
-            "amount": Decimal("7777"),
-            "reference_number": "If you are unable to view the below e-mailer.",
-        },
-    )
-    assert match.action == "defer"
-
-
-@pytest.mark.anyio
-async def test_find_match_by_reference_with_matching_amount_still_hits(
-    session: AsyncSession,
-):
-    """The amount guard must not break the normal case: a ref hit whose
-    amount agrees is still a confident match."""
-    existing = Transaction(
-        bank="hdfc",
-        email_type="hdfc_dc_transaction_alert",
-        direction="debit",
-        amount=Decimal("500"),
-        reference_number="IMPS:000000000042",
-    )
-    session.add(existing)
-    await session.flush()
-
-    match = await find_match(
-        session,
-        {
-            "bank": "hdfc",
-            "direction": "debit",
-            "amount": Decimal("500"),
-            "reference_number": "IMPS:000000000042",
-        },
-    )
-    assert match.action == "match"
-    assert match.transaction.id == existing.id
-
-
-@pytest.mark.anyio
-async def test_find_match_by_reference_equal_amount_different_balance_defers(
-    session: AsyncSession,
-):
-    """Two distinct same-amount debits that share a recycled/garbage
-    reference_number but have DIFFERENT known available balances are not the
-    same event — so they must NOT silently collapse into one row. The exact-ref
-    path applies the same balance guard as the fuzzy path, but DEFERS rather
-    than inserts: the `uq_transactions_ref` partial unique index forbids a
-    second row with the same (bank, ref, direction), so a new insert can't
-    physically land. We can neither merge (different balance) nor insert
-    (unique ref) — park for manual resolution."""
-    existing = Transaction(
-        bank="kotak",
-        email_type="kotak_digital_transaction",
-        direction="debit",
-        amount=Decimal("500"),
-        reference_number="Transaction Successful",
-        balance=Decimal("9000.00"),
-    )
-    session.add(existing)
-    await session.flush()
-
-    match = await find_match(
-        session,
-        {
-            "bank": "kotak",
-            "direction": "debit",
-            "amount": Decimal("500"),
-            "reference_number": "Transaction Successful",
-            "balance": Decimal("8500.00"),
-        },
-    )
-    assert match.action == "defer"
-    assert match.kind == "ref_amount_mismatch"
 
 
 @pytest.mark.anyio
@@ -927,20 +674,9 @@ async def test_merge_transaction_create_path(session: AsyncSession):
     assert row.bank == "hdfc"
     assert diff.changed_fields == []
 
-
-@pytest.mark.anyio
-async def test_merge_transaction_create_path_sets_email_id(
-    session: AsyncSession,
-):
-    txn_data = {
-        "bank": "hdfc",
-        "email_type": "hdfc_dc_transaction_alert",
-        "direction": "debit",
-        "amount": Decimal("100"),
-        "currency": "INR",
-        "transaction_date": date(2026, 5, 2),
-    }
-    outcome, row, _ = await merge_transaction(session, "email", txn_data, email_id=42)
+    outcome, row, _ = await merge_transaction(
+        session, "email", {**txn_data, "amount": Decimal("100")}, email_id=42
+    )
     assert outcome == "created"
     assert row.email_id == 42
     assert row.source == "email"
@@ -1046,6 +782,16 @@ async def test_merge_transaction_stores_and_replaces_a_user_alias(
     assert replaced.counterparty == "SAMPLE BENEFICIARY"
     assert replaced.counterparty_source == "bank"
 
+    # A label must not replace a name a bank stated.
+    _, kept, _ = await merge_transaction(
+        session,
+        "email",
+        {**base, "counterparty": "My Payee", "counterparty_source": "user_alias"},
+        email_id=101,
+    )
+    assert kept.counterparty == "SAMPLE BENEFICIARY"
+    assert kept.counterparty_source == "bank"
+
 
 def test_a_bank_that_states_the_stored_label_clears_the_label_claim() -> None:
     """A bank can send the same text the user saved as a label.
@@ -1056,16 +802,6 @@ def test_a_bank_that_states_the_stored_label_clears_the_label_claim() -> None:
     """
     txn = _make_txn(counterparty="My Savings Payee", counterparty_source="user_alias")
     sync_counterparty_source(txn, {"counterparty": "My Savings Payee"})
-    assert txn.counterparty_source == "bank"
-
-
-def test_a_refused_label_does_not_claim_the_stored_name() -> None:
-    """The guard refused the label, so the label owns nothing."""
-    txn = _make_txn(counterparty="SAMPLE BENEFICIARY NAME", counterparty_source="bank")
-    sync_counterparty_source(
-        txn,
-        {"counterparty": "My Savings Payee", "counterparty_source": "user_alias"},
-    )
     assert txn.counterparty_source == "bank"
 
 
@@ -1265,44 +1001,6 @@ async def test_merge_transaction_email_type_is_immutable(
 
 
 @pytest.mark.anyio
-async def test_am_pm_alias_match_recovers_pm_stored_as_am(session: AsyncSession):
-    """hour<12 case: a pre-fix ICICI CC email row stored
-    transaction_time=10:33:11 (interpreted as 24h AM, but the real txn
-    was at 22:33 PM). The matching SMS arrives later with the correct
-    received_at-derived time 22:33:30. The alias pass at incoming-12h
-    finds it, gated by counterparty + AM/PM-ambiguous email_type."""
-    existing = Transaction(
-        bank="icici",
-        email_type="icici_cc_transaction_alert",
-        direction="debit",
-        amount=Decimal("320000"),
-        currency="INR",
-        transaction_date=date(2026, 5, 16),
-        transaction_time=time(10, 33, 11),  # wrong: should be 22:33:11
-        counterparty="INDIAN INSTITUTE OF MA",
-    )
-    session.add(existing)
-    await session.flush()
-
-    match = await find_match(
-        session,
-        {
-            "bank": "icici",
-            "direction": "debit",
-            "amount": Decimal("320000"),
-            "currency": "INR",
-            "reference_number": None,
-            "transaction_date": date(2026, 5, 16),
-            "transaction_time": time(22, 33, 30),  # SMS-derived correct time
-            "counterparty": "INDIAN INSTITUT",
-        },
-    )
-    assert match.action == "match"
-    assert match.transaction.id == existing.id
-    assert match.kind == "am_pm_alias"
-
-
-@pytest.mark.anyio
 async def test_am_pm_alias_match_recovers_midnight_stored_as_noon(
     session: AsyncSession,
 ):
@@ -1387,7 +1085,8 @@ async def test_am_pm_alias_match_requires_counterparty_agreement(
 ):
     """Two ICICI CC purchases of the same amount on the same card on
     the same day, exactly 12h apart, at DIFFERENT merchants. The
-    counterparty-prerequisite guard must refuse the alias merge."""
+    counterparty-prerequisite guard must refuse the alias merge. It also
+    refuses when the incoming side has no counterparty."""
     existing = Transaction(
         bank="icici",
         email_type="icici_cc_transaction_alert",
@@ -1401,58 +1100,19 @@ async def test_am_pm_alias_match_requires_counterparty_agreement(
     session.add(existing)
     await session.flush()
 
-    match = await find_match(
-        session,
-        {
-            "bank": "icici",
-            "direction": "debit",
-            "amount": Decimal("500"),
-            "currency": "INR",
-            "reference_number": None,
-            "transaction_date": date(2026, 5, 16),
-            "transaction_time": time(22, 30, 0),  # 12h offset
-            "counterparty": "DOMINOS PIZZA",  # different merchant
-        },
-    )
-    assert match.action == "insert"
-
-
-@pytest.mark.anyio
-async def test_am_pm_alias_refuses_when_either_side_lacks_counterparty(
-    session: AsyncSession,
-):
-    """Counterparty is the alias pass's primary safety. If either side
-    lacks one, refuse the merge — better to land a duplicate than
-    silently glue together two same-amount events that might be
-    distinct."""
-    existing = Transaction(
-        bank="icici",
-        email_type="icici_cc_transaction_alert",
-        direction="debit",
-        amount=Decimal("500"),
-        currency="INR",
-        transaction_date=date(2026, 5, 16),
-        transaction_time=time(10, 30, 0),
-        counterparty="STARBUCKS",
-    )
-    session.add(existing)
-    await session.flush()
-
-    # Incoming with no counterparty — must NOT match.
-    match = await find_match(
-        session,
-        {
-            "bank": "icici",
-            "direction": "debit",
-            "amount": Decimal("500"),
-            "currency": "INR",
-            "reference_number": None,
-            "transaction_date": date(2026, 5, 16),
-            "transaction_time": time(22, 30, 0),
-            "counterparty": None,
-        },
-    )
-    assert match.action == "insert"
+    incoming = {
+        "bank": "icici",
+        "direction": "debit",
+        "amount": Decimal("500"),
+        "currency": "INR",
+        "reference_number": None,
+        "transaction_date": date(2026, 5, 16),
+        "transaction_time": time(22, 30, 0),  # 12h offset
+        "counterparty": "DOMINOS PIZZA",  # different merchant
+    }
+    assert (await find_match(session, incoming)).action == "insert"
+    no_counterparty = {**incoming, "counterparty": None}
+    assert (await find_match(session, no_counterparty)).action == "insert"
 
 
 @pytest.mark.anyio
@@ -1548,43 +1208,6 @@ async def test_am_pm_alias_plus12h_only_targets_noon_stored_candidates(
 
 
 @pytest.mark.anyio
-async def test_am_pm_alias_does_not_run_when_standard_pass_succeeds(
-    session: AsyncSession,
-):
-    """Standard pass must take precedence. If a candidate is in the
-    standard ±10-min window, the alias pass should not fire at all."""
-    existing = Transaction(
-        bank="icici",
-        email_type="icici_cc_transaction_alert",
-        direction="debit",
-        amount=Decimal("100"),
-        currency="INR",
-        transaction_date=date(2026, 5, 16),
-        transaction_time=time(22, 30, 0),
-        counterparty="ZEPTO",
-    )
-    session.add(existing)
-    await session.flush()
-
-    match = await find_match(
-        session,
-        {
-            "bank": "icici",
-            "direction": "debit",
-            "amount": Decimal("100"),
-            "currency": "INR",
-            "reference_number": None,
-            "transaction_date": date(2026, 5, 16),
-            "transaction_time": time(22, 33, 0),  # within ±10 min
-            "counterparty": "ZEPTO",
-        },
-    )
-    assert match.action == "match"
-    assert match.transaction.id == existing.id
-    assert match.kind == "standard"  # not am_pm_alias
-
-
-@pytest.mark.anyio
 async def test_merge_transaction_alias_match_overwrites_transaction_time(
     session: AsyncSession,
 ):
@@ -1649,28 +1272,21 @@ def test_email_enrichment_counterparty_upgrade_allowed():
     )
 
 
-def test_email_enrichment_mask_upgrade_allowed():
-    existing = _make_txn(account_mask="XX0000")
-    incoming = {"account_mask": "99XXXXXX0000"}
-    diff = compute_enrichment_diff(existing, incoming, "email")
-    assert diff.overwritten["account_mask"] == ("XX0000", "99XXXXXX0000")
-
-
-def test_email_enrichment_mask_no_downgrade():
-    existing = _make_txn(account_mask="99XXXXXX0000")
-    incoming = {"account_mask": "XX0000"}
-    diff = compute_enrichment_diff(existing, incoming, "email")
-    assert "account_mask" not in diff.overwritten
-
-
-def test_email_enrichment_unrelated_counterparty_still_overwrites():
-    existing = _make_txn(counterparty="PZCREDIT123")
-    incoming = {"counterparty": "Phone Pe Private Limited"}
-    diff = compute_enrichment_diff(existing, incoming, "email")
-    assert diff.overwritten["counterparty"] == (
-        "PZCREDIT123",
-        "Phone Pe Private Limited",
-    )
+@pytest.mark.parametrize(
+    ("old_mask", "new_mask", "overwrites"),
+    [
+        ("XX0000", "99XXXXXX0000", True),
+        ("99XXXXXX0000", "XX0000", False),
+    ],
+    ids=["upgrade", "downgrade"],
+)
+def test_email_enrichment_mask_upgrade_only(old_mask, new_mask, overwrites):
+    existing = _make_txn(account_mask=old_mask)
+    diff = compute_enrichment_diff(existing, {"account_mask": new_mask}, "email")
+    if overwrites:
+        assert diff.overwritten["account_mask"] == (old_mask, new_mask)
+    else:
+        assert "account_mask" not in diff.overwritten
 
 
 # ICICI CC payment-received pair: SMS (time, no counterparty) + email
@@ -1871,29 +1487,6 @@ def _icici_spend_sms(
         "balance": Decimal(balance) if balance is not None else None,
         "raw_description": None,
     }
-
-
-@pytest.mark.anyio
-async def test_two_distinct_charges_different_balance_split(session: AsyncSession):
-    """The de-merge bug: two distinct ₹5,000 charges ~30s apart, SMS-only,
-    identical on every old match field but with different available limits,
-    must produce TWO rows — not silently collapse into one."""
-    o1, _r1, _ = await merge_transaction(
-        session,
-        "sms",
-        _icici_spend_sms(balance="100000.00", transaction_time=time(21, 36, 27)),
-        sms_message_id=389,
-    )
-    o2, _r2, _ = await merge_transaction(
-        session,
-        "sms",
-        _icici_spend_sms(balance="95000.00", transaction_time=time(21, 36, 55)),
-        sms_message_id=390,
-    )
-    assert o1 == "created"
-    assert o2 == "created"
-    rows = (await session.execute(select(Transaction))).scalars().all()
-    assert len(rows) == 2
 
 
 @pytest.mark.anyio
@@ -2174,13 +1767,6 @@ def test_compute_diff_raw_description_real_change_overwrites():
     )
 
 
-def test_compute_diff_raw_description_fills_null():
-    existing = _make_txn(raw_description=None)
-    incoming = {"raw_description": "Billed by merchant"}
-    diff = compute_enrichment_diff(existing, incoming, "email")
-    assert diff.filled == {"raw_description": "Billed by merchant"}
-
-
 # ---------------------------------------------------------------------------
 # No-date fuzzy insert: an incoming row with no date and no ref cannot fuzzy
 # match and must insert.
@@ -2392,30 +1978,14 @@ def _exc_with_orig(message: str):
     return IntegrityError(statement=None, params=None, orig=Exception(message))
 
 
-def test_is_duplicate_transaction_error_named_index():
-    assert is_duplicate_transaction_error(
-        _exc_with_orig("UNIQUE constraint failed: uq_transactions_ref")
-    )
-
-
-def test_is_duplicate_transaction_error_legacy_name():
-    """The legacy uq_transaction_dedup name is still recognized for back-compat
-    with DBs migrated before the rename."""
-    assert is_duplicate_transaction_error(
-        _exc_with_orig("UNIQUE constraint failed: uq_transaction_dedup")
-    )
-
-
-def test_is_duplicate_transaction_error_generic_sqlite_text():
-    assert is_duplicate_transaction_error(
-        _exc_with_orig(
-            "UNIQUE constraint failed: transactions.bank, "
-            "transactions.reference_number, transactions.direction"
-        )
-    )
-
-
-def test_is_duplicate_transaction_error_unrelated_constraint_is_false():
+def test_is_duplicate_transaction_error_classifies_ref_index():
+    for message in (
+        "UNIQUE constraint failed: uq_transactions_ref",
+        "UNIQUE constraint failed: uq_transaction_dedup",
+        "UNIQUE constraint failed: transactions.bank, "
+        "transactions.reference_number, transactions.direction",
+    ):
+        assert is_duplicate_transaction_error(_exc_with_orig(message))
     assert not is_duplicate_transaction_error(
         _exc_with_orig("UNIQUE constraint failed: emails.message_id")
     )

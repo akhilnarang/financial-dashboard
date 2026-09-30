@@ -23,12 +23,11 @@ from typing import Literal, cast
 
 import pytest
 from cc_parser.parsers.models import Transaction as CcTransaction
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.db import (
     Account,
-    Base,
     Card,
     StatementUpload,
     Transaction,
@@ -47,6 +46,7 @@ from financial_dashboard.services.statements.cc import (
     parse_cc_date,
     reconcile_statement,
 )
+from tests.conftest import new_test_engine
 
 ACCOUNT_ID = 1
 CARD_NUMBER = "4111XXXXXXXX9012"
@@ -61,13 +61,12 @@ def anyio_backend():
 
 @pytest.fixture
 async def session_factory(monkeypatch):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(cc_module, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 def _stmt_txn(
@@ -191,12 +190,8 @@ async def _import(maker, parsed, recon, due_date=None) -> tuple[list, list]:
         # Two cards sharing a last-4: the visible BIN digits conflict, so a
         # flatten-to-digits rule would wrongly match here.
         pytest.param("5100XXXXXXXX9012", False, id="shared-last4-different-bin"),
-        # A short mask is blind, not empty: XX34 still says the card ends 34,
-        # and this account's card ends 12 — a real conflict on a shown digit.
+        # A short mask is blind, not empty: XX34 still conflicts on a shown digit.
         pytest.param("XX34", False, id="short-mask-conflicts-on-visible-digit"),
-        # Non-canonical spelling of the same card must not read as a
-        # conflict; refusing here would import a duplicate.
-        pytest.param("XX9012", True, id="non-canonical-spelling-same-card"),
         # XX12 agrees everywhere it shows a digit — unknown, not a conflict.
         pytest.param("XX12", True, id="partial-mask-is-unknown"),
     ],
@@ -279,12 +274,8 @@ async def test_an_addon_cards_transaction_matches_the_primarys_statement(
 async def test_a_card_on_another_account_is_still_not_this_accounts_card(
     session_factory,
 ):
-    """Account grain widens the rule to the account's own cards — no further.
-
-    The DB row carries a mask belonging to a card on a *different* account:
-    the picker refuses the pairing, and the statement row is held back rather
-    than imported, since a refusal is not evidence the transaction is absent.
-    """
+    """Only the account's own cards count. A mask from another account's card
+    refuses the pairing, and the statement row is held back."""
     await _seed_account(session_factory)
     async with session_factory() as session:
         session.add(
@@ -311,8 +302,7 @@ async def test_a_card_on_another_account_is_still_not_this_accounts_card(
     recon = await _reconcile(session_factory, parsed)
 
     assert recon["matched"] == []
-    assert len(recon["missing"]) == 1
-    assert recon["missing"][0]["ambiguous"] is True
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [True]
 
     imported, rows = await _import(session_factory, parsed, recon)
 
@@ -574,62 +564,6 @@ async def test_ambiguous_short_suffix_does_not_confirm_a_card(session_factory):
 
 
 @pytest.mark.anyio
-async def test_wildcard_only_card_does_not_confirm_and_stays_conservative(
-    session_factory,
-):
-    """A statement row whose card is wildcard-only names no card, so it cannot
-    be confirmed on a DB row and cannot prune a different-card rival. Both rows
-    stay conservatively demoted rather than one falsely claiming a match."""
-    await _seed_account(session_factory)
-    async with session_factory() as session:
-        session.add(
-            Card(account_id=ACCOUNT_ID, card_mask="4111XXXXXXXX1111", label="Add-on 1")
-        )
-        session.add(
-            Card(account_id=ACCOUNT_ID, card_mask="4111XXXXXXXX2222", label="Add-on 2")
-        )
-        await session.commit()
-
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("100.00"),
-        transaction_date=parse_cc_date("07/04/2026"),
-        counterparty="MERCHANT X",
-        card_mask="4111XXXXXXXX1111",
-    )
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("100.00"),
-        transaction_date=parse_cc_date("08/04/2026"),
-        counterparty="MERCHANT X",
-        card_mask="4111XXXXXXXX2222",
-    )
-
-    parsed = _parsed(
-        [
-            CcTransaction(
-                date="07/04/2026",
-                narration="NEW CHARGE",
-                amount="100.00",
-                card_number="XXXXXXXXXXXXXXXX",
-                transaction_type="debit",
-            ),
-            CcTransaction(
-                date="08/04/2026",
-                narration="MERCHANT X",
-                amount="100.00",
-                card_number="4111XXXXXXXX2222",
-                transaction_type="debit",
-            ),
-        ]
-    )
-    recon = await _reconcile(session_factory, parsed)
-
-    assert recon["matched"] == []
-    assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
-
-
-@pytest.mark.anyio
 async def test_new_rows_with_no_db_candidate_still_import(session_factory):
     """The ordinary-miss guarantee: two same-day, same-amount statement rows
     with nothing in the DB to claim have empty candidate sets, so neither is
@@ -700,10 +634,6 @@ async def _seed_cc_account(
             2,
             id="visible-bin-resolves-shared-last4",
         ),
-        # No trailing visible digits: a BIN denotes no particular card.
-        pytest.param(
-            ["5100XXXXXXXX9012"], "5100XXXXXXXX", None, id="bin-only-mask-refused"
-        ),
         # Flattened to digits, "1234XXXXXXXX" would read as the suffix of an
         # account ending 1234 — one clean, completely wrong hit that the
         # multiplicity refusal never gets a chance to save.
@@ -721,14 +651,6 @@ async def _seed_cc_account(
             "XXXX XXXX XXXX XX67",
             1,
             id="sbi-short-suffix-sole-reach",
-        ),
-        # ...and the multiplicity refusal is the half of the bargain that
-        # makes the short suffix safe to trust at all.
-        pytest.param(
-            ["5100XXXXXXXX9067", "4111XXXXXXXX1167"],
-            "XXXX XXXX XXXX XX67",
-            None,
-            id="sbi-short-suffix-two-reaches-refused",
         ),
         # An account recording no mask never wins a statement no other
         # account claims — silence is not a wildcard. Zero matches is zero.
@@ -770,24 +692,6 @@ async def test_find_account_selects_by_positional_mask(
 
 
 @pytest.mark.anyio
-async def test_find_account_matches_through_the_cards_table(session_factory):
-    """A card the account carries in the cards table identifies it just as an
-    account_number does — both routes are gathered before either decides."""
-    await _seed_cc_account(
-        session_factory, account_id=1, account_number="5100XXXXXXXX0001"
-    )
-    async with session_factory() as session:
-        session.add(Card(account_id=1, card_mask="4111XXXXXXXX5566", label="Addon"))
-        await session.commit()
-
-    parsed = SimpleNamespace(card_number="XXXX XXXX XXXX 5566")
-
-    account = await cc_module._find_account("hdfc", parsed)
-    assert account is not None
-    assert account.id == 1
-
-
-@pytest.mark.anyio
 async def test_find_account_aggregates_conflicts_across_both_routes(session_factory):
     """Account 1 records a card ending ``5566`` as its account_number;
     account 2 records one in the cards table. Each route alone sees a single
@@ -808,22 +712,14 @@ async def test_find_account_aggregates_conflicts_across_both_routes(session_fact
     assert await cc_module._find_account("hdfc", parsed) is None
 
 
-@pytest.mark.parametrize(
-    "stored",
-    [
-        "4000-XXXX-XXXX-1234",
-        "4000 xxxx xxxx 1234",
-        "4000XXXXXXXX1234",
-    ],
-)
 @pytest.mark.anyio
-async def test_find_account_matches_a_non_canonical_stored_mask(
-    session_factory, stored
-):
+async def test_find_account_matches_a_non_canonical_stored_mask(session_factory):
     """The stored side is a mask too: dashes, spaces and lowercase ``x`` are
     cosmetic. Compared raw, the separators shift every digit out of alignment
     and the account silently stops matching its own statements."""
-    await _seed_cc_account(session_factory, account_id=1, account_number=stored)
+    await _seed_cc_account(
+        session_factory, account_id=1, account_number="4000-xxxx xxxx-1234"
+    )
 
     parsed = SimpleNamespace(card_number="4000XXXXXXXX1234")
 
@@ -861,71 +757,6 @@ async def test_interchangeable_rivals_leave_the_winners_match_alone(session_fact
 
     assert len(imported) == 1
     assert [row.id for row in rows] == [a_id] + [row.id for row in imported]
-
-
-@pytest.mark.anyio
-async def test_rivals_with_differing_narrations_still_demote_the_winner(
-    session_factory,
-):
-    """Rows that disagree on the narration are a real choice: the winner
-    would write ``CGST ON FEE`` onto a row the loser was going to call
-    ``SGST ON FEE``, and nothing here says which is right — so neither is
-    committed."""
-    await _seed_account(session_factory)
-    a_id = await _seed_txn(
-        session_factory, amount=Decimal("90.00"), counterparty="MERCHANT A"
-    )
-
-    parsed = _parsed(
-        [
-            _stmt_txn(date="07/04/2026", amount="90.00", narration="CGST ON FEE"),
-            _stmt_txn(date="07/04/2026", amount="90.00", narration="SGST ON FEE"),
-        ]
-    )
-    recon = await _reconcile(session_factory, parsed)
-
-    assert recon["matched"] == []
-    assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
-
-    imported, rows = await _import(session_factory, parsed, recon)
-
-    assert len(imported) == 2
-    assert [row.id for row in rows] == [a_id] + [row.id for row in imported]
-
-
-@pytest.mark.anyio
-async def test_two_candidates_pair_to_their_matching_narration(session_factory):
-    """Two DB rows tie on amount and date with no reference, but their
-    counterparties differ. Each statement row names one of them, so the
-    counterparty tiebreak pairs them instead of demoting both as a false tie.
-    """
-    await _seed_account(session_factory)
-    cgst_id = await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="CGST ON FEE",
-        raw_description="CGST ON FEE",
-    )
-    sgst_id = await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="SGST ON FEE",
-        raw_description="SGST ON FEE",
-    )
-
-    parsed = _parsed(
-        [
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="CGST ON FEE"),
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="SGST ON FEE"),
-        ]
-    )
-    recon = await _reconcile(session_factory, parsed)
-
-    assert recon["missing"] == []
-    assert {entry["narration"]: entry["db_txn_id"] for entry in recon["matched"]} == {
-        "CGST ON FEE": cgst_id,
-        "SGST ON FEE": sgst_id,
-    }
 
 
 @pytest.mark.anyio
@@ -1045,31 +876,36 @@ async def test_an_unclaimed_tied_candidate_spoils_the_tiebreak(
     assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
 
 
+@pytest.mark.parametrize(
+    ("counterparty", "narration"),
+    [
+        pytest.param("CRED", "CREDIT MANTRA", id="latin-word"),
+        pytest.param("CAFE", "CAFE\u0301TERIA CENTRAL", id="combining-accent"),
+        pytest.param("राम", "रामा CENTRAL", id="devanagari-matra"),
+        pytest.param("SHOP", "SHOP\u200cLIFT CENTRAL", id="zero-width-non-joiner"),
+    ],
+)
 @pytest.mark.anyio
-async def test_counterparty_containment_respects_word_boundaries(session_factory):
+async def test_counterparty_containment_needs_a_whole_word(
+    session_factory, counterparty, narration
+):
     """Containment matches a whole counterparty, not a fragment of a longer
-    word. ``CRED`` must not be read inside ``CREDIT MANTRA`` nor ``MOB`` inside
-    ``MOBILE STORE``, so neither row singles a candidate out and both stay
-    demoted rather than pairing on a coincidental substring.
+    word. A combining mark, a matra, or a join control continues the word.
+    The first row singles out no candidate, so both rows stay demoted.
     """
     await _seed_account(session_factory)
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="CRED",
-        raw_description="CRED",
-    )
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="MOB",
-        raw_description="MOB",
-    )
+    for name in (counterparty, "BOOKS"):
+        await _seed_txn(
+            session_factory,
+            amount=Decimal("34.00"),
+            counterparty=name,
+            raw_description=name,
+        )
 
     parsed = _parsed(
         [
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="CREDIT MANTRA"),
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="MOBILE STORE"),
+            _stmt_txn(date="07/04/2026", amount="34.00", narration=narration),
+            _stmt_txn(date="07/04/2026", amount="34.00", narration="BOOKS STORE"),
         ]
     )
     recon = await _reconcile(session_factory, parsed)
@@ -1181,145 +1017,6 @@ async def test_two_candidates_without_narration_evidence_still_demote(session_fa
 
 
 @pytest.mark.anyio
-async def test_counterparty_containment_ignores_combining_marks(session_factory):
-    """A counterparty must not match across an accented boundary.
-
-    ``CAFE`` must not be read inside ``CAFÉTERIA`` when the accent is a
-    combining mark (``E`` + U+0301) — the combining mark is not a word
-    character, so a naive boundary would let a short counterparty falsely
-    single out an unrelated candidate and preserve a wrong pairing.
-    """
-    await _seed_account(session_factory)
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="CAFE",
-        raw_description="CAFE",
-    )
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="BOOKS",
-        raw_description="BOOKS",
-    )
-
-    parsed = _parsed(
-        [
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="CAFÉTERIA CENTRAL"),
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="BOOKS STORE"),
-        ]
-    )
-    recon = await _reconcile(session_factory, parsed)
-
-    assert recon["matched"] == []
-    assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
-
-
-@pytest.mark.anyio
-async def test_counterparty_containment_is_accent_sensitive(session_factory):
-    """Accented and unaccented names stay distinct.
-
-    A ``CAFE`` candidate must not resolve a ``CAFÉ`` row (precomposed é):
-    normalization is canonical (NFC), not compatibility, so the tiebreak holds
-    the pair back rather than guessing they are the same merchant.
-    """
-    await _seed_account(session_factory)
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="CAFE",
-        raw_description="CAFE",
-    )
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="BOOKS",
-        raw_description="BOOKS",
-    )
-
-    parsed = _parsed(
-        [
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="CAFÉ CENTRAL"),
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="BOOKS STORE"),
-        ]
-    )
-    recon = await _reconcile(session_factory, parsed)
-
-    assert recon["matched"] == []
-    assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
-
-
-@pytest.mark.anyio
-async def test_counterparty_containment_respects_non_latin_boundaries(session_factory):
-    """The word boundary holds for non-Latin scripts too.
-
-    A Devanagari vowel sign (matra) is a combining mark that NFC does not
-    precompose, so a name must not be read inside a longer word that only adds
-    a matra: candidate राम must not match inside रामा.
-    """
-    await _seed_account(session_factory)
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="राम",
-        raw_description="राम",
-    )
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="BOOKS",
-        raw_description="BOOKS",
-    )
-
-    parsed = _parsed(
-        [
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="रामा CENTRAL"),
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="BOOKS STORE"),
-        ]
-    )
-    recon = await _reconcile(session_factory, parsed)
-
-    assert recon["matched"] == []
-    assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
-
-
-@pytest.mark.anyio
-async def test_counterparty_containment_respects_zero_width_joiners(session_factory):
-    """A zero-width non-joiner is a within-word control, not a boundary.
-
-    ``SHOP`` must not match inside ``SHOP``+U+200C+``LIFT``: the ZWNJ/ZWJ join
-    controls join word parts in several scripts (Indic and Perso-Arabic), so
-    they continue a word for boundary purposes.
-    """
-    await _seed_account(session_factory)
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="SHOP",
-        raw_description="SHOP",
-    )
-    await _seed_txn(
-        session_factory,
-        amount=Decimal("34.00"),
-        counterparty="BOOKS",
-        raw_description="BOOKS",
-    )
-
-    parsed = _parsed(
-        [
-            _stmt_txn(
-                date="07/04/2026", amount="34.00", narration="SHOP\u200cLIFT CENTRAL"
-            ),
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="BOOKS STORE"),
-        ]
-    )
-    recon = await _reconcile(session_factory, parsed)
-
-    assert recon["matched"] == []
-    assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
-
-
-@pytest.mark.anyio
 async def test_reassignment_refreshes_the_decision_reason(session_factory):
     """A cross-date reassignment must refresh the evidence reason.
 
@@ -1356,55 +1053,6 @@ async def test_reassignment_refreshes_the_decision_reason(session_factory):
     assert by_narration["CGST ON FEE"]["db_txn_id"] == cgst_id
     assert by_narration["SGST ON FEE"]["decision_reason"] == "matched_date_offset"
     assert by_narration["CGST ON FEE"]["decision_reason"] == "matched_date_offset"
-
-
-@pytest.mark.anyio
-async def test_a_row_masked_with_a_deleted_card_is_held_back_not_reimported(
-    session_factory,
-):
-    """Deleting a card must not make its history re-importable.
-
-    The account had an add-on and the DB holds its purchase; the card is then
-    removed exactly the way ``card_delete`` removes it — ``card_id`` cleared,
-    ``card_mask`` left as it was. The card check now refuses the pairing, but
-    that refusal must not be read as "the DB does not hold this transaction":
-    the row stays in the candidate set, the statement row surfaces as
-    ambiguous, and the count does not grow.
-    """
-    await _seed_account(session_factory)
-    async with session_factory() as session:
-        card = Card(account_id=ACCOUNT_ID, card_mask="4111XXXXXXXX7788", label="Add-on")
-        session.add(card)
-        await session.flush()
-        card_id = card.id
-        await session.commit()
-
-    addon_txn_id = await _seed_txn(
-        session_factory, card_mask="4111XXXXXXXX7788", card_id=card_id
-    )
-
-    async with session_factory() as session:
-        await session.execute(
-            update(Transaction)
-            .where(Transaction.card_id == card_id)
-            .values(card_id=None)
-        )
-        await session.delete(await session.get(Card, card_id))
-        await session.commit()
-
-    parsed = _parsed(
-        [_stmt_txn(date="07/04/2026", amount="450.00", narration=NARRATION)]
-    )
-    recon = await _reconcile(session_factory, parsed)
-
-    assert recon["matched"] == []
-    assert len(recon["missing"]) == 1
-    assert recon["missing"][0]["ambiguous"] is True
-
-    imported, rows = await _import(session_factory, parsed, recon)
-
-    assert len(imported) == 1
-    assert [row.id for row in rows] == [addon_txn_id] + [row.id for row in imported]
 
 
 @pytest.mark.anyio

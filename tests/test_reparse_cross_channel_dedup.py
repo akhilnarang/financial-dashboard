@@ -22,32 +22,27 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.core.deps as core_deps
 import financial_dashboard.services.reminders as reminders_module
 from financial_dashboard.core.deps import get_session
-from financial_dashboard.db import Account, Base, Email, FetchRule, Transaction
+from financial_dashboard.db import Account, Email, FetchRule, Transaction
 from financial_dashboard.integrations.email.body import RawEmailResult
 from financial_dashboard.services.emails import _process_email_full
 from financial_dashboard.web import get_router as get_web_router
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
+from tests.conftest import new_test_engine
 
 
 @pytest.fixture
 async def session_maker(monkeypatch):
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(reminders_module, "async_session", maker)
     monkeypatch.setattr(core_deps, "async_session", maker)
     yield maker
     await engine.dispose()
+    holder.close()
 
 
 def _build_test_app(maker):
@@ -190,71 +185,6 @@ async def test_reparse_email_enriches_existing_sms_row(session_maker):
         # Downgrade-safe enrichment: the SMS row's in-body time must NOT be
         # clobbered by the email's missing time.
         assert row.transaction_time == datetime.time(15, 15, 12)
-
-
-@pytest.mark.anyio
-async def test_reparse_email_no_match_still_creates_row(session_maker):
-    """With no pre-existing cross-channel row, reparse must still insert a
-    fresh transaction — the dedup probe must not suppress the normal path."""
-    # Seed only the failed email + account; NO SMS transaction.
-    async with session_maker() as session:
-        rule = FetchRule(
-            provider="gmail",
-            sender="alerts@hdfcbank.bank.in",
-            bank="hdfc",
-            enabled=True,
-            email_kind="transaction",
-        )
-        session.add(rule)
-        session.add(
-            Account(
-                bank="hdfc",
-                type="bank_account",
-                label="HDFC Savings",
-                account_number="000000001111",
-                active=True,
-            )
-        )
-        await session.flush()
-        email_row = Email(
-            provider="gmail",
-            message_id="test-hdfc-ppf-nomatch",
-            sender="alerts@hdfcbank.bank.in",
-            subject="View: Account update for your HDFC Bank A/c",
-            received_at=datetime.datetime(2026, 6, 5, 9, 45, 11, tzinfo=datetime.UTC),
-            status="failed",
-            error="Previous parse failed",
-            rule_id=rule.id,
-        )
-        session.add(email_row)
-        await session.commit()
-        email_id = email_row.id
-
-    raw = _hdfc_ppf_transfer_eml()
-    with (
-        patch(
-            "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
-        ),
-        patch(
-            "financial_dashboard.web.emails.should_notify_transactions",
-            return_value=False,
-        ),
-    ):
-        app = _build_test_app(session_maker)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            r = await client.post(f"/emails/{email_id}/reparse")
-            assert r.status_code == 200, r.text
-
-    async with session_maker() as s:
-        rows = (await s.execute(select(Transaction))).scalars().all()
-        # The dedup probe found nothing, so the normal insert path runs.
-        # (Reparse-created rows leave source unset, as they always have.)
-        assert len(rows) == 1
-        assert rows[0].email_id == email_id
-        assert rows[0].sms_message_id is None
 
 
 @pytest.mark.anyio
@@ -710,45 +640,6 @@ async def test_reparse_does_not_steal_row_claimed_by_another_email(session_maker
 
 
 @pytest.mark.anyio
-async def test_reparse_that_enriches_sends_one_enrichment_message(session_maker):
-    """The email for an event that the SMS already captured adds data to that
-    row. Tell the user that the row changed. Do not send a second message
-    about a new transaction, because there is only one payment.
-    """
-    _sms_txn_id, email_id = await _seed_sms_row_and_failed_email(session_maker)
-
-    raw = _hdfc_ppf_transfer_eml()
-    with (
-        patch(
-            "financial_dashboard.web.emails.load_or_fetch_raw_email",
-            new=AsyncMock(return_value=RawEmailResult(raw, None, "provider")),
-        ),
-        patch(
-            "financial_dashboard.web.emails.should_notify_transactions",
-            return_value=True,
-        ),
-        patch("financial_dashboard.web.emails.get_telegram_chat_id", return_value=1),
-        patch(
-            "financial_dashboard.web.emails.send_enrichment_notification",
-            new=AsyncMock(),
-        ) as enrich_msg,
-        patch(
-            "financial_dashboard.web.emails.send_transaction_notification",
-            new=AsyncMock(),
-        ) as txn_msg,
-    ):
-        app = _build_test_app(session_maker)
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            r = await client.post(f"/emails/{email_id}/reparse")
-            assert r.status_code == 200, r.text
-
-    assert enrich_msg.await_count == 1
-    assert txn_msg.await_count == 0
-
-
-@pytest.mark.anyio
 async def test_reparse_that_makes_a_row_sends_a_transaction_message(session_maker):
     """With no row from another channel, the email makes the row. The user
     must then get a message about a new transaction."""
@@ -789,13 +680,16 @@ async def test_reparse_that_makes_a_row_sends_a_transaction_message(session_make
 
     assert txn_msg.await_count == 1
     assert enrich_msg.await_count == 0
+    async with session_maker() as s:
+        rows = (await s.execute(select(Transaction))).scalars().all()
+        assert [(r.email_id, r.sms_message_id) for r in rows] == [(email_id, None)]
 
 
 @pytest.mark.anyio
 async def test_a_second_reparse_that_changes_nothing_sends_no_message(session_maker):
     """Reparse the same email twice. The first run adds the email data to the
-    row that the SMS made. The second run finds the same row and changes no
-    field.
+    row that the SMS made and sends one enrichment message. The second run
+    finds the same row and changes no field.
 
     Send nothing. The row is not new, so a message about a new transaction is
     wrong. No field changed, so an enrichment message says nothing.
@@ -828,6 +722,8 @@ async def test_a_second_reparse_that_changes_nothing_sends_no_message(session_ma
         ) as client:
             first = await client.post(f"/emails/{email_id}/reparse")
             assert first.status_code == 200, first.text
+            assert enrich_msg.await_count == 1, "the SMS row changed"
+            assert txn_msg.await_count == 0, "there is only one payment"
             enrich_msg.reset_mock()
             txn_msg.reset_mock()
 

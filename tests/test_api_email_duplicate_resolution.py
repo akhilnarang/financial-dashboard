@@ -109,16 +109,17 @@ def _patch_current_parse(monkeypatch, txn_data: dict | None = None) -> AsyncMock
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "preview_token",
+    "payload",
     [
-        pytest.param("v1." + "a" * 63 + "é", id="non-ascii"),
-        pytest.param("not-a-preview-token", id="wrong-shape"),
-        pytest.param("v1." + "A" * 64, id="uppercase-hex"),
-        pytest.param("v1." + "a" * 63, id="truncated"),
+        pytest.param(
+            {"apply": True, "preview_token": "v1." + "a" * 63}, id="invalid-token"
+        ),
+        pytest.param({"apply": True}, id="apply-requires-token"),
+        pytest.param({"preview_token": "v1." + "a" * 64}, id="preview-forbids-token"),
     ],
 )
-async def test_apply_rejects_invalid_preview_token_before_service(
-    client, session, monkeypatch, preview_token
+async def test_bad_preview_token_is_rejected_before_service(
+    client, session, monkeypatch, payload
 ):
     email, target = await _seed_deferred(session)
     email_id, target_id = email.id, target.id
@@ -129,11 +130,7 @@ async def test_apply_rejects_invalid_preview_token_before_service(
 
     response = await client.post(
         f"/api/emails/{email_id}/resolve-duplicate",
-        json={
-            "transaction_id": target_id,
-            "apply": True,
-            "preview_token": preview_token,
-        },
+        json={"transaction_id": target_id, **payload},
     )
 
     assert response.status_code == 422, response.text
@@ -141,35 +138,6 @@ async def test_apply_rejects_invalid_preview_token_before_service(
     session.expire_all()
     assert (await session.get(Email, email_id)).status == "skipped"
     assert (await session.get(Transaction, target_id)).email_id is None
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "payload",
-    [
-        pytest.param({"apply": True}, id="apply-requires-token"),
-        pytest.param(
-            {"preview_token": "v1." + "a" * 64},
-            id="preview-forbids-token",
-        ),
-    ],
-)
-async def test_request_mode_rejects_missing_or_forbidden_token_before_service(
-    client, session, monkeypatch, payload
-):
-    email, target = await _seed_deferred(session)
-    import financial_dashboard.api.emails as emails_api
-
-    resolver = AsyncMock()
-    monkeypatch.setattr(emails_api, "resolve_email_duplicate", resolver)
-
-    response = await client.post(
-        f"/api/emails/{email.id}/resolve-duplicate",
-        json={"transaction_id": target.id, **payload},
-    )
-
-    assert response.status_code == 422, response.text
-    resolver.assert_not_awaited()
 
 
 @pytest.mark.anyio

@@ -4,28 +4,11 @@ import datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from financial_dashboard.db import Base, SmsMessage
+from financial_dashboard.db import SmsMessage
 from financial_dashboard.services.linker import build_link_context
 from financial_dashboard.services.sms_pipeline import process_sms_row
 from financial_dashboard.services.txn_merge import merge_transaction
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture
-async def session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    async with maker() as s:
-        yield s
-    await engine.dispose()
 
 
 @pytest.mark.anyio
