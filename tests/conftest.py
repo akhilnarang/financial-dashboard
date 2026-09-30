@@ -26,6 +26,10 @@ from financial_dashboard.web import get_router
 
 collect_ignore_glob = ["test_paisa_*", "test_synth_*"]
 
+# Router trees are stateless. Build them once, not for each test.
+_API_ROUTER = get_api_router(paisa_enabled=True)
+_WEB_ROUTER = get_router()
+
 STATIC_DIR = Path(financial_dashboard.__file__).resolve().parent / "static"
 
 
@@ -159,8 +163,8 @@ async def client(session):
 
     app.dependency_overrides[get_session] = _override_session
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-    app.include_router(get_api_router(paisa_enabled=True))
-    app.include_router(get_router())
+    app.include_router(_API_ROUTER)
+    app.include_router(_WEB_ROUTER)
 
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
