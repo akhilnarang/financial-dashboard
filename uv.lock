@@ -49,7 +49,7 @@ wheels = [
 [[package]]
 name = "bank-email-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-email-parser#b578829a576d9e4f80a7c063adce9a561bc354b8" }
+source = { git = "https://github.com/akhilnarang/bank-email-parser#bf2cd34beeffa9c1c335fe0ebdc961b0bc65e00d" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "pydantic" },
@@ -136,7 +136,7 @@ dependencies = [
 [[package]]
 name = "cc-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/cc-parser#12b91a48f9a63db962b05b6428aee27c98d7e968" }
+source = { git = "https://github.com/akhilnarang/cc-parser#a49973d9e5d1ace1626b2b7e809525a74d2d819b" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },
