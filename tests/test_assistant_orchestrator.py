@@ -113,6 +113,47 @@ async def test_shorthand_note_offers_an_unnamed_category_as_a_button(session):
 
 
 @pytest.mark.anyio
+async def test_turn_does_not_write_after_its_target_moved(session):
+    txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
+    session.add(txn)
+    await session.flush()
+    # A settlement fold moved this turn to another row while it ran.
+    interaction = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="reply",
+        status="processing",
+        transaction_id=txn.id + 1,
+    )
+    session.add(interaction)
+    await session.flush()
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": txn.id,
+                        "changes": {"note": {"op": "set", "value": "fuel"}},
+                    }
+                ],
+            )
+        ]
+    )
+
+    result = await run_turn(
+        session,
+        provider,
+        user_message="set note to fuel",
+        transaction_id=txn.id,
+        interaction_id=interaction.id,
+    )
+
+    assert result.response.code == "transaction_changed"
+    assert txn.note is None
+
+
+@pytest.mark.anyio
 async def test_orchestrator_renews_lease_between_provider_tool_rounds(session):
     txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
     session.add(txn)

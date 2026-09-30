@@ -905,6 +905,7 @@ async def test_attachment_cleanup_warning_never_removes_committed_replacement(
         status="processing",
         worker_token="worker",
         conversation_id=conversation.id,
+        transaction_id=transaction.id,
     )
     session.add(interaction)
     await session.commit()
@@ -983,6 +984,7 @@ async def test_attachment_cancellation_removes_uncommitted_published_file(
         status="processing",
         worker_token="worker",
         conversation_id=conversation.id,
+        transaction_id=transaction.id,
     )
     session.add(interaction)
     await session.commit()

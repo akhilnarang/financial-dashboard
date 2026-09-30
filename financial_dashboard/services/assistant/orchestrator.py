@@ -94,7 +94,6 @@ logger = logging.getLogger(__name__)
 # A turn must end inside the processing lease, so another worker does not
 # take it over while it runs.
 TURN_TIMEOUT_SECONDS = 180
-MAX_TURN_ATTEMPTS = 3
 
 
 _UNSUPPORTED_AGGREGATE = re.compile(
@@ -453,8 +452,22 @@ async def run_turn(
                         code="authorization_changed",
                     )
                 )
-            if transaction_id is not None and (
-                await current_confirmation_state_hash(session, transaction_id)
+            # A settlement fold moves a running turn to the surviving row.
+            # SQLite can give the old id to a new row with the same state.
+            moved = (
+                transaction_id is not None
+                and interaction_id is not None
+                and await session.scalar(
+                    select(AuditInteraction.id).where(
+                        AuditInteraction.id == interaction_id,
+                        AuditInteraction.transaction_id != transaction_id,
+                    )
+                )
+                is not None
+            )
+            if moved or (
+                transaction_id is not None
+                and await current_confirmation_state_hash(session, transaction_id)
                 != expected_state_hash
             ):
                 return completed(
@@ -1353,23 +1366,10 @@ async def resume_claimed_interactions(*, bot=None, limit: int = 50) -> int:
         async with async_session() as session:
             interaction, worker_token = await claim_processing(session, interaction_id)
             if interaction is None:
-                await session.rollback()
+                await session.commit()
                 continue
             if interaction.inbound_chat_id != get_telegram_chat_id():
                 await mark_authorization_changed(session, interaction.id)
-                await session.commit()
-                continue
-            if interaction.attempts > MAX_TURN_ATTEMPTS:
-                logger.warning(
-                    "Assistant turn %s failed after %s attempts",
-                    interaction_id,
-                    MAX_TURN_ATTEMPTS,
-                )
-                interaction.status = "failed"
-                interaction.outcome = "error"
-                interaction.error_code = "too_many_attempts"
-                interaction.worker_token = None
-                interaction.processing_lease_until = None
                 await session.commit()
                 continue
             attempt = interaction.attempts
@@ -1567,7 +1567,7 @@ async def handle_telegram_update(update, context, *, trigger: str) -> None:
             return
         interaction, worker_token = await claim_processing(session, interaction.id)
         if interaction is None:
-            await session.rollback()
+            await session.commit()
             return
         if interaction.inbound_chat_id != get_telegram_chat_id():
             await mark_authorization_changed(session, interaction.id)

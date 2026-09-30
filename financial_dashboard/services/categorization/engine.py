@@ -11,6 +11,7 @@ from financial_dashboard.db.models import (
     AuditAction,
     AuditInteraction,
     CategoryReviewDecision,
+    TelegramOutboundDelivery,
     Transaction,
     Setting,
     utc_now,
@@ -318,6 +319,17 @@ async def categorize_one(
             CategoryReviewDecision.status == "active",
         )
     )
+    if active_decision_id is not None and await session.scalar(
+        select(TelegramOutboundDelivery.id)
+        .where(
+            TelegramOutboundDelivery.category_review_decision_id == active_decision_id,
+            TelegramOutboundDelivery.status.in_(("abandoned", "cancelled")),
+        )
+        .limit(1)
+    ):
+        # The prompt was never sent. A new decision gets a new delivery.
+        await supersede_active_decisions(session, txn.id)
+        was_notified = False
     txn.category_method = "llm"
     txn.category_model = _active_model_name()
     txn.category_confidence = result.confidence

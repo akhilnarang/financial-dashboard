@@ -134,6 +134,7 @@ async def test_attachment_fence_and_caption_are_exact(session, tmp_path, monkeyp
     )
     session.add_all([transaction, interaction])
     await session.flush()
+    interaction.transaction_id = transaction.id + 1
     receipt = tmp_path / "receipt.pdf"
     receipt.write_bytes(b"%PDF-1.7\nreceipt")
     stored = StoredAttachment("receipt.pdf", receipt, "application/pdf")
@@ -147,6 +148,16 @@ async def test_attachment_fence_and_caption_are_exact(session, tmp_path, monkeyp
             interaction_id=interaction.id,
             worker_token="stale-worker",
         )
+    # A settlement fold moved the turn to another row during the download.
+    with pytest.raises(AttachmentError, match="lease"):
+        await attach_downloaded_attachment(
+            session,
+            transaction.id,
+            stored,
+            interaction_id=interaction.id,
+            worker_token="current-worker",
+        )
+    interaction.transaction_id = transaction.id
 
     mutation = await attach_downloaded_attachment(
         session,

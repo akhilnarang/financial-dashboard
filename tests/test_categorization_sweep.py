@@ -52,10 +52,17 @@ async def test_rule_sweep_categorizes_interest_rows(memdb):
         assert row.category_method == "rule"
 
 
-async def test_sweeps_retry_review_once_after_vocabulary_changes(memdb, monkeypatch):
+@pytest.mark.parametrize("prompt_failed", [False, True])
+async def test_sweeps_retry_review_once_after_vocabulary_changes(
+    memdb, monkeypatch, prompt_failed
+):
     from sqlalchemy import select
 
-    from financial_dashboard.db.models import Category, CategoryReviewDecision
+    from financial_dashboard.db.models import (
+        Category,
+        CategoryReviewDecision,
+        TelegramOutboundDelivery,
+    )
     from financial_dashboard.services import settings
     from financial_dashboard.services.categorization import engine, llm
 
@@ -103,6 +110,18 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(memdb, monkeypa
         assert row.review_status == "pending"
         row.review_status = "notified"
         s.add(Category(slug="groceries", active=True))
+        if prompt_failed:
+            decision = await s.scalar(select(CategoryReviewDecision))
+            s.add(
+                TelegramOutboundDelivery(
+                    category_review_decision_id=decision.id,
+                    transaction_id=row.id,
+                    recipient_chat_id=7,
+                    text="Needs a category",
+                    delivery_token="dead-prompt",
+                    status="abandoned",
+                )
+            )
         await s.commit()
     monkeypatch.setitem(settings._cache, "category_vocab_version", "2")
     assert await sweep.run_llm_sweep() == 1
@@ -110,11 +129,14 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(memdb, monkeypa
     async with memdb() as s:
         row = (await s.scalars(select(Transaction))).one()
         assert row.category == "expense"
-        # The same candidates reuse the sent prompt instead of sending it again.
-        assert row.review_status == "notified"
+        # The same candidates reuse a sent prompt. A prompt that was never
+        # sent must be sent again.
+        assert row.review_status == ("pending" if prompt_failed else "notified")
         assert row.category_vocab_version == 2
         decisions = (await s.scalars(select(CategoryReviewDecision))).all()
-        assert [decision.status for decision in decisions] == ["active"]
+        assert [decision.status for decision in decisions] == (
+            ["superseded", "active"] if prompt_failed else ["active"]
+        )
         row.category_method = "manual"
         row.category_vocab_version = 1
         row.review_status = "notified"

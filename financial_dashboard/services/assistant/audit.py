@@ -6,6 +6,7 @@ are one durable unit.
 """
 
 import datetime
+import logging
 import secrets
 from typing import NamedTuple, cast
 
@@ -16,7 +17,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import AuditInteraction, utc_now
 
+logger = logging.getLogger(__name__)
+
 PROCESSING_LEASE = datetime.timedelta(minutes=5)
+MAX_TURN_ATTEMPTS = 3
 
 
 class InteractionClaim(NamedTuple):
@@ -98,27 +102,55 @@ async def claim_processing(
     *,
     lease: datetime.timedelta = PROCESSING_LEASE,
 ) -> ProcessingClaim:
-    """Use compare-and-swap to claim processing, reclaiming only an expired lease."""
+    """Use compare-and-swap to claim processing, reclaiming only an expired lease.
+
+    A turn that used all its attempts is marked failed instead. The caller must
+    commit when the claim returns no row.
+    """
     token = secrets.token_urlsafe(24)
     now = utc_now()
     until = now + lease
+    claimable = and_(
+        AuditInteraction.id == interaction_id,
+        or_(
+            AuditInteraction.status == "claimed",
+            and_(
+                AuditInteraction.status == "processing",
+                or_(
+                    AuditInteraction.processing_lease_until.is_(None),
+                    AuditInteraction.processing_lease_until < now,
+                ),
+            ),
+        ),
+    )
+    exhausted = cast(
+        CursorResult,
+        await session.execute(
+            update(AuditInteraction)
+            .where(claimable, AuditInteraction.attempts >= MAX_TURN_ATTEMPTS)
+            .values(
+                status="failed",
+                outcome="error",
+                error_code="too_many_attempts",
+                worker_token=None,
+                processing_lease_until=None,
+                completed_at=now,
+            )
+            .execution_options(synchronize_session="fetch")
+        ),
+    )
+    if exhausted.rowcount == 1:
+        logger.warning(
+            "Assistant turn %s failed after %s attempts",
+            interaction_id,
+            MAX_TURN_ATTEMPTS,
+        )
+        return ProcessingClaim(None, token)
     result = cast(
         CursorResult,
         await session.execute(
             update(AuditInteraction)
-            .where(
-                AuditInteraction.id == interaction_id,
-                or_(
-                    AuditInteraction.status == "claimed",
-                    and_(
-                        AuditInteraction.status == "processing",
-                        or_(
-                            AuditInteraction.processing_lease_until.is_(None),
-                            AuditInteraction.processing_lease_until < now,
-                        ),
-                    ),
-                ),
-            )
+            .where(claimable)
             .values(
                 status="processing",
                 worker_token=token,

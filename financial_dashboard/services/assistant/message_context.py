@@ -1,5 +1,6 @@
 """Telegram message to application-record lookup and recovery helpers."""
 
+import json
 import re
 
 from sqlalchemy import select, update
@@ -148,6 +149,20 @@ async def move_transaction_references(
         old_id: The id of the transaction to delete.
         new_id: The id of the transaction that keeps the data.
     """
+    from financial_dashboard.services.assistant.conversations import (
+        clear_pending_confirmation,
+    )
+
+    # A pending "yes" names the old id. SQLite can give that id to a new row.
+    pending = await session.scalars(
+        select(TelegramConversation).where(
+            TelegramConversation.pending_confirmation_json.is_not(None)
+        )
+    )
+    for conversation in pending:
+        action = json.loads(conversation.pending_confirmation_json or "{}")
+        if action.get("action", {}).get("transaction_id") == old_id:
+            clear_pending_confirmation(conversation)
     for model in (
         TelegramConversation,
         TelegramMessageContext,
@@ -158,3 +173,12 @@ async def move_transaction_references(
             .where(model.transaction_id == old_id)
             .values(transaction_id=new_id)
         )
+    # A queued turn reads its target from the interaction when it resumes.
+    await session.execute(
+        update(AuditInteraction)
+        .where(
+            AuditInteraction.transaction_id == old_id,
+            AuditInteraction.status.in_(("claimed", "processing")),
+        )
+        .values(transaction_id=new_id)
+    )

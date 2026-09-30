@@ -168,6 +168,9 @@ async def attach_downloaded_attachment(
                 AuditInteraction.id == interaction_id,
                 AuditInteraction.status == "processing",
                 AuditInteraction.worker_token == worker_token,
+                # A settlement fold can move the turn to another transaction
+                # while the file downloads.
+                AuditInteraction.transaction_id == transaction_id,
             )
         )
         if owner is None:
