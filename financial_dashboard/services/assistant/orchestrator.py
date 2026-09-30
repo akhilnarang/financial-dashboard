@@ -1012,6 +1012,16 @@ async def _queue_result(
     ):
         raise RuntimeError("assistant processing lease was lost")
 
+    if transaction_id is not None:
+        current_target = await session.scalar(
+            select(AuditInteraction.transaction_id).where(
+                AuditInteraction.id == interaction_id
+            )
+        )
+        if current_target is not None and current_target != transaction_id:
+            # A settlement fold moved this turn while it ran. SQLite can give
+            # the old id to a new row, so the reply gets no target.
+            transaction_id = None
     chunks = split_plain_text(response_text, limit=4000)
     delivery_ids: list[int] = []
     for ordinal, chunk in enumerate(chunks):
@@ -1942,8 +1952,10 @@ async def _process_callback_interaction(
                         else None
                     )
                     if source_interaction is not None:
+                        # An undo only restores a rule. Its reply has no
+                        # transaction, so it cannot bind an id that a
+                        # settlement fold deleted.
                         interaction.conversation_id = source_interaction.conversation_id
-                        interaction.transaction_id = source_interaction.transaction_id
                     undone = await undo_merchant_rule(
                         session, action_id, interaction_id=interaction.id
                     )

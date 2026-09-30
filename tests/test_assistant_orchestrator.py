@@ -266,11 +266,13 @@ async def test_multi_transaction_query_queues_individually_mapped_results(
 
 @pytest.mark.anyio
 async def test_error_outcome_is_not_overridden_by_transport_label(session):
+    # A settlement fold moved this turn from row 100 to row 42 while it ran.
     interaction = AuditInteraction(
         inbound_chat_id=7,
         trigger="attachment",
         status="processing",
         worker_token="worker",
+        transaction_id=42,
     )
     session.add(interaction)
     await session.flush()
@@ -282,7 +284,7 @@ async def test_error_outcome_is_not_overridden_by_transport_label(session):
         result=OrchestrationResult(
             Error(outcome="error", message="download failed", code="attachment_failed")
         ),
-        transaction_id=None,
+        transaction_id=100,
         recipient_chat_id=7,
         outcome_override="attachment",
     )
@@ -290,6 +292,9 @@ async def test_error_outcome_is_not_overridden_by_transport_label(session):
     await session.refresh(interaction)
     assert interaction.outcome == "error"
     assert interaction.error_code == "attachment_failed"
+    # SQLite can give id 100 to a new row. A reply must not reach it.
+    delivery = await session.scalar(select(TelegramOutboundDelivery))
+    assert delivery.transaction_id is None
 
 
 @pytest.mark.anyio

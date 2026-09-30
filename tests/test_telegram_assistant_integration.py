@@ -674,8 +674,9 @@ async def test_merchant_rule_replacement_undo_restores_previous_rule(
     assert saved_rule.category == "dining"
     assert saved_rule.priority == 25
     assert saved_callback.conversation_id == conversation.id
-    assert saved_callback.transaction_id == transaction.id
-    assert output.transaction_id == transaction.id
+    # An undo reply has no transaction. A settlement fold can delete the old
+    # target, and SQLite can give its id to a new row.
+    assert (saved_callback.transaction_id, output.transaction_id) == (None, None)
 
 
 @pytest.mark.anyio
