@@ -257,12 +257,17 @@ def _parse_note_shorthand(text: str) -> InstructionParts | None:
         r"(?P<category>[A-Za-z][\w -]*?)\s*[.!]?\s*",
         text,
     )
-    if bare is None:
-        return None
-    payload = bare.group("payload").strip()
-    if not _safe_shorthand_note(payload):
-        return None
-    return InstructionParts(", " + bare.group("category").strip(), payload, True, True)
+    if bare is not None and _safe_shorthand_note(bare.group("payload")):
+        return InstructionParts(
+            ", " + bare.group("category").strip(),
+            bare.group("payload").strip(),
+            True,
+            True,
+        )
+    # Plain context with no instruction is the note itself.
+    if _safe_shorthand_note(text):
+        return InstructionParts("", text.strip(), False, True)
+    return None
 
 
 def parse_instruction(text: str) -> InstructionParts:

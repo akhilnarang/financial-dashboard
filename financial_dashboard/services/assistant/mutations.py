@@ -130,12 +130,12 @@ async def _category_evidence(
     return category
 
 
-async def unnamed_shorthand_category(
+async def unnamed_category(
     session: AsyncSession,
     request: ApplyTransactionChanges,
     current_user_message: str,
 ) -> str | None:
-    """Return a category that a shorthand note implies but does not name.
+    """Return a category that the model inferred but the message does not name.
 
     The caller must offer this category as a button. It must not write it.
 
@@ -145,18 +145,24 @@ async def unnamed_shorthand_category(
         current_user_message: The text of the current turn.
 
     Returns:
-        The implied category slug, or None when the message names it or the
-        turn is not a shorthand note.
+        The inferred category slug, or None when the message names it, or
+        when the message is a question or denies the change.
     """
     patch = request.changes.category
     if patch is None or patch.op != "set" or not patch.value:
         return None
-    instruction = parse_instruction(current_user_message.strip())
-    if not instruction.note_shorthand:
-        return None
+    raw = current_user_message.strip()
+    instruction = parse_instruction(raw)
     evidence = await _category_evidence(session, instruction.text, patch.value)
     value = normalize_text(evidence).replace("_", " ")
-    if mentions_category(normalize_text(current_user_message), value):
+    if (
+        mentions_category(normalize_text(raw), value)
+        or "?" in raw
+        or has_global_no_change(raw)
+        or has_non_mutating_intent(raw)
+        or negates_target(instruction.text, value)
+        or _category_assignment_is_negated(instruction.text)
+    ):
         return None
     return patch.value
 

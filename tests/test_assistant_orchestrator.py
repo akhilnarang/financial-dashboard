@@ -19,6 +19,7 @@ from financial_dashboard.services.assistant.orchestrator import (
     OrchestrationResult,
     _conversation_for_message,
     _queue_result,
+    run_pending_confirmation,
     run_turn,
 )
 from financial_dashboard.services.assistant.provider import StructuredResult
@@ -83,9 +84,64 @@ async def test_orchestrator_refuses_unsupported_aggregate_questions(session):
 
 
 @pytest.mark.anyio
-async def test_shorthand_note_offers_an_unnamed_category_as_a_button(session):
+@pytest.mark.parametrize(
+    ("message", "note"),
+    [
+        ("This was lunch with a friend", "lunch with a friend"),
+        # A bare reply is the note itself.
+        ("Snickers in train", "Snickers in train"),
+        # A category-only guess writes nothing and still offers the button.
+        ("Auto rickshaw", None),
+    ],
+)
+async def test_unnamed_category_is_offered_as_a_button(session, message, note):
     await ensure_category(session, "food")
     txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
+    session.add(txn)
+    await session.flush()
+    changes = {"category": {"op": "set", "value": "food"}}
+    if note is not None:
+        changes["note"] = {"op": "set", "value": note}
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": txn.id,
+                        "changes": changes,
+                    }
+                ],
+            )
+        ]
+    )
+
+    result = await run_turn(
+        session, provider, user_message=message, transaction_id=txn.id
+    )
+
+    assert txn.note == note
+    assert txn.category is None
+    assert (result.mutation is not None) == (note is not None)
+    assert isinstance(result.response, CategoryProposal)
+    assert [c.slug for c in result.response.candidates] == ["food"]
+    assert result.decision_id is not None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("message", "note"),
+    [
+        ("food", "lunch"),
+        ("food for lunch with a friend", "food for lunch with a friend"),
+    ],
+)
+async def test_category_only_reply_keeps_the_existing_note(session, message, note):
+    await ensure_category(session, "food")
+    txn = Transaction(
+        bank="test", email_type="test", direction="debit", amount=10, note="lunch"
+    )
     session.add(txn)
     await session.flush()
     provider = FakeProvider(
@@ -97,7 +153,7 @@ async def test_shorthand_note_offers_an_unnamed_category_as_a_button(session):
                         "name": "apply_transaction_changes",
                         "transaction_id": txn.id,
                         "changes": {
-                            "note": {"op": "set", "value": "lunch with a friend"},
+                            "note": {"op": "set", "value": message},
                             "category": {"op": "set", "value": "food"},
                         },
                     }
@@ -106,19 +162,92 @@ async def test_shorthand_note_offers_an_unnamed_category_as_a_button(session):
         ]
     )
 
+    await run_turn(session, provider, user_message=message, transaction_id=txn.id)
+
+    assert txn.category == "food"
+    assert txn.note == note
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        ("marked", None),
+        # A bare number can be an amount, so the user confirms the row first.
+        ("bare", None),
+        ("unnamed", "ambiguous_target"),
+        ("changed", "transaction_changed"),
+    ],
+)
+async def test_typed_transaction_number_is_a_change_target(session, case, error):
+    txn = Transaction(
+        bank="test",
+        email_type="test",
+        direction="debit",
+        amount=10,
+        counterparty="ZERODHA BROKING",
+    )
+    conversation = await start_conversation(session, chat_id=7, started_by="ask")
+    interaction = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="ask",
+        status="processing",
+        conversation_id=conversation.id,
+    )
+    session.add_all([txn, interaction])
+    await session.flush()
+
+    class EditingProvider(FakeProvider):
+        async def complete(self, context):
+            if case == "changed":
+                # Another writer edits the row while the model runs.
+                txn.note = "edited elsewhere"
+                await session.flush()
+            return await super().complete(context)
+
+    provider = EditingProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": txn.id,
+                        "changes": {
+                            "exclude_from_cashflow": {"op": "set", "value": True}
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+    # /ask has no bound target. Only a number the user typed can name one.
+    message = {
+        "unnamed": "exclude it from cashflow",
+        "bare": f"exclude {txn.id} from cashflow",
+    }.get(case, f"exclude #{txn.id} from cashflow")
+
     result = await run_turn(
         session,
         provider,
-        user_message="This was lunch with a friend",
-        transaction_id=txn.id,
+        user_message=message,
+        conversation_id=conversation.id,
+        interaction_id=interaction.id,
     )
 
-    assert result.mutation is not None
-    assert result.mutation.after["note"] == "lunch with a friend"
-    assert result.mutation.after["category"] is None
-    assert isinstance(result.response, CategoryProposal)
-    assert [c.slug for c in result.response.candidates] == ["food"]
-    assert result.decision_id is not None
+    if case == "bare":
+        assert txn.exclude_from_cashflow is False
+        assert "ZERODHA BROKING" in result.response.question
+        await run_pending_confirmation(
+            session,
+            conversation_id=conversation.id,
+            state_hash=conversation.pending_confirmation_state_hash,
+            user_message="yes",
+            replied_to_interaction_id=interaction.id,
+        )
+    assert txn.exclude_from_cashflow is (error is None)
+    if error is not None:
+        assert result.response.code == error
 
 
 @pytest.mark.anyio
@@ -163,12 +292,12 @@ async def test_turn_does_not_write_after_its_target_moved(session):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("rows", [1, 2])
+@pytest.mark.parametrize(("rows", "names_row"), [(1, False), (2, False), (1, True)])
 async def test_multi_transaction_query_queues_individually_mapped_results(
-    session, rows
+    session, rows, names_row
 ):
-    # A single row must also get its own card. The answer text must not be
-    # bound to a row that it does not show.
+    # A single row gets its own card unless the answer names it. The answer
+    # text must not be bound to a row that it does not show.
     transactions = [
         Transaction(
             bank="test",
@@ -187,8 +316,13 @@ async def test_multi_transaction_query_queues_individually_mapped_results(
     )
     session.add_all([*transactions, interaction])
     await session.flush()
+    text = (
+        f"Transaction {transactions[0].id} is a debit."
+        if names_row
+        else "I found two transactions."
+    )
     result = OrchestrationResult(
-        Answer(outcome="answer", text="I found two transactions."),
+        Answer(outcome="answer", text=text),
         transaction_ids=tuple(transaction.id for transaction in transactions),
         model_input_json='[{"role":"user","text":"find"}]',
         model_output_json='[{"outcome":"answer"}]',
@@ -220,6 +354,11 @@ async def test_multi_transaction_query_queues_individually_mapped_results(
             )
         ).all()
     )
+    if names_row:
+        assert [delivery.transaction_id for delivery in deliveries] == [
+            transactions[0].id
+        ]
+        return
     assert [delivery.transaction_id for delivery in deliveries] == [
         None,
         *(transaction.id for transaction in transactions),
