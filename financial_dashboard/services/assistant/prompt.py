@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v1"
+PROMPT_VERSION = "telegram-assistant-v2"
 
 
 class PromptContext(NamedTuple):
@@ -53,6 +53,13 @@ def build_prompt(context: PromptContext) -> str:
         '{"op":"set","value":true|false}. Omitted fields stay unchanged.',
         "A category proposal must contain exactly 2 or 3 existing category slugs.",
         "Categories must already exist; never propose creating a category.",
+        "Act; do not ask what to do. A reply to a transaction that only gives",
+        "context, such as 'Snickers in train', is the note: set the note to the",
+        "whole message and set your best category. The application asks the user",
+        "to confirm a category that the message does not name.",
+        "A reply that is only a category name sets the category and not the note.",
+        "A transaction number in the current message, such as 8788 or #8788, is a",
+        "valid target. Change one transaction per response.",
         "For a durable merchant rule, include an exact substring",
         "from the current user message as intent_evidence.",
         "Merchant-rule pattern and priority are server-derived; never provide them.",

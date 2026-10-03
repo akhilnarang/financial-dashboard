@@ -64,7 +64,7 @@ from financial_dashboard.services.assistant.mutations import (
     MutationRejected,
     MutationResult,
     apply_transaction_changes,
-    unnamed_shorthand_category,
+    unnamed_category,
 )
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.provider import (
@@ -154,7 +154,7 @@ def _request_direction_policy(
         )
     ):
         return default
-    normalized_message = normalize_text(instruction.text)
+    normalized_message = normalize_text(instruction.text or user_message)
     if re.search(rf"(?<!\w){re.escape(category_words)}(?!\w)", normalized_message):
         return DirectionPolicy.EXPLICIT_MANUAL_OVERRIDE
     return default
@@ -285,20 +285,19 @@ async def _dispatch_read(session: AsyncSession, call: object) -> object:
 async def _persist_pending(
     session: AsyncSession,
     conversation_id: int | None,
-    response: Clarification,
+    action: dict[str, object],
     *,
     source_interaction_id: int | None,
     transaction_state_hash: str,
     direction_policy: DirectionPolicy,
 ) -> None:
-    if conversation_id is None or response.pending_confirmation is None:
-        return
-    pending = response.pending_confirmation
+    if conversation_id is None:
+        raise MutationRejected("a confirmation needs a conversation")
     conversation = await session.get(TelegramConversation, conversation_id)
     if conversation is None:
-        return
-    payload = {
-        "action": pending.model_dump(),
+        raise MutationRejected("a confirmation needs a conversation")
+    payload: dict[str, object] = {
+        "action": action,
         "policy_version": POLICY_VERSION,
         "direction_policy": direction_policy.value,
     }
@@ -309,7 +308,7 @@ async def _persist_pending(
     set_pending_confirmation(
         conversation,
         payload,
-        kind=pending.kind,
+        kind=str(action["kind"]),
         source_interaction_id=source_interaction_id,
         expires_at=min(
             as_utc(conversation.expires_at) if conversation.expires_at else utc_now(),
@@ -350,6 +349,10 @@ async def run_turn(
         if transaction_id is not None
         else None
     )
+    named_state_hashes = {
+        named_id: await current_confirmation_state_hash(session, named_id)
+        for named_id in _named_transaction_ids(user_message)
+    }
     target = (
         await get_transaction(session, transaction_id)
         if transaction_id is not None
@@ -465,10 +468,27 @@ async def run_turn(
                 )
                 is not None
             )
-            if moved or (
-                transaction_id is not None
-                and await current_confirmation_state_hash(session, transaction_id)
-                != expected_state_hash
+            named_changed = False
+            if isinstance(response, ToolCalls):
+                for call in response.calls:
+                    if (
+                        isinstance(call, ApplyTransactionChanges)
+                        and call.transaction_id in named_state_hashes
+                        and call.transaction_id != transaction_id
+                        and await current_confirmation_state_hash(
+                            session, call.transaction_id
+                        )
+                        != named_state_hashes.get(call.transaction_id)
+                    ):
+                        named_changed = True
+            if (
+                moved
+                or named_changed
+                or (
+                    transaction_id is not None
+                    and await current_confirmation_state_hash(session, transaction_id)
+                    != expected_state_hash
+                )
             ):
                 return completed(
                     Error(
@@ -515,7 +535,7 @@ async def run_turn(
                         await _persist_pending(
                             session,
                             conversation_id,
-                            response,
+                            pending.model_dump(),
                             source_interaction_id=interaction_id,
                             transaction_state_hash=state_hash,
                             direction_policy=_request_direction_policy(
@@ -562,13 +582,26 @@ async def run_turn(
                 for call in response.calls
                 if isinstance(call, ApplyTransactionChanges)
             ]
-            if len(mutation_calls) > 1 or any(
-                transaction_id != call.transaction_id for call in mutation_calls
+            if len(mutation_calls) > 1:
+                return completed(
+                    Error(
+                        outcome="error",
+                        message="I change one transaction per message. Send one message for each.",
+                        code="ambiguous_target",
+                    )
+                )
+            if (
+                mutation_calls
+                and mutation_calls[0].transaction_id != transaction_id
+                and named_state_hashes.get(mutation_calls[0].transaction_id) is None
             ):
                 return completed(
                     Error(
                         outcome="error",
-                        message="I need one unambiguous transaction target for a change.",
+                        message=(
+                            "Which transaction? Reply to its message, or give its "
+                            "number, e.g. 'exclude 8788 from cashflow'."
+                        ),
                         code="ambiguous_target",
                     )
                 )
@@ -595,9 +628,50 @@ async def run_turn(
                     )
                 if mutation_calls:
                     call = mutation_calls[0]
-                    guessed = await unnamed_shorthand_category(
-                        session, call, user_message
+                    call_target = (
+                        target
+                        if call.transaction_id == transaction_id
+                        else await get_transaction(session, call.transaction_id)
                     )
+                    if call_target is None:
+                        raise MutationRejected("transaction not found")
+                    if call.transaction_id != transaction_id and (
+                        call.transaction_id not in _marked_transaction_ids(user_message)
+                    ):
+                        return completed(
+                            await _confirm_bare_target(
+                                session,
+                                call,
+                                call_target,
+                                user_message=user_message,
+                                conversation_id=conversation_id,
+                                interaction_id=interaction_id,
+                                direction_policy=_request_direction_policy(
+                                    call, user_message, direction_policy
+                                ),
+                            )
+                        )
+                    note = call.changes.note
+                    category = call.changes.category
+                    if (
+                        note is not None
+                        and note.op == "set"
+                        and category is not None
+                        and category.op == "set"
+                        and normalize_text(note.value).strip()
+                        == normalize_text(user_message).strip()
+                        and normalize_text(note.value).strip()
+                        == normalize_text((category.value or "").replace("_", " "))
+                    ):
+                        # A reply that names only a category keeps the old note.
+                        call = call.model_copy(
+                            update={
+                                "changes": call.changes.model_copy(
+                                    update={"note": None}
+                                )
+                            }
+                        )
+                    guessed = await unnamed_category(session, call, user_message)
                     if guessed is not None:
                         call = call.model_copy(
                             update={
@@ -606,15 +680,21 @@ async def run_turn(
                                 )
                             }
                         )
-                    mutation = await apply_transaction_changes(
-                        session,
-                        call,
-                        current_user_message=user_message,
-                        interaction_id=interaction_id,
-                        direction_policy=_request_direction_policy(
-                            call, user_message, direction_policy
-                        ),
-                    )
+                    if (
+                        guessed is None
+                        or call.changes.note is not None
+                        or call.changes.exclude_from_cashflow is not None
+                        or call.merchant_rule is not None
+                    ):
+                        mutation = await apply_transaction_changes(
+                            session,
+                            call,
+                            current_user_message=user_message,
+                            interaction_id=interaction_id,
+                            direction_policy=_request_direction_policy(
+                                call, user_message, direction_policy
+                            ),
+                        )
                     if guessed is not None:
                         proposal = CategoryProposal(
                             outcome="category_proposal",
@@ -623,26 +703,29 @@ async def run_turn(
                             candidates=[
                                 CategoryCandidate(
                                     slug=guessed,
-                                    reason="Guessed from the note.",
+                                    reason="Guessed from your message.",
                                     confidence=0.5,
                                 )
                             ],
                         )
                         try:
                             decision_id = await _save_proposal(
-                                session, proposal, target, interaction_id
+                                session, proposal, call_target, interaction_id
                             )
                         except MutationRejected:
+                            if mutation is None:
+                                raise
                             # The note is saved. An unsafe guess gets no button.
                             return completed(response, mutation)
                         return completed(proposal, mutation, decision_id)
-            except MutationRejected:
+            except MutationRejected as exc:
                 return completed(
                     Error(
                         outcome="error",
                         message=(
-                            "I couldn't safely apply that. Please state exactly "
-                            "which transaction field to change and its value."
+                            f"I couldn't safely apply that: {exc}. Say the change "
+                            "plainly, e.g. 'category groceries' or "
+                            "'exclude from cashflow'."
                         ),
                         code="mutation_rejected",
                     )
@@ -706,6 +789,10 @@ async def claim_pending_confirmation(
                     "intent_evidence": typed.category,
                 },
             )
+        elif pending.get("kind") == "transaction_change":
+            request = ApplyTransactionChanges.model_validate(pending.get("request"))
+            if request.transaction_id != pending.get("transaction_id"):
+                return None
         else:
             return None
     except (ValueError, TypeError) as exc:
@@ -841,6 +928,113 @@ async def _save_proposal(
     session.add(decision)
     await session.flush()
     return decision.id
+
+
+def _named_transaction_ids(text: str) -> set[int]:
+    """Return the transaction numbers that the user typed, such as 8788 or #8788.
+
+    A number with a currency mark, or a part of a date, time, or amount, is
+    not a transaction number.
+    """
+    text = re.sub(
+        r"(?:₹|\brs\.?|\binr)\s*[\d,.]+|[\d,.]+\s*(?:rupees|rs\b|inr\b|/-)",
+        " ",
+        text.lower(),
+    )
+    return {
+        int(match)
+        for match in re.findall(r"(?<![\d.,/:-])#?(\d+)(?![\d,/:-]|\.\d)", text)
+    }
+
+
+def _marked_transaction_ids(text: str) -> set[int]:
+    """Return the numbers that the user marked as ids, such as #8788 or txn 8788."""
+    return {
+        int(match)
+        for match in re.findall(
+            r"(?:#|\b(?:txn|transaction|id)\s*#?\s*)(\d+)", text, re.IGNORECASE
+        )
+    }
+
+
+class _DryRun(Exception):
+    """Roll back a validation-only apply."""
+
+
+def _describe_changes(request: ApplyTransactionChanges) -> str:
+    changes = request.changes
+    parts = []
+    if changes.note is not None:
+        parts.append(
+            f"set the note to '{changes.note.value[:200]}'"
+            if changes.note.op == "set"
+            else "clear the note"
+        )
+    if changes.category is not None:
+        parts.append(
+            f"set the category to {changes.category.value}"
+            if changes.category.op == "set"
+            else "clear the category"
+        )
+    if changes.exclude_from_cashflow is not None:
+        parts.append(
+            "exclude it from cashflow"
+            if changes.exclude_from_cashflow.value
+            else "include it in cashflow"
+        )
+    return " and ".join(parts)
+
+
+async def _confirm_bare_target(
+    session: AsyncSession,
+    request: ApplyTransactionChanges,
+    target: AssistantTransaction,
+    *,
+    user_message: str,
+    conversation_id: int | None,
+    interaction_id: int | None,
+    direction_policy: DirectionPolicy,
+) -> Clarification:
+    """Ask before a change to a row that a bare number names.
+
+    A bare number can be an amount. The user must see the row and confirm it.
+    """
+    if request.merchant_rule is not None:
+        raise MutationRejected("a merchant rule needs a marked id, such as #8788")
+    try:
+        async with session.begin_nested():
+            await apply_transaction_changes(
+                session,
+                request,
+                current_user_message=user_message,
+                direction_policy=direction_policy,
+            )
+            raise _DryRun
+    except _DryRun:
+        pass
+    state_hash = await current_confirmation_state_hash(session, request.transaction_id)
+    if state_hash is None:
+        raise MutationRejected("transaction not found")
+    await _persist_pending(
+        session,
+        conversation_id,
+        {
+            "kind": "transaction_change",
+            "transaction_id": request.transaction_id,
+            "request": request.model_dump(mode="json"),
+        },
+        source_interaction_id=interaction_id,
+        transaction_state_hash=state_hash,
+        direction_policy=direction_policy,
+    )
+    row = (
+        f"#{target.id} ({target.direction} {target.amount} {target.currency or 'INR'}"
+        f", {(target.counterparty or 'unknown')[:200]}, {target.transaction_date})"
+    )
+    question = f"{_describe_changes(request)} for {row[:400]}? Reply yes to confirm."
+    return Clarification(
+        outcome="clarification", question=question[0].upper() + question[1:]
+    )
 
 
 def _legacy_transaction_id(text: str) -> int | None:
@@ -1022,6 +1216,17 @@ async def _queue_result(
             # A settlement fold moved this turn while it ran. SQLite can give
             # the old id to a new row, so the reply gets no target.
             transaction_id = None
+    if result.mutation is not None:
+        transaction_id = result.mutation.transaction_id
+    elif isinstance(result.response, CategoryProposal):
+        transaction_id = result.response.transaction_id
+    elif (
+        transaction_id is None
+        and len(result.transaction_ids) == 1
+        and result.transaction_ids[0] in _named_transaction_ids(response_text)
+    ):
+        # The answer shows this one row, so a reply to it targets the row.
+        transaction_id = result.transaction_ids[0]
     chunks = split_plain_text(response_text, limit=4000)
     delivery_ids: list[int] = []
     for ordinal, chunk in enumerate(chunks):
