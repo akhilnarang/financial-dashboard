@@ -1,10 +1,14 @@
+import json
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.db.models import (
     AuditInteraction,
+    Setting,
+    TelegramConversation,
     TelegramOutboundDelivery,
     Transaction,
 )
@@ -15,9 +19,13 @@ from financial_dashboard.services.assistant.contracts import (
     ToolCalls,
 )
 from financial_dashboard.services.assistant.conversations import start_conversation
+from financial_dashboard.services.assistant.message_context import (
+    record_physical_message,
+)
 from financial_dashboard.services.assistant.orchestrator import (
     OrchestrationResult,
     _conversation_for_message,
+    _process_callback_interaction,
     _queue_result,
     run_pending_confirmation,
     run_turn,
@@ -469,3 +477,178 @@ async def test_conversation_timestamp_survives_sqlite_round_trip(session):
         mapped=SimpleNamespace(conversation_id=conversation_id, transaction_id=None),
     )
     assert resumed.id == conversation_id
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("choice", "bound"),
+    [
+        ("y", True),
+        ("n", True),
+        # A Yes from a different message must not authorize the change.
+        ("y", False),
+    ],
+)
+async def test_unclear_change_asks_with_yes_no_buttons(
+    session, monkeypatch, choice, bound
+):
+    import financial_dashboard.db as db_package
+    from financial_dashboard.services import telegram
+
+    session.add(Setting(key="telegram.chat_id", value="7"))
+    await ensure_category(session, "self_transfer")
+    txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
+    session.add(txn)
+    await session.flush()
+    conversation = await start_conversation(
+        session, chat_id=7, started_by="reply", transaction_id=txn.id
+    )
+    source = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="reply",
+        status="processing",
+        worker_token="worker",
+        conversation_id=conversation.id,
+        transaction_id=txn.id,
+    )
+    session.add(source)
+    await session.flush()
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": txn.id,
+                        "changes": {
+                            "category": {"op": "set", "value": "self_transfer"}
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    # A question does not clearly ask for the change, so the bot must ask.
+    result = await run_turn(
+        session,
+        provider,
+        user_message="I didn't say exclude? It is a self transfer",
+        transaction_id=txn.id,
+        conversation_id=conversation.id,
+        interaction_id=source.id,
+    )
+    await _queue_result(
+        session,
+        interaction_id=source.id,
+        worker_token="worker",
+        result=result,
+        transaction_id=txn.id,
+        recipient_chat_id=7,
+    )
+    assert txn.category is None
+    delivery = await session.scalar(
+        select(TelegramOutboundDelivery).where(
+            TelegramOutboundDelivery.interaction_id == source.id
+        )
+    )
+    buttons = json.loads(delivery.reply_markup_json)[0]
+    await record_physical_message(
+        session,
+        chat_id=7,
+        message_id=700,
+        context_kind="assistant_response",
+        conversation_id=conversation.id,
+        interaction_id=source.id,
+        outbound_delivery_id=delivery.id if bound else None,
+    )
+    callback = AuditInteraction(
+        telegram_update_id="callback-1",
+        inbound_chat_id=7,
+        trigger="confirm_button",
+        user_text="pending",
+        status="processing",
+        worker_token="callback-worker",
+    )
+    session.add(callback)
+    await session.commit()
+    maker = async_sessionmaker(
+        session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    monkeypatch.setattr(db_package, "async_session", maker)
+
+    async def fake_dispatch(delivery_id: int) -> bool:
+        return True
+
+    monkeypatch.setattr(telegram, "dispatch_saved_delivery", fake_dispatch)
+
+    await _process_callback_interaction(
+        interaction_id=callback.id,
+        worker_token="callback-worker",
+        trigger="confirm_button",
+        callback_data=next(
+            button["callback_data"]
+            for button in buttons
+            if button["callback_data"].endswith(f":{choice}")
+        ),
+        recipient_chat_id=7,
+        physical_message_id=700,
+    )
+
+    async with maker() as verification:
+        saved = await verification.get(Transaction, txn.id)
+        saved_conversation = await verification.get(
+            TelegramConversation, conversation.id
+        )
+    assert (saved.category == "self_transfer") is (choice == "y" and bound)
+    assert (saved_conversation.pending_confirmation_json is None) is bound
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Don't categorize this as self transfer",
+        # A question must not hide the denial behind a confirmation.
+        "Don't categorize this as self transfer?",
+        # An incomplete patch must not hide it either.
+        'Set note to "lunch" and category self transfer; don\'t make changes',
+    ],
+)
+async def test_forbidden_change_is_refused_not_offered(session, message):
+    await ensure_category(session, "self_transfer")
+    txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
+    session.add(txn)
+    await session.flush()
+    conversation = await start_conversation(
+        session, chat_id=7, started_by="reply", transaction_id=txn.id
+    )
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": txn.id,
+                        "changes": {
+                            "category": {"op": "set", "value": "self_transfer"}
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    result = await run_turn(
+        session,
+        provider,
+        user_message=message,
+        transaction_id=txn.id,
+        conversation_id=conversation.id,
+    )
+
+    assert result.response.outcome == "error"
+    assert conversation.pending_confirmation_json is None
+    assert txn.category is None

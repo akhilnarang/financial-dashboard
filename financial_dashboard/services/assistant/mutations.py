@@ -63,6 +63,10 @@ class MutationRejected(ValueError):
     """The requested assistant mutation was not safe to apply."""
 
 
+class ExplicitlyDenied(MutationRejected):
+    """The current message forbids this change. Do not offer to confirm it."""
+
+
 _NEGATION = (
     r"(?:do not|don t|never|no longer|stop|not|should not|shouldn t|"
     r"cannot|can t|will not|won t|would not|wouldn t|must not|mustn t|"
@@ -198,6 +202,28 @@ async def _validate_ordinary_intent(
     instruction_text = instruction.text
     normalized = normalize_text(instruction_text)
     changes = request.changes
+    if has_global_no_change(instruction_text) or (
+        instruction.note_shorthand and has_global_no_change(raw)
+    ):
+        raise ExplicitlyDenied("the current message forbids transaction changes")
+    # Check every explicit veto before a check that a confirmation can satisfy.
+    if changes.note is not None and negates_target(instruction_text, "note"):
+        raise ExplicitlyDenied("negated instructions cannot change transaction data")
+    if changes.category is not None:
+        if changes.category.op == "set":
+            evidence = await _category_evidence(
+                session, instruction_text, changes.category.value or ""
+            )
+            if negates_target(
+                instruction_text, normalize_text(evidence).replace("_", " ")
+            ) or _category_assignment_is_negated(instruction_text):
+                raise ExplicitlyDenied(
+                    "negated instructions cannot change transaction data"
+                )
+        elif negates_target(instruction_text, "category"):
+            raise ExplicitlyDenied(
+                "negated instructions cannot change transaction data"
+            )
     if instruction.note_requires_category and not (
         changes.note is not None
         and changes.note.op == "set"
@@ -208,16 +234,11 @@ async def _validate_ordinary_intent(
             "note/category shorthand requires both note and category changes"
         )
     if instruction.note_shorthand and (
-        "?" in raw
-        or has_global_no_change(raw)
-        or has_ambiguous_intent(raw)
-        or has_non_mutating_intent(raw)
+        "?" in raw or has_ambiguous_intent(raw) or has_non_mutating_intent(raw)
     ):
         raise MutationRejected(
             "questions or uncertain shorthand cannot change transaction data"
         )
-    if has_global_no_change(instruction_text):
-        raise MutationRejected("the current message forbids transaction changes")
     if has_ambiguous_intent(instruction_text):
         raise MutationRejected("uncertain instructions cannot change transaction data")
     if "?" in instruction_text or has_non_mutating_intent(instruction_text):
@@ -227,11 +248,6 @@ async def _validate_ordinary_intent(
         note_value = (
             normalize_text(raw_note_value).strip() if changes.note.op == "set" else ""
         )
-        intent_without_payload = instruction_text
-        if negates_target(intent_without_payload, "note"):
-            raise MutationRejected(
-                "negated instructions cannot change transaction data"
-            )
         if changes.note.op == "set":
             bounded_note = normalize_text(instruction.note_payload or "").strip()
             if not bounded_note or note_value != bounded_note:
@@ -246,12 +262,6 @@ async def _validate_ordinary_intent(
                 session, instruction_text, changes.category.value or ""
             )
             value = normalize_text(evidence).replace("_", " ")
-            if negates_target(
-                instruction_text, value
-            ) or _category_assignment_is_negated(instruction_text):
-                raise MutationRejected(
-                    "negated instructions cannot change transaction data"
-                )
             # A shorthand note moves text out of the instruction. The category
             # must still appear somewhere in the message.
             evidence_text = (
@@ -262,10 +272,6 @@ async def _validate_ordinary_intent(
                     "category value must be supported by the current message"
                 )
         else:
-            if negates_target(instruction_text, "category"):
-                raise MutationRejected(
-                    "negated instructions cannot change transaction data"
-                )
             if not re.search(
                 r"\b(?:clear|remove|delete|uncategorize|uncategorise)\b.*\bcategory\b",
                 normalized,
