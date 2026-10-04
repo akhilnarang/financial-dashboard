@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v3"
+PROMPT_VERSION = "telegram-assistant-v4"
 
 
 class PromptContext(NamedTuple):
@@ -58,6 +58,7 @@ def build_prompt(context: PromptContext) -> str:
         "whole message and set your best category. The application asks the user",
         "to confirm a category that the message does not name.",
         "A reply that is only a category name sets the category and not the note.",
+        "Change exclude_from_cashflow only when the user asks for it.",
         "The TRUSTED TRANSACTION TARGET is the transaction to change. A number",
         "inside context, such as 'Cashback received for 8864', is part of the",
         "note, not a new target. A transaction number, such as 8788 or #8788, is a",

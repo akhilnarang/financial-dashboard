@@ -114,6 +114,26 @@ def _cashflow_polarity_is_explicit(text: str, excluded: bool) -> bool:
     )
 
 
+def unrequested_exclusion(
+    request: ApplyTransactionChanges, current_user_message: str
+) -> bool:
+    """Return whether the patch changes cashflow exclusion without a request.
+
+    The caller must drop this field and apply the rest of the patch.
+
+    Args:
+        request: The patch that the model returned.
+        current_user_message: The text of the current turn.
+
+    Returns:
+        True when the patch sets exclusion and the message does not ask for it.
+    """
+    patch = request.changes.exclude_from_cashflow
+    return patch is not None and not _cashflow_polarity_is_explicit(
+        normalize_text(instruction_view(current_user_message)), patch.value
+    )
+
+
 async def _category_evidence(
     session: AsyncSession, instruction: str, category: str
 ) -> str:

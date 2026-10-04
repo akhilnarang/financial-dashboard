@@ -131,6 +131,44 @@ async def test_unnamed_category_is_offered_as_a_button(session, message, note):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
+    ("message", "excluded"),
+    [
+        # The model adds an exclusion that the user did not ask for.
+        ("Self transfer category", False),
+        ("Self transfer category, exclude from cashflow", True),
+    ],
+)
+async def test_unrequested_cashflow_exclusion_is_dropped(session, message, excluded):
+    await ensure_category(session, "self_transfer")
+    txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
+    session.add(txn)
+    await session.flush()
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": txn.id,
+                        "changes": {
+                            "category": {"op": "set", "value": "self_transfer"},
+                            "exclude_from_cashflow": {"op": "set", "value": True},
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    await run_turn(session, provider, user_message=message, transaction_id=txn.id)
+
+    assert txn.category == "self_transfer"
+    assert txn.exclude_from_cashflow is excluded
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
     ("message", "note"),
     [
         ("food", "lunch"),

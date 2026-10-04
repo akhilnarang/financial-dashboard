@@ -65,6 +65,7 @@ from financial_dashboard.services.assistant.mutations import (
     MutationResult,
     apply_transaction_changes,
     unnamed_category,
+    unrequested_exclusion,
 )
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.provider import (
@@ -668,6 +669,14 @@ async def run_turn(
                             update={
                                 "changes": call.changes.model_copy(
                                     update={"note": None}
+                                )
+                            }
+                        )
+                    if unrequested_exclusion(call, user_message):
+                        call = call.model_copy(
+                            update={
+                                "changes": call.changes.model_copy(
+                                    update={"exclude_from_cashflow": None}
                                 )
                             }
                         )
