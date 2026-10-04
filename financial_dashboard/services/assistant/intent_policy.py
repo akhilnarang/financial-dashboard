@@ -270,11 +270,17 @@ def _parse_note_shorthand(text: str) -> InstructionParts | None:
     return None
 
 
+# Every character that str.splitlines() treats as a line break.
+_LINE_BREAKS = r"\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+
+
 def parse_instruction(text: str) -> InstructionParts:
     """Split application-bounded note content from the remaining instructions."""
     match = re.search(
-        r"(?:\b(?:set|change|update|add|write)\s+(?:the\s+)?note\s*"
-        r"(?:(?:to|as|is)\b|[:=])?\s*|\bnote\s*:\s*)",
+        rf"(?:\b(?:set|change|update|add|write)\s+(?:the\s+)?note[^\S{_LINE_BREAKS}]*"
+        rf"(?:(?:to|as|is)\b|[:=])?[^\S{_LINE_BREAKS}]*|\bnote[^\S{_LINE_BREAKS}]*:[^\S{_LINE_BREAKS}]*"
+        # A label at the start of a line, such as "Description: ...".
+        rf"|(?m:^)[^\S{_LINE_BREAKS}]*(?:description|desc|memo)[^\S{_LINE_BREAKS}]*:[^\S{_LINE_BREAKS}]*)",
         text,
         re.IGNORECASE,
     )
@@ -300,7 +306,7 @@ def parse_instruction(text: str) -> InstructionParts:
                 False,
             )
     delimiter = re.search(
-        r"[,.;:!?\n]|\s+and\s+(?=(?:(?:set|change|update|assign)\s+)?"
+        rf"[,.;:!?{_LINE_BREAKS}]|\s+and\s+(?=(?:(?:set|change|update|assign)\s+)?"
         r"(?:the\s+)?category\b)",
         text[start:],
         re.IGNORECASE,

@@ -95,6 +95,24 @@ def _set(value):
         ),
         ("This might be salary", {"category": _set("salary")}),
         ("Never set the note to note", {"note": _set("note")}),
+        (
+            "Description: Amazon Fresh; do not change the description",
+            {"note": _set("Amazon Fresh")},
+        ),
+        # A Unicode line separator must not hide the denial in a note.
+        ("memo:\u2028Don't make changes", {"note": _set("Don't make changes")}),
+        (
+            "note:\nCategory: groceries",
+            {"note": _set("Category"), "category": _set("groceries")},
+        ),
+        (
+            "Description:\nCategory: groceries",
+            {"note": _set("Category"), "category": _set("groceries")},
+        ),
+        (
+            "Set category to groceries; the existing memo: Amazon Fresh",
+            {"category": _set("groceries"), "note": _set("Amazon Fresh")},
+        ),
         ("include this in cashflow", {"exclude_from_cashflow": _set(True)}),
         ("exclude this from cashflow", {"exclude_from_cashflow": _set(False)}),
         (
@@ -166,6 +184,12 @@ async def test_unsupported_instruction_leaves_transaction_unchanged(
             {"note": _set("Amazon Fresh"), "category": _set("groceries")},
         ),
         ("Set note to Don't make changes", {"note": _set("Don't make changes")}),
+        # A phone keyboard can type a non-breaking space.
+        ("set note\u00a0to Amazon Fresh", {"note": _set("Amazon Fresh")}),
+        (
+            "Description: Amazon Fresh\n\nCategory: groceries",
+            {"note": _set("Amazon Fresh"), "category": _set("groceries")},
+        ),
         ("include this in cashflow", {"exclude_from_cashflow": _set(False)}),
     ],
 )

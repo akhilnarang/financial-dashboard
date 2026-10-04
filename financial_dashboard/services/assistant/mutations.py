@@ -207,7 +207,10 @@ async def _validate_ordinary_intent(
     ):
         raise ExplicitlyDenied("the current message forbids transaction changes")
     # Check every explicit veto before a check that a confirmation can satisfy.
-    if changes.note is not None and negates_target(instruction_text, "note"):
+    if changes.note is not None and any(
+        negates_target(instruction_text, label)
+        for label in ("note", "description", "desc", "memo")
+    ):
         raise ExplicitlyDenied("negated instructions cannot change transaction data")
     evidence = (
         await _category_evidence(
