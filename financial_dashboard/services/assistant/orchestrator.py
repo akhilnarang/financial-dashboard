@@ -107,6 +107,9 @@ _UNSUPPORTED_AGGREGATE = re.compile(
 )
 
 
+_CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
+
+
 class OrchestrationResult(NamedTuple):
     response: AssistantResponse
     mutation: MutationResult | None = None
@@ -217,6 +220,25 @@ def _confirmation_question(
         f"'{pending.category}' and assign it to transaction "
         f"#{pending.transaction_id}? Reply yes to confirm."
     )
+
+
+async def _pending_conversation(
+    session: AsyncSession, source_interaction_id: int
+) -> TelegramConversation | None:
+    """Return the conversation that waits on a confirmation from this turn."""
+    return await session.scalar(
+        select(TelegramConversation).where(
+            TelegramConversation.pending_confirmation_source_interaction_id
+            == source_interaction_id,
+            TelegramConversation.pending_confirmation_json.is_not(None),
+        )
+    )
+
+
+def _without(call: ApplyTransactionChanges, field: str) -> ApplyTransactionChanges:
+    """Return the patch with one changes field left unchanged."""
+    changes = call.changes.model_copy(update={field: None})
+    return call.model_copy(update={"changes": changes})
 
 
 async def current_transaction_state_hash(
@@ -666,30 +688,12 @@ async def run_turn(
                         == normalize_text((category.value or "").replace("_", " "))
                     ):
                         # A reply that names only a category keeps the old note.
-                        call = call.model_copy(
-                            update={
-                                "changes": call.changes.model_copy(
-                                    update={"note": None}
-                                )
-                            }
-                        )
+                        call = _without(call, "note")
                     if unrequested_exclusion(call, user_message):
-                        call = call.model_copy(
-                            update={
-                                "changes": call.changes.model_copy(
-                                    update={"exclude_from_cashflow": None}
-                                )
-                            }
-                        )
+                        call = _without(call, "exclude_from_cashflow")
                     guessed = await unnamed_category(session, call, user_message)
                     if guessed is not None:
-                        call = call.model_copy(
-                            update={
-                                "changes": call.changes.model_copy(
-                                    update={"category": None}
-                                )
-                            }
-                        )
+                        call = _without(call, "category")
                     if (
                         guessed is None
                         or call.changes.note is not None
@@ -1301,18 +1305,7 @@ async def _queue_result(
                 separators=(",", ":"),
             )
         if ordinal == 0 and isinstance(result.response, Clarification):
-            pending_conversation = await session.scalar(
-                select(TelegramConversation).where(
-                    TelegramConversation.id
-                    == select(AuditInteraction.conversation_id)
-                    .where(AuditInteraction.id == interaction_id)
-                    .scalar_subquery(),
-                    TelegramConversation.pending_confirmation_source_interaction_id
-                    == interaction_id,
-                    TelegramConversation.pending_confirmation_json.is_not(None),
-                )
-            )
-            if pending_conversation is not None:
+            if await _pending_conversation(session, interaction_id) is not None:
                 delivery.reply_markup_json = json.dumps(
                     [
                         [
@@ -1516,29 +1509,14 @@ async def _process_text_interaction(
                 == conversation.pending_confirmation_source_interaction_id
                 and is_direct_affirmative(user_text)
             ):
-                try:
-                    mutation = await run_pending_confirmation(
-                        session,
-                        conversation_id=conversation.id,
-                        state_hash=conversation.pending_confirmation_state_hash or "",
-                        user_message=user_text,
-                        replied_to_interaction_id=replied_to_interaction_id,
-                        interaction_id=interaction_id,
-                        authorized_chat_id=recipient_chat_id,
-                    )
-                    result = OrchestrationResult(
-                        Answer(outcome="answer", text="Saved."), mutation=mutation
-                    )
-                except AuthorizationChanged:
-                    raise
-                except MutationRejected as exc:
-                    result = OrchestrationResult(
-                        Error(
-                            outcome="error",
-                            message=str(exc),
-                            code="confirmation_rejected",
-                        )
-                    )
+                result = await _apply_pending(
+                    session,
+                    conversation,
+                    user_message=user_text,
+                    source_interaction_id=replied_to_interaction_id,
+                    interaction_id=interaction_id,
+                    recipient_chat_id=recipient_chat_id,
+                )
             elif result is None and conversation.pending_confirmation_json:
                 from financial_dashboard.services.assistant.conversations import (
                     clear_pending_confirmation,
@@ -1624,7 +1602,7 @@ async def resume_claimed_interactions(*, bot=None, limit: int = 50) -> int:
     from financial_dashboard.services.assistant.message_context import resolve_reply
     from financial_dashboard.services.settings import get_telegram_chat_id
 
-    triggers = ["ask", "reply", "category_button", "undo", "confirm_button"]
+    triggers = ["ask", "reply", *_CALLBACK_TRIGGERS]
     if bot is not None:
         triggers.append("attachment")
     async with async_session() as session:
@@ -1708,7 +1686,7 @@ async def resume_claimed_interactions(*, bot=None, limit: int = 50) -> int:
                         declared_size=attachment_payload.get("declared_size"),
                         caption=caption,
                     )
-                elif trigger in {"category_button", "undo", "confirm_button"}:
+                elif trigger in _CALLBACK_TRIGGERS:
                     await _process_callback_interaction(
                         interaction_id=interaction_id,
                         worker_token=worker_token,
@@ -1753,7 +1731,7 @@ async def handle_telegram_update(update, context, *, trigger: str) -> None:
     message = update.message or (query.message if query is not None else None)
     if message is None or message.chat.id != get_telegram_chat_id():
         return
-    if trigger in {"category_button", "undo", "confirm_button"}:
+    if trigger in _CALLBACK_TRIGGERS:
         await _handle_assistant_callback(update, context=context, trigger=trigger)
         return
 
@@ -2285,10 +2263,41 @@ async def _process_callback_interaction(
             import logging
 
             logging.getLogger(__name__).exception(
-                "Merchant-rule undo committed but cache refresh failed"
+                "Assistant callback committed but cache refresh failed"
             )
     for delivery_id in delivery_ids:
         await dispatch_saved_delivery(delivery_id)
+
+
+async def _apply_pending(
+    session: AsyncSession,
+    conversation: TelegramConversation,
+    *,
+    user_message: str,
+    source_interaction_id: int,
+    interaction_id: int,
+    recipient_chat_id: int,
+) -> OrchestrationResult:
+    """Apply the conversation's pending confirmation, or explain why not."""
+    try:
+        mutation = await run_pending_confirmation(
+            session,
+            conversation_id=conversation.id,
+            state_hash=conversation.pending_confirmation_state_hash or "",
+            user_message=user_message,
+            replied_to_interaction_id=source_interaction_id,
+            interaction_id=interaction_id,
+            authorized_chat_id=recipient_chat_id,
+        )
+    except AuthorizationChanged:
+        raise
+    except MutationRejected as exc:
+        return OrchestrationResult(
+            Error(outcome="error", message=str(exc), code="confirmation_rejected")
+        )
+    return OrchestrationResult(
+        Answer(outcome="answer", text="Saved."), mutation=mutation
+    )
 
 
 async def _confirm_from_button(
@@ -2338,26 +2347,13 @@ async def _confirm_from_button(
         or delivery is None
         or delivery.interaction_id is None
         or not await validate_delivery_proof(
-            session,
-            delivery_id,
-            recipient_chat_id=recipient_chat_id,
-            interaction_id=delivery.interaction_id,
+            session, delivery_id, recipient_chat_id=recipient_chat_id
         )
         or not await settle_delivery_from_callback(session, delivery_id)
     ):
         return stale
-    source = await session.get(AuditInteraction, delivery.interaction_id)
-    conversation = (
-        await session.get(TelegramConversation, source.conversation_id)
-        if source is not None and source.conversation_id is not None
-        else None
-    )
-    if (
-        source is None
-        or conversation is None
-        or conversation.pending_confirmation_json is None
-        or conversation.pending_confirmation_source_interaction_id != source.id
-    ):
+    conversation = await _pending_conversation(session, delivery.interaction_id)
+    if conversation is None:
         return stale
     interaction.conversation_id = conversation.id
     if choice == "n":
@@ -2365,26 +2361,18 @@ async def _confirm_from_button(
         return OrchestrationResult(
             Answer(outcome="answer", text="Okay. Nothing changed.")
         )
-    try:
-        mutation = await run_pending_confirmation(
-            session,
-            conversation_id=conversation.id,
-            state_hash=conversation.pending_confirmation_state_hash or "",
-            user_message="yes",
-            replied_to_interaction_id=source.id,
-            interaction_id=interaction.id,
-            authorized_chat_id=recipient_chat_id,
-        )
-    except AuthorizationChanged:
-        raise
-    except MutationRejected as exc:
-        return OrchestrationResult(
-            Error(outcome="error", message=str(exc), code="confirmation_rejected")
-        )
-    interaction.transaction_id = mutation.transaction_id
-    return OrchestrationResult(
-        Answer(outcome="answer", text="Saved."), mutation=mutation
+    result = await _apply_pending(
+        session,
+        conversation,
+        # A Yes tap is a direct affirmative.
+        user_message="yes",
+        source_interaction_id=delivery.interaction_id,
+        interaction_id=interaction.id,
+        recipient_chat_id=recipient_chat_id,
     )
+    if result.mutation is not None:
+        interaction.transaction_id = result.mutation.transaction_id
+    return result
 
 
 async def _handle_assistant_callback(update, context, *, trigger: str) -> None:

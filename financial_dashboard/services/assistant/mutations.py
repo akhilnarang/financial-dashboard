@@ -209,11 +209,15 @@ async def _validate_ordinary_intent(
     # Check every explicit veto before a check that a confirmation can satisfy.
     if changes.note is not None and negates_target(instruction_text, "note"):
         raise ExplicitlyDenied("negated instructions cannot change transaction data")
+    evidence = (
+        await _category_evidence(
+            session, instruction_text, changes.category.value or ""
+        )
+        if changes.category is not None and changes.category.op == "set"
+        else ""
+    )
     if changes.category is not None:
         if changes.category.op == "set":
-            evidence = await _category_evidence(
-                session, instruction_text, changes.category.value or ""
-            )
             if negates_target(
                 instruction_text, normalize_text(evidence).replace("_", " ")
             ) or _category_assignment_is_negated(instruction_text):
@@ -258,9 +262,6 @@ async def _validate_ordinary_intent(
             raise MutationRejected("clearing a note requires current-message intent")
     if changes.category is not None:
         if changes.category.op == "set":
-            evidence = await _category_evidence(
-                session, instruction_text, changes.category.value or ""
-            )
             value = normalize_text(evidence).replace("_", " ")
             # A shorthand note moves text out of the instruction. The category
             # must still appear somewhere in the message.
