@@ -65,6 +65,7 @@ from financial_dashboard.services.assistant.mutations import (
     MutationRejected,
     MutationResult,
     apply_transaction_changes,
+    raise_vetoes,
     unnamed_category,
     unrequested_exclusion,
 )
@@ -1035,26 +1036,17 @@ async def _confirm_change(
     """
     if request.merchant_rule is not None:
         raise MutationRejected("a merchant rule needs a direct instruction")
+    await raise_vetoes(session, request, user_message)
     try:
         async with session.begin_nested():
-            try:
-                await apply_transaction_changes(
-                    session,
-                    request,
-                    current_user_message=user_message,
-                    direction_policy=direction_policy,
-                )
-            except ExplicitlyDenied:
-                raise
-            except MutationRejected:
-                # The tap supplies the intent. Every other check still runs.
-                await apply_transaction_changes(
-                    session,
-                    request,
-                    current_user_message=user_message,
-                    direction_policy=direction_policy,
-                    confirmed_pending=True,
-                )
+            # The tap supplies the intent. Every other check still runs.
+            await apply_transaction_changes(
+                session,
+                request,
+                current_user_message=user_message,
+                direction_policy=direction_policy,
+                confirmed_pending=True,
+            )
             raise _DryRun
     except _DryRun:
         pass

@@ -222,6 +222,8 @@ async def test_category_only_reply_keeps_the_existing_note(session, message, not
         # A bare number can be an amount, so the user confirms the row first.
         ("bare", None),
         ("unnamed", "ambiguous_target"),
+        # A bare number must not turn an explicit "no" into a Yes/No prompt.
+        ("bare_denied", "mutation_rejected"),
         ("changed", "transaction_changed"),
     ],
 )
@@ -271,6 +273,7 @@ async def test_typed_transaction_number_is_a_change_target(session, case, error)
     message = {
         "unnamed": "exclude it from cashflow",
         "bare": f"exclude {txn.id} from cashflow",
+        "bare_denied": f"exclude {txn.id} from cashflow; don't make changes",
     }.get(case, f"exclude #{txn.id} from cashflow")
 
     result = await run_turn(
@@ -294,6 +297,7 @@ async def test_typed_transaction_number_is_a_change_target(session, case, error)
     assert txn.exclude_from_cashflow is (error is None)
     if error is not None:
         assert result.response.code == error
+        assert conversation.pending_confirmation_json is None
 
 
 @pytest.mark.anyio

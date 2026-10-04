@@ -191,22 +191,32 @@ async def unnamed_category(
     return patch.value
 
 
-async def _validate_ordinary_intent(
+async def raise_vetoes(
     session: AsyncSession,
     request: ApplyTransactionChanges,
     current_user_message: str,
-) -> None:
-    """Bind ordinary patches to declarative current-turn evidence."""
+) -> str:
+    """Raise ExplicitlyDenied when the message forbids a change in the patch.
+
+    A confirmation never overrides these checks.
+
+    Args:
+        session: The session of the current turn.
+        request: The patch that the model returned.
+        current_user_message: The text of the current turn.
+
+    Returns:
+        The category evidence for a category set, else an empty string, so
+        the caller does not look it up again.
+    """
     raw = current_user_message.strip()
     instruction = parse_instruction(raw)
     instruction_text = instruction.text
-    normalized = normalize_text(instruction_text)
     changes = request.changes
     if has_global_no_change(instruction_text) or (
         instruction.note_shorthand and has_global_no_change(raw)
     ):
         raise ExplicitlyDenied("the current message forbids transaction changes")
-    # Check every explicit veto before a check that a confirmation can satisfy.
     if changes.note is not None and any(
         negates_target(instruction_text, label)
         for label in ("note", "description", "desc", "memo")
@@ -231,6 +241,21 @@ async def _validate_ordinary_intent(
             raise ExplicitlyDenied(
                 "negated instructions cannot change transaction data"
             )
+    return evidence
+
+
+async def _validate_ordinary_intent(
+    session: AsyncSession,
+    request: ApplyTransactionChanges,
+    current_user_message: str,
+) -> None:
+    """Bind ordinary patches to declarative current-turn evidence."""
+    raw = current_user_message.strip()
+    instruction = parse_instruction(raw)
+    instruction_text = instruction.text
+    normalized = normalize_text(instruction_text)
+    changes = request.changes
+    evidence = await raise_vetoes(session, request, current_user_message)
     if instruction.note_requires_category and not (
         changes.note is not None
         and changes.note.op == "set"
