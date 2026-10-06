@@ -9,7 +9,11 @@ from fastapi.responses import FileResponse
 
 from financial_dashboard.api.query import validate_date_range
 from financial_dashboard.core.deps import AsyncSessionDep
-from financial_dashboard.exceptions import BadRequestException, NotFoundException
+from financial_dashboard.exceptions import (
+    BadRequestException,
+    ConflictException,
+    NotFoundException,
+)
 from financial_dashboard.schemas import transactions as transaction_schemas
 from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.schemas.transactions import (
@@ -17,10 +21,16 @@ from financial_dashboard.schemas.transactions import (
     TransactionCategoryUpdate,
     TransactionExcludeResponse,
     TransactionExcludeUpdate,
+    TransactionMergeBatchRequest,
+    TransactionMergeResponse,
     TransactionNoteResponse,
     TransactionNoteUpdate,
     TransactionRelinkResponse,
     TransactionRelinkUpdate,
+)
+from financial_dashboard.services.duplicate_merge import (
+    MergeRefused,
+    merge_duplicates,
 )
 from financial_dashboard.services.transaction_reads import (
     get_transaction_detail,
@@ -100,6 +110,21 @@ async def transactions_batch(
 ) -> transaction_schemas.TransactionBatchResponse:
     """Return transaction summaries for an ordered, explicit set of IDs."""
     return await get_transactions_by_ids(session, payload.ids)
+
+
+@router.post("/transactions/merge-batch")
+async def transactions_merge_batch(
+    payload: TransactionMergeBatchRequest,
+    session: AsyncSessionDep,
+) -> TransactionMergeResponse:
+    """Merge duplicate rows into their keepers, all or nothing.
+
+    A dry run writes nothing. A refused pair refuses the whole batch.
+    """
+    try:
+        return await merge_duplicates(session, payload.pairs, dry_run=payload.dry_run)
+    except MergeRefused as exc:
+        raise ConflictException(detail={"refused": exc.refusals}) from exc
 
 
 @router.get("/transactions/{txn_id}")
