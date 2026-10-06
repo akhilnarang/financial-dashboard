@@ -242,6 +242,24 @@ async def test_pending_row_is_notified_once_with_escaped_fields(memdb, telegram_
     assert await sweep.run_review_notify() == 0
     assert len(telegram_send) == 1
 
+    # One statement import sends at most five prompts and one summary line.
+    # A small import sends one prompt per row.
+    big = [await _seed_pending(memdb, bank_statement_upload_id=41) for _ in range(7)]
+    small = [await _seed_pending(memdb, statement_upload_id=42) for _ in range(2)]
+    telegram_send.clear()
+    assert await sweep.run_review_notify() == 7
+    prompts = [text for text, _ in telegram_send if "Needs a category" in text]
+    assert len(prompts) == 7
+    assert all(f'/transactions/{i}">' in t for i, t in zip(big[:5] + small, prompts))
+    summaries = [text for text, _ in telegram_send if "Needs a category" not in text]
+    assert summaries == [
+        '\U0001f50d 2 more rows need a category\nhttp://host:8000"x/api/transactions'
+        "?bank_statement_upload_id=41&review_status=notified"
+    ]
+    async with memdb() as s:
+        for txn_id in big + small:
+            assert (await s.get(Transaction, txn_id)).review_status == "notified"
+
 
 async def test_failed_send_is_retried_until_the_cap(memdb, telegram_send, monkeypatch):
     """A transient send failure does not strand a row before the cap. A row at
