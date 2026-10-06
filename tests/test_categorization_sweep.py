@@ -260,17 +260,20 @@ async def test_pending_row_is_notified_once_with_escaped_fields(memdb, telegram_
         for txn_id in big + small:
             assert (await s.get(Transaction, txn_id)).review_status == "notified"
 
-    # Resolved prompts still use up the budget of their import. One summary
+    # Resolved or re-opened prompts still use up the budget of their import. One summary
     # covers all new rows, also those past the sweep batch limit.
     async with memdb() as s:
         for txn_id in big[:5]:
             (await s.get(Transaction, txn_id)).review_status = "resolved"
+        # A new vocabulary can send notified rows back to review.
+        for txn_id in big[:3]:
+            (await s.get(Transaction, txn_id)).review_status = "pending"
         await s.commit()
     late = [await _seed_pending(memdb, bank_statement_upload_id=41) for _ in range(55)]
     telegram_send.clear()
     assert await sweep.run_review_notify() == 0
     assert [text.split("\n")[0] for text, _ in telegram_send] == [
-        "\U0001f50d 55 more rows need a category"
+        "\U0001f50d 58 more rows need a category"
     ]
     async with memdb() as s:
         assert (await s.get(Transaction, late[-1])).review_status == "notified"
@@ -278,15 +281,20 @@ async def test_pending_row_is_notified_once_with_escaped_fields(memdb, telegram_
 
 async def test_failed_send_is_retried_until_the_cap(memdb, telegram_send, monkeypatch):
     """A transient send failure does not strand a row before the cap. A row at
-    the cap is skipped, so the queue drains."""
-    attempts = {"count": 0}
+    the cap is skipped, so the queue drains. A failed prompt keeps its import
+    slot and holds back the summary of the import."""
+    texts: list[str] = []
 
-    async def failing_send(*a, **kw):
-        attempts["count"] += 1
+    async def failing_send(*a, text, **kw):
+        texts.append(text)
         raise RuntimeError("still failing")
 
     monkeypatch.setattr(tg, "_send_with_retry", failing_send)
-    txn_id = await _seed_pending(memdb)
+    from financial_dashboard.services import settings
+
+    monkeypatch.setitem(settings._cache, "telegram.bulk_threshold", "1")
+    txn_id = await _seed_pending(memdb, bank_statement_upload_id=41)
+    await _seed_pending(memdb, bank_statement_upload_id=41)
 
     for expected in range(1, sweep._MAX_NOTIFY_ATTEMPTS + 1):
         await sweep.run_review_notify()
@@ -296,5 +304,7 @@ async def test_failed_send_is_retried_until_the_cap(memdb, telegram_send, monkey
         assert txn.notify_attempts == expected
         assert txn.last_notified_at is None
 
+    # The abandoned row frees its slot for the next row of the import.
     assert await sweep.run_review_notify() == 0
-    assert attempts["count"] == sweep._MAX_NOTIFY_ATTEMPTS
+    assert len(texts) == sweep._MAX_NOTIFY_ATTEMPTS + 1
+    assert all("Needs a category" in text for text in texts)

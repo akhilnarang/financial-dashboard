@@ -175,7 +175,6 @@ async def _notified_count(session: AsyncSession, key: ImportKey) -> int:
         select(func.count()).where(
             getattr(Transaction, key.param) == key.upload_id,
             Transaction.last_notified_at.is_not(None),
-            Transaction.review_status.is_distinct_from("pending"),
         )
     )
     return count or 0
@@ -409,6 +408,22 @@ async def _notify_plain(txn: Transaction, chat_id: int, base_url: str) -> bool:
     return True
 
 
+async def _notify_row(
+    session: AsyncSession,
+    txn: Transaction,
+    chat_id: int,
+    base_url: str,
+    assistant_enabled: bool,
+) -> bool:
+    """Send the review prompt of one row. Returns True when sent."""
+    decision = await _review_decision(session, txn, assistant_enabled)
+    if not assistant_enabled:
+        return await _notify_plain(txn, chat_id, base_url)
+    return decision is not None and await _notify_assistant(
+        session, txn, decision, chat_id, base_url
+    )
+
+
 async def run_review_notify() -> int:
     """Push rows flagged review_status='pending' to the Telegram review queue.
 
@@ -441,16 +456,16 @@ async def run_review_notify() -> int:
         rows = (await session.execute(stmt)).scalars().all()
         base_url = get_app_base_url()
         batch = await _cap_per_import(session, rows, assistant_enabled)
+        failed: set[ImportKey | None] = set()
         for txn in batch.prompt:
-            decision = await _review_decision(session, txn, assistant_enabled)
-            if assistant_enabled:
-                if decision is not None and await _notify_assistant(
-                    session, txn, decision, chat_id, base_url
-                ):
-                    sent += 1
-            elif await _notify_plain(txn, chat_id, base_url):
+            if await _notify_row(session, txn, chat_id, base_url, assistant_enabled):
                 sent += 1
+            else:
+                failed.add(_import_key(txn))
+        # A failed prompt keeps its slot. The summary waits until every prompt
+        # of the import is sent, so the import gets one summary only.
         for key, overflow in batch.overflow.items():
-            await _send_overflow_summary(chat_id, key, overflow, base_url)
+            if key not in failed:
+                await _send_overflow_summary(chat_id, key, overflow, base_url)
         await session.commit()
     return sent
