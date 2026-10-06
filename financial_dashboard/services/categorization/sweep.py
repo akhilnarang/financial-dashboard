@@ -6,9 +6,8 @@ import json
 import logging
 from collections.abc import Sequence
 from typing import NamedTuple
-from urllib.parse import urlencode
 
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import async_session
@@ -121,9 +120,9 @@ async def run_llm_sweep(*, batch_limit: int = 100) -> int:
 
 
 class ImportKey(NamedTuple):
-    """The statement upload that created a row, as a transactions API filter."""
+    """The statement upload that created a row, by its dashboard page path."""
 
-    param: str
+    path: str
     upload_id: int
 
 
@@ -137,65 +136,55 @@ class PromptBatch(NamedTuple):
 def _import_key(txn: Transaction) -> ImportKey | None:
     """Return the statement import of a row, or None for a single alert."""
     if (upload_id := txn.statement_upload_id) is not None:
-        return ImportKey("statement_upload_id", upload_id)
+        return ImportKey("/statements", upload_id)
     if (upload_id := txn.bank_statement_upload_id) is not None:
-        return ImportKey("bank_statement_upload_id", upload_id)
+        return ImportKey("/statements/bank", upload_id)
     return None
 
 
-async def _owned_by_conversation(session: AsyncSession, txn: Transaction) -> bool:
-    """Whether an assistant conversation alone owns the review of a row."""
-    active = (
-        CategoryReviewDecision.transaction_id == txn.id,
-        CategoryReviewDecision.status == "active",
+def _in_import(key: ImportKey) -> ColumnElement[bool]:
+    """Match the rows of one statement import."""
+    column = (
+        Transaction.statement_upload_id
+        if key.path == "/statements"
+        else Transaction.bank_statement_upload_id
     )
-    background = select(CategoryReviewDecision.id).where(
-        *active, CategoryReviewDecision.source_interaction_id.is_(None)
-    )
-    conversational = select(CategoryReviewDecision.id).where(
-        *active, CategoryReviewDecision.source_interaction_id.is_not(None)
-    )
-    return bool(
-        await session.scalar(select(conversational.exists() & ~background.exists()))
-    )
+    return column == key.upload_id
 
 
-async def _reviewable(
-    session: AsyncSession, rows: Sequence[Transaction], assistant_enabled: bool
-) -> list[Transaction]:
-    """Drop rows whose review an assistant conversation already owns."""
-    if not assistant_enabled:
-        return list(rows)
-    return [txn for txn in rows if not await _owned_by_conversation(session, txn)]
+def _needs_prompt(assistant_enabled: bool) -> ColumnElement[bool]:
+    """Match pending rows under the retry limit that the sweep may notify.
+
+    With the assistant on, a row that a conversation alone owns is left out.
+    """
+    clauses = [
+        Transaction.review_status == "pending",
+        Transaction.notify_attempts.is_(None)
+        | (Transaction.notify_attempts < _MAX_NOTIFY_ATTEMPTS),
+    ]
+    if assistant_enabled:
+        active = select(CategoryReviewDecision.id).where(
+            CategoryReviewDecision.transaction_id == Transaction.id,
+            CategoryReviewDecision.status == "active",
+        )
+        background = active.where(
+            CategoryReviewDecision.source_interaction_id.is_(None)
+        )
+        conversational = active.where(
+            CategoryReviewDecision.source_interaction_id.is_not(None)
+        )
+        clauses.append(~conversational.exists() | background.exists())
+    return and_(*clauses)
 
 
 async def _notified_count(session: AsyncSession, key: ImportKey) -> int:
     """Count the rows of an import that already had a prompt or a summary."""
     count = await session.scalar(
         select(func.count()).where(
-            getattr(Transaction, key.param) == key.upload_id,
-            Transaction.last_notified_at.is_not(None),
+            _in_import(key), Transaction.last_notified_at.is_not(None)
         )
     )
     return count or 0
-
-
-async def _pending_import_rows(
-    session: AsyncSession, key: ImportKey, skip: set[int]
-) -> Sequence[Transaction]:
-    """Return every pending row of an import, except the ids in ``skip``."""
-    stmt = (
-        select(Transaction)
-        .where(
-            getattr(Transaction, key.param) == key.upload_id,
-            Transaction.review_status == "pending",
-            (Transaction.notify_attempts.is_(None))
-            | (Transaction.notify_attempts < _MAX_NOTIFY_ATTEMPTS),
-            Transaction.id.not_in(skip),
-        )
-        .order_by(Transaction.id)
-    )
-    return (await session.execute(stmt)).scalars().all()
 
 
 async def _cap_per_import(
@@ -205,13 +194,13 @@ async def _cap_per_import(
 
     Each import gets at most ``telegram.bulk_threshold`` prompts. Rows of the
     import that an earlier sweep notified use up the same budget. A row that
-    had a prompt or a summary before goes to the summary. The overflow
-    of an import holds all its other pending rows, also those past the sweep
-    batch limit, so one summary covers them.
+    had a prompt or a summary before goes to the summary. The overflow of an
+    import holds all its other pending rows, also those past the sweep batch
+    limit, so one summary covers them.
 
     Args:
         session: Open session that owns ``rows``.
-        rows: Pending rows in id order.
+        rows: Rows that need a prompt, in id order.
         assistant_enabled: Whether the conversational assistant is on.
 
     Returns:
@@ -220,7 +209,7 @@ async def _cap_per_import(
     cap = get_setting_int("telegram.bulk_threshold", 5)
     used: dict[ImportKey, int] = {}
     batch = PromptBatch([], {})
-    for txn in await _reviewable(session, rows, assistant_enabled):
+    for txn in rows:
         if (key := _import_key(txn)) is None:
             batch.prompt.append(txn)
             continue
@@ -233,8 +222,16 @@ async def _cap_per_import(
             batch.overflow[key] = []
     prompted = {txn.id for txn in batch.prompt}
     for key in batch.overflow:
-        pending = await _pending_import_rows(session, key, prompted)
-        batch.overflow[key] = await _reviewable(session, pending, assistant_enabled)
+        stmt = (
+            select(Transaction)
+            .where(
+                _in_import(key),
+                _needs_prompt(assistant_enabled),
+                Transaction.id.not_in(prompted),
+            )
+            .order_by(Transaction.id)
+        )
+        batch.overflow[key] = list((await session.execute(stmt)).scalars().all())
     return batch
 
 
@@ -254,16 +251,16 @@ async def _send_overflow_summary(
     """
     from financial_dashboard.services.telegram import _send_with_retry, tg_app
 
-    text = f"\U0001f50d {len(rows)} more rows need a category"
+    noun = "row needs" if len(rows) == 1 else "rows need"
+    text = f"\U0001f50d {len(rows)} more {noun} a category"
     if base_url:
-        query = urlencode({key.param: key.upload_id, "review_status": "notified"})
-        text += f"\n{base_url}/api/transactions?{query}"
+        text += f"\n{base_url}{key.path}/{key.upload_id}"
     try:
         await _send_with_retry(tg_app, chat_id=chat_id, text=text, parse_mode=None)
     except asyncio.CancelledError:
         raise
     except Exception:
-        logger.exception("Review summary failed for %s=%s", key.param, key.upload_id)
+        logger.exception("Review summary failed for %s/%s", key.path, key.upload_id)
         for txn in rows:
             txn.notify_attempts = (txn.notify_attempts or 0) + 1
         return
@@ -446,11 +443,7 @@ async def run_review_notify() -> int:
     async with async_session() as session:
         stmt = (
             select(Transaction)
-            .where(
-                Transaction.review_status == "pending",
-                (Transaction.notify_attempts.is_(None))
-                | (Transaction.notify_attempts < _MAX_NOTIFY_ATTEMPTS),
-            )
+            .where(_needs_prompt(assistant_enabled))
             .order_by(Transaction.id)
             .limit(50)
         )
@@ -466,7 +459,7 @@ async def run_review_notify() -> int:
         # A failed prompt keeps its slot. The summary waits until every prompt
         # of the import is sent, so the import gets one summary only.
         for key, overflow in batch.overflow.items():
-            if key not in failed:
+            if overflow and key not in failed:
                 await _send_overflow_summary(chat_id, key, overflow, base_url)
         await session.commit()
     return sent

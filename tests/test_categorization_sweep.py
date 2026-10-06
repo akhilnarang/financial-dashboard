@@ -253,8 +253,7 @@ async def test_pending_row_is_notified_once_with_escaped_fields(memdb, telegram_
     assert all(f'/transactions/{i}">' in t for i, t in zip(big[:5] + small, prompts))
     summaries = [text for text, _ in telegram_send if "Needs a category" not in text]
     assert summaries == [
-        '\U0001f50d 2 more rows need a category\nhttp://host:8000"x/api/transactions'
-        "?bank_statement_upload_id=41&review_status=notified"
+        '\U0001f50d 2 more rows need a category\nhttp://host:8000"x/statements/bank/41'
     ]
     async with memdb() as s:
         for txn_id in big + small:
@@ -275,8 +274,9 @@ async def test_pending_row_is_notified_once_with_escaped_fields(memdb, telegram_
     assert await sweep.run_review_notify() == 0
     assert [text.split("\n")[0] for text, _ in telegram_send] == [
         "\U0001f50d 58 more rows need a category",
-        "\U0001f50d 1 more rows need a category",
+        "\U0001f50d 1 more row needs a category",
     ]
+    assert telegram_send[1][0].endswith("/statements/42")
     async with memdb() as s:
         assert (await s.get(Transaction, late[-1])).review_status == "notified"
 
