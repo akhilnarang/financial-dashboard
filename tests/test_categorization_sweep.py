@@ -260,20 +260,22 @@ async def test_pending_row_is_notified_once_with_escaped_fields(memdb, telegram_
         for txn_id in big + small:
             assert (await s.get(Transaction, txn_id)).review_status == "notified"
 
-    # Resolved or re-opened prompts still use up the budget of their import. One summary
-    # covers all new rows, also those past the sweep batch limit.
+    # Resolved or re-opened prompts still use up the budget of their import.
+    # A re-opened row goes to the summary. One summary covers all new rows,
+    # also those past the sweep batch limit.
     async with memdb() as s:
         for txn_id in big[:5]:
             (await s.get(Transaction, txn_id)).review_status = "resolved"
         # A new vocabulary can send notified rows back to review.
-        for txn_id in big[:3]:
+        for txn_id in big[:3] + small[:1]:
             (await s.get(Transaction, txn_id)).review_status = "pending"
         await s.commit()
     late = [await _seed_pending(memdb, bank_statement_upload_id=41) for _ in range(55)]
     telegram_send.clear()
     assert await sweep.run_review_notify() == 0
     assert [text.split("\n")[0] for text, _ in telegram_send] == [
-        "\U0001f50d 58 more rows need a category"
+        "\U0001f50d 58 more rows need a category",
+        "\U0001f50d 1 more rows need a category",
     ]
     async with memdb() as s:
         assert (await s.get(Transaction, late[-1])).review_status == "notified"

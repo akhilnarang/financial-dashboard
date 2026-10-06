@@ -204,7 +204,8 @@ async def _cap_per_import(
     """Split pending rows so one statement import sends a bounded prompt count.
 
     Each import gets at most ``telegram.bulk_threshold`` prompts. Rows of the
-    import that an earlier sweep notified use up the same budget. The overflow
+    import that an earlier sweep notified use up the same budget. A row that
+    had a prompt or a summary before goes to the summary. The overflow
     of an import holds all its other pending rows, also those past the sweep
     batch limit, so one summary covers them.
 
@@ -225,7 +226,7 @@ async def _cap_per_import(
             continue
         if key not in used:
             used[key] = await _notified_count(session, key)
-        if used[key] < cap:
+        if used[key] < cap and txn.last_notified_at is None:
             used[key] += 1
             batch.prompt.append(txn)
         else:
