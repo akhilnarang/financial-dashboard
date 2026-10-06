@@ -49,7 +49,7 @@ wheels = [
 [[package]]
 name = "bank-email-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-email-parser#bf2cd34beeffa9c1c335fe0ebdc961b0bc65e00d" }
+source = { git = "https://github.com/akhilnarang/bank-email-parser#aae00aacdd3243b39dea0c8643a27d7011446060" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "pydantic" },
@@ -70,7 +70,7 @@ dependencies = [
 [[package]]
 name = "bank-statement-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-statement-parser#576a9d4ab1d83b503935dbed68d633e2efd114b0" }
+source = { git = "https://github.com/akhilnarang/bank-statement-parser#9b5f4d374817fb504ae3a0d25afd7a911d3d9e7f" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },
