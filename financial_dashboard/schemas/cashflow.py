@@ -323,3 +323,90 @@ class TrendPoint(BaseModel):
             "currency filter, unlike the three monetary figures."
         ),
     )
+
+
+BalanceSource = Literal["statement", "estimated", "unknown"]
+
+
+class BridgeBalance(BaseModel):
+    """One account's balance at the end of one day."""
+
+    amount: Decimal | None = Field(
+        description="The balance, or null when no source gives one.",
+    )
+    source: BalanceSource = Field(
+        description=(
+            "'statement': a bank statement starts the next day or ends on this day. "
+            "'estimated': the nearest other balance (statement, snapshot or a "
+            "transaction's running balance), moved to this day with the rows between. "
+            "'unknown': no balance exists for the account."
+        ),
+    )
+    as_of: datetime.date | None = Field(
+        description=(
+            "End of the day that the source balance is for. It is the requested day "
+            "for a statement balance. Null when the source is unknown."
+        ),
+    )
+
+
+class BridgeAccount(BaseModel):
+    """One bank account's part of the cash bridge."""
+
+    account_id: int
+    label: str
+    bank: str
+    opening: BridgeBalance = Field(description="Balance at the start of date_from.")
+    closing: BridgeBalance = Field(description="Balance at the end of date_to.")
+    net_flow: Decimal = Field(
+        description=(
+            "Signed sum of every dated row on the account in the range, excluded rows "
+            "included. Credits are positive."
+        ),
+    )
+    gap: Decimal | None = Field(
+        description=(
+            "closing - opening - net_flow. Zero when the rows explain the balance "
+            "change. Null when a balance is unknown. The totals then leave the "
+            "account out."
+        ),
+    )
+
+
+class BridgeLine(BaseModel):
+    """One 'Other' term of the bridge."""
+
+    key: str
+    label: str
+    amount: Decimal = Field(
+        description="Signed change to bank cash. A credit adds, a debit subtracts.",
+    )
+
+
+class CashBridge(BaseModel):
+    """Opening bank cash, the cashflow terms, and the closing bank cash.
+
+    ``expected_closing = opening + earned - spent - net_invested + transfers_in +
+    sum(other)``. ``gap = actual_closing - expected_closing``. A gap of zero means
+    the rows explain the balance change. The gap is the sum of the account gaps.
+    """
+
+    date_from: datetime.date
+    date_to: datetime.date
+    opening: Decimal = Field(description="Sum of known opening balances.")
+    earned: Decimal = Field(description="The income bucket of the bank-scope report.")
+    spent: Decimal = Field(description="The expense bucket of the bank-scope report.")
+    net_invested: Decimal = Field(
+        description="Investment contributions minus redemptions, from the report.",
+    )
+    transfers_in: Decimal = Field(description="The transfers-in bucket of the report.")
+    other: list[BridgeLine] = Field(
+        description="Every other bank-cash movement in the range, signed.",
+    )
+    expected_closing: Decimal
+    actual_closing: Decimal = Field(description="Sum of known closing balances.")
+    gap: Decimal = Field(description="actual_closing - expected_closing.")
+    accounts: list[BridgeAccount]
+    warnings: list[str] = Field(
+        description="Plain-language notes on what the totals leave out.",
+    )

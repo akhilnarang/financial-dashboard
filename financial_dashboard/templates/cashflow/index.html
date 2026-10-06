@@ -45,6 +45,11 @@
         overflow: hidden;
     }
 
+    [data-bridge] td:not(:first-child),
+    [data-bridge] th:not(:first-child) {
+        text-align: right;
+    }
+
     #cf-breakdown,
     #cf-trend {
         display: block;
@@ -125,6 +130,61 @@
         {% endfor %}
     </span>
 </form>
+
+<article class="card" data-bridge style="margin-bottom: 1.5rem;">
+    <div class="section-header" style="margin-bottom: 0.5rem;">
+        <h3 style="margin: 0; font-size: 1.05rem;">Cash bridge</h3>
+        <span class="text-sm text-muted">Bank balances at the start and end of this range</span>
+    </div>
+    <div class="table">
+        <table>
+            <tbody>
+                <tr><td>Opening balance</td><td class="amt">{{ bridge.opening|inr_exact }}</td></tr>
+                <tr><td>+ Earned</td><td class="amt amt-credit">{{ bridge.earned|inr_exact }}</td></tr>
+                <tr><td>&minus; Spent</td><td class="amt amt-debit">{{ bridge.spent|inr_exact }}</td></tr>
+                <tr><td>&minus; Invested (net)</td><td class="amt">{{ bridge.net_invested|inr_exact }}</td></tr>
+                <tr><td>+ Transfers in</td><td class="amt amt-credit">{{ bridge.transfers_in|inr_exact }}</td></tr>
+                {% for line in bridge.other if line.amount %}
+                <tr><td>&plusmn; {{ line.label }}</td><td class="amt">{{ line.amount|inr_exact }}</td></tr>
+                {% endfor %}
+                <tr><td><strong>Expected closing balance</strong></td><td class="amt"><strong>{{ bridge.expected_closing|inr_exact }}</strong></td></tr>
+                <tr><td><strong>Actual closing balance</strong></td><td class="amt"><strong>{{ bridge.actual_closing|inr_exact }}</strong></td></tr>
+                <tr data-bridge-gap><td><strong>Difference</strong></td><td class="amt {% if bridge.gap %}amt-debit{% endif %}"><strong>{{ bridge.gap|inr_exact }}</strong></td></tr>
+            </tbody>
+        </table>
+    </div>
+    <p class="text-sm text-muted" style="margin: 0.5rem 0 0;">A difference of zero means the rows explain the balance change. Other values show missing or duplicate rows.</p>
+    {% if bridge.accounts %}
+    <details style="margin-top: 0.5rem;">
+        <summary class="text-sm">Per account</summary>
+        <div class="table">
+            <table>
+                <thead>
+                    <tr><th>Account</th><th>Opening</th><th>Closing</th><th>Rows</th><th>Difference</th></tr>
+                </thead>
+                <tbody>
+                    {% for acct in bridge.accounts %}
+                    <tr data-bridge-account="{{ acct.account_id }}">
+                        <td>{{ acct.label }}</td>
+                        {% for bal in (acct.opening, acct.closing) %}
+                        <td class="amt">
+                            {% if bal.amount is not none %}{{ bal.amount|inr_exact }}{% else %}&ndash;{% endif %}
+                            <br><span class="text-sm text-muted">{{ bal.source }}{% if bal.as_of %} &middot; {{ bal.as_of.strftime("%d %b %Y") }}{% endif %}</span>
+                        </td>
+                        {% endfor %}
+                        <td class="amt">{{ acct.net_flow|inr_exact }}</td>
+                        <td class="amt">{% if acct.gap is not none %}{{ acct.gap|inr_exact }}{% else %}&ndash;{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </details>
+    {% endif %}
+    {% for warning in bridge.warnings %}
+    <p class="text-sm text-muted" style="margin: 0.35rem 0 0;">{{ warning }}</p>
+    {% endfor %}
+</article>
 
 {#- An empty range says so, but still gets its tiles: a page that drops them
     entirely makes "nothing happened here" and "the page failed to build" look
