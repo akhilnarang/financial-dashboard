@@ -447,6 +447,7 @@ async def test_notifier_does_not_duplicate_active_conversational_decision(
         amount="960.00",
         review_status="pending",
         review_reason="ambiguous",
+        bank_statement_upload_id=91,
     )
     source = AuditInteraction(
         inbound_chat_id=7,
@@ -478,9 +479,23 @@ async def test_notifier_does_not_duplicate_active_conversational_decision(
         }
     )
 
+    # A zero cap puts the row past its import budget. The summary must still
+    # skip a row that the conversation owns.
+    monkeypatch.setitem(settings_service._cache, "telegram.bulk_threshold", "0")
+    sent = []
+
+    async def fake_send(app, **kwargs):
+        sent.append(kwargs["text"])
+
+    monkeypatch.setattr(telegram, "_send_with_retry", fake_send)
+
     assert await sweep.run_review_notify() == 0
+    assert sent == []
 
     async with maker() as verification:
+        assert (
+            await verification.get(Transaction, transaction.id)
+        ).review_status == "pending"
         active_count = await verification.scalar(
             select(func.count(CategoryReviewDecision.id)).where(
                 CategoryReviewDecision.transaction_id == transaction.id,

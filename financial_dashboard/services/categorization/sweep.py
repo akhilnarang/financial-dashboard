@@ -143,17 +143,76 @@ def _import_key(txn: Transaction) -> ImportKey | None:
     return None
 
 
+async def _owned_by_conversation(session: AsyncSession, txn: Transaction) -> bool:
+    """Whether an assistant conversation alone owns the review of a row."""
+    active = (
+        CategoryReviewDecision.transaction_id == txn.id,
+        CategoryReviewDecision.status == "active",
+    )
+    background = select(CategoryReviewDecision.id).where(
+        *active, CategoryReviewDecision.source_interaction_id.is_(None)
+    )
+    conversational = select(CategoryReviewDecision.id).where(
+        *active, CategoryReviewDecision.source_interaction_id.is_not(None)
+    )
+    return bool(
+        await session.scalar(select(conversational.exists() & ~background.exists()))
+    )
+
+
+async def _reviewable(
+    session: AsyncSession, rows: Sequence[Transaction], assistant_enabled: bool
+) -> list[Transaction]:
+    """Drop rows whose review an assistant conversation already owns."""
+    if not assistant_enabled:
+        return list(rows)
+    return [txn for txn in rows if not await _owned_by_conversation(session, txn)]
+
+
+async def _notified_count(session: AsyncSession, key: ImportKey) -> int:
+    """Count the rows of an import that already had a prompt or a summary."""
+    count = await session.scalar(
+        select(func.count()).where(
+            getattr(Transaction, key.param) == key.upload_id,
+            Transaction.last_notified_at.is_not(None),
+            Transaction.review_status.is_distinct_from("pending"),
+        )
+    )
+    return count or 0
+
+
+async def _pending_import_rows(
+    session: AsyncSession, key: ImportKey, skip: set[int]
+) -> Sequence[Transaction]:
+    """Return every pending row of an import, except the ids in ``skip``."""
+    stmt = (
+        select(Transaction)
+        .where(
+            getattr(Transaction, key.param) == key.upload_id,
+            Transaction.review_status == "pending",
+            (Transaction.notify_attempts.is_(None))
+            | (Transaction.notify_attempts < _MAX_NOTIFY_ATTEMPTS),
+            Transaction.id.not_in(skip),
+        )
+        .order_by(Transaction.id)
+    )
+    return (await session.execute(stmt)).scalars().all()
+
+
 async def _cap_per_import(
-    session: AsyncSession, rows: Sequence[Transaction]
+    session: AsyncSession, rows: Sequence[Transaction], assistant_enabled: bool
 ) -> PromptBatch:
     """Split pending rows so one statement import sends a bounded prompt count.
 
     Each import gets at most ``telegram.bulk_threshold`` prompts. Rows of the
-    import that a previous sweep already notified use up the same budget.
+    import that an earlier sweep notified use up the same budget. The overflow
+    of an import holds all its other pending rows, also those past the sweep
+    batch limit, so one summary covers them.
 
     Args:
         session: Open session that owns ``rows``.
         rows: Pending rows in id order.
+        assistant_enabled: Whether the conversational assistant is on.
 
     Returns:
         The rows to prompt, and the overflow rows of each import.
@@ -161,25 +220,21 @@ async def _cap_per_import(
     cap = get_setting_int("telegram.bulk_threshold", 5)
     used: dict[ImportKey, int] = {}
     batch = PromptBatch([], {})
-    for txn in rows:
+    for txn in await _reviewable(session, rows, assistant_enabled):
         if (key := _import_key(txn)) is None:
             batch.prompt.append(txn)
             continue
         if key not in used:
-            used[key] = (
-                await session.scalar(
-                    select(func.count()).where(
-                        getattr(Transaction, key.param) == key.upload_id,
-                        Transaction.review_status == "notified",
-                    )
-                )
-                or 0
-            )
+            used[key] = await _notified_count(session, key)
         if used[key] < cap:
             used[key] += 1
             batch.prompt.append(txn)
         else:
-            batch.overflow.setdefault(key, []).append(txn)
+            batch.overflow[key] = []
+    prompted = {txn.id for txn in batch.prompt}
+    for key in batch.overflow:
+        pending = await _pending_import_rows(session, key, prompted)
+        batch.overflow[key] = await _reviewable(session, pending, assistant_enabled)
     return batch
 
 
@@ -222,10 +277,7 @@ async def _send_overflow_summary(
 async def _review_decision(
     session: AsyncSession, txn: Transaction, assistant_enabled: bool
 ) -> CategoryReviewDecision | None:
-    """Return the background decision of a row, or None to skip it."""
-    # Rows created before durable review decisions existed still need a
-    # decision record so a later callback can fail closed. This path is
-    # deliberately zero-candidate and never invokes the LLM.
+    """Return the background decision of a row, made on demand for the assistant."""
     decision = await session.scalar(
         select(CategoryReviewDecision)
         .where(
@@ -237,20 +289,10 @@ async def _review_decision(
         .limit(1)
     )
     if decision is None and assistant_enabled:
-        # A conversational proposal already owns the transaction's
-        # current review conversation. Never manufacture a separate
-        # zero-candidate background decision for the same row.
-        conversational = await session.scalar(
-            select(CategoryReviewDecision)
-            .where(
-                CategoryReviewDecision.transaction_id == txn.id,
-                CategoryReviewDecision.status == "active",
-                CategoryReviewDecision.source_interaction_id.is_not(None),
-            )
-            .limit(1)
-        )
-        if conversational is not None:
-            return None
+        # Rows created before durable review decisions existed still need a
+        # decision record so a later callback can fail closed. This path is
+        # deliberately zero-candidate and never invokes the LLM. A row that a
+        # conversational proposal owns never reaches here.
         decision = await ensure_legacy_decision(session, txn)
     return decision
 
@@ -398,7 +440,7 @@ async def run_review_notify() -> int:
         )
         rows = (await session.execute(stmt)).scalars().all()
         base_url = get_app_base_url()
-        batch = await _cap_per_import(session, rows)
+        batch = await _cap_per_import(session, rows, assistant_enabled)
         for txn in batch.prompt:
             decision = await _review_decision(session, txn, assistant_enabled)
             if assistant_enabled:
