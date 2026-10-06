@@ -6,6 +6,11 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import Category
+from financial_dashboard.schemas.transactions import CategoryListResponse, CategoryRead
+from financial_dashboard.services.cashflow.buckets import (
+    bucket_for_slug,
+    label_for_slug,
+)
 from financial_dashboard.services import settings as settings_mod
 from financial_dashboard.services.settings import get_setting_int
 
@@ -74,6 +79,29 @@ async def get_active_slugs(session: AsyncSession) -> list[str]:
         select(Category.slug).where(Category.active.is_(True)).order_by(Category.slug)
     )
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def list_categories(session: AsyncSession) -> CategoryListResponse:
+    """List every category with its label and bank-scope cashflow bucket.
+
+    Args:
+        session: Open async session.
+
+    Returns:
+        Every category, ordered by slug.
+    """
+    categories = await session.scalars(select(Category).order_by(Category.slug))
+    return CategoryListResponse(
+        items=[
+            CategoryRead(
+                slug=category.slug,
+                label=label_for_slug(category.slug),
+                active=category.active,
+                bucket=bucket_for_slug(category.slug, scope="bank"),
+            )
+            for category in categories
+        ]
+    )
 
 
 def get_vocab_version() -> int:

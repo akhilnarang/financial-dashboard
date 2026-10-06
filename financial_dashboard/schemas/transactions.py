@@ -85,8 +85,15 @@ class TransactionRead(BaseModel):
     enriched_at: datetime.datetime | None
 
 
+class TransactionListItem(TransactionRead):
+    raw_description: str | None
+    raw_description_truncated: bool
+    note: str | None
+    note_truncated: bool
+
+
 class TransactionListResponse(BaseModel):
-    items: Annotated[list[TransactionRead], Field(max_length=100)]
+    items: Annotated[list[TransactionListItem], Field(max_length=100)]
     returned_count: Annotated[int, Field(ge=0, le=100)]
     total_count: Annotated[int, Field(ge=0)]
     limit: Annotated[int, Field(ge=1, le=100)]
@@ -120,11 +127,7 @@ class TransactionStatementLink(BaseModel):
     account_id: int
 
 
-class TransactionDetailResponse(TransactionRead):
-    raw_description: str | None
-    raw_description_truncated: bool
-    note: str | None
-    note_truncated: bool
+class TransactionDetailResponse(TransactionListItem):
     attachment_path: str | None
     has_attachment: bool
     category_confidence: float | None
@@ -151,3 +154,84 @@ class TransactionBatchRequest(BaseModel):
 class TransactionBatchResponse(BaseModel):
     items: Annotated[list[TransactionRead], Field(max_length=100)]
     missing_ids: Annotated[list[int], Field(max_length=100)]
+
+
+class TransactionMergePair(BaseModel):
+    """One duplicate to fold into a keeper. Keep the alert row; drop the statement row."""
+
+    keep_id: DatabaseId
+    duplicate_id: DatabaseId
+
+
+class TransactionMergeBatchRequest(BaseModel):
+    """Pairs to merge. The batch applies all pairs or none. Dry run is the default."""
+
+    pairs: Annotated[list[TransactionMergePair], Field(min_length=1, max_length=50)]
+    dry_run: bool = True
+
+
+class CcPaymentStateChange(BaseModel):
+    """Paid sum and status of the card cycle the merge recomputed."""
+
+    statement_upload_id: int
+    paid_before: Decimal | None
+    paid_after: Decimal | None
+    status_before: str | None
+    status_after: str | None
+
+
+class TransactionMergeReport(BaseModel):
+    """What one merge did. Conflicts list what the merge kept as is."""
+
+    keep_id: int
+    duplicate_id: int
+    keeper_before: TransactionRead
+    keeper_after: TransactionRead
+    moved_references: dict[str, int]
+    conflicts: list[str]
+    cc_payment_state: CcPaymentStateChange | None
+
+
+class TransactionMergeResponse(BaseModel):
+    """The merge reports. A dry run shows the result without writing it."""
+
+    dry_run: bool
+    merges: list[TransactionMergeReport]
+
+
+class TransactionCategorizeItem(BaseModel):
+    """One row change. A null or absent field stays unchanged.
+
+    An empty ``category`` clears the category. An empty ``note`` clears the
+    note.
+    """
+
+    id: DatabaseId
+    category: Annotated[str | None, Field(max_length=128)] = None
+    note: str | None = None
+    exclude_from_cashflow: bool | None = None
+
+
+class TransactionCategorizeRequest(BaseModel):
+    dry_run: bool = True
+    items: Annotated[
+        list[TransactionCategorizeItem], Field(min_length=1, max_length=100)
+    ]
+
+
+class TransactionCategorizeResponse(BaseModel):
+    dry_run: bool
+    items: list[TransactionListItem]
+
+
+class CategoryRead(BaseModel):
+    """One category slug and its bank-scope cashflow bucket."""
+
+    slug: str
+    label: str
+    active: bool
+    bucket: str
+
+
+class CategoryListResponse(BaseModel):
+    items: list[CategoryRead]

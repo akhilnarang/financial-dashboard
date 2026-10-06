@@ -12,7 +12,7 @@ from financial_dashboard.db.enums import EmailKind
 from financial_dashboard.db.models import CasUpload, EmailSource, FetchRule, utc_now
 from financial_dashboard.services.cas_ingestion import CasIngestError, ingest_cas_pdf
 from financial_dashboard.services.settings import get_setting, get_setting_bool
-from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
+from financial_dashboard.core.uploads import safe_upload_filename, save_statement_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -167,11 +167,8 @@ async def process_cas_email(
         )
 
     filename, pdf_bytes = pdfs[0]
-    STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
     safe_name = safe_upload_filename(filename or "cas.pdf")
-    file_path: Path = STATEMENTS_DIR / f"{ts}_src{source_id}_{safe_name}"
-    file_path.write_bytes(pdf_bytes)
+    file_path: Path = save_statement_pdf(pdf_bytes, safe_name, f"src{source_id}_")
 
     try:
         upload = await ingest_cas_pdf(session, file_path, password=pan)

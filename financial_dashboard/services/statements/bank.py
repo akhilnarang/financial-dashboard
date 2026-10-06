@@ -20,7 +20,6 @@ are used inside async functions to avoid circular import issues.
 """
 
 import asyncio
-import datetime
 import json
 import logging
 import re
@@ -32,6 +31,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 if TYPE_CHECKING:
     from bank_statement_parser.models import BankTransaction, ParsedBankStatement
@@ -46,6 +46,7 @@ from financial_dashboard.db import (
 from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
 from financial_dashboard.core.masks import mask_last4
+from financial_dashboard.core.uploads import safe_upload_filename, save_statement_pdf
 from financial_dashboard.integrations.parsers import parse_bank_statement_pdf
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.categorization.rules import is_fd_counterparty
@@ -74,8 +75,6 @@ from financial_dashboard.services.telegram import (
 
 logger = logging.getLogger(__name__)
 
-STATEMENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "statements"
-_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _TOKEN_RE = re.compile(r"[A-Za-z]{4,}")
 _MIN_REF_SUBSTRING_LEN = 6
 _OVERLAP_STOPWORDS: frozenset[str] = frozenset(
@@ -180,12 +179,6 @@ class BankStatementProcessingError(Exception):
     raises this error so the caller can put a real message in front of
     the user instead of "Statement processing returned no result".
     """
-
-
-def _safe_filename(filename: str | None) -> str:
-    base = Path(filename or "statement.pdf").name or "statement.pdf"
-    cleaned = _SAFE_FILENAME_RE.sub("_", base).strip("._") or "statement.pdf"
-    return cleaned[:120]
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +541,7 @@ class RefreshIdentity(NamedTuple):
     channel: str | None
 
 
-def _refresh_identity(txn: "BankTransaction") -> RefreshIdentity:
+def _refresh_identity(txn: BankTransaction) -> RefreshIdentity:
     counterparty = (txn.counterparty or "").strip()
     narration = (txn.narration or "").strip()
     return RefreshIdentity(counterparty or narration, txn.channel)
@@ -557,7 +550,7 @@ def _refresh_identity(txn: "BankTransaction") -> RefreshIdentity:
 def _missing_entry(
     statement_row_index: int,
     direction: str,
-    statement_transaction: "BankTransaction",
+    statement_transaction: BankTransaction,
     *,
     ambiguous: bool = False,
     candidate_ids: set[int] | None = None,
@@ -598,7 +591,7 @@ def _missing_entry(
 def _matched_entry(
     statement_row_index: int,
     direction: str,
-    statement_transaction: "BankTransaction",
+    statement_transaction: BankTransaction,
     matched_transaction: Transaction,
     *,
     candidate_ids: set[int],
@@ -646,7 +639,7 @@ def _matched_entry(
 
 
 def reconcile_bank_statement(
-    parsed: "ParsedBankStatement", db_transactions: list, account_id: int
+    parsed: ParsedBankStatement, db_transactions: list, account_id: int
 ) -> dict:
     """Match statement transactions against DB transactions.
 
@@ -669,14 +662,14 @@ def reconcile_bank_statement(
 
     Returns a dict with matched, missing lists and balance verification.
     """
-    stmt_txns: list[tuple[str, "BankTransaction"]] = [
+    stmt_txns: list[tuple[str, BankTransaction]] = [
         (txn.transaction_type, txn) for txn in parsed.transactions or []
     ]
 
     # Pre-parse amount/date once so every pass uses the same normalized form
     # and parse failures land in `missing` immediately.
     parsed_rows: list[
-        tuple[int, str, "BankTransaction", Decimal | None, date_type | None]
+        tuple[int, str, BankTransaction, Decimal | None, date_type | None]
     ] = []
     matched = []
     missing = []
@@ -1132,7 +1125,7 @@ async def _find_bank_account(bank: str, parsed) -> "Account | None":
 async def import_missing_bank_txns(
     session,
     upload: "BankStatementUpload",
-    parsed: "ParsedBankStatement",
+    parsed: ParsedBankStatement,
     account: "Account",
     recon: dict,
 ) -> list["Transaction"]:
@@ -1237,6 +1230,121 @@ async def import_missing_bank_txns(
         imported.append(txn)
 
     return imported
+
+
+class ManualBankUploadResult(NamedTuple):
+    """Outcome of one manual bank statement upload."""
+
+    parsed: ParsedBankStatement | None
+    recon: dict | None
+    upload: BankStatementUpload | None
+    error: str | None
+
+
+async def upload_bank_statement(
+    session: AsyncSession,
+    account: Account,
+    filename: str | None,
+    content: bytes,
+    password: str | None,
+    *,
+    dry_run: bool = False,
+) -> ManualBankUploadResult:
+    """Parse, reconcile and import one manually uploaded bank statement PDF.
+
+    A real run saves the PDF, records an upload row, enriches matched rows and
+    imports the missing rows. A dry run only parses and reconciles against the
+    account rows. It writes nothing.
+
+    Args:
+        session: Open async session. A real run commits it.
+        account: The bank_account the statement belongs to.
+        filename: Client file name. It is sanitized before use.
+        content: Raw PDF bytes.
+        password: PDF password, or None.
+        dry_run: Skip every write when True.
+
+    Returns:
+        The parsed statement, the reconciliation dict, the upload row (None in
+        a dry run) and the parse error text (None on success).
+    """
+    safe_name = safe_upload_filename(filename)
+    file_path = None if dry_run else save_statement_pdf(content, safe_name)
+    try:
+        parsed = await asyncio.to_thread(
+            _parse_pdf_bytes_sync, content, account.bank, password
+        )
+    except Exception as e:
+        error_msg = str(e)
+        if file_path is None:
+            return ManualBankUploadResult(None, None, None, error_msg)
+        is_encrypted = "encrypt" in error_msg.lower() or "password" in error_msg.lower()
+        upload = BankStatementUpload(
+            account_id=account.id,
+            bank=account.bank,
+            filename=safe_name,
+            file_path=str(file_path),
+            status="password_required" if is_encrypted else "parse_error",
+            error=error_msg,
+        )
+        session.add(upload)
+        await emit_bank_snapshot(session, upload)
+        await session.commit()
+        return ManualBankUploadResult(None, None, upload, error_msg)
+
+    db_txns = list(
+        (
+            await session.execute(
+                select(Transaction).where(Transaction.account_id == account.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    recon = reconcile_bank_statement(parsed, db_txns, account.id)
+    if file_path is None:
+        return ManualBankUploadResult(parsed, recon, None, None)
+
+    await enrich_matched_transactions(recon)
+
+    upload = BankStatementUpload(
+        account_id=account.id,
+        bank=parsed.bank or account.bank,
+        filename=safe_name,
+        file_path=str(file_path),
+        status="parsed",
+        account_number=parsed.account_number,
+        account_holder_name=parsed.account_holder_name,
+        opening_balance=parsed.opening_balance,
+        closing_balance=parsed.closing_balance,
+        statement_period_start=parsed.statement_period_start,
+        statement_period_end=parsed.statement_period_end,
+        parsed_txn_count=len(recon["matched"]) + len(recon["missing"]),
+        matched_count=len(recon["matched"]),
+        missing_count=len(recon["missing"]),
+        reconciliation_data=reconciliation_to_json(recon),
+    )
+    session.add(upload)
+    await session.flush()
+
+    # One bad row must not abort the whole manual upload.
+    imported = len(
+        await import_missing_bank_txns(session, upload, parsed, account, recon)
+    )
+
+    upload.imported_count = imported
+    upload.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
+    upload.reconciliation_data = reconciliation_to_json(recon)
+    if upload.missing_count == 0:
+        upload.status = "imported"
+    elif imported > 0:
+        upload.status = "partial_import"
+    _dupes, _errs, skip_error = import_skip_summary(recon)
+    if skip_error:
+        upload.error = skip_error
+    await emit_bank_snapshot(session, upload)
+    await session.commit()
+    return ManualBankUploadResult(parsed, recon, upload, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1387,11 +1495,8 @@ async def process_bank_statement_email(
 
         if not parsed:
             # Save for manual retry
-            STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-            ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
-            safe_name = _safe_filename(filename)
-            file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
-            file_path.write_bytes(pdf_bytes)
+            safe_name = safe_upload_filename(filename)
+            file_path = save_statement_pdf(pdf_bytes, safe_name)
 
             # Only attach if there's exactly one bank account for this bank;
             # otherwise we'd mis-attribute the PDF and (worse) leak the hint to
@@ -1477,11 +1582,8 @@ async def process_bank_statement_email(
     enriched = await enrich_matched_transactions(recon)
 
     # Save the PDF to disk
-    STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
-    safe_name = _safe_filename(filename)
-    file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
-    file_path.write_bytes(pdf_bytes)
+    safe_name = safe_upload_filename(filename)
+    file_path = save_statement_pdf(pdf_bytes, safe_name)
 
     # Create BankStatementUpload and import missing transactions
     async with async_session() as session:

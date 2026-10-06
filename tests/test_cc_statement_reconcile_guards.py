@@ -731,41 +731,74 @@ async def test_interchangeable_rivals_leave_the_winners_match_alone(session_fact
     assert [row.id for row in rows] == [a_id] + [row.id for row in imported]
 
 
+@pytest.mark.parametrize(
+    ("first", "second", "narrations"),
+    [
+        pytest.param(
+            "SGST ON FEE",
+            "CGST ON FEE",
+            ("CGST ON FEE", "SGST ON FEE"),
+            id="whole-word",
+        ),
+        pytest.param(
+            "SAMPLE*SHOP IN",
+            "SAMPLE FOOD",
+            ("SAMPLE FOODMUMBAI", "SAMPLE*SHOP INMUMBAI"),
+            id="city-glued-to-merchant",
+        ),
+        pytest.param(
+            "SAMPLE*SHOPMART",
+            "SAMPLE*SHOP",
+            ("SAMPLE*SHOP", "SAMPLE*SHOPMART"),
+            id="whole-word-outranks-glued-prefix",
+        ),
+    ],
+)
 @pytest.mark.anyio
-async def test_counterparty_tiebreak_overrides_greedy_insertion_order(session_factory):
+async def test_counterparty_tiebreak_overrides_greedy_insertion_order(
+    session_factory, first, second, narrations
+):
     """The greedy pick pairs rows to candidates in DB insertion order, so it
     can cross the correct pairing. The group-injective counterparty assignment
     reassigns each row to the candidate whose counterparty it names — proving
-    the tiebreak is not just greedy luck.
+    the tiebreak is not just greedy luck. A city glued onto a truncated
+    merchant name still names the alert's counterparty. A whole-word name
+    outranks a glued prefix. Nothing imports, and a second pass keeps the
+    same pairing.
     """
     await _seed_account(session_factory)
-    # DB insertion order is SGST then CGST — the reverse of the statement rows.
-    sgst_id = await _seed_txn(
+    # DB insertion order is the reverse of the statement rows.
+    first_id = await _seed_txn(
         session_factory,
         amount=Decimal("34.00"),
-        counterparty="SGST ON FEE",
-        raw_description="SGST ON FEE",
+        counterparty=first,
+        raw_description=first,
     )
-    cgst_id = await _seed_txn(
+    second_id = await _seed_txn(
         session_factory,
         amount=Decimal("34.00"),
-        counterparty="CGST ON FEE",
-        raw_description="CGST ON FEE",
+        counterparty=second,
+        raw_description=second,
     )
 
     parsed = _parsed(
         [
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="CGST ON FEE"),
-            _stmt_txn(date="07/04/2026", amount="34.00", narration="SGST ON FEE"),
+            _stmt_txn(date="07/04/2026", amount="34.00", narration=narration)
+            for narration in narrations
         ]
     )
-    recon = await _reconcile(session_factory, parsed)
+    for _ in range(2):
+        recon = await _reconcile(session_factory, parsed)
 
-    assert recon["missing"] == []
-    assert {entry["stmt_idx"]: entry["db_txn_id"] for entry in recon["matched"]} == {
-        0: cgst_id,
-        1: sgst_id,
-    }
+        assert recon["missing"] == []
+        assert {
+            entry["stmt_idx"]: entry["db_txn_id"] for entry in recon["matched"]
+        } == {0: second_id, 1: first_id}
+
+        imported, rows = await _import(session_factory, parsed, recon)
+
+        assert imported == []
+        assert len(rows) == 2
 
 
 @pytest.mark.anyio
@@ -854,6 +887,10 @@ async def test_an_unclaimed_tied_candidate_spoils_the_tiebreak(
         pytest.param("CRED", "CREDIT MANTRA", id="latin-word"),
         pytest.param("CAFE", "CAFE\u0301TERIA CENTRAL", id="combining-accent"),
         pytest.param("SHOP", "SHOP\u200cLIFT CENTRAL", id="zero-width-non-joiner"),
+        pytest.param("PAY*AB", "PAY*ABCD", id="short-glued-prefix"),
+        pytest.param("SAMPLEMART", "SAMPLEMARTINI", id="one-word-glued-prefix"),
+        pytest.param("SAMPLE FOOD", "MY SAMPLE FOODMUMBAI", id="glued-not-at-start"),
+        pytest.param("SAMPLE FOOD", "SAMPLE FOOD1234", id="glued-tail-not-letters"),
     ],
 )
 @pytest.mark.anyio
@@ -862,6 +899,9 @@ async def test_counterparty_containment_needs_a_whole_word(
 ):
     """Containment matches a whole counterparty, not a fragment of a longer
     word. A combining mark, a matra, or a join control continues the word.
+    A counterparty glued to one word counts only when it starts the narration,
+    has 8 or more characters, and has an inner space or ``*``. The glued tail
+    must be letters only.
     The first row singles out no candidate, so both rows stay demoted.
     """
     await _seed_account(session_factory)
