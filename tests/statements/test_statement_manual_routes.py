@@ -53,7 +53,7 @@ def _file_bytes(name="statement.pdf"):
 async def test_manual_cc_upload_imports_missing(maker, monkeypatch, tmp_path):
     import financial_dashboard.web.statements as cc_routes
 
-    monkeypatch.setattr(cc_routes, "STATEMENTS_DIR", tmp_path)
+    monkeypatch.setattr("financial_dashboard.core.uploads.STATEMENTS_DIR", tmp_path)
     acc_id = await h.add_cc_account(maker)
     parsed = h.cc_parsed(
         transactions=[
@@ -94,7 +94,7 @@ async def test_manual_bank_upload_imports_clean_rows_only(maker, monkeypatch, tm
     import financial_dashboard.web.bank_statements as bank_routes
     import financial_dashboard.services.statements.bank as bank_module
 
-    monkeypatch.setattr(bank_routes, "STATEMENTS_DIR", tmp_path)
+    monkeypatch.setattr("financial_dashboard.core.uploads.STATEMENTS_DIR", tmp_path)
     acc_id = await h.add_bank_account(maker)
     async with maker() as session:
         session.add(
@@ -274,7 +274,7 @@ async def test_reprocess_resets_tracking_when_due_changes(maker, monkeypatch, tm
     reprocess must not import the same rows again."""
     import financial_dashboard.web.statements as cc_routes
 
-    monkeypatch.setattr(cc_routes, "STATEMENTS_DIR", tmp_path)
+    monkeypatch.setattr("financial_dashboard.core.uploads.STATEMENTS_DIR", tmp_path)
     acc_id = await h.add_cc_account(maker)
     pdf_path = tmp_path / "cc.pdf"
     pdf_path.write_bytes(b"%PDF fake")

@@ -113,7 +113,7 @@ async def test_process_cas_email_ingests_or_surfaces_ingest_error(
                 "financial_dashboard.integrations.parsers.parse_cas_pdf",
                 return_value=FakeCasStatement(),
             ),
-            patch("financial_dashboard.services.cas_emails.STATEMENTS_DIR", tmp_path),
+            patch("financial_dashboard.core.uploads.STATEMENTS_DIR", tmp_path),
         ):
             return await cas_emails.process_cas_email(
                 session, b"raw", source_id=src.id, log_ref=log_ref

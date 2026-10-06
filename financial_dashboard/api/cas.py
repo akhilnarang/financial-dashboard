@@ -1,11 +1,9 @@
 """CAS PDF ingestion endpoints."""
 
-import datetime
-
 from fastapi import APIRouter, File, Form, UploadFile
 
 from financial_dashboard.core.deps import AsyncSessionDep
-from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
+from financial_dashboard.core.uploads import safe_upload_filename, save_statement_pdf
 from financial_dashboard.exceptions import (
     BadRequestException,
     PayloadTooLargeException,
@@ -32,11 +30,8 @@ async def upload_cas(
     if len(payload) > CAS_UPLOAD_MAX_BYTES:
         raise PayloadTooLargeException(detail="PDF exceeds 10 MB limit.")
 
-    STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
     safe_name = safe_upload_filename(file.filename)
-    file_path = STATEMENTS_DIR / f"{timestamp}_{safe_name}"
-    file_path.write_bytes(payload)
+    file_path = save_statement_pdf(payload, safe_name)
 
     try:
         upload = await ingest_cas_pdf(

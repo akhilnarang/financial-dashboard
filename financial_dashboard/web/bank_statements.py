@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter,
@@ -40,7 +39,7 @@ from financial_dashboard.services.statements.shared import (
     retry_bank_statement_upload,
 )
 from financial_dashboard.services.statements.skip_summary import import_skip_summary
-from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
+from financial_dashboard.core.uploads import safe_upload_filename, save_statement_pdf
 from financial_dashboard.web.forms import _unlink_statement_file
 from financial_dashboard.web.transaction_display import (
     hydrate_reconciliation_transactions,
@@ -71,12 +70,9 @@ async def bank_statement_upload(
         return RedirectResponse(url="/statements", status_code=303)
 
     # Save PDF to disk
-    STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     safe_name = safe_upload_filename(file.filename)
-    file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
     content = await file.read()
-    file_path.write_bytes(content)
+    file_path = save_statement_pdf(content, safe_name)
 
     # Parse the PDF
     try:

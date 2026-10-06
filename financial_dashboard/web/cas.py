@@ -1,6 +1,5 @@
 """CAS upload routes."""
 
-import datetime
 from urllib.parse import urlencode
 
 from fastapi import (
@@ -16,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
-from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
+from financial_dashboard.core.uploads import safe_upload_filename, save_statement_pdf
 from financial_dashboard.services.cas_ingestion import CasIngestError, ingest_cas_pdf
 
 templates = get_templates()
@@ -56,11 +55,8 @@ async def cas_upload(
             status_code=303,
         )
 
-    STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
     safe_name = safe_upload_filename(file.filename)
-    file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
-    file_path.write_bytes(payload)
+    file_path = save_statement_pdf(payload, safe_name)
 
     try:
         await ingest_cas_pdf(

@@ -33,7 +33,6 @@ used inside async functions to avoid circular import issues.
 """
 
 import asyncio
-import datetime
 import email as email_lib
 from collections import Counter
 from collections.abc import Mapping
@@ -61,7 +60,7 @@ from financial_dashboard.db import (
 
 from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
-from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
+from financial_dashboard.core.uploads import safe_upload_filename, save_statement_pdf
 from financial_dashboard.core.masks import (
     mask_digits,
     mask_last4,
@@ -1900,11 +1899,8 @@ async def process_statement_email(
 
         if not parsed:
             # No stored password worked — save for manual retry.
-            STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-            ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
             safe_name = safe_upload_filename(filename)
-            file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
-            file_path.write_bytes(pdf_bytes)
+            file_path = save_statement_pdf(pdf_bytes, safe_name)
 
             # Only attach if there's exactly one CC account for this bank;
             # otherwise we'd mis-attribute the PDF.
@@ -2000,11 +1996,8 @@ async def process_statement_email(
     recon = reconcile_statement(parsed, list(db_txns), account.id, card_masks)
 
     # Save the PDF to disk
-    STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
     safe_name = safe_upload_filename(filename)
-    file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
-    file_path.write_bytes(pdf_bytes)
+    file_path = save_statement_pdf(pdf_bytes, safe_name)
 
     # Create StatementUpload and import missing transactions
     async with async_session() as session:
