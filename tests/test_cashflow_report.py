@@ -2,10 +2,15 @@ import datetime
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import null, select
+from sqlalchemy import delete, null, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import Transaction
+from financial_dashboard.db.models import (
+    BalanceSnapshot,
+    BankStatementUpload,
+    Transaction,
+)
+from financial_dashboard.services.cashflow.bridge import cash_bridge
 from financial_dashboard.services.cashflow.buckets import BUCKET_BY_SLUG
 from financial_dashboard.services.cashflow.report import (
     cashflow_summary,
@@ -21,6 +26,7 @@ from tests.conftest import (
     MISSING_ACCOUNT_ID,
     bank_account,
     card_account,
+    ensure_account,
 )
 
 pytestmark = pytest.mark.anyio
@@ -391,3 +397,226 @@ async def test_trend_api_clamps_months(client):
     high = await client.get("/api/cashflow/trend?months=999")
     assert high.status_code == 200
     assert len(high.json()) == 60
+
+
+async def test_bridge_closes_on_complete_data_and_a_missing_row_is_the_gap(
+    session: AsyncSession,
+):
+    """Every bank-side row lands in exactly one bridge term.
+
+    The card-side family and excluded rows and the unlinked row are decoys. A
+    bridge that took the all-account footnotes, or the unaccounted net, would
+    miss the statement closing by their amount. An older statement that
+    overlaps the newer one and implies another opening balance loses to it,
+    with a warning.
+    """
+    bank = await bank_account(session)
+    card = await card_account(session)
+    session.add(
+        BankStatementUpload(
+            account_id=bank,
+            bank="hdfc",
+            filename="older.pdf",
+            file_path="/synthetic/older.pdf",
+            opening_balance="99,000.00",
+            closing_balance="98,775.00",
+            statement_period_start="15/05/2026",
+            statement_period_end="15/06/2026",
+        )
+    )
+    session.add(
+        BankStatementUpload(
+            account_id=bank,
+            bank="hdfc",
+            filename="synthetic.pdf",
+            file_path="/synthetic/statement.pdf",
+            opening_balance="1,00,000.00",
+            closing_balance="99,775.00",
+            statement_period_start="01/06/2026",
+            statement_period_end="30/06/2026",
+        )
+    )
+    for direction, amount, category in [
+        ("credit", "1000", "salary"),
+        ("credit", "50", "interest"),
+        ("credit", "200", "repayment"),
+        ("debit", "300", "dining"),
+        ("credit", "50", "refund"),
+        ("debit", "400", "credit_card_payment"),
+        ("debit", "100", "investment"),
+        ("credit", "40", "investment_redemption"),
+        ("debit", "700", "self_transfer"),
+        ("credit", "200", "self_transfer"),
+        ("debit", "150", "family"),
+        ("debit", "25", None),
+    ]:
+        await _add(session, direction=direction, amount=D(amount), category=category)
+    await _add(
+        session,
+        direction="debit",
+        amount=D("80"),
+        category="self_transfer",
+        exclude_from_cashflow=True,
+    )
+    await _add(
+        session, direction="debit", amount=D("10"), category="dining", currency="USD"
+    )
+    await _add(
+        session, direction="debit", amount=D("500"), category="family", account_id=card
+    )
+    await _add(
+        session,
+        direction="debit",
+        amount=D("60"),
+        category="dining",
+        account_id=card,
+        exclude_from_cashflow=True,
+    )
+    await _add(
+        session, direction="debit", amount=D("111"), category="dining", account_id=None
+    )
+
+    bridge = await cash_bridge(session, await cashflow_summary(session, JUN, JUN_END))
+    assert bridge.opening == D("100000")
+    assert bridge.actual_closing == D("99775")
+    assert bridge.expected_closing == D("99775")
+    assert bridge.gap == 0
+    assert {line.key: line.amount for line in bridge.other} == {
+        "internal": D("-500"),
+        "family": D("-150"),
+        "excluded": D("-80"),
+        "uncategorized": D("-25"),
+        "non_inr": D("-10"),
+        "no_balance": 0,
+    }
+    (account,) = bridge.accounts
+    assert (account.opening.source, account.closing.source) == (
+        "statement",
+        "statement",
+    )
+    assert account.gap == 0
+    assert any("100000.00, 99000.00" in w for w in bridge.warnings)
+
+    await session.execute(
+        delete(Transaction)
+        .where(Transaction.category == "self_transfer")
+        .where(Transaction.direction == "credit")
+    )
+    bridge = await cash_bridge(session, await cashflow_summary(session, JUN, JUN_END))
+    assert bridge.gap == D("200")
+    assert bridge.accounts[0].gap == D("200")
+
+
+async def test_bridge_api_estimates_from_a_running_balance_and_skips_unknown(
+    client, session: AsyncSession
+):
+    """A running balance is moved to each boundary with the rows between, the
+    later rows of its own day included. A statement that covers a day wins over
+    a nearer running balance, whose same-day order can be wrong. Statements that
+    do not cover the day do not hide a nearer snapshot. An account with no
+    balance at all stays out of the totals, and its rows do too.
+    """
+    await _add(
+        session,
+        direction="debit",
+        amount=D("100"),
+        category="dining",
+        transaction_date=datetime.date(2026, 6, 10),
+        transaction_time=datetime.time(10),
+        balance=D("900"),
+    )
+    await _add(
+        session,
+        direction="credit",
+        amount=D("30"),
+        category="refund",
+        transaction_date=datetime.date(2026, 6, 10),
+        transaction_time=datetime.time(12),
+    )
+    await _add(
+        session,
+        direction="credit",
+        amount=D("50"),
+        category="salary",
+        transaction_date=datetime.date(2026, 6, 20),
+    )
+    no_balance = await ensure_account(session, 3, "bank_account")
+    await _add(
+        session,
+        direction="credit",
+        amount=D("500"),
+        category="salary",
+        account_id=no_balance,
+    )
+
+    bracketed = await ensure_account(session, 4, "bank_account")
+    session.add(
+        BankStatementUpload(
+            account_id=bracketed,
+            bank="hdfc",
+            filename="half-year.pdf",
+            file_path="/synthetic/half-year.pdf",
+            opening_balance="0.00",
+            closing_balance="200.00",
+            statement_period_start="01/04/2026",
+            statement_period_end="30/09/2026",
+        )
+    )
+    # The alert times run in the reverse of the posting order.
+    for time, balance in ((datetime.time(10), D("100")), (datetime.time(9), D("200"))):
+        await _add(
+            session,
+            direction="credit",
+            amount=D("100"),
+            category="salary",
+            account_id=bracketed,
+            transaction_time=time,
+            balance=balance,
+        )
+
+    around = await ensure_account(session, 5, "bank_account")
+    for start, end in (("01/04/2026", "30/04/2026"), ("01/08/2026", "31/08/2026")):
+        session.add(
+            BankStatementUpload(
+                account_id=around,
+                bank="hdfc",
+                filename="around.pdf",
+                file_path="/synthetic/around.pdf",
+                opening_balance="0.00",
+                closing_balance="0.00",
+                statement_period_start=start,
+                statement_period_end=end,
+            )
+        )
+    for as_of in (datetime.date(2026, 5, 31), datetime.date(2026, 6, 30)):
+        session.add(
+            BalanceSnapshot(
+                account_id=around,
+                kind="asset",
+                category="bank_balance",
+                as_of_date=as_of,
+                value=D("500"),
+                source="bank_statement",
+            )
+        )
+
+    r = await client.get("/api/cashflow/bridge?date_from=2026-06-01&date_to=2026-06-30")
+    assert r.status_code == 200
+    body = r.json()
+    known, unknown, statement, snapshot = body["accounts"]
+    assert (known["opening"]["source"], D(str(known["opening"]["amount"]))) == (
+        "estimated",
+        D("1000"),
+    )
+    assert D(str(known["closing"]["amount"])) == D("980")
+    assert unknown["opening"]["source"] == "unknown"
+    assert unknown["gap"] is None
+    assert D(str(statement["closing"]["amount"])) == D("200")
+    assert D(str(statement["gap"])) == 0
+    assert statement["closing"]["as_of"] == "2026-03-31"
+    assert D(str(snapshot["opening"]["amount"])) == D("500")
+    assert snapshot["opening"]["as_of"] == "2026-05-31"
+    assert D(str(body["opening"])) == D("1500")
+    assert D(str(body["actual_closing"])) == D("1680")
+    assert D(str(body["gap"])) == 0
+    assert any(unknown["label"] in w for w in body["warnings"])

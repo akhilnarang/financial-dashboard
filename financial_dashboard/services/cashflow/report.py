@@ -99,12 +99,11 @@ NON_INR = Transaction.currency.is_not(None) & (Transaction.currency != "INR")
 INCLUDED = Transaction.exclude_from_cashflow.is_not(True)
 EXCLUDED = Transaction.exclude_from_cashflow.is_(True)
 
-SIGNED_FLOW = func.sum(
-    case(
-        (Transaction.direction == "credit", Transaction.amount),
-        else_=-Transaction.amount,
-    )
+SIGNED_AMOUNT = case(
+    (Transaction.direction == "credit", Transaction.amount),
+    else_=-Transaction.amount,
 )
+SIGNED_FLOW = func.sum(SIGNED_AMOUNT)
 ROW_COUNT = func.count()
 
 # NULL, empty and whitespace-only are the same absence of a value, and one line of
