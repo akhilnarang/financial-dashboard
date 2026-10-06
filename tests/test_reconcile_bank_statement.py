@@ -241,6 +241,80 @@ def test_fallback_matches_when_stmt_row_has_no_ref():
     assert recon["matched"][0]["db_txn_id"] == 12
 
 
+def test_reference_match_ignores_leading_zero_padding():
+    """One reference printed at different zero-padded widths is one row.
+
+    A monthly statement and an account export pad the same reference to
+    different widths. The export row must match the stored row and not
+    import a second copy. A reference that differs after the zeros still
+    refuses the date+amount fallback.
+    """
+    db_txn = StubDbTxn(
+        id=30,
+        transaction_date=datetime.date(2026, 4, 14),
+        amount=Decimal("75.00"),
+        direction="credit",
+        reference_number="001234567890",
+    )
+
+    padded = _stmt(
+        [
+            _txn(
+                date="14/04/2026",
+                amount="75.00",
+                direction="credit",
+                ref="0000001234567890",
+            )
+        ]
+    )
+    recon = reconcile_bank_statement(padded, [db_txn], account_id=1)
+
+    assert recon["missing"] == [], recon
+    assert recon["matched"][0]["db_txn_id"] == 30
+    assert recon["matched"][0]["decision_reason"] == "matched_reference"
+
+    different = _stmt(
+        [
+            _txn(
+                date="14/04/2026",
+                amount="75.00",
+                direction="credit",
+                ref="0000001234567891",
+            )
+        ]
+    )
+    recon = reconcile_bank_statement(different, [db_txn], account_id=1)
+
+    assert recon["matched"] == [], recon
+    assert len(recon["missing"]) == 1
+
+
+def test_all_zero_reference_counts_as_no_reference():
+    """An all-zero statement reference does not veto the date+amount match."""
+    db_txn = StubDbTxn(
+        id=31,
+        transaction_date=datetime.date(2026, 4, 14),
+        amount=Decimal("75.00"),
+        direction="credit",
+        reference_number="REF-A",
+    )
+    parsed = _stmt(
+        [
+            _txn(
+                date="14/04/2026",
+                amount="75.00",
+                direction="credit",
+                ref="0000000000000000",
+            )
+        ]
+    )
+
+    recon = reconcile_bank_statement(parsed, [db_txn], account_id=1)
+
+    assert recon["missing"] == [], recon
+    assert recon["matched"][0]["db_txn_id"] == 31
+
+
 def test_ref_with_opposite_direction_does_not_collide():
     """UPI refunds reuse the same ref with the opposite direction. The
     ref pool keys on ``(ref, direction)``, so a debit and credit sharing
