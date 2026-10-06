@@ -2,7 +2,7 @@ import datetime
 from decimal import Decimal
 from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from financial_dashboard.schemas.common import DatabaseId, DatabaseIdBatch
 
@@ -197,6 +197,33 @@ class TransactionMergeResponse(BaseModel):
 
     dry_run: bool
     merges: list[TransactionMergeReport]
+
+
+class TransactionDeleteBatchRequest(BaseModel):
+    """Phantom statement rows to delete. The batch deletes all rows or none.
+
+    Dry run is the default. The reason goes into the audit record.
+    """
+
+    ids: DatabaseIdBatch
+    reason: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)
+    ]
+    dry_run: bool = True
+
+
+class TransactionDeleteReport(BaseModel):
+    """One deleted row as it was, and the cleaned reference count per table."""
+
+    transaction: TransactionRead
+    cleaned_references: dict[str, int]
+
+
+class TransactionDeleteResponse(BaseModel):
+    """The delete reports. A dry run shows the result without writing it."""
+
+    dry_run: bool
+    deletions: list[TransactionDeleteReport]
 
 
 class TransactionCategorizeItem(BaseModel):

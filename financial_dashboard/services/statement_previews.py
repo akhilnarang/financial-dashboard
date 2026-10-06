@@ -70,7 +70,7 @@ class _LoadedStatement:
     password: str | None
 
 
-class _StatementCandidateIndex(NamedTuple):
+class StatementCandidateIndex(NamedTuple):
     """Normalized identities and uncertainty found in statement rows.
 
     Attributes:
@@ -389,16 +389,16 @@ def reconciliation_lists(
     return statement_schemas.StatementReconciliationLists(**fields)
 
 
-def _statement_candidate_index(
+def statement_candidate_index(
     entries: list[dict[str, Any]],
-) -> _StatementCandidateIndex:
+) -> StatementCandidateIndex:
     """Index normalized statement identities for conservative extra detection.
 
     Args:
         entries: Every matched and unmatched statement reconciliation record.
 
     Returns:
-        A ``_StatementCandidateIndex`` containing parsed identities and the
+        A ``StatementCandidateIndex`` containing parsed identities and the
         directions for which incomplete evidence requires conservative handling.
     """
     identities: set[tuple[str, Decimal, datetime.date]] = set()
@@ -419,14 +419,14 @@ def _statement_candidate_index(
             uncertain_directions.add(direction)
             continue
         identities.add((direction, amount, txn_date))
-    return _StatementCandidateIndex(
+    return StatementCandidateIndex(
         identities=identities,
         uncertain_directions=uncertain_directions,
         uncertain_all_directions=uncertain_all_directions,
     )
 
 
-def _could_be_statement_candidate(
+def could_be_statement_candidate(
     transaction: Transaction,
     identities: set[tuple[str, Decimal, datetime.date]],
     uncertain_directions: set[str],
@@ -463,6 +463,21 @@ def _could_be_statement_candidate(
     )
 
 
+class StoredReconciliation(NamedTuple):
+    """The bounded preview and every extra row id, untruncated.
+
+    Attributes:
+        preview: The bounded API response.
+        extra_ids: Every row in the statement period that no line can claim.
+        candidate_ids: Every row that a line matched or named as a candidate,
+            or ``None`` when a line has more candidates than it lists.
+    """
+
+    preview: statement_schemas.StatementReconciliationPreviewResponse
+    extra_ids: list[int]
+    candidate_ids: set[int] | None
+
+
 async def preview_statement_reconciliation(
     session: AsyncSession,
     kind: Literal["cc", "bank"],
@@ -471,15 +486,37 @@ async def preview_statement_reconciliation(
     """Preview reconciliation of one stored statement without side effects.
 
     Args:
+        session: Request-scoped asynchronous database session.
+        kind: Credit-card or bank-statement reconciliation pipeline.
+        statement_id: Database ID of the statement upload.
+
+    Returns:
+        The bounded preview, or ``None`` when the upload does not exist.
+
+    Raises:
+        StatementPreviewError: See ``reconcile_stored_statement``.
+    """
+    stored = await reconcile_stored_statement(session, kind, statement_id)
+    return stored.preview if stored else None
+
+
+async def reconcile_stored_statement(
+    session: AsyncSession,
+    kind: Literal["cc", "bank"],
+    statement_id: int,
+) -> StoredReconciliation | None:
+    """Reconcile one stored statement without side effects.
+
+    Args:
         session: Request-scoped asynchronous database session. Candidate queries
             run with autoflush disabled.
         kind: Credit-card or bank-statement reconciliation pipeline.
         statement_id: Database ID of the statement upload.
 
     Returns:
-        Bounded matched, missing, ambiguous, and extra classifications with
-        candidate counts, decision reasons, gates, and truncation indicators; or
-        ``None`` when the upload does not exist.
+        The bounded preview with matched, missing, ambiguous, and extra
+        classifications, and every extra row id; or ``None`` when the upload
+        does not exist.
 
     Raises:
         StatementPreviewError: If the PDF cannot be loaded or parsed, its date
@@ -582,21 +619,21 @@ async def preview_statement_reconciliation(
         if entry.get("db_txn_id") is not None
     }
     all_statement_entries = [*matched_all, *missing_all]
-    candidate_index = _statement_candidate_index(all_statement_entries)
+    candidate_index = statement_candidate_index(all_statement_entries)
     extra_ids = sorted(
         transaction.id
         for transaction in db_transactions
         if transaction.id not in matched_ids
         and transaction.transaction_date is not None
         and lo <= transaction.transaction_date <= hi
-        and not _could_be_statement_candidate(
+        and not could_be_statement_candidate(
             transaction,
             candidate_index.identities,
             candidate_index.uncertain_directions,
             candidate_index.uncertain_all_directions,
         )
     )
-    return statement_schemas.StatementReconciliationPreviewResponse(
+    preview = statement_schemas.StatementReconciliationPreviewResponse(
         **reconciliation_lists(reconciliation).model_dump(),
         statement_id=statement_id,
         kind=kind,
@@ -608,3 +645,11 @@ async def preview_statement_reconciliation(
         extra_transaction_ids=extra_ids[:_ROW_LIMIT],
         extra_transaction_ids_truncated=len(extra_ids) > _ROW_LIMIT,
     )
+    candidate_ids = None
+    if not any(entry.get("candidate_ids_truncated") for entry in all_statement_entries):
+        candidate_ids = matched_ids | {
+            candidate
+            for entry in all_statement_entries
+            for candidate in entry.get("candidate_transaction_ids", [])
+        }
+    return StoredReconciliation(preview, extra_ids, candidate_ids)

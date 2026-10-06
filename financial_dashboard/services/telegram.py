@@ -9,6 +9,7 @@ import asyncio
 import html
 import logging
 import re
+from collections.abc import Iterable
 from decimal import Decimal
 from typing import Literal, NamedTuple, TypedDict
 
@@ -408,6 +409,65 @@ async def send_bulk_summary(
         await _send_with_retry(app, chat_id=chat_id, text=text)
     except Exception as e:
         logger.warning("Failed to send Telegram bulk summary: %s", e)
+
+
+_BALANCE_NOTE_ROWS = 10
+
+
+def _capped(rows: Iterable[str]) -> list[str]:
+    """Escape the first ``_BALANCE_NOTE_ROWS`` rows and count the rest."""
+    rows = list(rows)
+    lines = [html.escape(row) for row in rows[:_BALANCE_NOTE_ROWS]]
+    if (extra := len(rows) - _BALANCE_NOTE_ROWS) > 0:
+        lines.append(f"and {extra} more")
+    return lines
+
+
+async def send_statement_balance_note(
+    chat_id: int,
+    *,
+    account_label: str,
+    mismatches: list[dict],
+    held: list[dict],
+    gap: Decimal,
+) -> None:
+    """Warn that a statement does not tally and list the rows to check.
+
+    The note lists at most ``_BALANCE_NOTE_ROWS`` rows of each kind, so it
+    stays under the Telegram text limit and shows both kinds.
+
+    Args:
+        chat_id: Telegram chat to send to.
+        account_label: Label of the statement account.
+        mismatches: Matched reconciliation entries whose alert and statement
+            balances differ.
+        held: Missing entries held back as ambiguous.
+        gap: DB net minus the statement balance change.
+
+    Returns:
+        None. A failure is logged and not raised.
+    """
+    app = tg_app
+    if not app:
+        return
+    try:
+        lines = [
+            f"\u26a0\ufe0f <b>{html.escape(account_label)}</b> statement does not tally",
+            f"DB net minus statement change: {format_money(gap, 'INR')}",
+        ]
+        lines += _capped(
+            f"{e['date']} {e['direction']} \u20b9{e['amount']}: alert balance "
+            f"\u20b9{e['db_balance']} vs statement \u20b9{e['balance']}"
+            for e in mismatches
+        )
+        lines += _capped(
+            f"{e['date']} {e['direction']} \u20b9{e['amount']}: held, may match "
+            "an existing row"
+            for e in held
+        )
+        await _send_with_retry(app, chat_id=chat_id, text="\n".join(lines))
+    except Exception as e:
+        logger.warning("Failed to send statement balance note: %s", e)
 
 
 def _reply_markup_from_json(raw: str | None) -> InlineKeyboardMarkup | None:

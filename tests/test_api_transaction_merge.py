@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 from bank_statement_parser.models import BankTransaction, ParsedBankStatement
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from financial_dashboard.db import (
     Account,
@@ -15,6 +15,7 @@ from financial_dashboard.db import (
     PaymentStatus,
     SmsMessage,
     StatementUpload,
+    TelegramMessageContext,
     Transaction,
 )
 from financial_dashboard.services.reminders import recompute_cc_payment_state
@@ -346,3 +347,264 @@ async def test_cc_payment_merge_matches_a_fresh_recompute(
     stored = upload.payment_paid_amount
     assert stored == await recompute_cc_payment_state(session, upload)
     assert stored == Decimal("1000.00")
+
+
+async def test_delete_batch_removes_only_phantom_statement_rows(
+    client, session, monkeypatch, tmp_path
+):
+    account = Account(bank="testbank", label="Test savings", type="bank_account")
+    session.add(account)
+    await session.flush()
+    # stmt: today's parse drops the phantom line. other: the stored parse saw
+    # nine lines, today's sees one. gone: no PDF. empty: today's parse is empty.
+    uploads = {}
+    for name, parsed_count in (("stmt", 2), ("other", 9), ("gone", 1), ("empty", 1)):
+        pdf = tmp_path / f"{name}.pdf"
+        if name != "gone":
+            pdf.write_bytes(b"synthetic PDF bytes")
+        uploads[name] = BankStatementUpload(
+            account_id=account.id,
+            bank="testbank",
+            filename=pdf.name,
+            file_path=str(pdf),
+            status="imported",
+            parsed_txn_count=parsed_count,
+        )
+    session.add_all(uploads.values())
+    await session.flush()
+    rows = {
+        name: Transaction(
+            account_id=account.id,
+            bank_statement_upload_id=uploads[upload].id,
+            bank="testbank",
+            email_type=email_type,
+            direction="debit",
+            amount=Decimal(amount),
+            currency="INR",
+            transaction_date=DAY,
+            counterparty=f"SYNTHETIC {name.upper()}",
+        )
+        for name, upload, email_type, amount in (
+            ("real", "stmt", "bank_statement", "1234.00"),
+            ("alert_owned", "stmt", "bank_statement", "55.00"),
+            ("phantom", "stmt", "bank_statement", "9000.00"),
+            ("named_elsewhere", "stmt", "bank_statement", "66.00"),
+            ("alert", "stmt", "testbank_account_debit_alert", "77.00"),
+            ("ref_candidate", "stmt", "bank_statement", "100.00"),
+            ("candidate_elsewhere", "stmt", "bank_statement", "44.00"),
+            ("unresolved_elsewhere", "stmt", "bank_statement", "33.00"),
+            ("short_parse", "other", "bank_statement", "88.00"),
+            ("no_pdf", "gone", "bank_statement", "99.00"),
+            ("empty_parse", "empty", "bank_statement", "11.00"),
+        )
+    }
+    rows["named_elsewhere"].note = "synthetic note"
+    rows["ref_candidate"].reference_number = "SYNREF123"
+    session.add_all(rows.values())
+    await session.flush()
+    session.add_all(
+        [
+            SmsMessage(
+                bank="testbank",
+                sender="TESTBK",
+                body="synthetic cafe alert",
+                received_at=dt.datetime(2030, 3, 4, 9, 30),
+                status="parsed",
+                transaction_id=rows["alert_owned"].id,
+            ),
+            AuditAction(
+                transaction_id=rows["phantom"].id,
+                action_type="set_category",
+                target_type="transaction",
+                target_id=rows["phantom"].id,
+            ),
+            TelegramMessageContext(
+                chat_id=1,
+                message_id=2,
+                context_kind="transaction_alert",
+                transaction_id=rows["phantom"].id,
+            ),
+        ]
+    )
+    real_id, phantom_id = rows["real"].id, rows["phantom"].id
+    uploads["stmt"].reconciliation_data = json.dumps(
+        {
+            "matched": [
+                {
+                    "stmt_idx": 0,
+                    "db_txn_id": real_id,
+                    "candidate_transaction_ids": [real_id, phantom_id],
+                }
+            ],
+            "missing": [{"stmt_idx": 1, "imported_txn_id": phantom_id}],
+        }
+    )
+    uploads["other"].reconciliation_data = json.dumps(
+        {
+            "matched": [{"stmt_idx": 0, "db_txn_id": rows["named_elsewhere"].id}],
+            "missing": [
+                {
+                    "stmt_idx": 1,
+                    "date": "04/03/2030",
+                    "amount": "45.00",
+                    "direction": "debit",
+                    "ambiguous": True,
+                    "candidate_transaction_ids": [rows["candidate_elsewhere"].id],
+                },
+                {
+                    "stmt_idx": 2,
+                    "date": "05/03/2030",
+                    "amount": "33.00",
+                    "direction": "debit",
+                    "import_error": "duplicate transaction",
+                },
+            ],
+        }
+    )
+    await session.commit()
+    ids = {name: row.id for name, row in rows.items()}
+    upload_ids = {name: upload.id for name, upload in uploads.items()}
+
+    def parse(path, _bank, _password):
+        """Today's parse holds the real row and a same-reference line."""
+        lines = [
+            BankTransaction(
+                date="04/03/2030",
+                narration="UPI/SYNTHETIC SHOP",
+                amount="1234.00",
+                transaction_type="debit",
+            ),
+            BankTransaction(
+                date="04/03/2030",
+                narration="NEFT/SYNTHETIC/SYNREF123",
+                amount="101.00",
+                transaction_type="debit",
+                reference_number="SYNREF123",
+            ),
+        ]
+        return ParsedBankStatement(
+            file=path.name,
+            bank="testbank",
+            statement_period_start="01/03/2030",
+            statement_period_end="31/03/2030",
+            transactions=[] if path.name == "empty.pdf" else lines,
+        )
+
+    monkeypatch.setattr(
+        "financial_dashboard.services.statement_previews.parse_bank_statement", parse
+    )
+
+    refused = await client.post(
+        "/api/transactions/delete-batch",
+        json={
+            "ids": list(ids.values()),
+            "reason": "linked deposit line",
+            "dry_run": False,
+        },
+    )
+    assert refused.status_code == 409
+    stmt, other = upload_ids["stmt"], upload_ids["other"]
+    assert refused.json()["detail"]["refused"] == [
+        {
+            "id": ids["real"],
+            "reasons": [f"today's parse of bank statement {stmt} still holds the row"],
+        },
+        {
+            "id": ids["alert_owned"],
+            "reasons": [
+                "the row owns an sms or email; a reparse would create it again"
+            ],
+        },
+        {
+            "id": ids["named_elsewhere"],
+            "reasons": [
+                "the row carries an attachment or a note; check it by hand",
+                f"bank statement {other} could claim the row; "
+                "its reparse would import it again",
+            ],
+        },
+        {"id": ids["alert"], "reasons": ["the row is not a statement import"]},
+        {
+            "id": ids["ref_candidate"],
+            "reasons": [f"today's parse of bank statement {stmt} still holds the row"],
+        },
+        {
+            "id": ids["candidate_elsewhere"],
+            "reasons": [
+                f"bank statement {other} could claim the row; "
+                "its reparse would import it again"
+            ],
+        },
+        {
+            "id": ids["unresolved_elsewhere"],
+            "reasons": [
+                f"bank statement {other} could claim the row; "
+                "its reparse would import it again"
+            ],
+        },
+        {
+            "id": ids["short_parse"],
+            "reasons": [
+                f"bank statement {other} cannot be checked: "
+                "today's parse found 2 lines; the stored parse found 9"
+            ],
+        },
+        {
+            "id": ids["no_pdf"],
+            "reasons": [
+                f"bank statement {upload_ids['gone']} cannot be checked: "
+                "Statement PDF is unavailable"
+            ],
+        },
+        {
+            "id": ids["empty_parse"],
+            "reasons": [
+                f"bank statement {upload_ids['empty']} cannot be checked: "
+                "today's parse found no lines"
+            ],
+        },
+    ]
+
+    request = {"ids": [phantom_id], "reason": "linked deposit line"}
+    dry = await client.post("/api/transactions/delete-batch", json=request)
+    assert dry.status_code == 200
+    assert dry.json()["dry_run"] is True
+    session.expire_all()
+    assert await session.get(Transaction, phantom_id) is not None
+    assert await session.scalar(select(func.count(AuditAction.id))) == 1
+
+    response = await client.post(
+        "/api/transactions/delete-batch", json=request | {"dry_run": False}
+    )
+
+    assert response.status_code == 200
+    report = response.json()["deletions"][0]
+    assert report["transaction"]["counterparty"] == "SYNTHETIC PHANTOM"
+    assert report["cleaned_references"] == {
+        "audit_actions": 1,
+        "bank_statement_uploads.reconciliation_data": 1,
+    }
+    session.expire_all()
+    remaining = await session.scalars(select(Transaction.id))
+    assert sorted(remaining) == sorted(set(ids.values()) - {phantom_id})
+    assert await session.scalar(select(TelegramMessageContext.transaction_id)) is None
+    record = await session.scalar(
+        select(AuditAction).where(AuditAction.action_type == "delete_transaction")
+    )
+    assert record is not None and record.target_id == phantom_id
+    assert json.loads(record.arguments_json or "{}") == {
+        "reason": "linked deposit line"
+    }
+    assert json.loads(record.before_json or "{}")["amount"] == "9000.00"
+    stored = await session.get(BankStatementUpload, stmt)
+    assert stored is not None
+    assert json.loads(stored.reconciliation_data or "{}") == {
+        "matched": [
+            {
+                "stmt_idx": 0,
+                "db_txn_id": real_id,
+                "candidate_transaction_ids": [real_id],
+            }
+        ],
+        "missing": [],
+    }

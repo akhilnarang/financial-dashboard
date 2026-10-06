@@ -25,7 +25,7 @@ from financial_dashboard.schemas.reconcile import (
 from financial_dashboard.schemas.transactions import TransactionRead
 from financial_dashboard.services.cashflow.buckets import SELF_TRANSFER_SLUG
 from financial_dashboard.services.statements.bank import _parse_amount, _parse_date
-from financial_dashboard.services.transaction_reads import _transaction_read
+from financial_dashboard.services.transaction_reads import transaction_read
 from financial_dashboard.services.txn_merge import (
     _normalized_currency,
     _shortened_reference_match,
@@ -299,6 +299,33 @@ def build_report(
     )
 
 
+async def statement_gap(
+    session: AsyncSession, statement: BankStatementUpload
+) -> Decimal | None:
+    """Return how far the DB net misses one statement's balance change.
+
+    Args:
+        session: An open session.
+        statement: The statement to check.
+
+    Returns:
+        The DB net minus the statement delta over the statement period. None
+        when the period or a balance does not parse.
+    """
+    if (period := _period(statement)) is None:
+        return None
+    txns = (
+        await session.scalars(
+            select(Transaction).where(
+                Transaction.account_id == statement.account_id,
+                Transaction.transaction_date.between(period.start, period.end),
+            )
+        )
+    ).all()
+    rows = [transaction_read(t) for t in txns]
+    return _statement_balance(statement, period, rows).gap
+
+
 async def reconcile(
     session: AsyncSession, date_from: datetime.date, date_to: datetime.date
 ) -> ReconcileReport:
@@ -333,5 +360,5 @@ async def reconcile(
             )
         )
     ).all()
-    rows = [_transaction_read(t) for t in txns]
+    rows = [transaction_read(t) for t in txns]
     return build_report(date_from, date_to, labels, statements, rows)

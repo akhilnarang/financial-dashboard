@@ -120,8 +120,15 @@ def build_transaction_filter_clauses(
     return clauses
 
 
-def _transaction_read(row: Transaction) -> transaction_schemas.TransactionRead:
-    """Map one ORM transaction to its redacted summary schema."""
+def transaction_read(row: Transaction) -> transaction_schemas.TransactionRead:
+    """Map one ORM transaction to its redacted summary schema.
+
+    Args:
+        row: The transaction to map.
+
+    Returns:
+        The summary that the JSON API returns for the row.
+    """
     return transaction_schemas.TransactionRead(
         id=row.id,
         bank=row.bank,
@@ -168,7 +175,7 @@ def transaction_list_item(
     raw_description, raw_description_truncated = bound_text(row.raw_description, limit)
     note, note_truncated = bound_text(row.note, limit)
     return transaction_schemas.TransactionListItem(
-        **_transaction_read(row).model_dump(),
+        **transaction_read(row).model_dump(),
         raw_description=raw_description,
         raw_description_truncated=raw_description_truncated,
         note=note,
@@ -473,7 +480,7 @@ async def get_transactions_by_ids(
             .scalars()
             .all()
         )
-    ordered = order_batch(ids, {row.id: _transaction_read(row) for row in rows})
+    ordered = order_batch(ids, {row.id: transaction_read(row) for row in rows})
     return transaction_schemas.TransactionBatchResponse(
         items=ordered.items,
         missing_ids=ordered.missing_ids,

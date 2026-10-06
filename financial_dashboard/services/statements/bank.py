@@ -58,6 +58,7 @@ from financial_dashboard.services.snapshots import emit_bank_snapshot
 from financial_dashboard.services.settings import (
     get_setting_int,
     get_telegram_chat_id,
+    is_telegram_configured,
     should_notify_transactions,
 )
 from financial_dashboard.services.statements.cc import extract_pdf_from_email
@@ -70,6 +71,7 @@ from financial_dashboard.services.statements.skip_summary import import_skip_sum
 from financial_dashboard.services.telegram import (
     build_account_label,
     send_bulk_summary,
+    send_statement_balance_note,
     send_transaction_notification,
 )
 
@@ -149,7 +151,6 @@ _BANK_RECONCILIATION_GATES = (
     "account_scope",
     "reference_direction",
     "reference_amount_compatibility",
-    "known_balance_compatibility",
     "direction_amount",
     "date_window_plus_minus_one_day",
     "reference_or_narration_compatibility",
@@ -208,17 +209,16 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
     return (txn_date, amount, direction)
 
 
-def _known_balance_compatible(
-    candidate_balance: Decimal | None, statement_balance: str | None
-) -> bool:
-    """Reject a reference match only when both known balances contradict."""
-    if candidate_balance is None or statement_balance is None:
-        return True
+def _balances_disagree(entry: dict) -> bool:
+    """Say whether a matched entry holds two known, different balances."""
+    alert_balance, statement_balance = entry.get("db_balance"), entry.get("balance")
+    if alert_balance is None or statement_balance is None:
+        return False
     try:
-        return Decimal(str(candidate_balance)) == _parse_amount(statement_balance)
+        return _parse_amount(alert_balance) != _parse_amount(statement_balance)
     except InvalidOperation, ValueError:
-        # An unparseable value is unknown evidence, not a contradiction.
-        return True
+        # An unparseable value is unknown evidence, not a disagreement.
+        return False
 
 
 def _reference_compatible_ids(
@@ -327,7 +327,6 @@ def _is_statement_candidate_compatible(
     statement_reference: str | None,
     statement_narration: str | None,
     statement_channel: str | None,
-    statement_balance: str | None,
     account_holder_tokens: set[str],
     has_date_offset: bool,
 ) -> bool:
@@ -340,7 +339,6 @@ def _is_statement_candidate_compatible(
         statement_narration: Description parsed from the statement row.
         statement_channel: Normalized payment channel parsed from the statement,
             such as ``"upi"``.
-        statement_balance: Post-transaction balance printed on the statement.
         account_holder_tokens: Name tokens excluded from narration overlap because
             they are common to unrelated self-transfers.
         has_date_offset: Whether the candidate and statement dates differ. A
@@ -349,8 +347,9 @@ def _is_statement_candidate_compatible(
 
     Compatibility rules:
 
-    - Contradictory known post-transaction balances always refuse a pairing;
-      one missing or unparseable balance remains unknown rather than negative.
+    - Balance never refuses a pairing. An alert reports the available
+      balance, which excludes held funds such as an IPO block. The statement
+      prints the book balance. The two differ while funds are held.
 
     - Refs agree, or at least one side has no ref → compatible. This is
       the common case: email parsers often miss the ref, statement
@@ -391,17 +390,9 @@ def _is_statement_candidate_compatible(
     )
     candidate_channel = candidate_transaction.channel
 
-    # Exact, non-null reference equality overrides a balance disagreement: an
-    # SMS-sourced row reports available balance while the statement reports
-    # book balance, so equal references with unequal balances is expected. The
-    # unique reference index leaves at most one candidate, so balance has
-    # nothing to weigh. The veto stays below for the fuzzy cases, where a
-    # balance disagreement is a real negative signal.
+    # Equal references match at any date offset.
     if statement_key and candidate_key and statement_key == candidate_key:
         return True
-
-    if not _known_balance_compatible(candidate_transaction.balance, statement_balance):
-        return False
     if not (statement_key and candidate_key):
         return True
 
@@ -449,7 +440,6 @@ def _compatible_candidates(
     statement_reference: str | None,
     statement_narration: str | None,
     statement_channel: str | None,
-    statement_balance: str | None,
     account_holder_tokens: set[str],
     has_date_offset: bool,
 ) -> CompatibleCandidates:
@@ -463,7 +453,6 @@ def _compatible_candidates(
         statement_reference: Reference number parsed from the statement row.
         statement_narration: Description parsed from the statement row.
         statement_channel: Normalized payment channel from the statement row.
-        statement_balance: Post-transaction balance from the statement row.
         account_holder_tokens: Holder-name tokens excluded from narration overlap.
         has_date_offset: Whether this bucket is one day away from the statement
             date rather than an exact-date bucket.
@@ -481,7 +470,6 @@ def _compatible_candidates(
             statement_reference=statement_reference,
             statement_narration=statement_narration,
             statement_channel=statement_channel,
-            statement_balance=statement_balance,
             account_holder_tokens=account_holder_tokens,
             has_date_offset=has_date_offset,
         ):
@@ -618,6 +606,11 @@ def _matched_entry(
         "channel": statement_transaction.channel,
         "balance": statement_transaction.balance,
         "db_txn_id": matched_transaction.id,
+        "db_balance": (
+            None
+            if matched_transaction.balance is None
+            else str(matched_transaction.balance)
+        ),
         "db_counterparty": matched_transaction.counterparty,
         "db_reference": matched_transaction.reference_number,
         "db_date": (
@@ -709,7 +702,7 @@ def reconcile_bank_statement(
     reference_matched_indices: set[int] = set()
 
     # Keep two reference sets per statement row. Every exact-reference row is
-    # retained as evidence so an amount/balance contradiction remains ambiguous
+    # retained as evidence so an amount contradiction remains ambiguous
     # rather than looking absent and being imported. Only compatible rows enter
     # contention, however: contradictory evidence cannot demote a valid winner.
     reference_evidence_sets: dict[int, set[int]] = {}
@@ -774,7 +767,6 @@ def reconcile_bank_statement(
                     statement_reference=txn.reference_number,
                     statement_narration=txn.narration,
                     statement_channel=txn.channel,
-                    statement_balance=txn.balance,
                     account_holder_tokens=account_holder_tokens,
                     has_date_offset=offset != 0,
                 ).compatible_ids
@@ -833,7 +825,6 @@ def reconcile_bank_statement(
                     statement_reference=statement_reference,
                     statement_narration=txn.narration,
                     statement_channel=txn.channel,
-                    statement_balance=txn.balance,
                     account_holder_tokens=account_holder_tokens,
                     has_date_offset=offset != 0,
                 )
@@ -1027,6 +1018,50 @@ async def enrich_matched_transactions(recon: dict) -> int:
             await session.commit()
 
     return enriched
+
+
+async def notify_balance_mismatches(
+    upload: BankStatementUpload, recon: dict, account_label: str
+) -> None:
+    """Send one note when the statement does not tally and rows need a check.
+
+    Balance does not refuse a match, so two kinds of row need a check: a match
+    whose alert balance differs from the statement balance, and a row held
+    back as ambiguous. Funds on hold explain both when the statement tallies.
+    Otherwise a match may be wrong or a held row may be new.
+
+    Args:
+        upload: The imported statement.
+        recon: Its reconciliation after import.
+        account_label: Label of the statement account.
+
+    Returns:
+        None. A failed check is logged and not raised.
+    """
+    mismatches = [e for e in recon["matched"] if _balances_disagree(e)]
+    held = [e for e in recon["missing"] if e.get("ambiguous") and not e.get("imported")]
+    if not (mismatches or held) or not is_telegram_configured():
+        return
+    # function-local: services.reconcile imports this module.
+    from financial_dashboard.services.reconcile import statement_gap
+
+    try:
+        async with async_session() as session:
+            gap = await statement_gap(session, upload)
+    except Exception:
+        # The import is already committed. A failed check must not undo it.
+        logger.warning("Statement tally check failed", exc_info=True)
+        return
+    # balance_verification uses the same 1-unit tolerance.
+    if gap is None or abs(gap) < 1:
+        return
+    await send_statement_balance_note(
+        get_telegram_chat_id(),
+        account_label=account_label,
+        mismatches=mismatches,
+        held=held,
+        gap=gap,
+    )
 
 
 def reconciliation_to_json(data: dict) -> str:
@@ -1344,6 +1379,7 @@ async def upload_bank_statement(
         upload.error = skip_error
     await emit_bank_snapshot(session, upload)
     await session.commit()
+    await notify_balance_mismatches(upload, recon, account.label)
     return ManualBankUploadResult(parsed, recon, upload, None)
 
 
@@ -1676,6 +1712,8 @@ async def process_bank_statement_email(
                 source="bank_statement",
                 txns=imported_txns,
             )
+
+    await notify_balance_mismatches(upload, recon, account.label)
 
     duplicate_count, import_error_count, _skip_msg = import_skip_summary(recon)
     logger.info(

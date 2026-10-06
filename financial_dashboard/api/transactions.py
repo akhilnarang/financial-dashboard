@@ -20,6 +20,8 @@ from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.schemas.transactions import (
     TransactionCategoryResponse,
     TransactionCategoryUpdate,
+    TransactionDeleteBatchRequest,
+    TransactionDeleteResponse,
     TransactionExcludeResponse,
     TransactionExcludeUpdate,
     TransactionMergeBatchRequest,
@@ -30,10 +32,11 @@ from financial_dashboard.schemas.transactions import (
     TransactionRelinkUpdate,
 )
 from financial_dashboard.services.duplicate_merge import (
-    MergeRefused,
+    BatchRefused,
     merge_duplicates,
 )
 from financial_dashboard.services.categorization.vocabulary import list_categories
+from financial_dashboard.services.phantom_delete import delete_phantoms
 from financial_dashboard.services.transaction_reads import (
     get_transaction_detail,
     get_transactions_by_ids,
@@ -137,7 +140,24 @@ async def transactions_merge_batch(
     """
     try:
         return await merge_duplicates(session, payload.pairs, dry_run=payload.dry_run)
-    except MergeRefused as exc:
+    except BatchRefused as exc:
+        raise ConflictException(detail={"refused": exc.refusals}) from exc
+
+
+@router.post("/transactions/delete-batch")
+async def transactions_delete_batch(
+    payload: TransactionDeleteBatchRequest,
+    session: AsyncSessionDep,
+) -> TransactionDeleteResponse:
+    """Delete phantom statement rows, all or nothing.
+
+    A dry run writes nothing. A refused row refuses the whole batch.
+    """
+    try:
+        return await delete_phantoms(
+            session, payload.ids, reason=payload.reason, dry_run=payload.dry_run
+        )
+    except BatchRefused as exc:
         raise ConflictException(detail={"refused": exc.refusals}) from exc
 
 
