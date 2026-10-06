@@ -459,19 +459,50 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     return bool(db_narration) and db_narration == narration
 
 
-def _row_names_candidate(stmt_idx: int, cid: int, txn_by_idx, db_by_id) -> bool:
-    """Whether a statement row names a DB candidate as its own.
+def _is_glued_prefix(row_narration: str | None, db_txn: Transaction) -> bool:
+    """Whether a narration is the counterparty plus one glued word of letters.
 
-    The row narration must single the candidate's counterparty out, and the
-    row must not be confirmed on a different card than the candidate — a
-    positive card conflict rules the candidate out. The reachability sets are
-    card-blind, so the card check has to be applied here.
+    HDFC prints ``SAMPLE FOOD`` + ``MUMBAI`` as ``SAMPLE FOODMUMBAI``. The
+    rule does not prove that the glued word is a city.
     """
-    if _confirmed_different_card(
-        txn_by_idx[stmt_idx].card_number, db_by_id[cid].card_mask
-    ):
-        return False
-    return _counterparty_singles_out(txn_by_idx[stmt_idx].narration, db_by_id[cid])
+    narration = _normalize_narration(row_narration)
+    counterparty = _normalize_narration(db_txn.counterparty)
+    return (
+        len(counterparty) >= 8
+        and (" " in counterparty or "*" in counterparty)
+        and narration.startswith(counterparty)
+        and narration[len(counterparty) :].isalpha()
+    )
+
+
+def _row_names(
+    stmt_idx: int,
+    cids: set[int],
+    txn_by_idx: dict[int, ParsedCcTransaction],
+    db_by_id: dict[int, Transaction],
+) -> set[int]:
+    """The candidates a statement row names as its own.
+
+    A candidate on a confirmed different card is never named. The
+    reachability sets are card-blind, so the card check is applied here. A
+    whole-word or exact match outranks a glued prefix. A glued prefix counts
+    only when the row names no candidate by a whole-word or exact match. Thus
+    a short merchant name cannot rival a longer one.
+    """
+    row = txn_by_idx[stmt_idx]
+    same_card = [
+        cid
+        for cid in cids
+        if not _confirmed_different_card(row.card_number, db_by_id[cid].card_mask)
+    ]
+    whole = {
+        cid
+        for cid in same_card
+        if _counterparty_singles_out(row.narration, db_by_id[cid])
+    }
+    return whole or {
+        cid for cid in same_card if _is_glued_prefix(row.narration, db_by_id[cid])
+    }
 
 
 def _resolve_contested_by_counterparty(
@@ -544,15 +575,13 @@ def _resolve_contested_by_counterparty(
         assignment: dict[int, int] = {}  # stmt_idx -> candidate id
         singled_out = True
         for stmt_idx in group_rows:
-            named = [
-                cid
-                for cid in candidate_sets.get(stmt_idx, set())
-                if _row_names_candidate(stmt_idx, cid, txn_by_idx, db_by_id)
-            ]
-            if len(named) != 1 or named[0] not in group_candidate_ids:
+            named = _row_names(
+                stmt_idx, candidate_sets.get(stmt_idx, set()), txn_by_idx, db_by_id
+            )
+            if len(named) != 1 or not named <= group_candidate_ids:
                 singled_out = False
                 break
-            assignment[stmt_idx] = named[0]
+            assignment[stmt_idx] = next(iter(named))
         if not singled_out:
             continue
         # The winners must pair bijectively with the candidates they won.
@@ -571,8 +600,8 @@ def _resolve_contested_by_counterparty(
             sum(
                 1
                 for stmt_idx in contesting_rows
-                if cid in candidate_sets[stmt_idx]
-                and _row_names_candidate(stmt_idx, cid, txn_by_idx, db_by_id)
+                if cid
+                in _row_names(stmt_idx, candidate_sets[stmt_idx], txn_by_idx, db_by_id)
             )
             != 1
             for cid in group_candidate_ids
