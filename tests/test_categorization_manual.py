@@ -134,3 +134,67 @@ async def test_apply_reviewed_rows(session: AsyncSession):
     assert good.category == "groceries" and good.category_method == "manual"
     for txn in (bad_slug, mismatch, blank):
         assert txn.category_method != "manual"
+
+
+async def test_bulk_categorize_and_category_list(client, session: AsyncSession):
+    """A dry run and a rejected batch write nothing. One bad slug or id rejects
+    every item. A real run applies each field and leaves null fields alone. The
+    category list names each slug's bank-scope bucket."""
+    for slug in ("groceries", "dining", "credit_card_payment"):
+        await ensure_category(session, slug)
+    first = await _txn(session)
+    second = await _txn(session, category="dining", note="old note")
+    await session.commit()
+    items = [
+        {"id": first.id, "category": "groceries", "exclude_from_cashflow": True},
+        {"id": second.id, "note": "new note"},
+    ]
+
+    async def _rows():
+        await session.refresh(first)
+        await session.refresh(second)
+        return [
+            (t.category, t.category_method, t.note, t.exclude_from_cashflow)
+            for t in (first, second)
+        ]
+
+    untouched = [(None, None, None, False), ("dining", None, "old note", False)]
+
+    preview = await client.post("/api/transactions/categorize", json={"items": items})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["dry_run"] is True
+    row = preview.json()["items"][0]
+    assert (row["category"], row["category_method"], row["exclude_from_cashflow"]) == (
+        "groceries",
+        "manual",
+        True,
+    )
+    assert await _rows() == untouched
+
+    bad = await client.post(
+        "/api/transactions/categorize",
+        json={
+            "dry_run": False,
+            "items": [
+                items[0],
+                {"id": second.id, "category": "nope"},
+                {"id": 999999, "category": "groceries"},
+            ],
+        },
+    )
+    assert bad.status_code == 400
+    assert [e["index"] for e in bad.json()["detail"]["errors"]] == [1, 2]
+    assert await _rows() == untouched
+
+    applied = await client.post(
+        "/api/transactions/categorize", json={"dry_run": False, "items": items}
+    )
+    assert applied.status_code == 200, applied.text
+    assert await _rows() == [
+        ("groceries", "manual", None, True),
+        ("dining", None, "new note", False),
+    ]
+
+    categories = await client.get("/api/categories")
+    buckets = {item["slug"]: item["bucket"] for item in categories.json()["items"]}
+    assert buckets["credit_card_payment"] == "expense"
