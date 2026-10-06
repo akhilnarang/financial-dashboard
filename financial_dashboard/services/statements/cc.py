@@ -61,6 +61,7 @@ from financial_dashboard.db import (
 
 from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
+from financial_dashboard.core.uploads import STATEMENTS_DIR
 from financial_dashboard.core.masks import (
     mask_digits,
     mask_last4,
@@ -140,8 +141,6 @@ class CopyKey(NamedTuple):
 
 
 logger = logging.getLogger(__name__)
-
-STATEMENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "statements"
 
 
 def parse_statement(pdf_path: Path, password: str | None = None, bank: str = "auto"):

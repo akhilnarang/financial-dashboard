@@ -46,6 +46,7 @@ from financial_dashboard.db import (
 from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
 from financial_dashboard.core.masks import mask_last4
+from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
 from financial_dashboard.integrations.parsers import parse_bank_statement_pdf
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.categorization.rules import is_fd_counterparty
@@ -74,8 +75,6 @@ from financial_dashboard.services.telegram import (
 
 logger = logging.getLogger(__name__)
 
-STATEMENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "statements"
-_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _TOKEN_RE = re.compile(r"[A-Za-z]{4,}")
 _MIN_REF_SUBSTRING_LEN = 6
 _OVERLAP_STOPWORDS: frozenset[str] = frozenset(
@@ -180,12 +179,6 @@ class BankStatementProcessingError(Exception):
     raises this error so the caller can put a real message in front of
     the user instead of "Statement processing returned no result".
     """
-
-
-def _safe_filename(filename: str | None) -> str:
-    base = Path(filename or "statement.pdf").name or "statement.pdf"
-    cleaned = _SAFE_FILENAME_RE.sub("_", base).strip("._") or "statement.pdf"
-    return cleaned[:120]
 
 
 # ---------------------------------------------------------------------------
@@ -1389,7 +1382,7 @@ async def process_bank_statement_email(
             # Save for manual retry
             STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
-            safe_name = _safe_filename(filename)
+            safe_name = safe_upload_filename(filename)
             file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
             file_path.write_bytes(pdf_bytes)
 
@@ -1479,7 +1472,7 @@ async def process_bank_statement_email(
     # Save the PDF to disk
     STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
-    safe_name = _safe_filename(filename)
+    safe_name = safe_upload_filename(filename)
     file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
     file_path.write_bytes(pdf_bytes)
 
