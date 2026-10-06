@@ -61,7 +61,7 @@ from financial_dashboard.db import (
 
 from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
-from financial_dashboard.core.uploads import STATEMENTS_DIR
+from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
 from financial_dashboard.core.masks import (
     mask_digits,
     mask_last4,
@@ -1902,7 +1902,7 @@ async def process_statement_email(
             # No stored password worked — save for manual retry.
             STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
             ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
-            safe_name = filename.replace("/", "_").replace("\\", "_")
+            safe_name = safe_upload_filename(filename)
             file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
             file_path.write_bytes(pdf_bytes)
 
@@ -2002,7 +2002,7 @@ async def process_statement_email(
     # Save the PDF to disk
     STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
-    safe_name = filename.replace("/", "_").replace("\\", "_")
+    safe_name = safe_upload_filename(filename)
     file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
     file_path.write_bytes(pdf_bytes)
 
