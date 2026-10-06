@@ -37,7 +37,7 @@ from financial_dashboard.services.reminders import (
     _latest_active_cycle,
     resync_tracked_cc_payment_state,
 )
-from financial_dashboard.services.transaction_reads import _transaction_read
+from financial_dashboard.services.transaction_reads import transaction_read
 from financial_dashboard.services.txn_merge import (
     _normalized_currency,
     _quantize_balance,
@@ -79,11 +79,11 @@ class PairRefused(Exception):
     """One pair fails a check that needs the DB."""
 
 
-class MergeRefused(Exception):
-    """One or more pairs fail the merge checks. Nothing is written."""
+class BatchRefused(Exception):
+    """One or more batch items fail their checks. Nothing is written."""
 
     def __init__(self, refusals: list[dict]) -> None:
-        super().__init__("merge refused")
+        super().__init__("batch refused")
         self.refusals = refusals
 
 
@@ -184,38 +184,59 @@ def _refusal_reasons(keep: Transaction, dup: Transaction) -> list[str]:
     return [reason for failed, reason in checks if failed]
 
 
-def _repoint_reconciliation(recon: dict, old_id: int, new_id: int) -> bool:
+def _repoint_reconciliation(recon: dict, old_id: int, new_id: int | None) -> bool:
     """Replace ``old_id`` with ``new_id`` in stored statement reconciliation data.
 
-    Return whether anything changed.
+    ``None`` drops each entry that names ``old_id`` as its row. Return whether
+    anything changed.
     """
     changed = False
-    for entry in recon.get("matched", []) + recon.get("missing", []):
-        for key in ("db_txn_id", "imported_txn_id"):
-            if entry.get(key) == old_id:
-                entry[key] = new_id
+    for group in ("matched", "missing"):
+        kept = []
+        for entry in recon.get(group, []):
+            named = False
+            for key in ("db_txn_id", "imported_txn_id"):
+                if entry.get(key) == old_id:
+                    entry[key] = new_id
+                    changed = named = True
+            candidates = entry.get("candidate_transaction_ids") or []
+            if old_id in candidates:
+                replaced = (new_id if i == old_id else i for i in candidates)
+                entry["candidate_transaction_ids"] = list(
+                    dict.fromkeys(i for i in replaced if i is not None)
+                )
                 changed = True
-        candidates = entry.get("candidate_transaction_ids") or []
-        if old_id in candidates:
-            entry["candidate_transaction_ids"] = list(
-                dict.fromkeys(new_id if i == old_id else i for i in candidates)
-            )
-            changed = True
+            if new_id is not None or not named:
+                kept.append(entry)
+        if group in recon:
+            recon[group] = kept
     return changed
 
 
-async def _move_references(
-    session: AsyncSession, old_id: int, new_id: int
+async def move_references(
+    session: AsyncSession, old_id: int, new_id: int | None
 ) -> dict[str, int]:
     """Point every row that names ``old_id`` at ``new_id``.
 
-    Return the moved row count per table. Telegram rows move too but are not
-    counted.
+    ``None`` cleans the references of a deleted row. A category review row
+    only expires, because its link cannot be empty. An audit row keeps its
+    target id as history. A stored statement reconciliation forgets the row.
+
+    Args:
+        session: The session that deletes ``old_id``.
+        old_id: The row that goes away.
+        new_id: The row that keeps the data, or ``None`` for a plain delete.
+
+    Returns:
+        The changed row count per table. Telegram rows change too but are not
+        counted.
     """
     moved = {}
     await supersede_active_decisions(session, old_id)
     await move_transaction_references(session, old_id, new_id)
     for model in _REFERRING_MODELS:
+        if new_id is None and model is CategoryReviewDecision:
+            continue
         result = await session.execute(
             update(model)
             .where(model.transaction_id == old_id)
@@ -224,13 +245,15 @@ async def _move_references(
         if rowcount := cast(CursorResult, result).rowcount:
             moved[model.__tablename__] = rowcount
 
-    await session.execute(
-        update(AuditAction)
-        .where(
-            AuditAction.target_type == "transaction", AuditAction.target_id == old_id
+    if new_id is not None:
+        await session.execute(
+            update(AuditAction)
+            .where(
+                AuditAction.target_type == "transaction",
+                AuditAction.target_id == old_id,
+            )
+            .values(target_id=new_id)
         )
-        .values(target_id=new_id)
-    )
 
     for model in (StatementUpload, BankStatementUpload):
         uploads = await session.scalars(
@@ -303,7 +326,7 @@ async def _merge_pair(
     Raises:
         PairRefused: The duplicate is a payment in a paid card cycle.
     """
-    before = _transaction_read(keep)
+    before = transaction_read(keep)
     data = {name: getattr(dup, name) for name in _COLUMNS}
     if data["channel"] == "bank_statement":
         # A statement import writes this label when the row names no channel.
@@ -314,7 +337,7 @@ async def _merge_pair(
     cycle, cc_conflicts = await _cc_cycle(session, keep, dup)
     cycle_before = (cycle.payment_paid_amount, cycle.payment_status) if cycle else None
 
-    moved = await _move_references(session, dup.id, keep.id)
+    moved = await move_references(session, dup.id, keep.id)
     await session.delete(dup)
     # The duplicate holds the unique reference until the delete flushes.
     await session.flush()
@@ -359,7 +382,7 @@ async def _merge_pair(
         keep_id=keep.id,
         duplicate_id=data["id"],
         keeper_before=before,
-        keeper_after=_transaction_read(keep),
+        keeper_after=transaction_read(keep),
         moved_references=moved,
         conflicts=conflicts,
         cc_payment_state=cc_state,
@@ -385,7 +408,7 @@ async def merge_duplicates(
         The report of each merge.
 
     Raises:
-        MergeRefused: A pair fails a check. The function writes nothing.
+        BatchRefused: A pair fails a check. The function writes nothing.
     """
     duplicate_ids = [pair.duplicate_id for pair in pairs]
     keep_ids = {pair.keep_id for pair in pairs}
@@ -416,5 +439,5 @@ async def merge_duplicates(
         if dry_run or refusals:
             await txn.rollback()
     if refusals:
-        raise MergeRefused(refusals)
+        raise BatchRefused(refusals)
     return TransactionMergeResponse(dry_run=dry_run, merges=reports)

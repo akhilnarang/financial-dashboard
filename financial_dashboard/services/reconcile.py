@@ -25,7 +25,7 @@ from financial_dashboard.schemas.reconcile import (
 from financial_dashboard.schemas.transactions import TransactionRead
 from financial_dashboard.services.cashflow.buckets import SELF_TRANSFER_SLUG
 from financial_dashboard.services.statements.bank import _parse_amount, _parse_date
-from financial_dashboard.services.transaction_reads import _transaction_read
+from financial_dashboard.services.transaction_reads import transaction_read
 from financial_dashboard.services.txn_merge import (
     _normalized_currency,
     _shortened_reference_match,
@@ -333,5 +333,5 @@ async def reconcile(
             )
         )
     ).all()
-    rows = [_transaction_read(t) for t in txns]
+    rows = [transaction_read(t) for t in txns]
     return build_report(date_from, date_to, labels, statements, rows)

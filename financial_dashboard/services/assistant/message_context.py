@@ -137,9 +137,9 @@ async def record_physical_message(
 
 
 async def move_transaction_references(
-    session: AsyncSession, old_id: int, new_id: int
+    session: AsyncSession, old_id: int, new_id: int | None
 ) -> None:
-    """Point reply mappings at the row that survives a fold.
+    """Point reply mappings at the row that survives a fold, or clear them.
 
     SQLite can give a deleted transaction id to a new row. A reply to an old
     message must not reach that new row.
@@ -147,7 +147,8 @@ async def move_transaction_references(
     Args:
         session: The session that deletes the old row.
         old_id: The id of the transaction to delete.
-        new_id: The id of the transaction that keeps the data.
+        new_id: The id of the transaction that keeps the data, or ``None``
+            when the old row is deleted without a keeper.
     """
     from financial_dashboard.services.assistant.conversations import (
         clear_pending_confirmation,
