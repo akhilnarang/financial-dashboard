@@ -50,9 +50,7 @@ def _file_bytes(name="statement.pdf"):
 
 
 @pytest.mark.anyio
-async def test_manual_cc_upload_imports_missing(
-    maker, monkeypatch, tmp_path, statements_dir
-):
+async def test_manual_cc_upload_imports_missing(maker, monkeypatch, statements_dir):
     import financial_dashboard.web.statements as cc_routes
 
     acc_id = await h.add_cc_account(maker)
@@ -90,7 +88,7 @@ async def test_manual_cc_upload_imports_missing(
 
 @pytest.mark.anyio
 async def test_manual_bank_upload_imports_clean_rows_only(
-    maker, monkeypatch, tmp_path, statements_dir
+    maker, monkeypatch, statements_dir
 ):
     """Manual upload holds back same-reference contenders and tolerates an
     unexpected per-row error. The clean row still commits."""
