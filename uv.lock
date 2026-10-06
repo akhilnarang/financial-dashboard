@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.14"
 
 [options]
@@ -70,7 +70,7 @@ dependencies = [
 [[package]]
 name = "bank-statement-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-statement-parser#45c92fe2c0fc6e6da579f8e5f2b9ad8910c07a21" }
+source = { git = "https://github.com/akhilnarang/bank-statement-parser#576a9d4ab1d83b503935dbed68d633e2efd114b0" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },
