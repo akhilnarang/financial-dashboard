@@ -1,4 +1,4 @@
-"""Shared validation and normalization for JSON API query parameters."""
+"""Shared validation and normalization for JSON API request inputs."""
 
 import datetime
 from typing import NamedTuple
