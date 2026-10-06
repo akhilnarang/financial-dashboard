@@ -98,6 +98,7 @@ async def test_transaction_list_is_bounded_filtered_stable_and_redacted(
     client, session
 ):
     first, account, card, email, sms, statement = await _seed_transaction(session)
+    first.note = "n" * 1_500
     second = Transaction(
         bank="OtherBank",
         email_type="other_alert",
@@ -140,9 +141,59 @@ async def test_transaction_list_is_bounded_filtered_stable_and_redacted(
     assert item["reference_number"] == "SYNTHETIC-REF-001"
     assert "4111111111119876" not in response.text
     assert "123456789012" not in response.text
-    assert "Synthetic raw description" not in response.text
-    assert "Synthetic note" not in response.text
+    assert item["raw_description"] == "Synthetic raw description"
+    assert item["note"] == "n" * 1_000
+    assert item["note_truncated"] is True
     assert "/private/synthetic.pdf" not in response.text
+
+
+async def test_transaction_list_text_category_and_exclusion_filters(client, session):
+    """``q`` searches the row text and treats wildcard characters as literal
+    text.
+    ``category`` repeats as an OR. ``exclude_from_cashflow`` narrows the rows."""
+
+    def _row(**fields):
+        return Transaction(
+            bank=fields.pop("bank", "SyntheticBank"),
+            email_type="synthetic_alert",
+            direction="debit",
+            amount=Decimal("1.00"),
+            **fields,
+        )
+
+    rows = {
+        "counterparty": _row(counterparty="Alpha Store", category="dining"),
+        "description": _row(
+            raw_description="upi to ALPHA",
+            category="groceries",
+            exclude_from_cashflow=True,
+        ),
+        "note": _row(note="alpha refund", category="shopping"),
+        "other": _row(counterparty="Beta", category="dining"),
+    }
+    session.add_all(rows.values())
+    await session.commit()
+    name_by_id = {row.id: name for name, row in rows.items()}
+
+    async def _names(params):
+        response = await client.get("/api/transactions", params=params)
+        assert response.status_code == 200, response.text
+        return {name_by_id[item["id"]] for item in response.json()["items"]}
+
+    assert await _names({"q": "Alpha"}) == {"counterparty", "description", "note"}
+    assert await _names({"q": "Alph_"}) == set()
+    assert await _names({"category": ["dining", "groceries"]}) == {
+        "counterparty",
+        "description",
+        "other",
+    }
+    assert await _names(
+        {
+            "q": "alpha",
+            "category": ["dining", "groceries"],
+            "exclude_from_cashflow": "false",
+        }
+    ) == {"counterparty"}
 
 
 async def test_transaction_list_orders_newest_first_and_paginates(client, session):

@@ -159,24 +159,45 @@ class StatementReconciliationEntry(BaseModel):
     candidate_ids_truncated: bool
     decision_reason: Annotated[str, Field(max_length=64)]
     gates: Annotated[list[str], Field(max_length=10)]
+    imported: bool
+    imported_transaction_id: int | None
+    import_error: Annotated[str | None, Field(max_length=1_000)]
 
 
-class StatementReconciliationPreviewResponse(BaseModel):
-    statement_id: int
-    kind: Literal["cc", "bank"]
-    account_id: int
-    candidate_scope: Literal["date_buffer_plus_statement_references"]
-    date_from: datetime.date
-    date_to: datetime.date
+class StatementReconciliationLists(BaseModel):
     matched_count: Annotated[int, Field(ge=0)]
     missing_count: Annotated[int, Field(ge=0)]
     ambiguous_count: Annotated[int, Field(ge=0)]
-    extra_count: Annotated[int, Field(ge=0)]
     matched: Annotated[list[StatementReconciliationEntry], Field(max_length=100)]
     matched_truncated: bool
     missing: Annotated[list[StatementReconciliationEntry], Field(max_length=100)]
     missing_truncated: bool
     ambiguous: Annotated[list[StatementReconciliationEntry], Field(max_length=100)]
     ambiguous_truncated: bool
+
+
+class StatementReconciliationPreviewResponse(StatementReconciliationLists):
+    statement_id: int
+    kind: Literal["cc", "bank"]
+    account_id: int
+    candidate_scope: Literal["date_buffer_plus_statement_references"]
+    date_from: datetime.date
+    date_to: datetime.date
+    extra_count: Annotated[int, Field(ge=0)]
     extra_transaction_ids: Annotated[list[int], Field(max_length=100)]
     extra_transaction_ids_truncated: bool
+
+
+class BankStatementUploadResponse(StatementReconciliationLists):
+    """Result of one bank statement upload. A dry run writes nothing."""
+
+    dry_run: bool
+    account_id: int
+    upload_id: int | None
+    status: str
+    error: str | None
+    statement_period_start: str | None
+    statement_period_end: str | None
+    opening_balance: str | None
+    closing_balance: str | None
+    imported_count: Annotated[int, Field(ge=0)]

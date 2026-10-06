@@ -358,7 +358,35 @@ def _reconciliation_entry(
         candidate_ids_truncated=bool(entry.get("candidate_ids_truncated")),
         decision_reason=_bounded(entry.get("decision_reason"), 64) or "unavailable",
         gates=[str(gate)[:64] for gate in entry.get("gates", [])[:10]],
+        imported=bool(entry.get("imported")),
+        imported_transaction_id=entry.get("imported_txn_id"),
+        import_error=_bounded(entry.get("import_error")),
     )
+
+
+def reconciliation_lists(
+    reconciliation: dict[str, Any],
+) -> statement_schemas.StatementReconciliationLists:
+    """Split reconciler output into bounded matched, missing and ambiguous rows.
+
+    Args:
+        reconciliation: Output of a statement reconciler.
+
+    Returns:
+        Full counts and the first rows of each list, with truncation flags.
+    """
+    missing_all = reconciliation.get("missing", [])
+    groups = {
+        "matched": reconciliation.get("matched", []),
+        "missing": [entry for entry in missing_all if not entry.get("ambiguous")],
+        "ambiguous": [entry for entry in missing_all if entry.get("ambiguous")],
+    }
+    fields: dict[str, Any] = {}
+    for name, rows in groups.items():
+        fields[f"{name}_count"] = len(rows)
+        fields[name] = [_reconciliation_entry(row) for row in rows[:_ROW_LIMIT]]
+        fields[f"{name}_truncated"] = len(rows) > _ROW_LIMIT
+    return statement_schemas.StatementReconciliationLists(**fields)
 
 
 def _statement_candidate_index(
@@ -548,8 +576,6 @@ async def preview_statement_reconciliation(
 
     matched_all = reconciliation.get("matched", [])
     missing_all = reconciliation.get("missing", [])
-    ambiguous_all = [entry for entry in missing_all if entry.get("ambiguous")]
-    unambiguous_missing = [entry for entry in missing_all if not entry.get("ambiguous")]
     matched_ids = {
         entry["db_txn_id"]
         for entry in matched_all
@@ -571,24 +597,14 @@ async def preview_statement_reconciliation(
         )
     )
     return statement_schemas.StatementReconciliationPreviewResponse(
+        **reconciliation_lists(reconciliation).model_dump(),
         statement_id=statement_id,
         kind=kind,
         account_id=loaded.account_id,
         candidate_scope="date_buffer_plus_statement_references",
         date_from=lo,
         date_to=hi,
-        matched_count=len(matched_all),
-        missing_count=len(unambiguous_missing),
-        ambiguous_count=len(ambiguous_all),
         extra_count=len(extra_ids),
-        matched=[_reconciliation_entry(row) for row in matched_all[:_ROW_LIMIT]],
-        matched_truncated=len(matched_all) > _ROW_LIMIT,
-        missing=[
-            _reconciliation_entry(row) for row in unambiguous_missing[:_ROW_LIMIT]
-        ],
-        missing_truncated=len(unambiguous_missing) > _ROW_LIMIT,
-        ambiguous=[_reconciliation_entry(row) for row in ambiguous_all[:_ROW_LIMIT]],
-        ambiguous_truncated=len(ambiguous_all) > _ROW_LIMIT,
         extra_transaction_ids=extra_ids[:_ROW_LIMIT],
         extra_transaction_ids_truncated=len(extra_ids) > _ROW_LIMIT,
     )

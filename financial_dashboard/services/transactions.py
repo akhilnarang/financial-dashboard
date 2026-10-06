@@ -7,6 +7,8 @@ from typing import NamedTuple
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import Account, Card, Transaction
+from financial_dashboard.schemas import transactions as transaction_schemas
+from financial_dashboard.services.transaction_reads import transaction_list_item
 from financial_dashboard.services.cc_disambiguation import (
     should_auto_reconcile_statement,
 )
@@ -112,6 +114,66 @@ async def update_transaction_category(
     if not ok:
         raise ValueError(f"Invalid category: {category!r}")
     return True, slug
+
+
+async def categorize_transactions(
+    session: AsyncSession,
+    items: list[transaction_schemas.TransactionCategorizeItem],
+    *,
+    dry_run: bool,
+) -> list[transaction_schemas.TransactionListItem]:
+    """Apply category, note and exclusion changes to many rows in one transaction.
+
+    Each change goes through the same per-row function as the single endpoints.
+    The function commits only when every item is valid and ``dry_run`` is False.
+    Otherwise it rolls back, so nothing is written.
+
+    Args:
+        session: Request session. This function commits or rolls it back.
+        items: Row changes. A None field stays unchanged.
+        dry_run: Roll back after computing the result.
+
+    Returns:
+        The state of each row after its change.
+
+    Raises:
+        ValueError: One or more items are invalid. ``args[0]`` holds one
+            ``{"index", "id", "error"}`` dict per invalid item.
+    """
+    from financial_dashboard.services.categorization.manual import (
+        assign_category_no_commit,
+    )
+
+    after: list[transaction_schemas.TransactionListItem] = []
+    errors: list[dict] = []
+    for index, item in enumerate(items):
+        txn = await session.get(Transaction, item.id)
+        if txn is None:
+            errors.append(
+                {"index": index, "id": item.id, "error": "Transaction not found"}
+            )
+            continue
+        if item.note is not None:
+            await update_transaction_note_no_commit(session, item.id, item.note)
+        if item.category is not None:
+            ok, _ = await assign_category_no_commit(session, item.id, item.category)
+            if not ok:
+                error = f"Invalid category: {item.category!r}"
+                errors.append({"index": index, "id": item.id, "error": error})
+                continue
+        if item.exclude_from_cashflow is not None:
+            await set_transaction_excluded_no_commit(
+                session, item.id, item.exclude_from_cashflow
+            )
+        after.append(transaction_list_item(txn))
+
+    if errors or dry_run:
+        await session.rollback()
+    else:
+        await session.commit()
+    if errors:
+        raise ValueError(errors)
+    return after
 
 
 async def relink_transaction(

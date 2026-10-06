@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from financial_dashboard.core.uploads import STATEMENTS_DIR
+from financial_dashboard.core import uploads
 
 
 def _unlink_statement_file(path_str: str | None) -> None:
@@ -11,7 +11,7 @@ def _unlink_statement_file(path_str: str | None) -> None:
         return
     try:
         target = Path(path_str).resolve()
-        target.relative_to(STATEMENTS_DIR.resolve())
+        target.relative_to(uploads.STATEMENTS_DIR.resolve())
     except ValueError, OSError:
         return
     try:
