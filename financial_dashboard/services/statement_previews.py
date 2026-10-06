@@ -8,6 +8,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
+from bank_statement_parser.models import ParsedBankStatement
+from cc_parser.parsers.models import ParsedStatement
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import status
@@ -463,6 +465,61 @@ def could_be_statement_candidate(
     )
 
 
+STATEMENT_UPLOADS = {"bank": BankStatementUpload, "cc": StatementUpload}
+
+
+class StatementRef(NamedTuple):
+    """The stored statement that imported a row."""
+
+    kind: Literal["cc", "bank"]
+    id: int
+
+
+def statement_of(row: Transaction) -> StatementRef | None:
+    """Return the statement that imported the row.
+
+    Args:
+        row: The transaction to look up.
+
+    Returns:
+        The bank or card statement that imported the row, or ``None`` when no
+        statement imported it.
+    """
+    if row.email_type == "bank_statement" and row.bank_statement_upload_id:
+        return StatementRef("bank", row.bank_statement_upload_id)
+    if row.email_type == "cc_statement" and row.statement_upload_id:
+        return StatementRef("cc", row.statement_upload_id)
+    return None
+
+
+async def parse_shortfall(
+    session: AsyncSession,
+    statement: StatementRef,
+    preview: statement_schemas.StatementReconciliationPreviewResponse,
+    dropped: int,
+) -> str | None:
+    """Return why today's parse may have lost real lines, or ``None``.
+
+    Args:
+        session: Asynchronous database session.
+        statement: The statement that today's parse read.
+        preview: Today's reconciliation of the statement.
+        dropped: The lines that today's parse may drop on purpose.
+
+    Returns:
+        The error text when the parse found no lines, or fewer lines than the
+        stored parse less ``dropped``; otherwise ``None``.
+    """
+    upload = await session.get(STATEMENT_UPLOADS[statement.kind], statement.id)
+    expected = (upload.parsed_txn_count or 0) if upload else 0
+    found = preview.matched_count + preview.missing_count + preview.ambiguous_count
+    if found == 0:
+        return "today's parse found no lines"
+    if found + dropped < expected:
+        return f"today's parse found {found} lines; the stored parse found {expected}"
+    return None
+
+
 class StoredReconciliation(NamedTuple):
     """The bounded preview and every extra row id, untruncated.
 
@@ -471,11 +528,13 @@ class StoredReconciliation(NamedTuple):
         extra_ids: Every row in the statement period that no line can claim.
         candidate_ids: Every row that a line matched or named as a candidate,
             or ``None`` when a line has more candidates than it lists.
+        matched_ids: Every row that a line matched.
     """
 
     preview: statement_schemas.StatementReconciliationPreviewResponse
     extra_ids: list[int]
     candidate_ids: set[int] | None
+    matched_ids: set[int]
 
 
 async def preview_statement_reconciliation(
@@ -498,6 +557,42 @@ async def preview_statement_reconciliation(
     """
     stored = await reconcile_stored_statement(session, kind, statement_id)
     return stored.preview if stored else None
+
+
+class ParsedStoredStatement(NamedTuple):
+    """Today's parse of one stored statement."""
+
+    kind: Literal["cc", "bank"]
+    statement_id: int
+    account_id: int
+    parsed: ParsedBankStatement | ParsedStatement
+
+
+async def parse_stored_statement(
+    session: AsyncSession,
+    kind: Literal["cc", "bank"],
+    statement_id: int,
+) -> ParsedStoredStatement | None:
+    """Parse one stored statement.
+
+    The function ends the session's transaction before the slow parse.
+
+    Args:
+        session: Asynchronous database session with no write to keep.
+        kind: Credit-card or bank-statement parser.
+        statement_id: Database ID of the statement upload.
+
+    Returns:
+        Today's parse, or ``None`` when the upload does not exist.
+
+    Raises:
+        StatementPreviewError: If the PDF cannot be loaded or parsed.
+    """
+    if (loaded := await _load_statement(session, kind, statement_id)) is None:
+        return None
+    return ParsedStoredStatement(
+        kind, statement_id, loaded.account_id, await _parse(loaded)
+    )
 
 
 async def reconcile_stored_statement(
@@ -523,10 +618,33 @@ async def reconcile_stored_statement(
             range is unusable, reference closure exceeds the limit, or the
             reconciler fails.
     """
-    loaded = await _load_statement(session, kind, statement_id)
-    if loaded is None:
+    if (stored := await parse_stored_statement(session, kind, statement_id)) is None:
         return None
-    parsed = await _parse(loaded)
+    return await reconcile_parsed_statement(session, stored)
+
+
+async def reconcile_parsed_statement(
+    session: AsyncSession, stored: ParsedStoredStatement, *, as_reparse: bool = False
+) -> StoredReconciliation:
+    """Reconcile today's parse of a statement with the rows the session sees.
+
+    The function writes nothing and keeps the session's transaction open.
+
+    Args:
+        session: Asynchronous database session. Candidate queries run with
+            autoflush disabled.
+        stored: Today's parse of the statement.
+        as_reparse: True uses only the rows a reparse sees: rows in the
+            buffered date range, without rows found by reference alone.
+
+    Returns:
+        The bounded preview and every extra row id.
+
+    Raises:
+        StatementPreviewError: If the date range is unusable, reference closure
+            exceeds the limit, or the reconciler fails.
+    """
+    kind, statement_id, account_id, parsed = stored
     date_range = (
         cc_stmt_date_range(parsed) if kind == "cc" else bank_stmt_date_range(parsed)
     )
@@ -544,7 +662,7 @@ async def reconcile_stored_statement(
     # fuzzy matching can only reach the buffered date range, while bank rows can
     # additionally match a misdated/NULL-dated DB row by exact reference.
     statement = select(Transaction).where(
-        Transaction.account_id == loaded.account_id,
+        Transaction.account_id == account_id,
         Transaction.transaction_date.between(
             lo - datetime.timedelta(days=STMT_RECONCILE_DATE_BUFFER_DAYS),
             hi + datetime.timedelta(days=STMT_RECONCILE_DATE_BUFFER_DAYS),
@@ -558,7 +676,7 @@ async def reconcile_stored_statement(
                 if row.reference_number
             }
         )
-        if kind == "bank"
+        if isinstance(parsed, ParsedBankStatement) and not as_reparse
         else []
     )
     if len(references) > _REFERENCE_LIMIT:
@@ -581,7 +699,7 @@ async def reconcile_stored_statement(
                     await session.execute(
                         select(Transaction)
                         .where(
-                            Transaction.account_id == loaded.account_id,
+                            Transaction.account_id == account_id,
                             Transaction.reference_number.in_(
                                 references[start : start + _REFERENCE_CHUNK_SIZE]
                             ),
@@ -595,16 +713,16 @@ async def reconcile_stored_statement(
             candidate_by_id.update((row.id, row) for row in reference_rows)
         db_transactions = list(candidate_by_id.values())
         try:
-            if kind == "cc":
+            if not isinstance(parsed, ParsedBankStatement):
                 reconciliation = reconcile_statement(
                     parsed,
                     db_transactions,
-                    loaded.account_id,
-                    await load_account_card_masks(session, loaded.account_id),
+                    account_id,
+                    await load_account_card_masks(session, account_id),
                 )
             else:
                 reconciliation = reconcile_bank_statement(
-                    parsed, db_transactions, loaded.account_id
+                    parsed, db_transactions, account_id
                 )
         except Exception as exc:
             raise StatementPreviewError(
@@ -637,7 +755,7 @@ async def reconcile_stored_statement(
         **reconciliation_lists(reconciliation).model_dump(),
         statement_id=statement_id,
         kind=kind,
-        account_id=loaded.account_id,
+        account_id=account_id,
         candidate_scope="date_buffer_plus_statement_references",
         date_from=lo,
         date_to=hi,
@@ -652,4 +770,4 @@ async def reconcile_stored_statement(
             for entry in all_statement_entries
             for candidate in entry.get("candidate_transaction_ids", [])
         }
-    return StoredReconciliation(preview, extra_ids, candidate_ids)
+    return StoredReconciliation(preview, extra_ids, candidate_ids, matched_ids)

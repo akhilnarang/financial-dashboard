@@ -2,16 +2,14 @@
 
 import json
 from collections import Counter
-from typing import Literal, NamedTuple
+from typing import NamedTuple
 
 from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import (
     AuditAction,
-    BankStatementUpload,
     SmsMessage,
-    StatementUpload,
     Transaction,
 )
 from financial_dashboard.exceptions import StatementPreviewError
@@ -24,30 +22,17 @@ from financial_dashboard.services.duplicate_merge import (
     move_references,
 )
 from financial_dashboard.services.statement_previews import (
+    STATEMENT_UPLOADS,
+    StatementRef,
     could_be_statement_candidate,
+    parse_shortfall,
     reconcile_stored_statement,
     statement_candidate_index,
+    statement_of,
 )
 from financial_dashboard.services.transaction_reads import transaction_read
 
 _COLUMNS = tuple(attr.key for attr in inspect(Transaction).column_attrs)
-_UPLOADS = {"bank": BankStatementUpload, "cc": StatementUpload}
-
-
-class _Statement(NamedTuple):
-    """The stored statement that imported a row."""
-
-    kind: Literal["cc", "bank"]
-    id: int
-
-
-def _statement_of(row: Transaction) -> _Statement | None:
-    """Return the statement that imported the row, or ``None``."""
-    if row.email_type == "bank_statement" and row.bank_statement_upload_id:
-        return _Statement("bank", row.bank_statement_upload_id)
-    if row.email_type == "cc_statement" and row.statement_upload_id:
-        return _Statement("cc", row.statement_upload_id)
-    return None
 
 
 def _snapshot(row: Transaction) -> dict[str, object]:
@@ -55,37 +40,45 @@ def _snapshot(row: Transaction) -> dict[str, object]:
     return {name: getattr(row, name) for name in _COLUMNS}
 
 
+class _StatementCheck(NamedTuple):
+    """What today's parse of one statement proves."""
+
+    unheld: frozenset[int] = frozenset()
+    error: str | None = None
+
+
+class _Checks(NamedTuple):
+    """Each statement's check, and each row as seen before the write lock."""
+
+    statements: dict[StatementRef, _StatementCheck]
+    rows: dict[int, dict[str, object]]
+
+
 async def _unheld_by(
-    session: AsyncSession, statement: _Statement, requested: int
-) -> set[int] | str:
+    session: AsyncSession, statement: StatementRef, requested: int
+) -> _StatementCheck:
     """Return the rows today's parse of the statement no longer holds.
 
     A parse that finds no lines, or fewer lines than the stored parse less the
     requested rows, may have lost real lines. It maps to its error text, as
     does a failed parse.
     """
-    upload = await session.get(_UPLOADS[statement.kind], statement.id)
-    expected = (upload.parsed_txn_count or 0) if upload else 0
     try:
         stored = await reconcile_stored_statement(session, statement.kind, statement.id)
     except StatementPreviewError as exc:
-        return str(exc)
+        return _StatementCheck(error=str(exc))
     if stored is None:
-        return "statement not found"
-    preview = stored.preview
-    found = preview.matched_count + preview.missing_count + preview.ambiguous_count
-    if found == 0:
-        return "today's parse found no lines"
-    if found + requested < expected:
-        return f"today's parse found {found} lines; the stored parse found {expected}"
+        return _StatementCheck(error="statement not found")
+    if shortfall := await parse_shortfall(
+        session, statement, stored.preview, requested
+    ):
+        return _StatementCheck(error=shortfall)
     if stored.candidate_ids is None:
-        return "a statement line has too many candidate rows"
-    return set(stored.extra_ids) - stored.candidate_ids
+        return _StatementCheck(error="a statement line has too many candidate rows")
+    return _StatementCheck(frozenset(stored.extra_ids) - stored.candidate_ids)
 
 
-async def _check_statements(
-    session: AsyncSession, ids: list[int]
-) -> tuple[dict[_Statement, set[int] | str], dict[int, dict[str, object]]]:
+async def _check_statements(session: AsyncSession, ids: list[int]) -> _Checks:
     """Reparse each statement. Return what each proves, and each row as seen.
 
     A reparse imports every statement line that matches no row. Thus a row
@@ -99,9 +92,9 @@ async def _check_statements(
         )
     ).all()
     seen = {row.id: _snapshot(row) for row in rows}
-    requested = Counter(s for row in rows if (s := _statement_of(row)))
-    unheld = {s: await _unheld_by(session, s, n) for s, n in requested.items()}
-    return unheld, seen
+    requested = Counter(s for row in rows if (s := statement_of(row)))
+    statements = {s: await _unheld_by(session, s, n) for s, n in requested.items()}
+    return _Checks(statements, seen)
 
 
 def _names(entry: dict, row_id: int) -> bool:
@@ -117,7 +110,7 @@ def _names(entry: dict, row_id: int) -> bool:
 
 
 async def _named_elsewhere(
-    session: AsyncSession, row: Transaction, own: _Statement
+    session: AsyncSession, row: Transaction, own: StatementRef
 ) -> list[str]:
     """Return each other statement whose stored reconciliation could claim the row.
 
@@ -125,7 +118,7 @@ async def _named_elsewhere(
     unimported line names no row, so its date, amount and direction count.
     """
     names = []
-    for kind, model in _UPLOADS.items():
+    for kind, model in STATEMENT_UPLOADS.items():
         uploads = await session.scalars(
             select(model).where(
                 model.account_id == row.account_id,
@@ -152,13 +145,12 @@ async def _named_elsewhere(
 async def _refusal_reasons(
     session: AsyncSession,
     row: Transaction,
-    unheld: dict[_Statement, set[int] | str],
-    seen: dict[int, dict[str, object]],
+    checks: _Checks,
 ) -> list[str]:
     """Return every reason the row must stay. An empty list allows the delete."""
-    if (statement := _statement_of(row)) is None:
+    if (statement := statement_of(row)) is None:
         return ["the row is not a statement import"]
-    if seen.get(row.id) != _snapshot(row):
+    if checks.rows.get(row.id) != _snapshot(row):
         # SQLite can give a deleted id to a new row.
         return ["the row changed during the check; try again"]
     reasons = []
@@ -176,11 +168,13 @@ async def _refusal_reasons(
         f"{name} could claim the row; its reparse would import it again"
         for name in await _named_elsewhere(session, row, statement)
     )
-    held = unheld.get(statement, "statement not checked")
+    check = checks.statements.get(
+        statement, _StatementCheck(error="statement not checked")
+    )
     name = f"{statement.kind} statement {statement.id}"
-    if isinstance(held, str):
-        reasons.append(f"{name} cannot be checked: {held}")
-    elif row.id not in held:
+    if check.error:
+        reasons.append(f"{name} cannot be checked: {check.error}")
+    elif row.id not in check.unheld:
         reasons.append(f"today's parse of {name} still holds the row")
     return reasons
 
@@ -230,7 +224,7 @@ async def delete_phantoms(
         BatchRefused: A row fails a check. The function writes nothing.
     """
     # The parse runs before the write lock. A PDF parse can take seconds.
-    unheld, seen = await _check_statements(session, ids)
+    checks = await _check_statements(session, ids)
     await session.rollback()
     reports = []
     refusals = []
@@ -241,7 +235,7 @@ async def delete_phantoms(
             if (row := await session.get(Transaction, txn_id)) is None:
                 refusals.append({"id": txn_id, "reasons": ["transaction not found"]})
                 continue
-            if reasons := await _refusal_reasons(session, row, unheld, seen):
+            if reasons := await _refusal_reasons(session, row, checks):
                 refusals.append({"id": txn_id, "reasons": reasons})
                 continue
             reports.append(await _delete_row(session, row, reason))

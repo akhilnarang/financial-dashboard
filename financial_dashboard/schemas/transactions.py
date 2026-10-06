@@ -1,8 +1,8 @@
 import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from financial_dashboard.schemas.common import DatabaseId, DatabaseIdBatch
 
@@ -156,11 +156,29 @@ class TransactionBatchResponse(BaseModel):
     missing_ids: Annotated[list[int], Field(max_length=100)]
 
 
+MergeOverride = Literal["references", "dates"]
+
+
 class TransactionMergePair(BaseModel):
-    """One duplicate to fold into a keeper. Keep the alert row; drop the statement row."""
+    """One duplicate to fold into a keeper. Keep the alert row; drop the statement row.
+
+    An override lifts the named refusal for a pair a person checked by hand.
+    The reason goes into the audit record and must be set.
+    """
 
     keep_id: DatabaseId
     duplicate_id: DatabaseId
+    override: list[MergeOverride] = []
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, max_length=500)] = (
+        ""
+    )
+
+    @model_validator(mode="after")
+    def require_override_reason(self) -> Self:
+        """Refuse an override that gives no reason."""
+        if self.override and not self.reason:
+            raise ValueError("an override needs a reason")
+        return self
 
 
 class TransactionMergeBatchRequest(BaseModel):
@@ -190,6 +208,7 @@ class TransactionMergeReport(BaseModel):
     moved_references: dict[str, int]
     conflicts: list[str]
     cc_payment_state: CcPaymentStateChange | None
+    overrides: list[MergeOverride]
 
 
 class TransactionMergeResponse(BaseModel):

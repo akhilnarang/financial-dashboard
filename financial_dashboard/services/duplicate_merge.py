@@ -2,7 +2,7 @@
 
 import json
 from datetime import timedelta
-from typing import cast
+from typing import NamedTuple, cast
 
 from sqlalchemy import CursorResult, inspect, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,8 +17,10 @@ from financial_dashboard.db import (
     StatementUpload,
     Transaction,
 )
+from financial_dashboard.exceptions import StatementPreviewError
 from financial_dashboard.schemas.transactions import (
     CcPaymentStateChange,
+    MergeOverride,
     TransactionMergePair,
     TransactionMergeReport,
     TransactionMergeResponse,
@@ -36,6 +38,16 @@ from financial_dashboard.services.cc_disambiguation import (
 from financial_dashboard.services.reminders import (
     _latest_active_cycle,
     resync_tracked_cc_payment_state,
+)
+from financial_dashboard.services.statement_previews import (
+    ParsedStoredStatement,
+    StatementRef,
+    could_be_statement_candidate,
+    parse_shortfall,
+    parse_stored_statement,
+    reconcile_parsed_statement,
+    statement_candidate_index,
+    statement_of,
 )
 from financial_dashboard.services.transaction_reads import transaction_read
 from financial_dashboard.services.txn_merge import (
@@ -73,6 +85,18 @@ _CATEGORY_FIELDS = (
     "review_status",
     "review_reason",
 )
+# A person may lift these refusals for a pair they checked by hand.
+_OVERRIDABLE: dict[str, MergeOverride] = {
+    "dates are more than 1 day apart": "dates",
+    "references prove distinct events": "references",
+}
+
+
+class PairChecks(NamedTuple):
+    """The refusals that stand and the overrides that lifted the others."""
+
+    reasons: list[str]
+    applied: list[MergeOverride]
 
 
 class PairRefused(Exception):
@@ -139,8 +163,13 @@ def _owns_other(keep: Transaction, dup: Transaction, slot: str) -> bool:
     return None not in owners and len(owners) == 2
 
 
-def _refusal_reasons(keep: Transaction, dup: Transaction) -> list[str]:
-    """Return every reason the pair must not merge. An empty list allows it."""
+def _refusal_reasons(
+    keep: Transaction, dup: Transaction, override: list[MergeOverride]
+) -> PairChecks:
+    """Return every reason the pair must not merge. No reason allows it.
+
+    An override lifts only its own refusal. Every other refusal stands.
+    """
     days_apart = (
         abs(keep.transaction_date - dup.transaction_date)
         if keep.transaction_date and dup.transaction_date
@@ -158,8 +187,9 @@ def _refusal_reasons(keep: Transaction, dup: Transaction) -> list[str]:
             "currency differs",
         ),
         (keep.amount != dup.amount, "amount differs"),
+        (days_apart is None, "a row has no date"),
         (
-            days_apart is None or days_apart > _DATE_WINDOW,
+            days_apart is not None and days_apart > _DATE_WINDOW,
             "dates are more than 1 day apart",
         ),
         (None not in balances and len(balances) == 2, "balances differ"),
@@ -181,7 +211,11 @@ def _refusal_reasons(keep: Transaction, dup: Transaction) -> list[str]:
             "both statement rows carry a different reference",
         ),
     ]
-    return [reason for failed, reason in checks if failed]
+    failed = [reason for refused, reason in checks if refused]
+    return PairChecks(
+        reasons=[r for r in failed if _OVERRIDABLE.get(r) not in override],
+        applied=[_OVERRIDABLE[r] for r in failed if _OVERRIDABLE.get(r) in override],
+    )
 
 
 def _repoint_reconciliation(recon: dict, old_id: int, new_id: int | None) -> bool:
@@ -314,20 +348,126 @@ async def _cc_cycle(
     return cycle, []
 
 
+async def _parse_statements(
+    session: AsyncSession, pairs: list[TransactionMergePair]
+) -> dict[int, ParsedStoredStatement | str]:
+    """Parse the statement of each duplicate that a pair overrides.
+
+    The parse runs before the write lock. A PDF parse can take seconds.
+    Each duplicate id maps to today's parse, or to why it cannot be checked.
+    """
+    parses: dict[int, ParsedStoredStatement | str] = {}
+    for pair in pairs:
+        if not pair.override:
+            continue
+        if (dup := await session.get(Transaction, pair.duplicate_id)) is None:
+            continue
+        if (statement := statement_of(dup)) is None:
+            parses[pair.duplicate_id] = (
+                "an override needs a statement row as the duplicate"
+            )
+            continue
+        name = f"{statement.kind} statement {statement.id}"
+        try:
+            stored = await parse_stored_statement(session, *statement)
+        except StatementPreviewError as exc:
+            stored = f"{name} cannot be checked: {exc}"
+        parses[pair.duplicate_id] = stored or f"{name} cannot be checked: not found"
+    await session.rollback()
+    return parses
+
+
+async def _reparse_refusal(
+    session: AsyncSession,
+    keep: Transaction,
+    dup: Transaction,
+    stored: ParsedStoredStatement | str,
+) -> str | None:
+    """Return why a reparse of the duplicate's statement would import it again.
+
+    The merge must be flushed. Today's parse must match a line to the keeper.
+    It must leave no line unmatched that could be the keeper or the duplicate
+    by date, amount and direction, or by reference.
+    """
+    if isinstance(stored, str):
+        return stored
+    statement = StatementRef(stored.kind, stored.statement_id)
+    name = f"{statement.kind} statement {statement.id}"
+    if statement_of(dup) != statement:
+        return "the duplicate changed during the check; try again"
+    try:
+        recon = await reconcile_parsed_statement(session, stored, as_reparse=True)
+    except StatementPreviewError as exc:
+        return f"{name} cannot be checked: {exc}"
+    preview = recon.preview
+    if shortfall := await parse_shortfall(session, statement, preview, 0):
+        return f"{name} cannot be checked: {shortfall}"
+    if keep.id not in recon.matched_ids:
+        return f"today's parse of {name} matches no line to the keeper"
+    if preview.missing_truncated or preview.ambiguous_truncated:
+        return f"{name} cannot be checked: too many unmatched lines"
+    unresolved = [e.model_dump() for e in (*preview.missing, *preview.ambiguous)]
+    index = statement_candidate_index(unresolved)
+    refs = {_normalized_ref(r) for r in (keep.reference_number, dup.reference_number)}
+    if unresolved and (
+        any(could_be_statement_candidate(r, *index) for r in (keep, dup))
+        or any(
+            _normalized_ref(e["reference_number"]) in refs - {""} for e in unresolved
+        )
+    ):
+        return (
+            f"today's parse of {name} leaves the row unmatched; "
+            "a reparse would import it again"
+        )
+    return None
+
+
+def _pair_checks(
+    pair: TransactionMergePair,
+    keep: Transaction | None,
+    dup: Transaction | None,
+    duplicate_ids: list[int],
+    keep_ids: set[int],
+) -> PairChecks:
+    """Return the refusals of one batch pair and the overrides it applies."""
+    if keep is None or dup is None:
+        return PairChecks(["transaction not found"], [])
+    if keep.id == dup.id:
+        return PairChecks(["a row cannot merge into itself"], [])
+    if duplicate_ids.count(dup.id) > 1 or dup.id in keep_ids:
+        return PairChecks(["the duplicate appears in another pair"], [])
+    return _refusal_reasons(keep, dup, pair.override)
+
+
+class _Proof(NamedTuple):
+    """An overridden merge that today's parse must back."""
+
+    ids: dict[str, int]
+    keep: Transaction
+    dup: Transaction
+    statement: ParsedStoredStatement | str
+
+
 async def _merge_pair(
-    session: AsyncSession, keep: Transaction, dup: Transaction
+    session: AsyncSession,
+    keep: Transaction,
+    dup: Transaction,
+    applied: list[MergeOverride],
+    reason: str,
 ) -> TransactionMergeReport:
     """Fold ``dup`` into ``keep`` and delete ``dup``.
 
     The keeper gains the duplicate's links and empty fields. Every reference
     moves to the keeper. The card cycle that holds the duplicate is recomputed
-    unless it has no total due. The caller owns the commit or rollback.
+    unless it has no total due. An applied override writes an audit record
+    with the reason. The caller owns the commit or rollback.
 
     Raises:
         PairRefused: The duplicate is a payment in a paid card cycle.
     """
     before = transaction_read(keep)
     data = {name: getattr(dup, name) for name in _COLUMNS}
+    original = json.dumps(data, default=str, sort_keys=True)
     if data["channel"] == "bank_statement":
         # A statement import writes this label when the row names no channel.
         data["channel"] = None
@@ -342,7 +482,14 @@ async def _merge_pair(
     # The duplicate holds the unique reference until the delete flushes.
     await session.flush()
 
-    keep.reference_number = _surviving_reference(keep, data)
+    # An override keeps the keeper's reference, even an empty one, not the
+    # statement reference. A person found the duplicate's parse wrong: an old
+    # parse misdated it or took another line's reference. The reparse check
+    # below proves that today's parse still pairs a line with the keeper.
+    if applied:
+        data["reference_number"] = keep.reference_number
+    else:
+        keep.reference_number = _surviving_reference(keep, data)
     for name in _LINK_FIELDS:
         if getattr(keep, name) is None:
             setattr(keep, name, data[name])
@@ -378,6 +525,22 @@ async def _merge_pair(
             status_after=cycle.payment_status,
         )
 
+    if applied:
+        session.add(
+            AuditAction(
+                transaction_id=keep.id,
+                action_type="merge_transaction",
+                target_type="transaction",
+                target_id=data["id"],
+                arguments_json=json.dumps(
+                    {"keep_id": keep.id, "override": applied, "reason": reason}
+                ),
+                before_json=original,
+                status="applied",
+            )
+        )
+        await session.flush()
+
     return TransactionMergeReport(
         keep_id=keep.id,
         duplicate_id=data["id"],
@@ -386,6 +549,7 @@ async def _merge_pair(
         moved_references=moved,
         conflicts=conflicts,
         cc_payment_state=cc_state,
+        overrides=applied,
     )
 
 
@@ -401,7 +565,8 @@ async def merge_duplicates(
 
     Args:
         session: A session with no open transaction.
-        pairs: The (keep_id, duplicate_id) pairs, applied in order.
+        pairs: The (keep_id, duplicate_id) pairs, applied in order. A pair
+            can lift the date or the reference refusal with a reason.
         dry_run: True rolls back every change after the report is built.
 
     Returns:
@@ -414,28 +579,38 @@ async def merge_duplicates(
     keep_ids = {pair.keep_id for pair in pairs}
     reports = []
     refusals = []
+    proofs: list[_Proof] = []
+    parses = await _parse_statements(session, pairs)
     async with session.begin() as txn:
         if session.get_bind().dialect.name == "sqlite":
             await session.execute(text("BEGIN IMMEDIATE"))
         for pair in pairs:
             keep = await session.get(Transaction, pair.keep_id)
             dup = await session.get(Transaction, pair.duplicate_id)
-            if keep is None or dup is None:
-                reasons = ["transaction not found"]
-            elif keep.id == dup.id:
-                reasons = ["a row cannot merge into itself"]
-            elif duplicate_ids.count(dup.id) > 1 or dup.id in keep_ids:
-                reasons = ["the duplicate appears in another pair"]
-            else:
-                reasons = _refusal_reasons(keep, dup)
+            reasons, applied = _pair_checks(pair, keep, dup, duplicate_ids, keep_ids)
+            ids = pair.model_dump(include={"keep_id", "duplicate_id"})
             if reasons:
-                refusals.append(pair.model_dump() | {"reasons": reasons})
+                refusals.append(ids | {"reasons": reasons})
                 continue
             assert keep is not None and dup is not None
             try:
-                reports.append(await _merge_pair(session, keep, dup))
+                reports.append(
+                    await _merge_pair(session, keep, dup, applied, pair.reason)
+                )
             except PairRefused as exc:
-                refusals.append(pair.model_dump() | {"reasons": [str(exc)]})
+                refusals.append(ids | {"reasons": [str(exc)]})
+                continue
+            if applied:
+                statement = parses.get(dup.id, "statement not checked")
+                proofs.append(_Proof(ids, keep, dup, statement))
+        # A person checked each overridden pair. Today's parse must agree on
+        # the batch's final state: a later pair can change a keeper.
+        await session.flush()
+        refusals += [
+            proof.ids | {"reasons": [refusal]}
+            for proof in proofs
+            if (refusal := await _reparse_refusal(session, *proof[1:]))
+        ]
         if dry_run or refusals:
             await txn.rollback()
     if refusals:

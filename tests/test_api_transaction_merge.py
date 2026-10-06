@@ -29,7 +29,7 @@ DAY = dt.date(2030, 3, 4)
 async def _seed_pair(
     session,
     *,
-    alert_ref: str = "123456",
+    alert_ref: str | None = "123456",
     statement_ref: str = "UTR000123456",
     email_ids: tuple[int | None, int | None] = (None, None),
     statement_balance: Decimal | None = None,
@@ -114,9 +114,11 @@ async def _seed_pair(
     return alert.id, statement.id, upload.id
 
 
-def _batch(*pairs: tuple[int, int], dry_run: bool = False) -> dict:
+def _batch(*pairs: tuple[int, int], dry_run: bool = False, **fields) -> dict:
     return {
-        "pairs": [{"keep_id": keep, "duplicate_id": dup} for keep, dup in pairs],
+        "pairs": [
+            {"keep_id": keep, "duplicate_id": dup} | fields for keep, dup in pairs
+        ],
         "dry_run": dry_run,
     }
 
@@ -126,8 +128,13 @@ async def test_dry_run_writes_nothing(client, session):
 
     request = _batch((alert_id, statement_id))
     del request["dry_run"]
+    unexplained = await client.post(
+        "/api/transactions/merge-batch",
+        json=_batch((alert_id, statement_id), override=["dates"], reason=" "),
+    )
     response = await client.post("/api/transactions/merge-batch", json=request)
 
+    assert unexplained.status_code == 422
     assert response.status_code == 200
     body = response.json()
     assert body["dry_run"] is True
@@ -231,43 +238,199 @@ async def test_batch_merges_each_pair_once(client, session):
 
 
 @pytest.mark.parametrize(
-    ("seed", "reason"),
+    ("seed", "reason", "override"),
     [
-        ({"statement_ref": "654321"}, "references prove distinct events"),
-        ({"email_ids": (11, 12)}, "both rows own a different email"),
-        ({"statement_balance": Decimal("9999.00")}, "balances differ"),
+        ({"statement_ref": "654321"}, "references prove distinct events", "references"),
+        ({"email_ids": (11, 12)}, "both rows own a different email", None),
+        ({"statement_balance": Decimal("9999.00")}, "balances differ", None),
         (
             {"statement_date": DAY + dt.timedelta(days=2)},
             "dates are more than 1 day apart",
+            "dates",
         ),
         (
             {"alert_on_statement": True},
             "both statement rows carry a different reference",
+            None,
         ),
+        ({"statement_date": None}, "a row has no date", None),
     ],
 )
-async def test_refused_pair_refuses_the_whole_batch(client, session, seed, reason):
+async def test_refused_pair_refuses_the_whole_batch(
+    client, session, seed, reason, override
+):
     alert_id, statement_id, _ = await _seed_pair(session, **seed)
     other_alert, other_statement, _ = await _seed_pair(
         session, alert_ref="777888", statement_ref="UTR000777888"
     )
+    pairs = ((other_alert, other_statement), (alert_id, statement_id))
+    # Each override lifts only its own refusal.
+    wrong = [kind for kind in ("references", "dates") if kind != override]
 
-    response = await client.post(
-        "/api/transactions/merge-batch",
-        json=_batch((other_alert, other_statement), (alert_id, statement_id)),
-    )
+    for request in (
+        _batch(*pairs),
+        _batch(*pairs, override=wrong, reason="checked by hand"),
+    ):
+        response = await client.post("/api/transactions/merge-batch", json=request)
 
-    assert response.status_code == 409
-    assert response.json()["detail"]["refused"] == [
-        {
-            "keep_id": alert_id,
-            "duplicate_id": statement_id,
-            "reasons": [reason],
-        }
-    ]
+        assert response.status_code == 409
+        assert response.json()["detail"]["refused"] == [
+            {
+                "keep_id": alert_id,
+                "duplicate_id": statement_id,
+                "reasons": [reason],
+            }
+        ]
     session.expire_all()
     for txn_id in (alert_id, statement_id, other_alert, other_statement):
         assert await session.get(Transaction, txn_id) is not None
+
+
+@pytest.mark.parametrize("override", ["references", "dates"])
+async def test_override_merges_only_what_todays_parse_backs(
+    client, session, monkeypatch, tmp_path, override
+):
+    alert_id, statement_id, upload_id = await _seed_pair(
+        session,
+        **(
+            {"statement_ref": "654321"}
+            if override == "references"
+            else {"statement_date": DAY + dt.timedelta(days=2), "alert_ref": None}
+        ),
+    )
+    other_alert, other_statement, _ = await _seed_pair(
+        session, alert_ref="777888", statement_ref="UTR000777888"
+    )
+    pairs = ((other_alert, other_statement), (alert_id, statement_id))
+    upload = await session.get(BankStatementUpload, upload_id)
+    assert upload is not None
+    pdf = tmp_path / "stmt.pdf"
+    pdf.write_bytes(b"synthetic PDF bytes")
+    upload.file_path = str(pdf)
+    upload.parsed_txn_count = 2
+    await session.commit()
+    # The old parse printed the duplicate's line. Today's parse prints the
+    # true date and the keeper's reference.
+    old = BankTransaction(
+        date="06/03/2030" if override == "dates" else "10/03/2030",
+        narration="UPI/SYNTHETIC SHOP",
+        amount="1234.00",
+        transaction_type="debit",
+        reference_number="654321" if override == "references" else None,
+    )
+    today = old.model_copy(
+        update={
+            "date": "04/03/2030",
+            "reference_number": "123456" if override == "references" else "UTR000555",
+        }
+    )
+    parsed = [today]
+    period = ["01/03/2030"]
+    monkeypatch.setattr(
+        "financial_dashboard.services.statement_previews.parse_bank_statement",
+        lambda path, _bank, _password: ParsedBankStatement(
+            file=path.name,
+            bank="testbank",
+            statement_period_start=period[0],
+            statement_period_end="31/03/2030",
+            transactions=parsed,
+        ),
+    )
+    request = _batch(*pairs, override=[override], reason="checked by hand")
+    name = f"today's parse of bank statement {upload_id}"
+
+    short = await client.post("/api/transactions/merge-batch", json=request)
+    upload = await session.get(BankStatementUpload, upload_id)
+    assert upload is not None
+    upload.parsed_txn_count = 1
+    await session.commit()
+    # A reparse of a later period cannot see the keeper.
+    period[0] = "20/03/2030"
+    far = await client.post("/api/transactions/merge-batch", json=request)
+    period[0] = "01/03/2030"
+    parsed[:] = [old]
+    stale = await client.post("/api/transactions/merge-batch", json=request)
+    parsed[:] = [today, old]
+    doubled = await client.post("/api/transactions/merge-batch", json=request)
+    # Only a lookup by reference finds a row out of the reparse's date range.
+    session.add(
+        Transaction(
+            account_id=upload.account_id,
+            bank="otherbank",
+            email_type="bank_statement",
+            direction="debit",
+            amount=Decimal("1234.00"),
+            transaction_date=dt.date(2030, 1, 5),
+            reference_number="999999",
+        )
+    )
+    await session.commit()
+    parsed[:] = [today, today.model_copy(update={"reference_number": "999999"})]
+    distant = await client.post("/api/transactions/merge-batch", json=request)
+    parsed[:] = [today]
+    if override == "dates":
+        # A later pair in the batch fills the keeper's empty reference.
+        copy = Transaction(
+            account_id=upload.account_id,
+            bank="testbank",
+            email_type="testbank_account_debit_alert",
+            direction="debit",
+            amount=Decimal("1234.00"),
+            currency="INR",
+            transaction_date=DAY,
+            reference_number="999999",
+            source="email",
+        )
+        session.add(copy)
+        await session.commit()
+        shared = await client.post(
+            "/api/transactions/merge-batch",
+            json=request
+            | {"pairs": [*request["pairs"], _batch((alert_id, copy.id))["pairs"][0]]},
+        )
+        assert shared.json()["detail"]["refused"][0]["reasons"] == [
+            f"{name} matches no line to the keeper"
+        ]
+    response = await client.post("/api/transactions/merge-batch", json=request)
+    preview = await client.post(f"/api/statements/bank/{upload_id}/reconcile-preview")
+
+    refused = (short, far, stale, doubled, distant)
+    assert [r.json()["detail"]["refused"][0]["reasons"] for r in refused] == [
+        [
+            f"bank statement {upload_id} cannot be checked: "
+            "today's parse found 1 lines; the stored parse found 2"
+        ],
+        [f"{name} matches no line to the keeper"],
+        [f"{name} matches no line to the keeper"],
+        [f"{name} leaves the row unmatched; a reparse would import it again"],
+        [f"{name} leaves the row unmatched; a reparse would import it again"],
+    ]
+    assert response.status_code == 200
+    assert [m["overrides"] for m in response.json()["merges"]] == [[], [override]]
+    assert preview.json()["missing_count"] == 0
+    assert preview.json()["matched"][0]["matched_transaction_id"] == alert_id
+    session.expire_all()
+    assert await session.get(Transaction, statement_id) is None
+    keeper = await session.get(Transaction, alert_id)
+    assert keeper is not None
+    # The keeper keeps its own reference, even an empty one.
+    assert (keeper.transaction_date, keeper.reference_number) == (
+        DAY,
+        "123456" if override == "references" else None,
+    )
+    assert keeper.bank_statement_upload_id == upload_id
+    record = await session.scalar(
+        select(AuditAction).where(AuditAction.action_type == "merge_transaction")
+    )
+    assert record is not None and record.target_id == statement_id
+    assert json.loads(record.arguments_json or "{}") == {
+        "keep_id": alert_id,
+        "override": [override],
+        "reason": "checked by hand",
+    }
+    assert json.loads(record.before_json or "{}")["reference_number"] == (
+        "654321" if override == "references" else "UTR000123456"
+    )
 
 
 @pytest.mark.parametrize(
