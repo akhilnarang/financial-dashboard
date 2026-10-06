@@ -390,8 +390,9 @@ def _is_statement_candidate_compatible(
 
     - Otherwise → incompatible.
     """
-    candidate_reference = _ref_key(candidate_transaction.reference_number)
-    statement_reference = _ref_key(statement_reference)
+    candidate_reference = candidate_transaction.reference_number
+    candidate_key = _ref_key(candidate_reference)
+    statement_key = _ref_key(statement_reference)
     candidate_narration = (
         candidate_transaction.raw_description or candidate_transaction.counterparty
     )
@@ -403,16 +404,12 @@ def _is_statement_candidate_compatible(
     # unique reference index leaves at most one candidate, so balance has
     # nothing to weigh. The veto stays below for the fuzzy cases, where a
     # balance disagreement is a real negative signal.
-    if (
-        statement_reference
-        and candidate_reference
-        and statement_reference == candidate_reference
-    ):
+    if statement_key and candidate_key and statement_key == candidate_key:
         return True
 
     if not _known_balance_compatible(candidate_transaction.balance, statement_balance):
         return False
-    if not (statement_reference and candidate_reference):
+    if not (statement_key and candidate_key):
         return True
 
     if has_date_offset:

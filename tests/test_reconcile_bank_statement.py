@@ -379,7 +379,8 @@ def test_db_ref_inside_stmt_narration_matches_despite_ref_disagreement():
     ref column. The email-derived DB row carries the UTR as
     ``reference_number``. When the DB ref appears verbatim inside the
     statement narration we treat it as the same logical transaction
-    even though both rows have refs that disagree.
+    even though both rows have refs that disagree. A leading zero in the
+    embedded ref stays part of the match.
 
     Example shape: db row with ref=100200300400 (the UTR) vs statement
     row with ref=20990428180878701 (bank-internal txn id) and narration
@@ -391,7 +392,7 @@ def test_db_ref_inside_stmt_narration_matches_despite_ref_disagreement():
         transaction_date=datetime.date(2026, 4, 28),
         amount=Decimal("650.00"),
         direction="credit",
-        reference_number="100200300400",
+        reference_number="0100200300400",
         counterparty="Sample Payer",
         raw_description="You have received Rs.650 via UPI in your savings account xx1234",
         channel="upi",
@@ -404,7 +405,7 @@ def test_db_ref_inside_stmt_narration_matches_despite_ref_disagreement():
                 amount="650.00",
                 direction="credit",
                 ref="20990428180878701",
-                narration="UPI-Credit-100200300400-Sample Payer-KARB-sample.payer-2@okaxis-amazon prime",
+                narration="UPI-Credit-0100200300400-Sample Payer-KARB-sample.payer-2@okaxis-amazon prime",
                 channel="upi",
             )
         ]
