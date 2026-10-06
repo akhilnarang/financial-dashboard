@@ -272,6 +272,18 @@ def _take_sole_unconsumed(
     return None
 
 
+def _ref_key(ref: str | None) -> str | None:
+    """Return a numeric reference without leading zeros.
+
+    One bank prints the same numeric reference at different zero-padded
+    widths in different statement layouts. An all-zero reference carries no
+    identity, so the result is ``None``. Other references do not change.
+    """
+    if ref and ref.isdigit():
+        return ref.lstrip("0") or None
+    return ref or None
+
+
 def _ref_appears_in(ref: str | None, text: str | None) -> bool:
     """Word-boundary-aware containment check used as fuzzy match evidence.
 
@@ -379,6 +391,8 @@ def _is_statement_candidate_compatible(
     - Otherwise → incompatible.
     """
     candidate_reference = candidate_transaction.reference_number
+    candidate_key = _ref_key(candidate_reference)
+    statement_key = _ref_key(statement_reference)
     candidate_narration = (
         candidate_transaction.raw_description or candidate_transaction.counterparty
     )
@@ -390,16 +404,12 @@ def _is_statement_candidate_compatible(
     # unique reference index leaves at most one candidate, so balance has
     # nothing to weigh. The veto stays below for the fuzzy cases, where a
     # balance disagreement is a real negative signal.
-    if (
-        statement_reference
-        and candidate_reference
-        and statement_reference == candidate_reference
-    ):
+    if statement_key and candidate_key and statement_key == candidate_key:
         return True
 
     if not _known_balance_compatible(candidate_transaction.balance, statement_balance):
         return False
-    if not (statement_reference and candidate_reference):
+    if not (statement_key and candidate_key):
         return True
 
     if has_date_offset:
@@ -680,17 +690,15 @@ def reconcile_bank_statement(
         parsed_rows.append((stmt_idx, direction, txn, amount, txn_date))
 
     # Build DB candidate pools.
-    # ref_pool: (reference_number, direction) — UPI refunds may reuse the
+    # ref_pool: (reference key, direction) — UPI refunds may reuse the
     # same ref with the opposite direction, so direction stays in the key.
     # date_pool: (date, amount, direction) for fuzzy fallback.
     db_by_id: dict[int, Transaction] = {db_txn.id: db_txn for db_txn in db_transactions}
     ref_pool: dict[tuple[str, str], list[int]] = {}
     date_pool: dict[tuple, list[int]] = {}
     for db_txn in db_transactions:
-        if db_txn.reference_number and db_txn.direction:
-            ref_pool.setdefault((db_txn.reference_number, db_txn.direction), []).append(
-                db_txn.id
-            )
+        if (db_ref := _ref_key(db_txn.reference_number)) and db_txn.direction:
+            ref_pool.setdefault((db_ref, db_txn.direction), []).append(db_txn.id)
         if db_txn.transaction_date and db_txn.amount is not None and db_txn.direction:
             key = _match_key(
                 db_txn.transaction_date,
@@ -714,9 +722,10 @@ def reconcile_bank_statement(
     reference_evidence_sets: dict[int, set[int]] = {}
     compatible_reference_ids: dict[int, list[int]] = {}
     for stmt_idx, direction, txn, amount, _txn_date in parsed_rows:
-        if not txn.reference_number or amount is None:
+        statement_ref = _ref_key(txn.reference_number)
+        if not statement_ref or amount is None:
             continue
-        reference_ids = ref_pool.get((txn.reference_number, direction))
+        reference_ids = ref_pool.get((statement_ref, direction))
         if not reference_ids:
             continue
         reference_evidence_sets[stmt_idx] = set(reference_ids)

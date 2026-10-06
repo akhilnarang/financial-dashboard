@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
 
+import pytest
+
 from bank_statement_parser.models import BankTransaction, ParsedBankStatement
 
 from financial_dashboard.services.statements.bank import reconcile_bank_statement
@@ -220,9 +222,11 @@ def test_ref_match_takes_priority_over_date_fallback():
     assert missing_refs == {"REF-Y"}
 
 
-def test_fallback_matches_when_stmt_row_has_no_ref():
+@pytest.mark.parametrize("stmt_ref", [None, "0000000000000000"])
+def test_fallback_matches_when_stmt_row_has_no_ref(stmt_ref: str | None):
     """If the statement row has no ref but date+amount+direction line
-    up with an unconsumed DB row, that's a valid fallback match."""
+    up with an unconsumed DB row, that's a valid fallback match. An
+    all-zero ref counts as no ref."""
     db_txn = StubDbTxn(
         id=12,
         transaction_date=datetime.date(2026, 4, 14),
@@ -232,13 +236,92 @@ def test_fallback_matches_when_stmt_row_has_no_ref():
     )
 
     parsed = _stmt(
-        [_txn(date="14/04/2026", amount="250.00", direction="credit", ref=None)]
+        [_txn(date="14/04/2026", amount="250.00", direction="credit", ref=stmt_ref)]
     )
 
     recon = reconcile_bank_statement(parsed, [db_txn], account_id=1)
 
     assert len(recon["matched"]) == 1
     assert recon["matched"][0]["db_txn_id"] == 12
+
+
+def test_reference_match_ignores_leading_zero_padding():
+    """One reference printed at different zero-padded widths is one row.
+
+    A monthly statement and an account export pad the same reference to
+    different widths. The export row must match the stored row and not
+    import a second copy. A reference that differs after the zeros still
+    refuses the date+amount fallback. A zero in a non-numeric reference
+    stays significant; a 4-day date gap rules out the fallback there. Two
+    stored rows that differ only by padding are ambiguous and block import.
+    """
+    db_txn = StubDbTxn(
+        id=30,
+        transaction_date=datetime.date(2026, 4, 14),
+        amount=Decimal("75.00"),
+        direction="credit",
+        reference_number="001234567890",
+    )
+
+    padded = _stmt(
+        [
+            _txn(
+                date="14/04/2026",
+                amount="75.00",
+                direction="credit",
+                ref="0000001234567890",
+            )
+        ]
+    )
+    recon = reconcile_bank_statement(padded, [db_txn], account_id=1)
+
+    assert recon["missing"] == [], recon
+    assert recon["matched"][0]["db_txn_id"] == 30
+    assert recon["matched"][0]["decision_reason"] == "matched_reference"
+
+    different = _stmt(
+        [
+            _txn(
+                date="14/04/2026",
+                amount="75.00",
+                direction="credit",
+                ref="0000001234567891",
+            )
+        ]
+    )
+    recon = reconcile_bank_statement(different, [db_txn], account_id=1)
+
+    assert recon["matched"] == [], recon
+    assert len(recon["missing"]) == 1
+    assert recon["missing"][0]["decision_reason"] == "no_candidate"
+
+    opaque_db = StubDbTxn(
+        id=32,
+        transaction_date=datetime.date(2026, 4, 10),
+        amount=Decimal("75.00"),
+        direction="credit",
+        reference_number="ABC123456",
+    )
+    opaque = _stmt(
+        [_txn(date="14/04/2026", amount="75.00", direction="credit", ref="0ABC123456")]
+    )
+    recon = reconcile_bank_statement(opaque, [opaque_db], account_id=1)
+
+    assert recon["matched"] == [], recon
+
+    twin_db = StubDbTxn(
+        id=33,
+        transaction_date=datetime.date(2026, 4, 14),
+        amount=Decimal("75.00"),
+        direction="credit",
+        reference_number="1234567890",
+    )
+    recon = reconcile_bank_statement(padded, [db_txn, twin_db], account_id=1)
+
+    assert recon["matched"] == [], recon
+    assert len(recon["missing"]) == 1
+    assert recon["missing"][0]["ambiguous"] is True
+    assert set(recon["missing"][0]["candidate_transaction_ids"]) == {30, 33}
 
 
 def test_ref_with_opposite_direction_does_not_collide():
@@ -296,7 +379,8 @@ def test_db_ref_inside_stmt_narration_matches_despite_ref_disagreement():
     ref column. The email-derived DB row carries the UTR as
     ``reference_number``. When the DB ref appears verbatim inside the
     statement narration we treat it as the same logical transaction
-    even though both rows have refs that disagree.
+    even though both rows have refs that disagree. A leading zero in the
+    embedded ref stays part of the match.
 
     Example shape: db row with ref=100200300400 (the UTR) vs statement
     row with ref=20990428180878701 (bank-internal txn id) and narration
@@ -308,7 +392,7 @@ def test_db_ref_inside_stmt_narration_matches_despite_ref_disagreement():
         transaction_date=datetime.date(2026, 4, 28),
         amount=Decimal("650.00"),
         direction="credit",
-        reference_number="100200300400",
+        reference_number="0100200300400",
         counterparty="Sample Payer",
         raw_description="You have received Rs.650 via UPI in your savings account xx1234",
         channel="upi",
@@ -321,7 +405,7 @@ def test_db_ref_inside_stmt_narration_matches_despite_ref_disagreement():
                 amount="650.00",
                 direction="credit",
                 ref="20990428180878701",
-                narration="UPI-Credit-100200300400-Sample Payer-KARB-sample.payer-2@okaxis-amazon prime",
+                narration="UPI-Credit-0100200300400-Sample Payer-KARB-sample.payer-2@okaxis-amazon prime",
                 channel="upi",
             )
         ]
