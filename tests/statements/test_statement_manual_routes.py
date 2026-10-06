@@ -111,8 +111,13 @@ async def test_manual_bank_upload_imports_clean_rows_only(
         )
         await session.commit()
 
+    # The statement does not tally, so the held rows reach Telegram.
     parsed = h.bank_parsed(
         account_number="1234567890",
+        statement_period_start="01/07/2026",
+        statement_period_end="31/07/2026",
+        opening_balance="10,000.00",
+        closing_balance="5,000.00",
         transactions=[
             h.bank_txn(
                 date="02/07/2026",
@@ -145,6 +150,7 @@ async def test_manual_bank_upload_imports_clean_rows_only(
         real_link(ctx, txn)
 
     monkeypatch.setattr(bank_module, "link_transaction", _flaky)
+    notes = h.capture_balance_notes(monkeypatch)
 
     app = _build_app(maker)
     async with AsyncClient(
@@ -167,6 +173,8 @@ async def test_manual_bank_upload_imports_clean_rows_only(
         assert len(ambiguous) == 2
         txns = (await session.execute(select(Transaction))).scalars().all()
         assert sorted(t.reference_number for t in txns) == ["CLEANREF", "MANUALDUP"]
+    assert len(notes) == 1
+    assert notes[0].count(": held") == 2
 
 
 @pytest.mark.anyio

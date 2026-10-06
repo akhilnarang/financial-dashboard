@@ -147,13 +147,13 @@ def test_reference_match_ignores_contradictory_known_balance():
     assert recon["missing"] == []
 
 
-def test_fuzzy_no_ref_path_still_refuses_on_contradictory_balance():
-    """The balance veto stays a negative signal on the fuzzy path.
+def test_fuzzy_path_matches_despite_balance_disagreement():
+    """An alert balance never vetoes a statement match.
 
-    A DB row with no reference and a statement row with one line up on
-    date, amount, and direction, but their known balances contradict. Only
-    exact-reference equality overrides a balance disagreement; the fuzzy
-    either-ref-missing path must still refuse this pairing.
+    The alert reports the available balance, which excludes funds held for an
+    IPO. The statement prints the book balance. Rows that differ only by
+    balance are one event, so nothing is imported. The matched entry keeps
+    both balances for the tally note.
     """
     db_txn = StubDbTxn(
         id=13,
@@ -177,7 +177,9 @@ def test_fuzzy_no_ref_path_still_refuses_on_contradictory_balance():
 
     recon = reconcile_bank_statement(parsed, [db_txn], account_id=1)
 
-    assert recon["matched"] == []
+    assert [entry["db_txn_id"] for entry in recon["matched"]] == [db_txn.id]
+    assert recon["matched"][0]["db_balance"] == "9999.00"
+    assert recon["missing"] == []
 
 
 def test_ref_match_takes_priority_over_date_fallback():

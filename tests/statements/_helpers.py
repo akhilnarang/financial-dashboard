@@ -10,6 +10,10 @@ email, and account builders so the test modules stay tiny and offline.
 """
 
 from email.message import EmailMessage
+from unittest.mock import AsyncMock, MagicMock
+
+import financial_dashboard.services.statements.bank as bank_module
+import financial_dashboard.services.telegram as telegram_module
 
 from financial_dashboard.db.models import Account, Card
 
@@ -282,3 +286,14 @@ def make_bank_parser(parsed, *, password_required=False, correct_password=None):
         return parsed
 
     return _fake
+
+
+def capture_balance_notes(monkeypatch) -> list[str]:
+    """Turn Telegram on with a fake bot and return the sent balance notes."""
+    notes: list[str] = []
+    app = MagicMock()
+    app.bot.send_message = AsyncMock(side_effect=lambda **kw: notes.append(kw["text"]))
+    monkeypatch.setattr(telegram_module, "tg_app", app)
+    monkeypatch.setattr(bank_module, "is_telegram_configured", lambda: True)
+    monkeypatch.setattr(bank_module, "get_telegram_chat_id", lambda: 1)
+    return notes

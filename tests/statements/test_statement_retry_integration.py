@@ -173,9 +173,12 @@ async def test_retry_bank_scopes_candidates_and_holds_back_contention(
         )
         await session.commit()
 
+    # The statement does not tally, so the held rows reach Telegram.
     parsed = h.bank_parsed(
         statement_period_start="01/07/2026",
         statement_period_end="31/07/2026",
+        opening_balance="10,000.00",
+        closing_balance="5,000.00",
         transactions=[
             h.bank_txn(date="05/07/2026", amount="1,000.00", narration="JULY"),
             h.bank_txn(
@@ -200,8 +203,11 @@ async def test_retry_bank_scopes_candidates_and_holds_back_contention(
     )
     monkeypatch.setattr(bank_module, "parse_bank_statement", lambda *a, **kw: parsed)
     monkeypatch.setattr(shared_module, "parse_bank_statement", lambda *a, **kw: parsed)
+    notes = h.capture_balance_notes(monkeypatch)
 
     assert await retry_bank_statement_upload(upload_id, "secret") is True
+    assert len(notes) == 1
+    assert notes[0].count(": held") == 2
 
     async with maker() as session:
         upload = await session.get(BankStatementUpload, upload_id)

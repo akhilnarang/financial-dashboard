@@ -22,6 +22,7 @@ from financial_dashboard.services.statements.dates import (
 from financial_dashboard.services.statements.bank import (
     enrich_matched_transactions as enrich_bank_matched_transactions,
     import_missing_bank_txns,
+    notify_balance_mismatches,
     parse_bank_statement,
     reconcile_bank_statement,
 )
@@ -244,4 +245,5 @@ async def retry_bank_statement_upload(
         await emit_bank_snapshot(session, upload)
         await session.commit()
 
+    await notify_balance_mismatches(upload, recon, account.label)
     return True
