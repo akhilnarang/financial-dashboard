@@ -4,6 +4,7 @@ already have an upload row for must return the existing row and skip
 reconcile / PDF write / import.
 """
 
+import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -175,6 +176,13 @@ async def test_no_dedup_when_parsed_due_date_missing(
     )
 
     # The same attachment twice in one second must not overwrite the first PDF.
+    fixed = datetime.datetime(2026, 5, 1, tzinfo=datetime.UTC)
+    monkeypatch.setattr(
+        "financial_dashboard.core.uploads.datetime",
+        SimpleNamespace(
+            datetime=SimpleNamespace(now=lambda tz: fixed), UTC=datetime.UTC
+        ),
+    )
     for _ in range(2):
         result = await cc_module.process_statement_email(
             "jupiter", b"raw", "Your Jupiter Card Statement"

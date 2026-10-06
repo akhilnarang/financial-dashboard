@@ -20,7 +20,8 @@ def save_statement_pdf(data: bytes, safe_name: str, prefix: str = "") -> Path:
     """Write a statement PDF to a new file in STATEMENTS_DIR.
 
     A random token keeps two saves in the same second apart. Exclusive
-    create mode makes sure a save never overwrites an existing file.
+    create mode makes sure a save never overwrites an existing file. A
+    failed write removes the partial file.
 
     Args:
         data: The PDF bytes.
@@ -33,6 +34,13 @@ def save_statement_pdf(data: bytes, safe_name: str, prefix: str = "") -> Path:
     STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
     path = STATEMENTS_DIR / f"{ts}_{secrets.token_hex(4)}_{prefix}{safe_name}"
-    with path.open("xb") as fh:
-        fh.write(data)
+    try:
+        with path.open("xb") as fh:
+            fh.write(data)
+    except FileExistsError:
+        # The path belongs to another file. Do not remove it.
+        raise
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise
     return path
