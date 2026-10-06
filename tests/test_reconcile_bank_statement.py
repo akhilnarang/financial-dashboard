@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Literal
 
+import pytest
+
 from bank_statement_parser.models import BankTransaction, ParsedBankStatement
 
 from financial_dashboard.services.statements.bank import reconcile_bank_statement
@@ -220,9 +222,11 @@ def test_ref_match_takes_priority_over_date_fallback():
     assert missing_refs == {"REF-Y"}
 
 
-def test_fallback_matches_when_stmt_row_has_no_ref():
+@pytest.mark.parametrize("stmt_ref", [None, "0000000000000000"])
+def test_fallback_matches_when_stmt_row_has_no_ref(stmt_ref: str | None):
     """If the statement row has no ref but date+amount+direction line
-    up with an unconsumed DB row, that's a valid fallback match."""
+    up with an unconsumed DB row, that's a valid fallback match. An
+    all-zero ref counts as no ref."""
     db_txn = StubDbTxn(
         id=12,
         transaction_date=datetime.date(2026, 4, 14),
@@ -232,7 +236,7 @@ def test_fallback_matches_when_stmt_row_has_no_ref():
     )
 
     parsed = _stmt(
-        [_txn(date="14/04/2026", amount="250.00", direction="credit", ref=None)]
+        [_txn(date="14/04/2026", amount="250.00", direction="credit", ref=stmt_ref)]
     )
 
     recon = reconcile_bank_statement(parsed, [db_txn], account_id=1)
@@ -248,7 +252,8 @@ def test_reference_match_ignores_leading_zero_padding():
     different widths. The export row must match the stored row and not
     import a second copy. A reference that differs after the zeros still
     refuses the date+amount fallback. A zero in a non-numeric reference
-    stays significant.
+    stays significant; a 4-day date gap rules out the fallback there. Two
+    stored rows that differ only by padding are ambiguous and block import.
     """
     db_txn = StubDbTxn(
         id=30,
@@ -288,6 +293,7 @@ def test_reference_match_ignores_leading_zero_padding():
 
     assert recon["matched"] == [], recon
     assert len(recon["missing"]) == 1
+    assert recon["missing"][0]["decision_reason"] == "no_candidate"
 
     opaque_db = StubDbTxn(
         id=32,
@@ -303,31 +309,19 @@ def test_reference_match_ignores_leading_zero_padding():
 
     assert recon["matched"] == [], recon
 
-
-def test_all_zero_reference_counts_as_no_reference():
-    """An all-zero statement reference does not veto the date+amount match."""
-    db_txn = StubDbTxn(
-        id=31,
+    twin_db = StubDbTxn(
+        id=33,
         transaction_date=datetime.date(2026, 4, 14),
         amount=Decimal("75.00"),
         direction="credit",
-        reference_number="REF-A",
+        reference_number="1234567890",
     )
-    parsed = _stmt(
-        [
-            _txn(
-                date="14/04/2026",
-                amount="75.00",
-                direction="credit",
-                ref="0000000000000000",
-            )
-        ]
-    )
+    recon = reconcile_bank_statement(padded, [db_txn, twin_db], account_id=1)
 
-    recon = reconcile_bank_statement(parsed, [db_txn], account_id=1)
-
-    assert recon["missing"] == [], recon
-    assert recon["matched"][0]["db_txn_id"] == 31
+    assert recon["matched"] == [], recon
+    assert len(recon["missing"]) == 1
+    assert recon["missing"][0]["ambiguous"] is True
+    assert set(recon["missing"][0]["candidate_transaction_ids"]) == {30, 33}
 
 
 def test_ref_with_opposite_direction_does_not_collide():

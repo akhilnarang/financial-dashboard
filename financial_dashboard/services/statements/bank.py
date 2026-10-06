@@ -296,19 +296,12 @@ def _ref_appears_in(ref: str | None, text: str | None) -> bool:
     - ``ref`` appears at an alphanumeric word boundary in ``text``
       (so e.g. ``"3456"`` does NOT match inside ``"12345678901234"``,
       but ``"123456789012"`` does match in ``"ref 123456789012 to"``).
-
-    Leading zeros of a numeric reference do not count on either side.
     """
-    numeric = bool(ref and ref.isdigit())
-    ref = _ref_key(ref)
     if not ref or not text or len(ref) < _MIN_REF_SUBSTRING_LEN:
         return False
     return bool(
         re.search(
-            r"(?<![A-Za-z0-9])"
-            + ("0*" if numeric else "")
-            + re.escape(ref)
-            + r"(?![A-Za-z0-9])",
+            r"(?<![A-Za-z0-9])" + re.escape(ref) + r"(?![A-Za-z0-9])",
             text,
         )
     )
