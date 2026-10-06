@@ -247,7 +247,8 @@ def test_reference_match_ignores_leading_zero_padding():
     A monthly statement and an account export pad the same reference to
     different widths. The export row must match the stored row and not
     import a second copy. A reference that differs after the zeros still
-    refuses the date+amount fallback.
+    refuses the date+amount fallback. A zero in a non-numeric reference
+    stays significant.
     """
     db_txn = StubDbTxn(
         id=30,
@@ -287,6 +288,20 @@ def test_reference_match_ignores_leading_zero_padding():
 
     assert recon["matched"] == [], recon
     assert len(recon["missing"]) == 1
+
+    opaque_db = StubDbTxn(
+        id=32,
+        transaction_date=datetime.date(2026, 4, 10),
+        amount=Decimal("75.00"),
+        direction="credit",
+        reference_number="ABC123456",
+    )
+    opaque = _stmt(
+        [_txn(date="14/04/2026", amount="75.00", direction="credit", ref="0ABC123456")]
+    )
+    recon = reconcile_bank_statement(opaque, [opaque_db], account_id=1)
+
+    assert recon["matched"] == [], recon
 
 
 def test_all_zero_reference_counts_as_no_reference():

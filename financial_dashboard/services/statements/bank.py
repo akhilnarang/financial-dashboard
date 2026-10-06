@@ -273,12 +273,15 @@ def _take_sole_unconsumed(
 
 
 def _ref_key(ref: str | None) -> str | None:
-    """Return the reference without leading zeros, or ``None`` if none remains.
+    """Return a numeric reference without leading zeros.
 
-    One bank prints the same reference at different zero-padded widths in
-    different statement layouts. An all-zero reference carries no identity.
+    One bank prints the same numeric reference at different zero-padded
+    widths in different statement layouts. An all-zero reference carries no
+    identity, so the result is ``None``. Other references do not change.
     """
-    return (ref or "").lstrip("0") or None
+    if ref and ref.isdigit():
+        return ref.lstrip("0") or None
+    return ref or None
 
 
 def _ref_appears_in(ref: str | None, text: str | None) -> bool:
@@ -294,14 +297,18 @@ def _ref_appears_in(ref: str | None, text: str | None) -> bool:
       (so e.g. ``"3456"`` does NOT match inside ``"12345678901234"``,
       but ``"123456789012"`` does match in ``"ref 123456789012 to"``).
 
-    Leading zeros do not count on either side.
+    Leading zeros of a numeric reference do not count on either side.
     """
+    numeric = bool(ref and ref.isdigit())
     ref = _ref_key(ref)
     if not ref or not text or len(ref) < _MIN_REF_SUBSTRING_LEN:
         return False
     return bool(
         re.search(
-            r"(?<![A-Za-z0-9])0*" + re.escape(ref) + r"(?![A-Za-z0-9])",
+            r"(?<![A-Za-z0-9])"
+            + ("0*" if numeric else "")
+            + re.escape(ref)
+            + r"(?![A-Za-z0-9])",
             text,
         )
     )
