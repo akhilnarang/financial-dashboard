@@ -185,6 +185,7 @@ async def cc_statement_reparse(
     """Reparse and reconcile one stored CC statement through the canonical path.
 
     The supplied password is used only for this operation and is never persisted.
+    An empty password uses the saved password of the account.
     A successful reparse may enrich matches, import missing transactions, update
     statement payment tracking, and emit the corresponding balance snapshot.
     """
@@ -301,6 +302,7 @@ async def bank_statement_reparse(
     """Reparse and reconcile one stored bank statement through the canonical path.
 
     The supplied password is used only for this operation and is never persisted.
+    An empty password uses the saved password of the account.
     A successful reparse may enrich matches, import missing transactions, and
     emit the corresponding account balance snapshot.
     """

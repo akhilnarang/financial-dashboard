@@ -72,6 +72,7 @@ from financial_dashboard.services.statements.cc import (
     reconciliation_to_json,
 )
 from financial_dashboard.services.statements.shared import (
+    decrypt_statement_password,
     retry_cc_statement_upload,
 )
 from financial_dashboard.services.statements.skip_summary import import_skip_summary
@@ -408,16 +409,9 @@ async def statement_csv_download(
             "PDF file missing; CSV export requires the saved statement PDF."
         )
 
-    password = None
-    if account := await session.get(Account, upload.account_id):
-        bank = account.bank
-        if encrypted_password := account.statement_password:
-            try:
-                password = get_fernet().decrypt(encrypted_password.encode()).decode()
-            except Exception:
-                pass
-    else:
-        bank = upload.bank
+    account = await session.get(Account, upload.account_id)
+    password = decrypt_statement_password(account)
+    bank = account.bank if account else upload.bank
 
     try:
         parsed = await asyncio.to_thread(parse_statement, pdf_path, password, bank)
@@ -657,15 +651,8 @@ async def statement_reprocess(
     email_id = upload.email_id
 
     # Try to get password if needed
-    password = None
     account = await session.get(Account, account_id)
-    if account and account.statement_password:
-        try:
-            password = (
-                get_fernet().decrypt(account.statement_password.encode()).decode()
-            )
-        except Exception:
-            pass
+    password = decrypt_statement_password(account)
 
     def _reprocess_fail(msg: str):
         logger.warning("Reprocess failed for statement %d: %s", upload_id, msg)
