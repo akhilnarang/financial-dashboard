@@ -136,9 +136,18 @@ def test_default_merchant_rules_are_valid():
             seen.add(pattern)
 
 
-async def test_init_db_retires_bare_supermoney_rule_and_keeps_cashback(monkeypatch):
+@pytest.mark.parametrize(
+    ("legacy_category", "p2p_slug"),
+    [("cashback_rewards", None), ("reimbursement", "reimbursement")],
+)
+async def test_init_db_retires_bare_supermoney_rule_and_keeps_cashback(
+    monkeypatch, legacy_category, p2p_slug
+):
     """A friend who pays through SuperMoney is not cashback. A payout from
-    SuperMoney's own handle is. A deployed DB loses the old bare rule on boot."""
+    SuperMoney's own handle is. The first boot deletes the old seeded rule but
+    keeps a user rule on that pattern with another category. A later boot
+    keeps a rule that the user adds again."""
+    from sqlalchemy import select
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from financial_dashboard.db.init_db import init_db
@@ -155,8 +164,8 @@ async def test_init_db_retires_bare_supermoney_rule_and_keeps_cashback(monkeypat
     try:
         maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         async with maker() as s:
-            await ensure_category(s, "cashback_rewards")
-            s.add(MerchantRule(pattern="supermoney", category="cashback_rewards"))
+            await ensure_category(s, legacy_category)
+            s.add(MerchantRule(pattern="supermoney", category=legacy_category))
             await s.commit()
 
         await init_db(engine)
@@ -166,9 +175,9 @@ async def test_init_db_retires_bare_supermoney_rule_and_keeps_cashback(monkeypat
         cfg = default_rule_config()._replace(merchant_rules=get_merchant_rules())
         cases = {
             "UPI/123456789012/CR/ALEX/ICIC/alex@superyes/ Paidalex@superyes/"
-            "ALEX DOE/Paid via SuperMoney": None,
+            "ALEX DOE/Paid via SuperMoney": p2p_slug,
             "UPI Credit-ALEX DOE-alex@superyes-ICIC0000001-123456789012-"
-            "Paid via SuperMoney": None,
+            "Paid via SuperMoney": p2p_slug,
             "UPI/supermoney/supermoney1@ye/Supermoney/YES BANKL/123456789012": (
                 "cashback_rewards"
             ),
@@ -176,6 +185,18 @@ async def test_init_db_retires_bare_supermoney_rule_and_keeps_cashback(monkeypat
         for raw, slug in cases.items():
             r = match_rules(_f(raw=raw, channel="upi", direction="credit"), cfg)
             assert (r and r.slug) == slug, raw
+
+        async with maker() as s:
+            await add_merchant_rule(s, "supermoney", "cashback_rewards")
+            await s.commit()
+        await init_db(engine)
+        async with maker() as s:
+            kept = await s.scalar(
+                select(MerchantRule.category).where(
+                    MerchantRule.pattern == "supermoney"
+                )
+            )
+        assert kept == "cashback_rewards"
     finally:
         await engine.dispose()
         holder.close()
