@@ -28,6 +28,7 @@ from financial_dashboard.services.assistant.intent_policy import (
     mentions_category,
     negates_target,
     parse_instruction,
+    preserves_target,
 )
 from financial_dashboard.services.categorization.manual import (
     CategoryDirectionPolicy,
@@ -217,6 +218,17 @@ async def raise_vetoes(
         instruction.note_shorthand and has_global_no_change(raw)
     ):
         raise ExplicitlyDenied("the current message forbids transaction changes")
+    # A note payload can contain these words, so look only outside it.
+    kept_text = raw if instruction.note_payload is None else instruction_text
+    if (
+        preserves_target(kept_text, "it|this|everything")
+        or (
+            changes.note is not None
+            and preserves_target(kept_text, "note|description|desc|memo")
+        )
+        or (changes.category is not None and preserves_target(kept_text, "category"))
+    ):
+        raise ExplicitlyDenied("the current message asks to keep this unchanged")
     if changes.note is not None and any(
         negates_target(instruction_text, label)
         for label in ("note", "description", "desc", "memo")

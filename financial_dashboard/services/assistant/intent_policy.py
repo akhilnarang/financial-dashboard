@@ -349,6 +349,23 @@ def negates_target(text: str, target: str) -> bool:
     return False
 
 
+def preserves_target(text: str, target: str) -> bool:
+    """Return whether a clause asks to keep this target as it is.
+
+    Args:
+        text: The instruction text.
+        target: A regex alternation of target words, such as "note|memo".
+    """
+    return any(
+        re.search(
+            rf"\b(?:keep|leave|preserve)\s+(?:(?:the|this|its)\s+)?(?:{target})"
+            r"(?:\s+(?:unchanged|as is|alone|intact)\b|$)",
+            normalize_text(clause),
+        )
+        for clause in re.split(r"[,.;:!?\n]", text)
+    )
+
+
 def evidence_is_current(user_text: str, evidence: str) -> bool:
     """Require the model's evidence to be an exact span of this user turn."""
     cleaned = evidence.strip()

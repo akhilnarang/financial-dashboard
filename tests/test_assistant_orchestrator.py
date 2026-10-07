@@ -144,12 +144,22 @@ async def test_unnamed_category_is_offered_as_a_button(session, message, note):
         # The model adds an exclusion that the user did not ask for.
         ("Self transfer category", False),
         ("Self transfer category, exclude from cashflow", True),
+        # A preserved field that the patch does not touch is no veto.
+        ("Self transfer category, keep the note unchanged", False),
+        # A bare number asks first. The Yes must not save the exclusion.
+        ("Set {id} category to self transfer", False),
     ],
 )
 async def test_unrequested_cashflow_exclusion_is_dropped(session, message, excluded):
     await ensure_category(session, "self_transfer")
     txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
     session.add(txn)
+    await session.flush()
+    conversation = await start_conversation(session, chat_id=7, started_by="ask")
+    interaction = AuditInteraction(
+        inbound_chat_id=7, trigger="ask", conversation_id=conversation.id
+    )
+    session.add(interaction)
     await session.flush()
     provider = FakeProvider(
         [
@@ -169,7 +179,22 @@ async def test_unrequested_cashflow_exclusion_is_dropped(session, message, exclu
         ]
     )
 
-    await run_turn(session, provider, user_message=message, transaction_id=txn.id)
+    await run_turn(
+        session,
+        provider,
+        user_message=message.format(id=txn.id),
+        transaction_id=None if "{id}" in message else txn.id,
+        conversation_id=conversation.id,
+        interaction_id=interaction.id,
+    )
+    if (state_hash := conversation.pending_confirmation_state_hash) is not None:
+        await run_pending_confirmation(
+            session,
+            conversation_id=conversation.id,
+            state_hash=state_hash,
+            user_message="yes",
+            replied_to_interaction_id=interaction.id,
+        )
 
     assert txn.category == "self_transfer"
     assert txn.exclude_from_cashflow is excluded
@@ -485,16 +510,18 @@ async def test_conversation_timestamp_survives_sqlite_round_trip(session):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("choice", "bound"),
+    ("choice", "mapping"),
     [
-        ("y", True),
-        ("n", True),
+        ("y", "saved"),
+        ("n", "saved"),
+        # The send failed after Telegram showed the message. The Ref recovers it.
+        ("y", "ref"),
         # A Yes from a different message must not authorize the change.
-        ("y", False),
+        ("y", "other"),
     ],
 )
 async def test_unclear_change_asks_with_yes_no_buttons(
-    session, monkeypatch, choice, bound
+    session, monkeypatch, choice, mapping
 ):
     import financial_dashboard.db as db_package
     from financial_dashboard.services import telegram
@@ -558,15 +585,17 @@ async def test_unclear_change_asks_with_yes_no_buttons(
         )
     )
     buttons = json.loads(delivery.reply_markup_json)[0]
-    await record_physical_message(
-        session,
-        chat_id=7,
-        message_id=700,
-        context_kind="assistant_response",
-        conversation_id=conversation.id,
-        interaction_id=source.id,
-        outbound_delivery_id=delivery.id if bound else None,
-    )
+    bound = mapping != "other"
+    if mapping != "ref":
+        await record_physical_message(
+            session,
+            chat_id=7,
+            message_id=700,
+            context_kind="assistant_response",
+            conversation_id=conversation.id,
+            interaction_id=source.id,
+            outbound_delivery_id=delivery.id if bound else None,
+        )
     callback = AuditInteraction(
         telegram_update_id="callback-1",
         inbound_chat_id=7,
@@ -598,6 +627,7 @@ async def test_unclear_change_asks_with_yes_no_buttons(
         ),
         recipient_chat_id=7,
         physical_message_id=700,
+        message_text=delivery.text,
     )
 
     async with maker() as verification:
@@ -618,6 +648,9 @@ async def test_unclear_change_asks_with_yes_no_buttons(
         "Don't categorize this as self transfer?",
         # An incomplete patch must not hide it either.
         'Set note to "lunch" and category self transfer; don\'t make changes',
+        "Keep the note unchanged",
+        "Self transfer? Leave the category as is",
+        "Keep it as is",
     ],
 )
 async def test_forbidden_change_is_refused_not_offered(session, message):
@@ -637,7 +670,8 @@ async def test_forbidden_change_is_refused_not_offered(session, message):
                         "name": "apply_transaction_changes",
                         "transaction_id": txn.id,
                         "changes": {
-                            "category": {"op": "set", "value": "self_transfer"}
+                            "category": {"op": "set", "value": "self_transfer"},
+                            "note": {"op": "set", "value": "new"},
                         },
                     }
                 ],
@@ -656,3 +690,4 @@ async def test_forbidden_change_is_refused_not_offered(session, message):
     assert result.response.outcome == "error"
     assert conversation.pending_confirmation_json is None
     assert txn.category is None
+    assert txn.note is None

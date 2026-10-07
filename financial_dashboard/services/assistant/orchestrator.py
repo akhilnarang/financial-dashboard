@@ -660,6 +660,8 @@ async def run_turn(
                     )
                     if call_target is None:
                         raise MutationRejected("transaction not found")
+                    if unrequested_exclusion(call, user_message):
+                        call = _without(call, "exclude_from_cashflow")
                     if call.transaction_id != transaction_id and (
                         call.transaction_id not in _marked_transaction_ids(user_message)
                     ):
@@ -690,8 +692,6 @@ async def run_turn(
                     ):
                         # A reply that names only a category keeps the old note.
                         call = _without(call, "note")
-                    if unrequested_exclusion(call, user_message):
-                        call = _without(call, "exclude_from_cashflow")
                     guessed = await unnamed_category(session, call, user_message)
                     if guessed is not None:
                         call = _without(call, "category")
@@ -2053,6 +2053,7 @@ async def _process_callback_interaction(
     callback_data: str,
     recipient_chat_id: int,
     physical_message_id: int | None,
+    message_text: str | None = None,
 ) -> None:
     from financial_dashboard.db import async_session
     from financial_dashboard.services.assistant.delivery import (
@@ -2185,6 +2186,7 @@ async def _process_callback_interaction(
                     callback_data=callback_data,
                     recipient_chat_id=recipient_chat_id,
                     physical_message_id=physical_message_id,
+                    message_text=message_text,
                 )
             else:
                 try:
@@ -2299,6 +2301,7 @@ async def _confirm_from_button(
     callback_data: str,
     recipient_chat_id: int,
     physical_message_id: int | None,
+    message_text: str | None,
 ) -> OrchestrationResult:
     """Apply or dismiss the pending confirmation that a Yes/No button shows."""
     from financial_dashboard.db.models import TelegramOutboundDelivery
@@ -2309,7 +2312,10 @@ async def _confirm_from_button(
         settle_delivery_from_callback,
         validate_delivery_proof,
     )
-    from financial_dashboard.services.assistant.message_context import resolve_reply
+    from financial_dashboard.services.assistant.message_context import (
+        recover_ref_context,
+        resolve_reply,
+    )
 
     stale = OrchestrationResult(
         Error(
@@ -2324,13 +2330,20 @@ async def _confirm_from_button(
     except ValueError:
         return stale
     # The tapped message must be the confirmation delivery itself.
-    tapped = (
-        await resolve_reply(
+    tapped = None
+    if physical_message_id is not None:
+        tapped = await resolve_reply(
             session, chat_id=recipient_chat_id, message_id=physical_message_id
         )
-        if physical_message_id is not None
-        else None
-    )
+        if tapped is None and message_text:
+            # The send can fail after Telegram shows the message. Its Ref
+            # footer then binds the message to the delivery.
+            tapped = await recover_ref_context(
+                session,
+                chat_id=recipient_chat_id,
+                message_id=physical_message_id,
+                message_text=message_text,
+            )
     delivery = await session.get(TelegramOutboundDelivery, delivery_id)
     if (
         choice not in {"y", "n"}
@@ -2410,5 +2423,6 @@ async def _handle_assistant_callback(update, context, *, trigger: str) -> None:
             callback_data=query.data,
             recipient_chat_id=message.chat.id,
             physical_message_id=message.message_id,
+            message_text=message.text,
         )
     await query.answer()
