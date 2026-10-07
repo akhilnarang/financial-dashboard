@@ -15,7 +15,8 @@ SENDERS = {1: "alerts@tick.example", 2: "alerts@plain.example"}
 
 def _message(uid: int) -> bytes:
     """Return the raw message the fake server stores under one UID."""
-    subject = Header(SUBJECT_UTF8, "utf-8").encode() if uid == 1 else "Account alert"
+    tick = Header("✅", "utf-8").encode()
+    subject = f"Payment received {tick}" if uid == 1 else "Account alert"
     return f"From: {SENDERS[uid]}\r\nSubject: {subject}\r\n\r\nbody\r\n".encode()
 
 
@@ -122,6 +123,9 @@ def test_non_ascii_rule_searches_as_utf8_and_a_failed_rule_skips_alone(
     backfilled: set[int],
 ) -> None:
     """A "✅" subject searches with a UTF-8 literal and fetches its email.
+
+    The "✅" is a separate encoded word. Its decoded subject must keep one
+    space, or the local rule filter drops the email.
 
     A SELECT or SEARCH that imaplib or the server rejects skips only its
     rule, and that rule does not finish its backfill. A rule with two

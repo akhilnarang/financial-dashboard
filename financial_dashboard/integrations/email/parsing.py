@@ -3,7 +3,7 @@
 import datetime
 import email as email_lib
 import email.utils
-from email.header import decode_header
+from email.header import Header, decode_header
 
 
 def _parse_email_date(raw_bytes: bytes) -> datetime.datetime | None:
@@ -21,14 +21,12 @@ def _parse_email_date(raw_bytes: bytes) -> datetime.datetime | None:
 def _decode_header_value(raw: str | None) -> str:
     if not raw:
         return ""
-    parts = decode_header(raw)
-    decoded = []
-    for part, charset in parts:
-        if isinstance(part, bytes):
-            decoded.append(part.decode(charset or "utf-8", errors="replace"))
-        else:
-            decoded.append(part)
-    return " ".join(decoded)
+    # Header keeps the RFC 2047 spacing. A plain " ".join doubles the space
+    # next to an encoded word.
+    header = Header()
+    for part, charset in decode_header(raw):
+        header.append(part, charset, errors="replace")
+    return str(header)
 
 
 def _extract_message_metadata(raw_bytes: bytes) -> dict:
