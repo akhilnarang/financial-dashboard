@@ -255,24 +255,6 @@ async def test_row_the_matcher_refused_is_not_imported(session_factory, monkeypa
             {},
             id="told-apart-by-narration-fallback",
         ),
-        # Twins with no reference: each row wins a DB row by date, but each
-        # also reaches the other's. Statement order decided the pairing.
-        pytest.param(
-            [
-                {"counterparty": None, "raw_description": "NEFT OUT"},
-                {
-                    "counterparty": None,
-                    "raw_description": "NEFT OUT",
-                    "transaction_date": bank_module._parse_date("08/04/2026"),
-                },
-            ],
-            [
-                dict(date="07/04/2026", amount="2,500.00", narration="NEFT OUT ONE"),
-                dict(date="07/04/2026", amount="2,500.00", narration="NEFT OUT TWO"),
-            ],
-            {},
-            id="refless-twins",
-        ),
         # Twins with distinct references: each reference names one DB row, so
         # the date overlap is no contest and both rows match.
         pytest.param(

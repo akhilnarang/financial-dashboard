@@ -535,36 +535,6 @@ def _refresh_identity(txn: BankTransaction) -> RefreshIdentity:
     return RefreshIdentity(counterparty or narration, txn.channel)
 
 
-def _contested_winners(
-    claimed_ids: dict[int, int],
-    contention_sets: dict[int, set[int]],
-    reference_sets: dict[int, list[int]],
-    txn_by_idx: dict[int, BankTransaction],
-    *,
-    final_indices: set[int],
-) -> list[int]:
-    """Return the statement rows whose claimed DB row a rival also reached.
-
-    A row in ``final_indices`` has a match by a reference that one DB row
-    alone carries. The reference names that DB row, so a rival that reaches
-    it only by date does not contest the match. A rival with the same
-    reference still does. The row still counts as a rival for a date match.
-    """
-    contested = []
-    for stmt_idx, db_id in claimed_ids.items():
-        reach = reference_sets if stmt_idx in final_indices else contention_sets
-        rivals = [
-            other_idx
-            for other_idx, candidates in reach.items()
-            if other_idx != stmt_idx and db_id in candidates
-        ]
-        if not rivals:
-            continue
-        if len({_refresh_identity(txn_by_idx[i]) for i in (stmt_idx, *rivals)}) > 1:
-            contested.append(stmt_idx)
-    return contested
-
-
 def _missing_entry(
     statement_row_index: int,
     direction: str,
@@ -876,17 +846,22 @@ def reconcile_bank_statement(
     # winners (either pairing lands the same values), so the winner keeps its
     # match. The loser is held back regardless — it is a second statement row
     # for a transaction the DB holds once.
-    contested = _contested_winners(
-        claimed_ids,
-        contention_sets,
-        compatible_reference_ids,
-        {stmt_idx: txn for stmt_idx, _direction, txn, *_rest in parsed_rows},
-        final_indices={
-            stmt_idx
-            for stmt_idx in reference_matched_indices
-            if len(reference_evidence_sets[stmt_idx]) == 1
-        },
-    )
+    txn_by_idx = {stmt_idx: txn for stmt_idx, _direction, txn, *_rest in parsed_rows}
+    final = {
+        i for i in reference_matched_indices if len(reference_evidence_sets[i]) == 1
+    }
+    contested = []
+    for stmt_idx, db_id in claimed_ids.items():
+        reach = compatible_reference_ids if stmt_idx in final else contention_sets
+        rivals = [
+            other_idx
+            for other_idx, candidates in reach.items()
+            if other_idx != stmt_idx and db_id in candidates
+        ]
+        if not rivals:
+            continue
+        if len({_refresh_identity(txn_by_idx[i]) for i in (stmt_idx, *rivals)}) > 1:
+            contested.append(stmt_idx)
     for stmt_idx in contested:
         del matched_db_ids[stmt_idx]
 
