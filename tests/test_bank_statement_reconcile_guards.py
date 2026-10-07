@@ -330,6 +330,46 @@ async def test_row_the_matcher_refused_is_not_imported(session_factory, monkeypa
             {},
             id="shared-ref-still-contested",
         ),
+        # Two lines carry the same reference at different zero-padded widths.
+        # The rival reaches the DB row by reference, so the match is contested.
+        pytest.param(
+            [{"reference_number": "700077778888"}],
+            [
+                dict(
+                    date="07/04/2026",
+                    amount="2,500.00",
+                    narration="MERCHANT A RETAIL",
+                    ref="00700077778888",
+                ),
+                dict(
+                    date="07/04/2026",
+                    amount="2,500.00",
+                    narration="MERCHANT B RETAIL",
+                    ref="700077778888",
+                ),
+            ],
+            {},
+            id="same-ref-rival-still-contests",
+        ),
+        # The reference match stands, but its line still reaches the
+        # ref-less DB row by date, so the date match it rivals is demoted.
+        pytest.param(
+            [
+                {"reference_number": "700099990000"},
+                {"counterparty": "MERCHANT B", "raw_description": "MERCHANT B"},
+            ],
+            [
+                dict(
+                    date="07/04/2026",
+                    amount="2,500.00",
+                    narration="MERCHANT A RETAIL",
+                    ref="700099990000",
+                ),
+                dict(date="07/04/2026", amount="2,500.00", narration="MERCHANT C"),
+            ],
+            {0: 0},
+            id="final-match-rivals-a-date-match",
+        ),
     ],
 )
 @pytest.mark.anyio
