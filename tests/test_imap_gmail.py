@@ -1,6 +1,7 @@
 """Gmail IMAP fetch, driven through the real imaplib against a scripted server."""
 
 import imaplib
+from collections.abc import Buffer
 from email.header import Header
 
 import pytest
@@ -34,7 +35,7 @@ class _FakeGmail(imaplib.IMAP4):
     def open(
         self,
         host: str = "",
-        port: int = imaplib.IMAP4_PORT,
+        port: int = 143,
         timeout: float | None = None,
     ) -> None:
         self.host, self.port = host, port
@@ -51,7 +52,8 @@ class _FakeGmail(imaplib.IMAP4):
     def shutdown(self) -> None:
         pass
 
-    def send(self, data: bytes) -> None:
+    def send(self, data: Buffer) -> None:
+        data = bytes(data)
         if data == b"\r\n":
             return
         if (line := self._awaiting_literal) is not None:

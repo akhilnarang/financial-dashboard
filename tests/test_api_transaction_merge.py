@@ -290,14 +290,13 @@ async def test_refused_pair_refuses_the_whole_batch(
 async def test_override_merges_only_what_todays_parse_backs(
     client, session, monkeypatch, tmp_path, override
 ):
-    alert_id, statement_id, upload_id = await _seed_pair(
-        session,
-        **(
-            {"statement_ref": "654321"}
-            if override == "references"
-            else {"statement_date": DAY + dt.timedelta(days=2), "alert_ref": None}
-        ),
-    )
+    if override == "references":
+        seeded = await _seed_pair(session, statement_ref="654321")
+    else:
+        seeded = await _seed_pair(
+            session, statement_date=DAY + dt.timedelta(days=2), alert_ref=None
+        )
+    alert_id, statement_id, upload_id = seeded
     other_alert, other_statement, _ = await _seed_pair(
         session, alert_ref="777888", statement_ref="UTR000777888"
     )
