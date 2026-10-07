@@ -221,14 +221,21 @@ def _late_flow(
 ) -> Decimal:
     """Signed flow of the statement's rows that are dated after ``end``.
 
-    The statement's rows are the rows it imported and the rows it matched.
+    The statement's rows are the rows it imported and the rows it matched. A
+    merge can move such a row onto a row of another statement. The
+    reconciliation data then names the kept row.
     """
     members: set[int | None] = set(flows.upload_rows.get(upload.id, ()))
     try:
         recon = reconciliation_from_json(upload.reconciliation_data or "{}")
     except ValueError:
         recon = {}
-    members.update(entry.get("db_txn_id") for entry in recon.get("matched", []))
+    members.update(
+        entry.get(key)
+        for group in ("matched", "missing")
+        for entry in recon.get(group, [])
+        for key in ("db_txn_id", "imported_txn_id")
+    )
     dated = (flows.row_flow[i] for i in members if i in flows.row_flow)
     return sum((flow for day, flow in dated if day > end), Decimal(0))
 
