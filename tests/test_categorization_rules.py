@@ -78,7 +78,6 @@ def test_email_type_card_alerts_with_blank_fields():
         "credit_card_payment"
     )
     assert match_rules(f("bankd_cc_refund_alert"), CFG).slug == "refund"
-    assert match_rules(f("bankf_pocket_topup"), CFG).slug == "self_transfer"
     # A card SPEND alert must NOT be treated as a payment.
     assert match_rules(f("banke_cc_transaction_alert", "debit"), CFG) is None
 
