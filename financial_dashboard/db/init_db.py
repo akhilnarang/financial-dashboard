@@ -1,11 +1,12 @@
 """Database initialization and inline migrations."""
 
 from sqlalchemy import Table, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from financial_dashboard.db.models import Base, InvestmentLot
 
 _INVESTMENT_LOT_BACKFILL_MARKER = "migrations.investment_lots_backfill_v1"
+_SUPERMONEY_RULE_MARKER = "migrations.retire_supermoney_cashback_rule"
 
 
 #: Core tables whose changes dirty an extension's reconciled projection.
@@ -165,6 +166,32 @@ async def _backfill_legacy_investment_lots(conn) -> None:
             {"key": _INVESTMENT_LOT_BACKFILL_MARKER},
         )
         await session.commit()
+
+
+async def _retire_bare_supermoney_rule(conn: AsyncConnection) -> None:
+    """Remove the old bare "supermoney" cashback default, once.
+
+    It also matched person-to-person credits sent through the app. A user rule
+    on that pattern with another category stays.
+    """
+    marker = (
+        await conn.execute(
+            text("SELECT 1 FROM settings WHERE key = :key"),
+            {"key": _SUPERMONEY_RULE_MARKER},
+        )
+    ).first()
+    if marker is not None:
+        return
+    await conn.execute(
+        text(
+            "DELETE FROM merchant_rules WHERE pattern = 'supermoney' "
+            "AND category = 'cashback_rewards'"
+        )
+    )
+    await conn.execute(
+        text("INSERT INTO settings (key, value) VALUES (:key, '1')"),
+        {"key": _SUPERMONEY_RULE_MARKER},
+    )
 
 
 async def init_db(engine, *, paisa_enabled: bool = True) -> None:
@@ -828,6 +855,8 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
         from financial_dashboard.services.categorization.merchant_defaults import (
             DEFAULT_MERCHANT_RULES,
         )
+
+        await _retire_bare_supermoney_rule(conn)
 
         for _category, _patterns in DEFAULT_MERCHANT_RULES.items():
             for _pattern in _patterns:

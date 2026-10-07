@@ -134,3 +134,48 @@ def test_default_merchant_rules_are_valid():
             )
             assert pattern not in seen, f"duplicate pattern: {pattern!r}"
             seen.add(pattern)
+
+
+async def test_init_db_retires_bare_supermoney_rule_and_keeps_cashback(monkeypatch):
+    """A friend who pays through SuperMoney is not cashback. A payout from
+    SuperMoney's own handle is. A deployed DB loses the old bare rule on boot."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from financial_dashboard.db.init_db import init_db
+    from financial_dashboard.services import settings as settings_mod
+    from tests.conftest import new_test_engine
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(settings_mod, "load_all_settings", _noop)
+    monkeypatch.setattr(mr_mod, "load_merchant_rules", _noop)
+
+    engine, holder = new_test_engine()
+    try:
+        maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        async with maker() as s:
+            await ensure_category(s, "cashback_rewards")
+            s.add(MerchantRule(pattern="supermoney", category="cashback_rewards"))
+            await s.commit()
+
+        await init_db(engine)
+
+        async with maker() as s:
+            await load_merchant_rules(_session=s)
+        cfg = default_rule_config()._replace(merchant_rules=get_merchant_rules())
+        cases = {
+            "UPI/123456789012/CR/ALEX/ICIC/alex@superyes/ Paidalex@superyes/"
+            "ALEX DOE/Paid via SuperMoney": None,
+            "UPI Credit-ALEX DOE-alex@superyes-ICIC0000001-123456789012-"
+            "Paid via SuperMoney": None,
+            "UPI/supermoney/supermoney1@ye/Supermoney/YES BANKL/123456789012": (
+                "cashback_rewards"
+            ),
+        }
+        for raw, slug in cases.items():
+            r = match_rules(_f(raw=raw, channel="upi", direction="credit"), cfg)
+            assert (r and r.slug) == slug, raw
+    finally:
+        await engine.dispose()
+        holder.close()
