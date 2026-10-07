@@ -676,7 +676,7 @@ async def test_unclear_change_asks_with_yes_no_buttons(
         'Set note to "lunch" and category self transfer; don\'t make changes',
         "Preserve the existing note",
         # A guess must not offer the category that the user keeps.
-        'Set note to "new"; keep the category the same',
+        "Set note to new and keep the category the same",
         "Exclude from cashflow; keep the cashflow exclusion unchanged",
         "Keep it as it is",
     ],

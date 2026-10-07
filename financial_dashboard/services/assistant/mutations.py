@@ -225,8 +225,18 @@ async def raise_vetoes(
         instruction.note_shorthand and has_global_no_change(raw)
     ):
         raise ExplicitlyDenied("the current message forbids transaction changes")
-    # A note payload can contain these words, so look only outside it.
-    kept_text = raw if instruction.note_payload is None else instruction_text
+    # A note can contain these words, so skip the note that the patch saves.
+    # Text after that note is an instruction.
+    note = (
+        changes.note.value
+        if changes.note is not None and changes.note.op == "set"
+        else None
+    )
+    kept_text = (
+        raw
+        if instruction.note_payload is None
+        else f"{instruction_text}\n{instruction.note_payload.removeprefix(note or '')}"
+    )
     if preserves_target(kept_text, "it|this|everything") or any(
         getattr(changes, field) is not None and preserves_target(kept_text, target)
         for field, target in _PRESERVE_TARGETS
