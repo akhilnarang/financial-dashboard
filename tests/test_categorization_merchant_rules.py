@@ -141,8 +141,8 @@ def test_default_merchant_rules_are_valid():
     [("cashback_rewards", None), ("reimbursement", "reimbursement")],
 )
 async def test_init_db_retires_bare_supermoney_rule_and_keeps_cashback(
-    monkeypatch, legacy_category, p2p_slug
-):
+    monkeypatch: pytest.MonkeyPatch, legacy_category: str, p2p_slug: str | None
+) -> None:
     """A friend who pays through SuperMoney is not cashback. A payout from
     SuperMoney's own handle is. The first boot deletes the old seeded rule but
     keeps a user rule on that pattern with another category. A later boot
@@ -154,7 +154,7 @@ async def test_init_db_retires_bare_supermoney_rule_and_keeps_cashback(
     from financial_dashboard.services import settings as settings_mod
     from tests.conftest import new_test_engine
 
-    async def _noop():
+    async def _noop() -> None:
         return None
 
     monkeypatch.setattr(settings_mod, "load_all_settings", _noop)
