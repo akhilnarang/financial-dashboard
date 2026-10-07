@@ -182,6 +182,11 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
     ):
         return RuleResult("credit_card_payment", 0.95)
 
+    # A wallet top-up moves the holder's own money from a bank into the wallet.
+    # The email names no payer, so no other rule can see that it is a transfer.
+    if "pocket_topup" in email_type:
+        return RuleResult("self_transfer", 0.95)
+
     # Fee reversal: a credit reversing a previously-debited fee nets against the
     # fee it reversed, so it belongs on the fees_charges line as a contra-credit
     # (the cashflow report's expense bucket reads it as a negative contra). This
