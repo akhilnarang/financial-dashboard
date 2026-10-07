@@ -463,8 +463,9 @@ async def test_notifier_does_not_duplicate_active_conversational_decision(
         category_input_hash="hash",
         candidates_json=json.dumps([{"category": "groceries", "confidence": 0.5}]),
     )
-    # A conversation claims the second alert while the first prompt is sent.
-    first, claimed = (
+    # A conversation claims an alert and a row of the import while the first
+    # prompt is sent.
+    first, claimed, claimed_in_import = (
         Transaction(
             bank="hdfc",
             email_type="purchase",
@@ -472,10 +473,11 @@ async def test_notifier_does_not_duplicate_active_conversational_decision(
             amount=amount,
             review_status="pending",
             review_reason="ambiguous",
+            bank_statement_upload_id=upload_id,
         )
-        for amount in ("12.00", "34.00")
+        for amount, upload_id in (("12.00", 92), ("34.00", None), ("56.00", 92))
     )
-    session.add_all([decision, first, claimed])
+    session.add_all([decision, first, claimed, claimed_in_import])
     await session.commit()
     maker = async_sessionmaker(
         session.bind, class_=AsyncSession, expire_on_commit=False
@@ -483,15 +485,16 @@ async def test_notifier_does_not_duplicate_active_conversational_decision(
     monkeypatch.setattr(sweep, "async_session", maker)
     monkeypatch.setattr(telegram, "tg_app", object())
 
-    async def claiming_dispatch(delivery_id):
+    async def claiming_dispatch(delivery_id: int) -> bool:
         async with maker() as claim:
-            claim.add(
+            claim.add_all(
                 CategoryReviewDecision(
-                    transaction_id=claimed.id,
+                    transaction_id=owned.id,
                     source_interaction_id=source.id,
                     category_input_hash="hash",
                     candidates_json="[]",
                 )
+                for owned in (claimed, claimed_in_import)
             )
             await claim.commit()
         return True
@@ -506,13 +509,13 @@ async def test_notifier_does_not_duplicate_active_conversational_decision(
         }
     )
 
-    # A zero cap puts the row past its import budget. The summary must still
-    # skip a row that the conversation owns.
-    monkeypatch.setitem(settings_service._cache, "telegram.bulk_threshold", "0")
+    # A cap of one puts the claimed row of the import past its budget. The
+    # summary must skip it.
+    monkeypatch.setitem(settings_service._cache, "telegram.bulk_threshold", "1")
     sent = []
 
-    async def fake_send(app, **kwargs):
-        sent.append(kwargs["text"])
+    async def fake_send(app: object, *, text: str, **kwargs: object) -> None:
+        sent.append(text)
 
     monkeypatch.setattr(telegram, "_send_with_retry", fake_send)
 
@@ -520,10 +523,10 @@ async def test_notifier_does_not_duplicate_active_conversational_decision(
     assert sent == []
 
     async with maker() as verification:
-        assert (
-            await verification.get(Transaction, transaction.id)
-        ).review_status == "pending"
-        for owned in (transaction, claimed):
+        for owned in (transaction, claimed, claimed_in_import):
+            assert (
+                await verification.get(Transaction, owned.id)
+            ).review_status == "pending"
             active_count = await verification.scalar(
                 select(func.count(CategoryReviewDecision.id)).where(
                     CategoryReviewDecision.transaction_id == owned.id,
