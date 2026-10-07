@@ -59,6 +59,8 @@ def _rule_since(rule: FetchRule, since_str: str | None) -> str | None:
 
 
 class _SearchQuery(NamedTuple):
+    """UID SEARCH criteria, and the UTF-8 literal that follows them."""
+
     criteria: str
     literal: bytes | None
 
@@ -66,9 +68,10 @@ class _SearchQuery(NamedTuple):
 def _build_search_query(rule: FetchRule, since_str: str | None) -> _SearchQuery:
     """Build the UID SEARCH criteria for one rule.
 
-    An IMAP quoted string holds ASCII only. A non-ASCII filter value goes
-    last, as a UTF-8 literal under CHARSET UTF-8. imaplib sends one literal
-    per command, so a rule with two non-ASCII filters raises ValueError.
+    An IMAP quoted string holds ASCII only. The first non-ASCII filter value
+    goes last, as a UTF-8 literal under CHARSET UTF-8. imaplib sends one
+    literal per command, so the search leaves out any other non-ASCII
+    filter. The local rule filter checks every filter after the fetch.
 
     Args:
         rule: The fetch rule.
@@ -84,10 +87,33 @@ def _build_search_query(rule: FetchRule, since_str: str | None) -> _SearchQuery:
         parts.append(f"SINCE {since_str}")
     if not wide:
         return _SearchQuery(" ".join(parts) or "ALL", None)
-    if len(wide) > 1:
-        raise ValueError("only one non-ASCII filter per rule is supported")
     key, value = wide[0]
     return _SearchQuery(" ".join(["CHARSET UTF-8", *parts, key]), value.encode())
+
+
+def _select_folder(conn: imaplib.IMAP4, folder: str) -> bool:
+    """Select one folder read-only.
+
+    An error fails only this folder. A dropped connection still aborts the
+    whole source.
+
+    Args:
+        conn: The IMAP connection.
+        folder: The Gmail folder name.
+
+    Returns:
+        True when the folder is selected.
+    """
+    try:
+        typ, _ = conn.select(f'"{folder}"', readonly=True)
+    except imaplib.IMAP4.abort:
+        raise
+    except (imaplib.IMAP4.error, ValueError) as e:
+        logger.error("Could not select Gmail folder %s: %s", folder, e)
+        return False
+    if typ != "OK":
+        logger.error("Could not select Gmail folder %s: %s", folder, typ)
+    return typ == "OK"
 
 
 def _search_rule(
@@ -177,9 +203,7 @@ def _fetch_gmail_source_sync(
         for rule in rules:
             folder = rule.folder or "[Gmail]/All Mail"
             if folder != current_folder:
-                typ, _ = conn.select(f'"{folder}"', readonly=True)
-                if typ != "OK":
-                    logger.error("Could not select Gmail folder: %s", folder)
+                if not _select_folder(conn, folder):
                     continue
                 current_folder = folder
 
@@ -210,8 +234,7 @@ def _fetch_gmail_source_sync(
 
         for folder, uids in folder_uids.items():
             if folder != current_folder:
-                typ, _ = conn.select(f'"{folder}"', readonly=True)
-                if typ != "OK":
+                if not _select_folder(conn, folder):
                     continue
                 current_folder = folder
 
@@ -339,8 +362,7 @@ def _fetch_gmail_source_sync(
         current_folder = None
         for folder, keys in folder_new_keys.items():
             if folder != current_folder:
-                typ, _ = conn.select(f'"{folder}"', readonly=True)
-                if typ != "OK":
+                if not _select_folder(conn, folder):
                     continue
                 current_folder = folder
 

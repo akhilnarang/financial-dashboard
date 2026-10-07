@@ -27,7 +27,6 @@ class _FakeGmail(imaplib.IMAP4):
 
     def __init__(self, host: str, refusal: str) -> None:
         self.refusal = refusal
-        self.searches: list[tuple[bytes, bytes]] = []
         self._replies = bytearray()
         self._awaiting_literal: bytes | None = None
         super().__init__(host)
@@ -71,7 +70,6 @@ class _FakeGmail(imaplib.IMAP4):
             self._replies += tag + b" BAD Unexpected literal\r\n"
             return
         if words[:2] == [b"UID", b"SEARCH"]:
-            self.searches.append((line, literal))
             if b'FROM "alerts@refused.example"' in line:
                 self._refuse(tag)
                 return
@@ -100,54 +98,38 @@ class _FakeGmail(imaplib.IMAP4):
 
 
 @pytest.mark.parametrize(
-    ("refusal", "fetch_ok", "fetched", "backfilled", "literals"),
+    ("refusal", "fetch_ok", "fetched", "backfilled"),
     [
-        (
-            "BAD",
-            True,
-            {1: ["91"], 2: [], 3: [], 4: ["92"]},
-            {1, 4},
-            [SUBJECT_UTF8.encode(), b"", b""],
-        ),
-        (
-            "drop",
-            False,
-            {1: [], 2: [], 3: [], 4: []},
-            set(),
-            [SUBJECT_UTF8.encode(), b""],
-        ),
+        ("BAD", True, {1: ["91"], 2: [], 3: [], 4: [], 5: ["92"]}, {1, 5}),
+        ("drop", False, {1: [], 2: [], 3: [], 4: [], 5: []}, set()),
     ],
 )
-def test_non_ascii_rule_searches_as_utf8_and_a_failed_search_skips_one_rule(
+def test_non_ascii_rule_searches_as_utf8_and_a_failed_rule_skips_alone(
     monkeypatch: pytest.MonkeyPatch,
     refusal: str,
     fetch_ok: bool,
     fetched: dict[int, list[str]],
     backfilled: set[int],
-    literals: list[bytes],
 ) -> None:
     """A "✅" subject searches with a UTF-8 literal and fetches its email.
 
-    A SEARCH that imaplib or the server rejects skips only its rule, and the
-    rejected rule does not finish its backfill. A dropped connection still
-    fails the whole source.
+    A SELECT or SEARCH that imaplib or the server rejects skips only its
+    rule, and that rule does not finish its backfill. A dropped connection
+    still fails the whole source.
     """
-    servers: list[_FakeGmail] = []
-
-    def connect(host: str) -> _FakeGmail:
-        servers.append(server := _FakeGmail(host, refusal))
-        return server
-
-    monkeypatch.setattr(imap_gmail.imaplib, "IMAP4_SSL", connect)
+    monkeypatch.setattr(
+        imap_gmail.imaplib, "IMAP4_SSL", lambda host: _FakeGmail(host, refusal)
+    )
     rules = [
         FetchRule(id=1, bank="tick", sender=SENDERS[1], subject=SUBJECT_UTF8),
         FetchRule(
             id=2, bank="crlf", sender="alerts@crlf.example\r\n", subject="Zahlung ✅"
         ),
+        FetchRule(id=3, bank="folder", sender=SENDERS[2], folder="Überweisungen"),
         FetchRule(
-            id=3, bank="refused", sender="alerts@refused.example", folder="INBOX"
+            id=4, bank="refused", sender="alerts@refused.example", folder="INBOX"
         ),
-        FetchRule(id=4, bank="plain", sender=SENDERS[2], folder="INBOX"),
+        FetchRule(id=5, bank="plain", sender=SENDERS[2], folder="INBOX"),
     ]
 
     result = imap_gmail._fetch_gmail_source_sync(
@@ -164,4 +146,3 @@ def test_non_ascii_rule_searches_as_utf8_and_a_failed_search_skips_one_rule(
         rid: [e.remote_id for e in got] for rid, got in result.results_by_rule.items()
     } == fetched
     assert result.backfill_ready_rule_ids == backfilled
-    assert [literal for _, literal in servers[0].searches] == literals

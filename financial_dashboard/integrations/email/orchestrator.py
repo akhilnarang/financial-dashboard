@@ -8,7 +8,10 @@ from collections import defaultdict
 from sqlalchemy import select
 
 from financial_dashboard.db import Email, EmailSource, FetchRule, async_session
-from financial_dashboard.integrations.email.base import get_provider
+from financial_dashboard.integrations.email.base import (
+    FetchSourceResult,
+    get_provider,
+)
 from financial_dashboard.integrations.email.body import _cleanup_failed_spool
 from financial_dashboard.services.emails import _serialize_datetime, handle_polled_email
 from financial_dashboard.services.linker import build_link_context
@@ -30,6 +33,26 @@ def get_poll_status(poll_status: dict) -> dict:
         "last_error": status["last_error"],
         "progress": status["progress"],
     }
+
+
+async def _fetch_source(
+    source: EmailSource,
+    rules: list[FetchRule],
+    *,
+    fetch_limit: int,
+    existing_remote_ids: set[str],
+) -> FetchSourceResult:
+    """Fetch one source. An error fails only this source, not the poll."""
+    try:
+        return await get_provider(source).fetch_source(
+            source,
+            rules,
+            fetch_limit=fetch_limit,
+            existing_remote_ids=existing_remote_ids,
+        )
+    except Exception:
+        logger.exception("Email fetch failed for source %s", source.id)
+        return FetchSourceResult({}, False, set())
 
 
 async def poll_all(*, poll_lock: asyncio.Lock, poll_status: dict) -> dict:
@@ -147,12 +170,11 @@ async def poll_all(*, poll_lock: asyncio.Lock, poll_status: dict) -> dict:
                     ).scalars()
                     existing_remote_ids: set[str] = {r for r in rows if r is not None}
 
-                provider = get_provider(source)
                 (
                     results_by_rule,
                     fetch_ok,
                     backfill_ready_rule_ids,
-                ) = await provider.fetch_source(
+                ) = await _fetch_source(
                     source,
                     source_rules,
                     fetch_limit=fetch_limit,
