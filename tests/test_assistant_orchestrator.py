@@ -1,10 +1,14 @@
+import json
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.db.models import (
     AuditInteraction,
+    Setting,
+    TelegramConversation,
     TelegramOutboundDelivery,
     Transaction,
 )
@@ -15,9 +19,13 @@ from financial_dashboard.services.assistant.contracts import (
     ToolCalls,
 )
 from financial_dashboard.services.assistant.conversations import start_conversation
+from financial_dashboard.services.assistant.message_context import (
+    record_physical_message,
+)
 from financial_dashboard.services.assistant.orchestrator import (
     OrchestrationResult,
     _conversation_for_message,
+    _process_callback_interaction,
     _queue_result,
     run_pending_confirmation,
     run_turn,
@@ -131,6 +139,69 @@ async def test_unnamed_category_is_offered_as_a_button(session, message, note):
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
+    ("message", "excluded"),
+    [
+        # The model adds an exclusion that the user did not ask for.
+        ("Self transfer category", False),
+        ("Self transfer category, exclude from cashflow", True),
+        # A preserved field that the patch does not touch is no veto.
+        ("Self transfer category, keep the note unchanged", False),
+        # A bare number asks first. The Yes must not save the exclusion.
+        ("Set {id} category to self transfer", False),
+    ],
+)
+async def test_unrequested_cashflow_exclusion_is_dropped(session, message, excluded):
+    await ensure_category(session, "self_transfer")
+    txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
+    session.add(txn)
+    await session.flush()
+    conversation = await start_conversation(session, chat_id=7, started_by="ask")
+    interaction = AuditInteraction(
+        inbound_chat_id=7, trigger="ask", conversation_id=conversation.id
+    )
+    session.add(interaction)
+    await session.flush()
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": txn.id,
+                        "changes": {
+                            "category": {"op": "set", "value": "self_transfer"},
+                            "exclude_from_cashflow": {"op": "set", "value": True},
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    await run_turn(
+        session,
+        provider,
+        user_message=message.format(id=txn.id),
+        transaction_id=None if "{id}" in message else txn.id,
+        conversation_id=conversation.id,
+        interaction_id=interaction.id,
+    )
+    if (state_hash := conversation.pending_confirmation_state_hash) is not None:
+        await run_pending_confirmation(
+            session,
+            conversation_id=conversation.id,
+            state_hash=state_hash,
+            user_message="yes",
+            replied_to_interaction_id=interaction.id,
+        )
+
+    assert txn.category == "self_transfer"
+    assert txn.exclude_from_cashflow is excluded
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
     ("message", "note"),
     [
         ("food", "lunch"),
@@ -176,6 +247,8 @@ async def test_category_only_reply_keeps_the_existing_note(session, message, not
         # A bare number can be an amount, so the user confirms the row first.
         ("bare", None),
         ("unnamed", "ambiguous_target"),
+        # A bare number must not turn an explicit "no" into a Yes/No prompt.
+        ("bare_denied", "mutation_rejected"),
         ("changed", "transaction_changed"),
     ],
 )
@@ -225,6 +298,7 @@ async def test_typed_transaction_number_is_a_change_target(session, case, error)
     message = {
         "unnamed": "exclude it from cashflow",
         "bare": f"exclude {txn.id} from cashflow",
+        "bare_denied": f"exclude {txn.id} from cashflow; don't make changes",
     }.get(case, f"exclude #{txn.id} from cashflow")
 
     result = await run_turn(
@@ -248,6 +322,7 @@ async def test_typed_transaction_number_is_a_change_target(session, case, error)
     assert txn.exclude_from_cashflow is (error is None)
     if error is not None:
         assert result.response.code == error
+        assert conversation.pending_confirmation_json is None
 
 
 @pytest.mark.anyio
@@ -431,3 +506,218 @@ async def test_conversation_timestamp_survives_sqlite_round_trip(session):
         mapped=SimpleNamespace(conversation_id=conversation_id, transaction_id=None),
     )
     assert resumed.id == conversation_id
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("choice", "mapping"),
+    [
+        ("y", "saved"),
+        ("n", "saved"),
+        # The send failed after Telegram showed the message, and the worker
+        # crashed after the claim. The replay finds the binding from the Ref.
+        ("y", "ref"),
+        # A Yes from a different message must not authorize the change.
+        ("y", "other"),
+    ],
+)
+async def test_unclear_change_asks_with_yes_no_buttons(
+    session, monkeypatch, choice, mapping
+):
+    import financial_dashboard.db as db_package
+    from financial_dashboard.services import telegram
+    from financial_dashboard.services.assistant import orchestrator
+
+    session.add(Setting(key="telegram.chat_id", value="7"))
+    await ensure_category(session, "self_transfer")
+    txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
+    session.add(txn)
+    await session.flush()
+    conversation = await start_conversation(
+        session, chat_id=7, started_by="reply", transaction_id=txn.id
+    )
+    source = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="reply",
+        status="processing",
+        worker_token="worker",
+        conversation_id=conversation.id,
+        transaction_id=txn.id,
+    )
+    session.add(source)
+    await session.flush()
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": txn.id,
+                        "changes": {
+                            "category": {"op": "set", "value": "self_transfer"}
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    # A question does not clearly ask for the change, so the bot must ask.
+    result = await run_turn(
+        session,
+        provider,
+        user_message="I didn't say exclude? It is a self transfer",
+        transaction_id=txn.id,
+        conversation_id=conversation.id,
+        interaction_id=source.id,
+    )
+    await _queue_result(
+        session,
+        interaction_id=source.id,
+        worker_token="worker",
+        result=result,
+        transaction_id=txn.id,
+        recipient_chat_id=7,
+    )
+    assert txn.category is None
+    delivery = await session.scalar(
+        select(TelegramOutboundDelivery).where(
+            TelegramOutboundDelivery.interaction_id == source.id
+        )
+    )
+    buttons = json.loads(delivery.reply_markup_json)[0]
+    bound = mapping != "other"
+    if mapping != "ref":
+        await record_physical_message(
+            session,
+            chat_id=7,
+            message_id=700,
+            context_kind="assistant_response",
+            conversation_id=conversation.id,
+            interaction_id=source.id,
+            outbound_delivery_id=delivery.id if bound else None,
+        )
+    callback = AuditInteraction(
+        telegram_update_id="callback-1",
+        inbound_chat_id=7,
+        trigger="confirm_button",
+        user_text="pending",
+        status="processing",
+        worker_token="callback-worker",
+    )
+    session.add(callback)
+    await session.commit()
+    maker = async_sessionmaker(
+        session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    monkeypatch.setattr(db_package, "async_session", maker)
+
+    async def fake_dispatch(delivery_id: int) -> bool:
+        return True
+
+    monkeypatch.setattr(telegram, "dispatch_saved_delivery", fake_dispatch)
+    callback_data = next(
+        button["callback_data"]
+        for button in buttons
+        if button["callback_data"].endswith(f":{choice}")
+    )
+    if mapping == "ref":
+
+        async def crash(**kwargs) -> None:
+            raise RuntimeError("worker crashed")
+
+        async def bot_user() -> SimpleNamespace:
+            return SimpleNamespace(id=1)
+
+        monkeypatch.setattr(orchestrator, "_process_callback_interaction", crash)
+        tapped = SimpleNamespace(
+            chat=SimpleNamespace(id=7),
+            message_id=700,
+            text=delivery.text,
+            from_user=SimpleNamespace(id=1),
+        )
+        with pytest.raises(RuntimeError):
+            await orchestrator._handle_assistant_callback(
+                SimpleNamespace(
+                    update_id=1,
+                    callback_query=SimpleNamespace(data=callback_data, message=tapped),
+                ),
+                SimpleNamespace(bot=SimpleNamespace(get_me=bot_user)),
+                trigger="confirm_button",
+            )
+
+    await _process_callback_interaction(
+        interaction_id=callback.id,
+        worker_token="callback-worker",
+        trigger="confirm_button",
+        callback_data=callback_data,
+        recipient_chat_id=7,
+        physical_message_id=700,
+    )
+
+    async with maker() as verification:
+        saved = await verification.get(Transaction, txn.id)
+        saved_conversation = await verification.get(
+            TelegramConversation, conversation.id
+        )
+    assert (saved.category == "self_transfer") is (choice == "y" and bound)
+    assert (saved_conversation.pending_confirmation_json is None) is bound
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Don't categorize this as self transfer",
+        # A question must not hide the denial behind a confirmation.
+        "Don't categorize this as self transfer?",
+        # An incomplete patch must not hide it either.
+        'Set note to "lunch" and category self transfer; don\'t make changes',
+        "Preserve the existing note",
+        # A guess must not offer the category that the user keeps.
+        "Set note to new and keep the category the same",
+        "Exclude from cashflow; keep the cashflow exclusion unchanged",
+        "Keep it as it is",
+    ],
+)
+async def test_forbidden_change_is_refused_not_offered(session, message):
+    await ensure_category(session, "self_transfer")
+    txn = Transaction(bank="test", email_type="test", direction="debit", amount=10)
+    session.add(txn)
+    await session.flush()
+    conversation = await start_conversation(
+        session, chat_id=7, started_by="reply", transaction_id=txn.id
+    )
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": txn.id,
+                        "changes": {
+                            "category": {"op": "set", "value": "self_transfer"},
+                            "note": {"op": "set", "value": "new"},
+                            "exclude_from_cashflow": {"op": "set", "value": True},
+                        },
+                    }
+                ],
+            )
+        ]
+    )
+
+    result = await run_turn(
+        session,
+        provider,
+        user_message=message,
+        transaction_id=txn.id,
+        conversation_id=conversation.id,
+    )
+
+    assert result.response.outcome == "error"
+    assert conversation.pending_confirmation_json is None
+    assert txn.category is None
+    assert txn.note is None
+    assert txn.exclude_from_cashflow is False

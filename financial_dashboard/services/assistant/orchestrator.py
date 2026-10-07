@@ -61,10 +61,13 @@ from financial_dashboard.services.assistant.intent_policy import (
 )
 from financial_dashboard.services.assistant.mutations import (
     DirectionPolicy,
+    ExplicitlyDenied,
     MutationRejected,
     MutationResult,
     apply_transaction_changes,
+    raise_vetoes,
     unnamed_category,
+    unrequested_exclusion,
 )
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.provider import (
@@ -103,6 +106,9 @@ _UNSUPPORTED_AGGREGATE = re.compile(
     r"\b(?:today|week|month|quarter|year|between|from|through)\b",
     re.IGNORECASE,
 )
+
+
+_CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
 
 
 class OrchestrationResult(NamedTuple):
@@ -215,6 +221,25 @@ def _confirmation_question(
         f"'{pending.category}' and assign it to transaction "
         f"#{pending.transaction_id}? Reply yes to confirm."
     )
+
+
+async def _pending_conversation(
+    session: AsyncSession, source_interaction_id: int
+) -> TelegramConversation | None:
+    """Return the conversation that waits on a confirmation from this turn."""
+    return await session.scalar(
+        select(TelegramConversation).where(
+            TelegramConversation.pending_confirmation_source_interaction_id
+            == source_interaction_id,
+            TelegramConversation.pending_confirmation_json.is_not(None),
+        )
+    )
+
+
+def _without(call: ApplyTransactionChanges, field: str) -> ApplyTransactionChanges:
+    """Return the patch with one changes field left unchanged."""
+    changes = call.changes.model_copy(update={field: None})
+    return call.model_copy(update={"changes": changes})
 
 
 async def current_transaction_state_hash(
@@ -635,11 +660,13 @@ async def run_turn(
                     )
                     if call_target is None:
                         raise MutationRejected("transaction not found")
+                    if unrequested_exclusion(call, user_message):
+                        call = _without(call, "exclude_from_cashflow")
                     if call.transaction_id != transaction_id and (
                         call.transaction_id not in _marked_transaction_ids(user_message)
                     ):
                         return completed(
-                            await _confirm_bare_target(
+                            await _confirm_change(
                                 session,
                                 call,
                                 call_target,
@@ -664,37 +691,44 @@ async def run_turn(
                         == normalize_text((category.value or "").replace("_", " "))
                     ):
                         # A reply that names only a category keeps the old note.
-                        call = call.model_copy(
-                            update={
-                                "changes": call.changes.model_copy(
-                                    update={"note": None}
-                                )
-                            }
-                        )
+                        call = _without(call, "note")
+                    # A guess drops the category. Check the vetoes first.
+                    await raise_vetoes(session, call, user_message)
                     guessed = await unnamed_category(session, call, user_message)
                     if guessed is not None:
-                        call = call.model_copy(
-                            update={
-                                "changes": call.changes.model_copy(
-                                    update={"category": None}
-                                )
-                            }
-                        )
+                        call = _without(call, "category")
                     if (
                         guessed is None
                         or call.changes.note is not None
                         or call.changes.exclude_from_cashflow is not None
                         or call.merchant_rule is not None
                     ):
-                        mutation = await apply_transaction_changes(
-                            session,
-                            call,
-                            current_user_message=user_message,
-                            interaction_id=interaction_id,
-                            direction_policy=_request_direction_policy(
-                                call, user_message, direction_policy
-                            ),
-                        )
+                        try:
+                            mutation = await apply_transaction_changes(
+                                session,
+                                call,
+                                current_user_message=user_message,
+                                interaction_id=interaction_id,
+                                direction_policy=_request_direction_policy(
+                                    call, user_message, direction_policy
+                                ),
+                            )
+                        except ExplicitlyDenied:
+                            raise
+                        except MutationRejected:
+                            return completed(
+                                await _confirm_change(
+                                    session,
+                                    call,
+                                    call_target,
+                                    user_message=user_message,
+                                    conversation_id=conversation_id,
+                                    interaction_id=interaction_id,
+                                    direction_policy=_request_direction_policy(
+                                        call, user_message, direction_policy
+                                    ),
+                                )
+                            )
                     if guessed is not None:
                         proposal = CategoryProposal(
                             outcome="category_proposal",
@@ -966,7 +1000,7 @@ def _describe_changes(request: ApplyTransactionChanges) -> str:
     parts = []
     if changes.note is not None:
         parts.append(
-            f"set the note to '{changes.note.value[:200]}'"
+            f"set the note to '{changes.note.value}'"
             if changes.note.op == "set"
             else "clear the note"
         )
@@ -985,7 +1019,7 @@ def _describe_changes(request: ApplyTransactionChanges) -> str:
     return " and ".join(parts)
 
 
-async def _confirm_bare_target(
+async def _confirm_change(
     session: AsyncSession,
     request: ApplyTransactionChanges,
     target: AssistantTransaction,
@@ -995,19 +1029,25 @@ async def _confirm_bare_target(
     interaction_id: int | None,
     direction_policy: DirectionPolicy,
 ) -> Clarification:
-    """Ask before a change to a row that a bare number names.
+    """Ask the user to confirm a change before it is written.
 
-    A bare number can be an amount. The user must see the row and confirm it.
+    The bot asks when a bare number names the row, which can be an amount, or
+    when the message does not clearly ask for the change. The user sees the
+    row and the change, and a Yes tap authorizes it. A change that the message
+    forbids, or that is not valid, raises instead.
     """
     if request.merchant_rule is not None:
-        raise MutationRejected("a merchant rule needs a marked id, such as #8788")
+        raise MutationRejected("a merchant rule needs a direct instruction")
+    await raise_vetoes(session, request, user_message)
     try:
         async with session.begin_nested():
+            # The tap supplies the intent. Every other check still runs.
             await apply_transaction_changes(
                 session,
                 request,
                 current_user_message=user_message,
                 direction_policy=direction_policy,
+                confirmed_pending=True,
             )
             raise _DryRun
     except _DryRun:
@@ -1031,7 +1071,9 @@ async def _confirm_bare_target(
         f"#{target.id} ({target.direction} {target.amount} {target.currency or 'INR'}"
         f", {(target.counterparty or 'unknown')[:200]}, {target.transaction_date})"
     )
-    question = f"{_describe_changes(request)} for {row[:400]}? Reply yes to confirm."
+    # A note is at most 500 characters and is shown whole, so the user sees
+    # everything a Yes saves. The row text is cut to keep the question short.
+    question = f"{_describe_changes(request)} for {row[:280]}?"
     return Clarification(
         outcome="clarification", question=question[0].upper() + question[1:]
     )
@@ -1256,6 +1298,17 @@ async def _queue_result(
                 ],
                 separators=(",", ":"),
             )
+        if ordinal == 0 and isinstance(result.response, Clarification):
+            if await _pending_conversation(session, interaction_id) is not None:
+                delivery.reply_markup_json = json.dumps(
+                    [
+                        [
+                            {"text": "Yes", "callback_data": f"pc:v1:{delivery.id}:y"},
+                            {"text": "No", "callback_data": f"pc:v1:{delivery.id}:n"},
+                        ]
+                    ],
+                    separators=(",", ":"),
+                )
         if ordinal == 0 and result.mutation is not None:
             from financial_dashboard.db.models import AuditAction
 
@@ -1450,29 +1503,14 @@ async def _process_text_interaction(
                 == conversation.pending_confirmation_source_interaction_id
                 and is_direct_affirmative(user_text)
             ):
-                try:
-                    mutation = await run_pending_confirmation(
-                        session,
-                        conversation_id=conversation.id,
-                        state_hash=conversation.pending_confirmation_state_hash or "",
-                        user_message=user_text,
-                        replied_to_interaction_id=replied_to_interaction_id,
-                        interaction_id=interaction_id,
-                        authorized_chat_id=recipient_chat_id,
-                    )
-                    result = OrchestrationResult(
-                        Answer(outcome="answer", text="Saved."), mutation=mutation
-                    )
-                except AuthorizationChanged:
-                    raise
-                except MutationRejected as exc:
-                    result = OrchestrationResult(
-                        Error(
-                            outcome="error",
-                            message=str(exc),
-                            code="confirmation_rejected",
-                        )
-                    )
+                result = await _apply_pending(
+                    session,
+                    conversation,
+                    user_message=user_text,
+                    source_interaction_id=replied_to_interaction_id,
+                    interaction_id=interaction_id,
+                    recipient_chat_id=recipient_chat_id,
+                )
             elif result is None and conversation.pending_confirmation_json:
                 from financial_dashboard.services.assistant.conversations import (
                     clear_pending_confirmation,
@@ -1558,7 +1596,7 @@ async def resume_claimed_interactions(*, bot=None, limit: int = 50) -> int:
     from financial_dashboard.services.assistant.message_context import resolve_reply
     from financial_dashboard.services.settings import get_telegram_chat_id
 
-    triggers = ["ask", "reply", "category_button", "undo"]
+    triggers = ["ask", "reply", *_CALLBACK_TRIGGERS]
     if bot is not None:
         triggers.append("attachment")
     async with async_session() as session:
@@ -1642,7 +1680,7 @@ async def resume_claimed_interactions(*, bot=None, limit: int = 50) -> int:
                         declared_size=attachment_payload.get("declared_size"),
                         caption=caption,
                     )
-                elif trigger in {"category_button", "undo"}:
+                elif trigger in _CALLBACK_TRIGGERS:
                     await _process_callback_interaction(
                         interaction_id=interaction_id,
                         worker_token=worker_token,
@@ -1687,7 +1725,7 @@ async def handle_telegram_update(update, context, *, trigger: str) -> None:
     message = update.message or (query.message if query is not None else None)
     if message is None or message.chat.id != get_telegram_chat_id():
         return
-    if trigger in {"category_button", "undo"}:
+    if trigger in _CALLBACK_TRIGGERS:
         await _handle_assistant_callback(update, context=context, trigger=trigger)
         return
 
@@ -2142,6 +2180,14 @@ async def _process_callback_interaction(
                             text=f"Saved category {selected_slug} for #{action.target_id}.",
                         )
                     )
+            elif trigger == "confirm_button":
+                result = await _confirm_from_button(
+                    session,
+                    interaction,
+                    callback_data=callback_data,
+                    recipient_chat_id=recipient_chat_id,
+                    physical_message_id=physical_message_id,
+                )
             else:
                 try:
                     _, _, raw_action = callback_data.split(":")
@@ -2182,9 +2228,10 @@ async def _process_callback_interaction(
                 result=result,
                 transaction_id=interaction.transaction_id,
                 recipient_chat_id=recipient_chat_id,
-                outcome_override=(
-                    "category_choice" if trigger == "category_button" else "undo"
-                ),
+                outcome_override={
+                    "category_button": "category_choice",
+                    "confirm_button": "confirmation",
+                }.get(trigger, "undo"),
             )
             await session.commit()
         except AuthorizationChanged:
@@ -2196,7 +2243,9 @@ async def _process_callback_interaction(
             await mark_authorization_changed(session, interaction_id)
             await session.commit()
             return
-    if trigger == "undo" and result.response.outcome != "error":
+    if (trigger == "undo" and result.response.outcome != "error") or (
+        result.mutation is not None
+    ):
         try:
             async with async_session() as session:
                 from financial_dashboard.services.assistant.mutations import (
@@ -2208,10 +2257,116 @@ async def _process_callback_interaction(
             import logging
 
             logging.getLogger(__name__).exception(
-                "Merchant-rule undo committed but cache refresh failed"
+                "Assistant callback committed but cache refresh failed"
             )
     for delivery_id in delivery_ids:
         await dispatch_saved_delivery(delivery_id)
+
+
+async def _apply_pending(
+    session: AsyncSession,
+    conversation: TelegramConversation,
+    *,
+    user_message: str,
+    source_interaction_id: int,
+    interaction_id: int,
+    recipient_chat_id: int,
+) -> OrchestrationResult:
+    """Apply the conversation's pending confirmation, or explain why not."""
+    try:
+        mutation = await run_pending_confirmation(
+            session,
+            conversation_id=conversation.id,
+            state_hash=conversation.pending_confirmation_state_hash or "",
+            user_message=user_message,
+            replied_to_interaction_id=source_interaction_id,
+            interaction_id=interaction_id,
+            authorized_chat_id=recipient_chat_id,
+        )
+    except AuthorizationChanged:
+        raise
+    except MutationRejected as exc:
+        return OrchestrationResult(
+            Error(outcome="error", message=str(exc), code="confirmation_rejected")
+        )
+    return OrchestrationResult(
+        Answer(outcome="answer", text="Saved."), mutation=mutation
+    )
+
+
+async def _confirm_from_button(
+    session: AsyncSession,
+    interaction: AuditInteraction,
+    *,
+    callback_data: str,
+    recipient_chat_id: int,
+    physical_message_id: int | None,
+) -> OrchestrationResult:
+    """Apply or dismiss the pending confirmation that a Yes/No button shows."""
+    from financial_dashboard.db.models import TelegramOutboundDelivery
+    from financial_dashboard.services.assistant.conversations import (
+        clear_pending_confirmation,
+    )
+    from financial_dashboard.services.assistant.delivery import (
+        settle_delivery_from_callback,
+        validate_delivery_proof,
+    )
+    from financial_dashboard.services.assistant.message_context import resolve_reply
+
+    stale = OrchestrationResult(
+        Error(
+            outcome="error",
+            message="That confirmation is stale or already used.",
+            code="stale_confirmation",
+        )
+    )
+    try:
+        _, _, raw_delivery, choice = callback_data.split(":")
+        delivery_id = int(raw_delivery)
+    except ValueError:
+        return stale
+    # The tapped message must be the confirmation delivery itself.
+    tapped = (
+        await resolve_reply(
+            session, chat_id=recipient_chat_id, message_id=physical_message_id
+        )
+        if physical_message_id is not None
+        else None
+    )
+    delivery = await session.get(TelegramOutboundDelivery, delivery_id)
+    if (
+        choice not in {"y", "n"}
+        or tapped is None
+        or tapped.outbound_delivery_id != delivery_id
+        or delivery is None
+        or delivery.interaction_id is None
+        or not await validate_delivery_proof(
+            session, delivery_id, recipient_chat_id=recipient_chat_id
+        )
+        or not await settle_delivery_from_callback(session, delivery_id)
+    ):
+        return stale
+    conversation = await _pending_conversation(session, delivery.interaction_id)
+    if conversation is None:
+        return stale
+    interaction.conversation_id = conversation.id
+    if choice == "n":
+        clear_pending_confirmation(conversation)
+        return OrchestrationResult(
+            Answer(outcome="answer", text="Okay. Nothing changed.")
+        )
+    result = await _apply_pending(
+        session,
+        conversation,
+        # A Yes tap is a direct affirmative.
+        user_message="yes",
+        source_interaction_id=delivery.interaction_id,
+        interaction_id=interaction.id,
+        recipient_chat_id=recipient_chat_id,
+    )
+    if result.mutation is not None:
+        interaction.transaction_id = result.mutation.transaction_id
+    return result
 
 
 async def _handle_assistant_callback(update, context, *, trigger: str) -> None:
@@ -2219,6 +2374,10 @@ async def _handle_assistant_callback(update, context, *, trigger: str) -> None:
     from financial_dashboard.services.assistant.audit import (
         claim_interaction,
         claim_processing,
+    )
+    from financial_dashboard.services.assistant.message_context import (
+        recover_ref_context,
+        resolve_reply,
     )
 
     query = update.callback_query
@@ -2241,6 +2400,23 @@ async def _handle_assistant_callback(update, context, *, trigger: str) -> None:
             trigger=trigger,
             user_text=query.data,
         )
+        if (
+            trigger == "confirm_button"
+            and message.text
+            and await resolve_reply(
+                session, chat_id=message.chat.id, message_id=message.message_id
+            )
+            is None
+        ):
+            # The send can fail after Telegram shows the message. Its Ref
+            # footer then binds the message to the delivery. Save the binding
+            # with the claim, so that a replay after a crash finds it.
+            await recover_ref_context(
+                session,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                message_text=message.text,
+            )
         await session.commit()
         if not is_new:
             await query.answer("Already handled")

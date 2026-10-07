@@ -651,7 +651,7 @@ async def _handle_callback(update: Update, context) -> None:
     if not query or not query.data:
         return
 
-    if query.data.startswith(("cat:v1:", "undo:v1:")):
+    if query.data.startswith(("cat:v1:", "undo:v1:", "pc:v1:")):
         if not query.message or query.message.chat.id != get_telegram_chat_id():
             await query.answer("Unauthorized")
             return
@@ -661,7 +661,9 @@ async def _handle_callback(update: Update, context) -> None:
         await _call_assistant(
             update,
             context,
-            trigger="category_button" if query.data.startswith("cat:") else "undo",
+            trigger={"cat": "category_button", "pc": "confirm_button"}.get(
+                query.data.split(":", 1)[0], "undo"
+            ),
         )
         return
 

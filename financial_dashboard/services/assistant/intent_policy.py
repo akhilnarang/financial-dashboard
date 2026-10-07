@@ -132,8 +132,8 @@ _NON_MUTATING_START = re.compile(
     r"may\s+(?:i|we|you|this|that|it|the|there)\b|might|"
     r"explain|describe|show|list|"
     r"find|search|tell|give|check|inspect|review|look\s+up|"
-    r"take\s+a\s+look(?:\s+at)?|leave\b.{0,48}\bunchanged|"
-    r"keep\b.{0,48}\b(?:unchanged|as\s+is)|preserve|"
+    r"take\s+a\s+look(?:\s+at)?|(?:keep|leave|retain)\b.{0,48}\b(?:unchanged|"
+    r"as\s+(?:it\s+)?is|the\s+same|alone|intact|as\s+before)|preserve|"
     r"help\s+me\s+understand)\b"
     r"|^i\s+(?:want|need|would\s+like|'d\s+like)\s+to\s+"
     r"(?:understand|know|see|review|inspect)\b",
@@ -270,11 +270,17 @@ def _parse_note_shorthand(text: str) -> InstructionParts | None:
     return None
 
 
+# Every character that str.splitlines() treats as a line break.
+_LINE_BREAKS = r"\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+
+
 def parse_instruction(text: str) -> InstructionParts:
     """Split application-bounded note content from the remaining instructions."""
     match = re.search(
-        r"(?:\b(?:set|change|update|add|write)\s+(?:the\s+)?note\s*"
-        r"(?:(?:to|as|is)\b|[:=])?\s*|\bnote\s*:\s*)",
+        rf"(?:\b(?:set|change|update|add|write)\s+(?:the\s+)?note[^\S{_LINE_BREAKS}]*"
+        rf"(?:(?:to|as|is)\b|[:=])?[^\S{_LINE_BREAKS}]*|\bnote[^\S{_LINE_BREAKS}]*:[^\S{_LINE_BREAKS}]*"
+        # A label at the start of a line, such as "Description: ...".
+        rf"|(?m:^)[^\S{_LINE_BREAKS}]*(?:description|desc|memo)[^\S{_LINE_BREAKS}]*:[^\S{_LINE_BREAKS}]*)",
         text,
         re.IGNORECASE,
     )
@@ -300,7 +306,7 @@ def parse_instruction(text: str) -> InstructionParts:
                 False,
             )
     delimiter = re.search(
-        r"[,.;:!?\n]|\s+and\s+(?=(?:(?:set|change|update|assign)\s+)?"
+        rf"[,.;:!?{_LINE_BREAKS}]|\s+and\s+(?=(?:(?:set|change|update|assign)\s+)?"
         r"(?:the\s+)?category\b)",
         text[start:],
         re.IGNORECASE,
@@ -341,6 +347,25 @@ def negates_target(text: str, target: str) -> bool:
         ):
             return True
     return False
+
+
+def preserves_target(text: str, target: str) -> bool:
+    """Return whether a clause asks to keep this target as it is.
+
+    Args:
+        text: The instruction text.
+        target: A regex alternation of target words, such as "note|memo".
+    """
+    return any(
+        re.search(
+            rf"\b(?:keep|leave|preserve|retain)\s+"
+            rf"(?:(?:the|this|its|my|current|existing|old)\s+){{0,2}}(?:{target})"
+            r"(?:\s+(?:unchanged|as (?:it )?is|(?:the )?same|alone|intact|as before)"
+            r"\b|$)",
+            normalize_text(clause),
+        )
+        for clause in re.split(r"[,.;:!?\n]", text)
+    )
 
 
 def evidence_is_current(user_text: str, evidence: str) -> bool:

@@ -28,6 +28,7 @@ from financial_dashboard.services.assistant.intent_policy import (
     mentions_category,
     negates_target,
     parse_instruction,
+    preserves_target,
 )
 from financial_dashboard.services.categorization.manual import (
     CategoryDirectionPolicy,
@@ -61,6 +62,10 @@ class MutationResult(NamedTuple):
 
 class MutationRejected(ValueError):
     """The requested assistant mutation was not safe to apply."""
+
+
+class ExplicitlyDenied(MutationRejected):
+    """The current message forbids this change. Do not offer to confirm it."""
 
 
 _NEGATION = (
@@ -111,6 +116,26 @@ def _cashflow_polarity_is_explicit(text: str, excluded: bool) -> bool:
         re.search(rf"\b(?:include(?:d)?|add|restore|count)\b{flow}", text)
         or re.search(rf"\b{_NEGATION}\b(?:\s+\w+){{0,5}}\s+exclude(?:d)?\b{flow}", text)
         or re.search(r"\bcash ?flow exclusion\b.{0,16}\b(?:off|false|no)\b", text)
+    )
+
+
+def unrequested_exclusion(
+    request: ApplyTransactionChanges, current_user_message: str
+) -> bool:
+    """Return whether the patch changes cashflow exclusion without a request.
+
+    The caller must drop this field and apply the rest of the patch.
+
+    Args:
+        request: The patch that the model returned.
+        current_user_message: The text of the current turn.
+
+    Returns:
+        True when the patch sets exclusion and the message does not ask for it.
+    """
+    patch = request.changes.exclude_from_cashflow
+    return patch is not None and not _cashflow_polarity_is_explicit(
+        normalize_text(instruction_view(current_user_message)), patch.value
     )
 
 
@@ -167,6 +192,83 @@ async def unnamed_category(
     return patch.value
 
 
+_PRESERVE_TARGETS = (
+    ("note", "note|description|desc|memo"),
+    ("category", "category"),
+    ("exclude_from_cashflow", "(?:cashflow|cash flow)(?: exclusion)?|exclusion"),
+)
+
+
+async def raise_vetoes(
+    session: AsyncSession,
+    request: ApplyTransactionChanges,
+    current_user_message: str,
+) -> str:
+    """Raise ExplicitlyDenied when the message forbids a change in the patch.
+
+    A confirmation never overrides these checks.
+
+    Args:
+        session: The session of the current turn.
+        request: The patch that the model returned.
+        current_user_message: The text of the current turn.
+
+    Returns:
+        The category evidence for a category set, else an empty string, so
+        the caller does not look it up again.
+    """
+    raw = current_user_message.strip()
+    instruction = parse_instruction(raw)
+    instruction_text = instruction.text
+    changes = request.changes
+    if has_global_no_change(instruction_text) or (
+        instruction.note_shorthand and has_global_no_change(raw)
+    ):
+        raise ExplicitlyDenied("the current message forbids transaction changes")
+    # A note can contain these words, so skip the note that the patch saves.
+    # Text after that note is an instruction.
+    note = (
+        changes.note.value
+        if changes.note is not None and changes.note.op == "set"
+        else None
+    )
+    kept_text = (
+        raw
+        if instruction.note_payload is None
+        else f"{instruction_text}\n{instruction.note_payload.removeprefix(note or '')}"
+    )
+    if preserves_target(kept_text, "it|this|everything") or any(
+        getattr(changes, field) is not None and preserves_target(kept_text, target)
+        for field, target in _PRESERVE_TARGETS
+    ):
+        raise ExplicitlyDenied("the current message asks to keep this unchanged")
+    if changes.note is not None and any(
+        negates_target(instruction_text, label)
+        for label in ("note", "description", "desc", "memo")
+    ):
+        raise ExplicitlyDenied("negated instructions cannot change transaction data")
+    evidence = (
+        await _category_evidence(
+            session, instruction_text, changes.category.value or ""
+        )
+        if changes.category is not None and changes.category.op == "set"
+        else ""
+    )
+    if changes.category is not None:
+        if changes.category.op == "set":
+            if negates_target(
+                instruction_text, normalize_text(evidence).replace("_", " ")
+            ) or _category_assignment_is_negated(instruction_text):
+                raise ExplicitlyDenied(
+                    "negated instructions cannot change transaction data"
+                )
+        elif negates_target(instruction_text, "category"):
+            raise ExplicitlyDenied(
+                "negated instructions cannot change transaction data"
+            )
+    return evidence
+
+
 async def _validate_ordinary_intent(
     session: AsyncSession,
     request: ApplyTransactionChanges,
@@ -178,6 +280,7 @@ async def _validate_ordinary_intent(
     instruction_text = instruction.text
     normalized = normalize_text(instruction_text)
     changes = request.changes
+    evidence = await raise_vetoes(session, request, current_user_message)
     if instruction.note_requires_category and not (
         changes.note is not None
         and changes.note.op == "set"
@@ -188,16 +291,11 @@ async def _validate_ordinary_intent(
             "note/category shorthand requires both note and category changes"
         )
     if instruction.note_shorthand and (
-        "?" in raw
-        or has_global_no_change(raw)
-        or has_ambiguous_intent(raw)
-        or has_non_mutating_intent(raw)
+        "?" in raw or has_ambiguous_intent(raw) or has_non_mutating_intent(raw)
     ):
         raise MutationRejected(
             "questions or uncertain shorthand cannot change transaction data"
         )
-    if has_global_no_change(instruction_text):
-        raise MutationRejected("the current message forbids transaction changes")
     if has_ambiguous_intent(instruction_text):
         raise MutationRejected("uncertain instructions cannot change transaction data")
     if "?" in instruction_text or has_non_mutating_intent(instruction_text):
@@ -207,11 +305,6 @@ async def _validate_ordinary_intent(
         note_value = (
             normalize_text(raw_note_value).strip() if changes.note.op == "set" else ""
         )
-        intent_without_payload = instruction_text
-        if negates_target(intent_without_payload, "note"):
-            raise MutationRejected(
-                "negated instructions cannot change transaction data"
-            )
         if changes.note.op == "set":
             bounded_note = normalize_text(instruction.note_payload or "").strip()
             if not bounded_note or note_value != bounded_note:
@@ -222,16 +315,7 @@ async def _validate_ordinary_intent(
             raise MutationRejected("clearing a note requires current-message intent")
     if changes.category is not None:
         if changes.category.op == "set":
-            evidence = await _category_evidence(
-                session, instruction_text, changes.category.value or ""
-            )
             value = normalize_text(evidence).replace("_", " ")
-            if negates_target(
-                instruction_text, value
-            ) or _category_assignment_is_negated(instruction_text):
-                raise MutationRejected(
-                    "negated instructions cannot change transaction data"
-                )
             # A shorthand note moves text out of the instruction. The category
             # must still appear somewhere in the message.
             evidence_text = (
@@ -242,10 +326,6 @@ async def _validate_ordinary_intent(
                     "category value must be supported by the current message"
                 )
         else:
-            if negates_target(instruction_text, "category"):
-                raise MutationRejected(
-                    "negated instructions cannot change transaction data"
-                )
             if not re.search(
                 r"\b(?:clear|remove|delete|uncategorize|uncategorise)\b.*\bcategory\b",
                 normalized,
