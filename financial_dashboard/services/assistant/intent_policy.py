@@ -132,8 +132,8 @@ _NON_MUTATING_START = re.compile(
     r"may\s+(?:i|we|you|this|that|it|the|there)\b|might|"
     r"explain|describe|show|list|"
     r"find|search|tell|give|check|inspect|review|look\s+up|"
-    r"take\s+a\s+look(?:\s+at)?|leave\b.{0,48}\bunchanged|"
-    r"keep\b.{0,48}\b(?:unchanged|as\s+is)|preserve|"
+    r"take\s+a\s+look(?:\s+at)?|(?:keep|leave|retain)\b.{0,48}\b(?:unchanged|"
+    r"as\s+(?:it\s+)?is|the\s+same|alone|intact|as\s+before)|preserve|"
     r"help\s+me\s+understand)\b"
     r"|^i\s+(?:want|need|would\s+like|'d\s+like)\s+to\s+"
     r"(?:understand|know|see|review|inspect)\b",
@@ -358,8 +358,10 @@ def preserves_target(text: str, target: str) -> bool:
     """
     return any(
         re.search(
-            rf"\b(?:keep|leave|preserve)\s+(?:(?:the|this|its)\s+)?(?:{target})"
-            r"(?:\s+(?:unchanged|as is|alone|intact)\b|$)",
+            rf"\b(?:keep|leave|preserve|retain)\s+"
+            rf"(?:(?:the|this|its|my|current|existing|old)\s+){{0,2}}(?:{target})"
+            r"(?:\s+(?:unchanged|as (?:it )?is|(?:the )?same|alone|intact|as before)"
+            r"\b|$)",
             normalize_text(clause),
         )
         for clause in re.split(r"[,.;:!?\n]", text)

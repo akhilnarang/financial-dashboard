@@ -674,11 +674,11 @@ async def test_unclear_change_asks_with_yes_no_buttons(
         "Don't categorize this as self transfer?",
         # An incomplete patch must not hide it either.
         'Set note to "lunch" and category self transfer; don\'t make changes',
-        "Keep the note unchanged",
+        "Preserve the existing note",
         # A guess must not offer the category that the user keeps.
-        'Set note to "new"; keep the category unchanged',
+        'Set note to "new"; keep the category the same',
         "Exclude from cashflow; keep the cashflow exclusion unchanged",
-        "Keep it as is",
+        "Keep it as it is",
     ],
 )
 async def test_forbidden_change_is_refused_not_offered(session, message):
