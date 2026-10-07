@@ -78,6 +78,15 @@
                     Folder
                     <input type="text" name="folder" placeholder="Optional">
                 </label>
+                <label data-field style="min-width: 140px;">
+                    Email kind
+                    <select name="email_kind">
+                        <option value="auto">Auto</option>
+                        {% for kind, label in email_kind_labels.items() %}
+                        <option value="{{ kind }}">{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
                 <button type="submit">Add</button>
             </div>
         </form>
@@ -96,6 +105,7 @@
                     <th>Sender</th>
                     <th>Subject</th>
                     <th>Folder</th>
+                    <th>Email kind</th>
                     <th>Status</th>
                     <th style="text-align: right;">Actions</th>
                 </tr>
@@ -108,6 +118,7 @@
                     <td class="text-sm"><code>{{ rule.sender or "&mdash;"|safe }}</code></td>
                     <td class="text-sm">{{ rule.subject or "&mdash;"|safe }}</td>
                     <td class="text-sm">{{ rule.folder or "&mdash;"|safe }}</td>
+                    <td class="text-sm">{{ email_kind_labels.get(rule.email_kind, rule.email_kind) if rule.email_kind else "Auto" }}</td>
                     <td>
                         <form method="post" action="/rules/{{ rule.id }}/toggle" style="display: inline;">
                             {% if rule.enabled %}
