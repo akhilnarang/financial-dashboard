@@ -35,26 +35,6 @@ def get_poll_status(poll_status: dict) -> dict:
     }
 
 
-async def _fetch_source(
-    source: EmailSource,
-    rules: list[FetchRule],
-    *,
-    fetch_limit: int,
-    existing_remote_ids: set[str],
-) -> FetchSourceResult:
-    """Fetch one source. An error fails only this source, not the poll."""
-    try:
-        return await get_provider(source).fetch_source(
-            source,
-            rules,
-            fetch_limit=fetch_limit,
-            existing_remote_ids=existing_remote_ids,
-        )
-    except Exception:
-        logger.exception("Email fetch failed for source %s", source.id)
-        return FetchSourceResult({}, False, set())
-
-
 async def poll_all(*, poll_lock: asyncio.Lock, poll_status: dict) -> dict:
     if poll_lock.locked():
         logger.info(
@@ -170,16 +150,23 @@ async def poll_all(*, poll_lock: asyncio.Lock, poll_status: dict) -> dict:
                     ).scalars()
                     existing_remote_ids: set[str] = {r for r in rows if r is not None}
 
-                (
-                    results_by_rule,
-                    fetch_ok,
-                    backfill_ready_rule_ids,
-                ) = await _fetch_source(
-                    source,
-                    source_rules,
-                    fetch_limit=fetch_limit,
-                    existing_remote_ids=existing_remote_ids,
-                )
+                try:
+                    (
+                        results_by_rule,
+                        fetch_ok,
+                        backfill_ready_rule_ids,
+                    ) = await get_provider(source).fetch_source(
+                        source,
+                        source_rules,
+                        fetch_limit=fetch_limit,
+                        existing_remote_ids=existing_remote_ids,
+                    )
+                except Exception:
+                    # An error fails only this source, not the poll.
+                    logger.exception("Email fetch failed for source %s", source_id)
+                    results_by_rule, fetch_ok, backfill_ready_rule_ids = (
+                        FetchSourceResult({}, False, set())
+                    )
                 logger.info(
                     "Email fetch completed for source %s, fetched %d total emails",
                     source_id,

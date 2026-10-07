@@ -37,27 +37,6 @@ def _imap_since_date(last_synced_at: datetime.datetime | None) -> str | None:
     return since.strftime("%d-%b-%Y")
 
 
-def _rule_since(rule: FetchRule, since_str: str | None) -> str | None:
-    """Return the SINCE date for one rule.
-
-    A rule without a finished initial backfill scans the last 3 months.
-    """
-    if rule.initial_backfill_done_at is not None:
-        return since_str
-    backfill_since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        days=INITIAL_BACKFILL_DAYS
-    )
-    rule_since_str = backfill_since.strftime("%d-%b-%Y")
-    logger.info(
-        "Rule %s (bank=%s, sender=%s) initial backfill — SINCE %s",
-        rule.id,
-        rule.bank,
-        rule.sender,
-        rule_since_str,
-    )
-    return rule_since_str
-
-
 class _SearchQuery(NamedTuple):
     """UID SEARCH criteria, and the UTF-8 literal that follows them."""
 
@@ -136,8 +115,21 @@ def _search_rule(
     Returns:
         The matching UIDs, or None when the SEARCH fails.
     """
+    if rule.initial_backfill_done_at is None:
+        # A rule without a finished initial backfill scans the last 3 months.
+        backfill_since = datetime.datetime.now(
+            datetime.timezone.utc
+        ) - datetime.timedelta(days=INITIAL_BACKFILL_DAYS)
+        since_str = backfill_since.strftime("%d-%b-%Y")
+        logger.info(
+            "Rule %s (bank=%s, sender=%s) initial backfill — SINCE %s",
+            rule.id,
+            rule.bank,
+            rule.sender,
+            since_str,
+        )
     try:
-        query = _build_search_query(rule, _rule_since(rule, since_str))
+        query = _build_search_query(rule, since_str)
         # The stub types literal as str. imaplib sends it as raw bytes.
         conn.literal = cast(str | None, query.literal)
         typ, data = conn.uid("SEARCH", query.criteria)
