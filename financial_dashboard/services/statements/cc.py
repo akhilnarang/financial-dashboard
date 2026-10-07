@@ -1736,16 +1736,8 @@ async def _upload_for_due_date(
 
     Only a real date identifies a cycle. SBI prints "NO PAYMENT REQUIRED" on
     every zero-due statement, so that text identifies no cycle.
-
-    Args:
-        account_id: The account that owns the statement.
-        due_date: The parsed due date text, or ``None``.
-
-    Returns:
-        The earlier upload, or ``None`` when there is none or the due date
-        is not a date.
     """
-    if due_date is None:
+    if not due_date:
         return None
     try:
         parse_cc_date(due_date)
