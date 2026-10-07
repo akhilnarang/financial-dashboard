@@ -3,6 +3,7 @@
 import datetime
 import email as email_lib
 import email.utils
+import re
 from email.header import decode_header
 
 
@@ -21,14 +22,16 @@ def _parse_email_date(raw_bytes: bytes) -> datetime.datetime | None:
 def _decode_header_value(raw: str | None) -> str:
     if not raw:
         return ""
-    parts = decode_header(raw)
+    # decode_header keeps the spaces of plain text and drops the spaces
+    # between encoded words. Unfold first, because it splits on line breaks.
+    unfolded = re.sub(r"\r?\n(?=[ \t])", "", raw)
     decoded = []
-    for part, charset in parts:
+    for part, charset in decode_header(unfolded):
         if isinstance(part, bytes):
             decoded.append(part.decode(charset or "utf-8", errors="replace"))
         else:
             decoded.append(part)
-    return " ".join(decoded)
+    return "".join(decoded)
 
 
 def _extract_message_metadata(raw_bytes: bytes) -> dict:

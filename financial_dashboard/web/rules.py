@@ -1,7 +1,7 @@
 """Rule HTML routes."""
 
 import logging
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Form, Query, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
 from financial_dashboard.db import (
+    EmailKind,
     EmailSource,
     FetchRule,
 )
@@ -26,6 +27,17 @@ logger = logging.getLogger(__name__)
 
 templates = get_templates()
 router = APIRouter()
+
+EMAIL_KIND_LABELS = {
+    EmailKind.TRANSACTION: "Transaction",
+    EmailKind.CC_STATEMENT: "Card statement",
+    EmailKind.BANK_STATEMENT: "Bank statement",
+    EmailKind.CAS_STATEMENT: "CAS statement",
+    EmailKind.STATEMENT: "Any statement (old)",
+}
+
+# FastAPI reads an empty form value as absent, so "auto" stands for NULL.
+EmailKindForm = Annotated[EmailKind | Literal["auto"] | None, Form()]
 
 
 @router.get("/rules", response_class=HTMLResponse)
@@ -74,6 +86,7 @@ async def rule_list(
             "sources": sources,
             "banks": banks,
             "supported_banks": SUPPORTED_BANKS,
+            "email_kind_labels": EMAIL_KIND_LABELS,
             "filters": filters,
         },
     )
@@ -88,6 +101,7 @@ async def rule_create(
     folder: str = Form(""),
     source_id: int = Form(None),
     provider: str = Form(""),
+    email_kind: EmailKindForm = None,
     session: AsyncSession = Depends(get_session),
 ):
     resolved_provider = provider.strip()
@@ -103,6 +117,7 @@ async def rule_create(
         sender=sender.strip() or None,
         subject=subject.strip() or None,
         folder=folder.strip() or None,
+        email_kind=None if email_kind == "auto" else email_kind,
     )
     session.add(rule)
     await session.commit()
@@ -133,6 +148,7 @@ async def rule_edit_form(
             "rule": rule,
             "sources": sources,
             "supported_banks": SUPPORTED_BANKS,
+            "email_kind_labels": EMAIL_KIND_LABELS,
         },
     )
 
@@ -148,6 +164,7 @@ async def rule_update(
     enabled: bool = Form(False),
     source_id: int = Form(None),
     provider: str = Form(""),
+    email_kind: EmailKindForm = None,
     session: AsyncSession = Depends(get_session),
 ):
     rule = await session.get(FetchRule, rule_id)
@@ -167,6 +184,8 @@ async def rule_update(
     rule.subject = subject.strip() or None
     rule.folder = folder.strip() or None
     rule.enabled = enabled
+    if email_kind is not None:
+        rule.email_kind = None if email_kind == "auto" else email_kind
     await session.commit()
 
     return RedirectResponse(url="/rules", status_code=303)

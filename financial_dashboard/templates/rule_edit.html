@@ -39,6 +39,15 @@
                     Folder
                     <input type="text" name="folder" value="{{ rule.folder or '' }}" placeholder="Optional">
                 </label>
+                <label data-field style="min-width: 140px;">
+                    Email kind
+                    <select name="email_kind">
+                        <option value="auto">Auto</option>
+                        {% for kind, label in email_kind_labels.items() %}
+                        <option value="{{ kind }}" {% if rule.email_kind == kind %}selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
                 <label data-field style="min-width: 100px; flex-direction: row; gap: 0.5rem; align-items: center;">
                     <input type="checkbox" name="enabled" value="true" {% if rule.enabled %}checked{% endif %} style="width: auto; margin: 0;">
                     Enabled
