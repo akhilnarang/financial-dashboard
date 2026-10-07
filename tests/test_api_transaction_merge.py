@@ -286,9 +286,12 @@ async def test_refused_pair_refuses_the_whole_batch(
         assert await session.get(Transaction, txn_id) is not None
 
 
-@pytest.mark.parametrize("override", ["references", "dates"])
+@pytest.mark.parametrize(
+    ("override", "keep_statement"),
+    [("references", False), ("dates", False), ("dates", True)],
+)
 async def test_override_merges_only_what_todays_parse_backs(
-    client, session, monkeypatch, tmp_path, override
+    client, session, monkeypatch, tmp_path, override, keep_statement
 ):
     if override == "references":
         seeded = await _seed_pair(session, statement_ref="654321")
@@ -297,10 +300,15 @@ async def test_override_merges_only_what_todays_parse_backs(
             session, statement_date=DAY + dt.timedelta(days=2), alert_ref=None
         )
     alert_id, statement_id, upload_id = seeded
+    # The statement posts the purchase days after the alert. The statement row
+    # stays, and the alert folds into it.
+    keep_id, dup_id = (
+        (statement_id, alert_id) if keep_statement else (alert_id, statement_id)
+    )
     other_alert, other_statement, _ = await _seed_pair(
         session, alert_ref="777888", statement_ref="UTR000777888"
     )
-    pairs = ((other_alert, other_statement), (alert_id, statement_id))
+    pairs = ((other_alert, other_statement), (keep_id, dup_id))
     upload = await session.get(BankStatementUpload, upload_id)
     assert upload is not None
     pdf = tmp_path / "stmt.pdf"
@@ -323,6 +331,11 @@ async def test_override_merges_only_what_todays_parse_backs(
             "reference_number": "123456" if override == "references" else "UTR000555",
         }
     )
+    if keep_statement:
+        old, today = (
+            today.model_copy(update={"reference_number": None}),
+            old.model_copy(update={"reference_number": "UTR000123456"}),
+        )
     parsed = [today]
     period = ["01/03/2030"]
     monkeypatch.setattr(
@@ -367,7 +380,7 @@ async def test_override_merges_only_what_todays_parse_backs(
     parsed[:] = [today, today.model_copy(update={"reference_number": "999999"})]
     distant = await client.post("/api/transactions/merge-batch", json=request)
     parsed[:] = [today]
-    if override == "dates":
+    if override == "dates" and not keep_statement:
         # A later pair in the batch fills the keeper's empty reference.
         copy = Transaction(
             account_id=upload.account_id,
@@ -407,28 +420,39 @@ async def test_override_merges_only_what_todays_parse_backs(
     assert response.status_code == 200
     assert [m["overrides"] for m in response.json()["merges"]] == [[], [override]]
     assert preview.json()["missing_count"] == 0
-    assert preview.json()["matched"][0]["matched_transaction_id"] == alert_id
+    assert preview.json()["matched"][0]["matched_transaction_id"] == keep_id
     session.expire_all()
-    assert await session.get(Transaction, statement_id) is None
-    keeper = await session.get(Transaction, alert_id)
+    assert await session.get(Transaction, dup_id) is None
+    keeper = await session.get(Transaction, keep_id)
     assert keeper is not None
     # The keeper keeps its own reference, even an empty one.
     assert (keeper.transaction_date, keeper.reference_number) == (
-        DAY,
-        "123456" if override == "references" else None,
+        (DAY + dt.timedelta(days=2), "UTR000123456")
+        if keep_statement
+        else (DAY, "123456" if override == "references" else None)
     )
     assert keeper.bank_statement_upload_id == upload_id
+    assert keeper.balance == Decimal("5000.00")
+    alert_sms = await session.scalar(
+        select(SmsMessage).where(SmsMessage.body.startswith("synthetic alert"))
+    )
+    assert alert_sms is not None
+    assert (keeper.sms_message_id, alert_sms.transaction_id) == (alert_sms.id, keep_id)
     record = await session.scalar(
         select(AuditAction).where(AuditAction.action_type == "merge_transaction")
     )
-    assert record is not None and record.target_id == statement_id
+    assert record is not None and record.target_id == dup_id
     assert json.loads(record.arguments_json or "{}") == {
-        "keep_id": alert_id,
+        "keep_id": keep_id,
         "override": [override],
         "reason": "checked by hand",
     }
     assert json.loads(record.before_json or "{}")["reference_number"] == (
-        "654321" if override == "references" else "UTR000123456"
+        None
+        if keep_statement
+        else "654321"
+        if override == "references"
+        else "UTR000123456"
     )
 
 

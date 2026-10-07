@@ -351,7 +351,11 @@ async def _cc_cycle(
 async def _parse_statements(
     session: AsyncSession, pairs: list[TransactionMergePair]
 ) -> dict[int, ParsedStoredStatement | str]:
-    """Parse the statement of each duplicate that a pair overrides.
+    """Parse the statement of each pair that an override lifts.
+
+    The duplicate's statement comes first, then the keeper's. A card statement
+    can post a purchase days after its alert. The keeper is then the statement
+    row, and the alert folds into it.
 
     The parse runs before the write lock. A PDF parse can take seconds.
     Each duplicate id maps to today's parse, or to why it cannot be checked.
@@ -360,12 +364,12 @@ async def _parse_statements(
     for pair in pairs:
         if not pair.override:
             continue
-        if (dup := await session.get(Transaction, pair.duplicate_id)) is None:
+        keep = await session.get(Transaction, pair.keep_id)
+        dup = await session.get(Transaction, pair.duplicate_id)
+        if keep is None or dup is None:
             continue
-        if (statement := statement_of(dup)) is None:
-            parses[pair.duplicate_id] = (
-                "an override needs a statement row as the duplicate"
-            )
+        if (statement := statement_of(dup) or statement_of(keep)) is None:
+            parses[pair.duplicate_id] = "an override needs a statement row"
             continue
         name = f"{statement.kind} statement {statement.id}"
         try:
@@ -393,8 +397,8 @@ async def _reparse_refusal(
         return stored
     statement = StatementRef(stored.kind, stored.statement_id)
     name = f"{statement.kind} statement {statement.id}"
-    if statement_of(dup) != statement:
-        return "the duplicate changed during the check; try again"
+    if statement not in (statement_of(dup), statement_of(keep)):
+        return "the pair changed during the check; try again"
     try:
         recon = await reconcile_parsed_statement(session, stored, as_reparse=True)
     except StatementPreviewError as exc:
