@@ -1,8 +1,6 @@
 """Bank statement HTML routes."""
 
-import asyncio
 import logging
-from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter,
@@ -13,7 +11,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import select, update
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.config import get_fernet
@@ -27,20 +25,13 @@ from financial_dashboard.db import (
 from financial_dashboard.services.accounts import (
     retry_password_required_statements as accounts_retry_password_required_statements,
 )
-from financial_dashboard.services.snapshots import emit_bank_snapshot
 from financial_dashboard.services.statements.bank import (
-    enrich_matched_transactions,
-    import_missing_bank_txns,
-    parse_bank_statement,
-    reconcile_bank_statement,
     reconciliation_from_json,
-    reconciliation_to_json,
+    upload_bank_statement,
 )
 from financial_dashboard.services.statements.shared import (
     retry_bank_statement_upload,
 )
-from financial_dashboard.services.statements.skip_summary import import_skip_summary
-from financial_dashboard.core.uploads import STATEMENTS_DIR, safe_upload_filename
 from financial_dashboard.web.forms import _unlink_statement_file
 from financial_dashboard.web.transaction_display import (
     hydrate_reconciliation_transactions,
@@ -70,95 +61,11 @@ async def bank_statement_upload(
     if not account or account.type != "bank_account":
         return RedirectResponse(url="/statements", status_code=303)
 
-    # Save PDF to disk
-    STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    safe_name = safe_upload_filename(file.filename)
-    file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
-    content = await file.read()
-    file_path.write_bytes(content)
-
-    # Parse the PDF
-    try:
-        parsed = await asyncio.to_thread(
-            parse_bank_statement, file_path, account.bank, password or None
-        )
-    except Exception as e:
-        error_msg = str(e)
-        is_encrypted = "encrypt" in error_msg.lower() or "password" in error_msg.lower()
-        upload = BankStatementUpload(
-            account_id=account_id,
-            bank=account.bank,
-            filename=safe_name,
-            file_path=str(file_path),
-            status="password_required" if is_encrypted else "parse_error",
-            error=error_msg,
-        )
-        session.add(upload)
-        await emit_bank_snapshot(session, upload)
-        await session.commit()
-        upload_id = upload.id
-        return RedirectResponse(url=f"/statements/bank/{upload_id}", status_code=303)
-
-    # Reconcile against DB transactions for this account
-    db_txns = (
-        (
-            await session.execute(
-                select(Transaction).where(Transaction.account_id == account_id)
-            )
-        )
-        .scalars()
-        .all()
+    result = await upload_bank_statement(
+        session, account, file.filename, await file.read(), password or None
     )
-
-    db_txns = list(db_txns)
-    recon = reconcile_bank_statement(parsed, db_txns, account_id)
-    await enrich_matched_transactions(recon)
-
-    # Create upload and auto-import missing transactions
-    upload = BankStatementUpload(
-        account_id=account_id,
-        bank=parsed.bank or account.bank,
-        filename=safe_name,
-        file_path=str(file_path),
-        status="parsed",
-        account_number=parsed.account_number,
-        account_holder_name=parsed.account_holder_name,
-        opening_balance=parsed.opening_balance,
-        closing_balance=parsed.closing_balance,
-        statement_period_start=parsed.statement_period_start,
-        statement_period_end=parsed.statement_period_end,
-        parsed_txn_count=len(recon["matched"]) + len(recon["missing"]),
-        matched_count=len(recon["matched"]),
-        missing_count=len(recon["missing"]),
-        reconciliation_data=reconciliation_to_json(recon),
-    )
-    session.add(upload)
-    await session.flush()
-
-    # Auto-import missing transactions with the same per-row SAVEPOINT /
-    # duplicate-tolerant semantics as the email path — one bad row must not
-    # abort the entire manual upload.
-    imported_rows = await import_missing_bank_txns(
-        session, upload, parsed, account, recon
-    )
-    imported = len(imported_rows)
-
-    upload.imported_count = imported
-    upload.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
-    upload.reconciliation_data = reconciliation_to_json(recon)
-    if upload.missing_count == 0:
-        upload.status = "imported"
-    elif imported > 0:
-        upload.status = "partial_import"
-    _dupes, _errs, skip_error = import_skip_summary(recon)
-    if skip_error:
-        upload.error = skip_error
-    await emit_bank_snapshot(session, upload)
-    await session.commit()
-    upload_id = upload.id
-
-    return RedirectResponse(url=f"/statements/bank/{upload_id}", status_code=303)
+    assert result.upload is not None
+    return RedirectResponse(url=f"/statements/bank/{result.upload.id}", status_code=303)
 
 
 @router.get("/statements/bank/{upload_id}", response_class=HTMLResponse)

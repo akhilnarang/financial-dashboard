@@ -20,7 +20,6 @@ are used inside async functions to avoid circular import issues.
 """
 
 import asyncio
-import datetime
 import json
 import logging
 import re
@@ -32,6 +31,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 if TYPE_CHECKING:
     from bank_statement_parser.models import BankTransaction, ParsedBankStatement
@@ -46,6 +46,7 @@ from financial_dashboard.db import (
 from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
 from financial_dashboard.core.masks import mask_last4
+from financial_dashboard.core.uploads import safe_upload_filename, save_statement_pdf
 from financial_dashboard.integrations.parsers import parse_bank_statement_pdf
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.categorization.rules import is_fd_counterparty
@@ -57,6 +58,7 @@ from financial_dashboard.services.snapshots import emit_bank_snapshot
 from financial_dashboard.services.settings import (
     get_setting_int,
     get_telegram_chat_id,
+    is_telegram_configured,
     should_notify_transactions,
 )
 from financial_dashboard.services.statements.cc import extract_pdf_from_email
@@ -69,13 +71,12 @@ from financial_dashboard.services.statements.skip_summary import import_skip_sum
 from financial_dashboard.services.telegram import (
     build_account_label,
     send_bulk_summary,
+    send_statement_balance_note,
     send_transaction_notification,
 )
 
 logger = logging.getLogger(__name__)
 
-STATEMENTS_DIR = Path(__file__).resolve().parent.parent / "data" / "statements"
-_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _TOKEN_RE = re.compile(r"[A-Za-z]{4,}")
 _MIN_REF_SUBSTRING_LEN = 6
 _OVERLAP_STOPWORDS: frozenset[str] = frozenset(
@@ -150,7 +151,6 @@ _BANK_RECONCILIATION_GATES = (
     "account_scope",
     "reference_direction",
     "reference_amount_compatibility",
-    "known_balance_compatibility",
     "direction_amount",
     "date_window_plus_minus_one_day",
     "reference_or_narration_compatibility",
@@ -182,12 +182,6 @@ class BankStatementProcessingError(Exception):
     """
 
 
-def _safe_filename(filename: str | None) -> str:
-    base = Path(filename or "statement.pdf").name or "statement.pdf"
-    cleaned = _SAFE_FILENAME_RE.sub("_", base).strip("._") or "statement.pdf"
-    return cleaned[:120]
-
-
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
@@ -215,17 +209,16 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> tuple:
     return (txn_date, amount, direction)
 
 
-def _known_balance_compatible(
-    candidate_balance: Decimal | None, statement_balance: str | None
-) -> bool:
-    """Reject a reference match only when both known balances contradict."""
-    if candidate_balance is None or statement_balance is None:
-        return True
+def _balances_disagree(entry: dict) -> bool:
+    """Say whether a matched entry holds two known, different balances."""
+    alert_balance, statement_balance = entry.get("db_balance"), entry.get("balance")
+    if alert_balance is None or statement_balance is None:
+        return False
     try:
-        return Decimal(str(candidate_balance)) == _parse_amount(statement_balance)
+        return _parse_amount(alert_balance) != _parse_amount(statement_balance)
     except InvalidOperation, ValueError:
-        # An unparseable value is unknown evidence, not a contradiction.
-        return True
+        # An unparseable value is unknown evidence, not a disagreement.
+        return False
 
 
 def _reference_compatible_ids(
@@ -270,6 +263,18 @@ def _take_sole_unconsumed(
     if len(pool) == 1:
         return pool[0]
     return None
+
+
+def _ref_key(ref: str | None) -> str | None:
+    """Return a numeric reference without leading zeros.
+
+    One bank prints the same numeric reference at different zero-padded
+    widths in different statement layouts. An all-zero reference carries no
+    identity, so the result is ``None``. Other references do not change.
+    """
+    if ref and ref.isdigit():
+        return ref.lstrip("0") or None
+    return ref or None
 
 
 def _ref_appears_in(ref: str | None, text: str | None) -> bool:
@@ -322,7 +327,6 @@ def _is_statement_candidate_compatible(
     statement_reference: str | None,
     statement_narration: str | None,
     statement_channel: str | None,
-    statement_balance: str | None,
     account_holder_tokens: set[str],
     has_date_offset: bool,
 ) -> bool:
@@ -335,7 +339,6 @@ def _is_statement_candidate_compatible(
         statement_narration: Description parsed from the statement row.
         statement_channel: Normalized payment channel parsed from the statement,
             such as ``"upi"``.
-        statement_balance: Post-transaction balance printed on the statement.
         account_holder_tokens: Name tokens excluded from narration overlap because
             they are common to unrelated self-transfers.
         has_date_offset: Whether the candidate and statement dates differ. A
@@ -344,8 +347,9 @@ def _is_statement_candidate_compatible(
 
     Compatibility rules:
 
-    - Contradictory known post-transaction balances always refuse a pairing;
-      one missing or unparseable balance remains unknown rather than negative.
+    - Balance never refuses a pairing. An alert reports the available
+      balance, which excludes held funds such as an IPO block. The statement
+      prints the book balance. The two differ while funds are held.
 
     - Refs agree, or at least one side has no ref → compatible. This is
       the common case: email parsers often miss the ref, statement
@@ -379,27 +383,17 @@ def _is_statement_candidate_compatible(
     - Otherwise → incompatible.
     """
     candidate_reference = candidate_transaction.reference_number
+    candidate_key = _ref_key(candidate_reference)
+    statement_key = _ref_key(statement_reference)
     candidate_narration = (
         candidate_transaction.raw_description or candidate_transaction.counterparty
     )
     candidate_channel = candidate_transaction.channel
 
-    # Exact, non-null reference equality overrides a balance disagreement: an
-    # SMS-sourced row reports available balance while the statement reports
-    # book balance, so equal references with unequal balances is expected. The
-    # unique reference index leaves at most one candidate, so balance has
-    # nothing to weigh. The veto stays below for the fuzzy cases, where a
-    # balance disagreement is a real negative signal.
-    if (
-        statement_reference
-        and candidate_reference
-        and statement_reference == candidate_reference
-    ):
+    # Equal references match at any date offset.
+    if statement_key and candidate_key and statement_key == candidate_key:
         return True
-
-    if not _known_balance_compatible(candidate_transaction.balance, statement_balance):
-        return False
-    if not (statement_reference and candidate_reference):
+    if not (statement_key and candidate_key):
         return True
 
     if has_date_offset:
@@ -446,7 +440,6 @@ def _compatible_candidates(
     statement_reference: str | None,
     statement_narration: str | None,
     statement_channel: str | None,
-    statement_balance: str | None,
     account_holder_tokens: set[str],
     has_date_offset: bool,
 ) -> CompatibleCandidates:
@@ -460,7 +453,6 @@ def _compatible_candidates(
         statement_reference: Reference number parsed from the statement row.
         statement_narration: Description parsed from the statement row.
         statement_channel: Normalized payment channel from the statement row.
-        statement_balance: Post-transaction balance from the statement row.
         account_holder_tokens: Holder-name tokens excluded from narration overlap.
         has_date_offset: Whether this bucket is one day away from the statement
             date rather than an exact-date bucket.
@@ -478,7 +470,6 @@ def _compatible_candidates(
             statement_reference=statement_reference,
             statement_narration=statement_narration,
             statement_channel=statement_channel,
-            statement_balance=statement_balance,
             account_holder_tokens=account_holder_tokens,
             has_date_offset=has_date_offset,
         ):
@@ -538,7 +529,7 @@ class RefreshIdentity(NamedTuple):
     channel: str | None
 
 
-def _refresh_identity(txn: "BankTransaction") -> RefreshIdentity:
+def _refresh_identity(txn: BankTransaction) -> RefreshIdentity:
     counterparty = (txn.counterparty or "").strip()
     narration = (txn.narration or "").strip()
     return RefreshIdentity(counterparty or narration, txn.channel)
@@ -547,7 +538,7 @@ def _refresh_identity(txn: "BankTransaction") -> RefreshIdentity:
 def _missing_entry(
     statement_row_index: int,
     direction: str,
-    statement_transaction: "BankTransaction",
+    statement_transaction: BankTransaction,
     *,
     ambiguous: bool = False,
     candidate_ids: set[int] | None = None,
@@ -588,7 +579,7 @@ def _missing_entry(
 def _matched_entry(
     statement_row_index: int,
     direction: str,
-    statement_transaction: "BankTransaction",
+    statement_transaction: BankTransaction,
     matched_transaction: Transaction,
     *,
     candidate_ids: set[int],
@@ -615,6 +606,11 @@ def _matched_entry(
         "channel": statement_transaction.channel,
         "balance": statement_transaction.balance,
         "db_txn_id": matched_transaction.id,
+        "db_balance": (
+            None
+            if matched_transaction.balance is None
+            else str(matched_transaction.balance)
+        ),
         "db_counterparty": matched_transaction.counterparty,
         "db_reference": matched_transaction.reference_number,
         "db_date": (
@@ -636,7 +632,7 @@ def _matched_entry(
 
 
 def reconcile_bank_statement(
-    parsed: "ParsedBankStatement", db_transactions: list, account_id: int
+    parsed: ParsedBankStatement, db_transactions: list, account_id: int
 ) -> dict:
     """Match statement transactions against DB transactions.
 
@@ -659,14 +655,14 @@ def reconcile_bank_statement(
 
     Returns a dict with matched, missing lists and balance verification.
     """
-    stmt_txns: list[tuple[str, "BankTransaction"]] = [
+    stmt_txns: list[tuple[str, BankTransaction]] = [
         (txn.transaction_type, txn) for txn in parsed.transactions or []
     ]
 
     # Pre-parse amount/date once so every pass uses the same normalized form
     # and parse failures land in `missing` immediately.
     parsed_rows: list[
-        tuple[int, str, "BankTransaction", Decimal | None, date_type | None]
+        tuple[int, str, BankTransaction, Decimal | None, date_type | None]
     ] = []
     matched = []
     missing = []
@@ -680,17 +676,15 @@ def reconcile_bank_statement(
         parsed_rows.append((stmt_idx, direction, txn, amount, txn_date))
 
     # Build DB candidate pools.
-    # ref_pool: (reference_number, direction) — UPI refunds may reuse the
+    # ref_pool: (reference key, direction) — UPI refunds may reuse the
     # same ref with the opposite direction, so direction stays in the key.
     # date_pool: (date, amount, direction) for fuzzy fallback.
     db_by_id: dict[int, Transaction] = {db_txn.id: db_txn for db_txn in db_transactions}
     ref_pool: dict[tuple[str, str], list[int]] = {}
     date_pool: dict[tuple, list[int]] = {}
     for db_txn in db_transactions:
-        if db_txn.reference_number and db_txn.direction:
-            ref_pool.setdefault((db_txn.reference_number, db_txn.direction), []).append(
-                db_txn.id
-            )
+        if (db_ref := _ref_key(db_txn.reference_number)) and db_txn.direction:
+            ref_pool.setdefault((db_ref, db_txn.direction), []).append(db_txn.id)
         if db_txn.transaction_date and db_txn.amount is not None and db_txn.direction:
             key = _match_key(
                 db_txn.transaction_date,
@@ -708,15 +702,16 @@ def reconcile_bank_statement(
     reference_matched_indices: set[int] = set()
 
     # Keep two reference sets per statement row. Every exact-reference row is
-    # retained as evidence so an amount/balance contradiction remains ambiguous
+    # retained as evidence so an amount contradiction remains ambiguous
     # rather than looking absent and being imported. Only compatible rows enter
     # contention, however: contradictory evidence cannot demote a valid winner.
     reference_evidence_sets: dict[int, set[int]] = {}
     compatible_reference_ids: dict[int, list[int]] = {}
     for stmt_idx, direction, txn, amount, _txn_date in parsed_rows:
-        if not txn.reference_number or amount is None:
+        statement_ref = _ref_key(txn.reference_number)
+        if not statement_ref or amount is None:
             continue
-        reference_ids = ref_pool.get((txn.reference_number, direction))
+        reference_ids = ref_pool.get((statement_ref, direction))
         if not reference_ids:
             continue
         reference_evidence_sets[stmt_idx] = set(reference_ids)
@@ -772,7 +767,6 @@ def reconcile_bank_statement(
                     statement_reference=txn.reference_number,
                     statement_narration=txn.narration,
                     statement_channel=txn.channel,
-                    statement_balance=txn.balance,
                     account_holder_tokens=account_holder_tokens,
                     has_date_offset=offset != 0,
                 ).compatible_ids
@@ -831,7 +825,6 @@ def reconcile_bank_statement(
                     statement_reference=statement_reference,
                     statement_narration=txn.narration,
                     statement_channel=txn.channel,
-                    statement_balance=txn.balance,
                     account_holder_tokens=account_holder_tokens,
                     has_date_offset=offset != 0,
                 )
@@ -854,11 +847,15 @@ def reconcile_bank_statement(
     # match. The loser is held back regardless — it is a second statement row
     # for a transaction the DB holds once.
     txn_by_idx = {stmt_idx: txn for stmt_idx, _direction, txn, *_rest in parsed_rows}
+    final = {
+        i for i in reference_matched_indices if len(reference_evidence_sets[i]) == 1
+    }
     contested = []
     for stmt_idx, db_id in claimed_ids.items():
+        reach = compatible_reference_ids if stmt_idx in final else contention_sets
         rivals = [
             other_idx
-            for other_idx, candidates in contention_sets.items()
+            for other_idx, candidates in reach.items()
             if other_idx != stmt_idx and db_id in candidates
         ]
         if not rivals:
@@ -1027,6 +1024,50 @@ async def enrich_matched_transactions(recon: dict) -> int:
     return enriched
 
 
+async def notify_balance_mismatches(
+    upload: BankStatementUpload, recon: dict, account_label: str
+) -> None:
+    """Send one note when the statement does not tally and rows need a check.
+
+    Balance does not refuse a match, so two kinds of row need a check: a match
+    whose alert balance differs from the statement balance, and a row held
+    back as ambiguous. Funds on hold explain both when the statement tallies.
+    Otherwise a match may be wrong or a held row may be new.
+
+    Args:
+        upload: The imported statement.
+        recon: Its reconciliation after import.
+        account_label: Label of the statement account.
+
+    Returns:
+        None. A failed check is logged and not raised.
+    """
+    mismatches = [e for e in recon["matched"] if _balances_disagree(e)]
+    held = [e for e in recon["missing"] if e.get("ambiguous") and not e.get("imported")]
+    if not (mismatches or held) or not is_telegram_configured():
+        return
+    # function-local: services.reconcile imports this module.
+    from financial_dashboard.services.reconcile import statement_gap
+
+    try:
+        async with async_session() as session:
+            gap = await statement_gap(session, upload)
+    except Exception:
+        # The import is already committed. A failed check must not undo it.
+        logger.warning("Statement tally check failed", exc_info=True)
+        return
+    # balance_verification uses the same 1-unit tolerance.
+    if gap is None or abs(gap) < 1:
+        return
+    await send_statement_balance_note(
+        get_telegram_chat_id(),
+        account_label=account_label,
+        mismatches=mismatches,
+        held=held,
+        gap=gap,
+    )
+
+
 def reconciliation_to_json(data: dict) -> str:
     """Serialize reconciliation data to JSON."""
     return json.dumps(data)
@@ -1123,7 +1164,7 @@ async def _find_bank_account(bank: str, parsed) -> "Account | None":
 async def import_missing_bank_txns(
     session,
     upload: "BankStatementUpload",
-    parsed: "ParsedBankStatement",
+    parsed: ParsedBankStatement,
     account: "Account",
     recon: dict,
 ) -> list["Transaction"]:
@@ -1228,6 +1269,122 @@ async def import_missing_bank_txns(
         imported.append(txn)
 
     return imported
+
+
+class ManualBankUploadResult(NamedTuple):
+    """Outcome of one manual bank statement upload."""
+
+    parsed: ParsedBankStatement | None
+    recon: dict | None
+    upload: BankStatementUpload | None
+    error: str | None
+
+
+async def upload_bank_statement(
+    session: AsyncSession,
+    account: Account,
+    filename: str | None,
+    content: bytes,
+    password: str | None,
+    *,
+    dry_run: bool = False,
+) -> ManualBankUploadResult:
+    """Parse, reconcile and import one manually uploaded bank statement PDF.
+
+    A real run saves the PDF, records an upload row, enriches matched rows and
+    imports the missing rows. A dry run only parses and reconciles against the
+    account rows. It writes nothing.
+
+    Args:
+        session: Open async session. A real run commits it.
+        account: The bank_account the statement belongs to.
+        filename: Client file name. It is sanitized before use.
+        content: Raw PDF bytes.
+        password: PDF password, or None.
+        dry_run: Skip every write when True.
+
+    Returns:
+        The parsed statement, the reconciliation dict, the upload row (None in
+        a dry run) and the parse error text (None on success).
+    """
+    safe_name = safe_upload_filename(filename)
+    file_path = None if dry_run else save_statement_pdf(content, safe_name)
+    try:
+        parsed = await asyncio.to_thread(
+            _parse_pdf_bytes_sync, content, account.bank, password
+        )
+    except Exception as e:
+        error_msg = str(e)
+        if file_path is None:
+            return ManualBankUploadResult(None, None, None, error_msg)
+        is_encrypted = "encrypt" in error_msg.lower() or "password" in error_msg.lower()
+        upload = BankStatementUpload(
+            account_id=account.id,
+            bank=account.bank,
+            filename=safe_name,
+            file_path=str(file_path),
+            status="password_required" if is_encrypted else "parse_error",
+            error=error_msg,
+        )
+        session.add(upload)
+        await emit_bank_snapshot(session, upload)
+        await session.commit()
+        return ManualBankUploadResult(None, None, upload, error_msg)
+
+    db_txns = list(
+        (
+            await session.execute(
+                select(Transaction).where(Transaction.account_id == account.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    recon = reconcile_bank_statement(parsed, db_txns, account.id)
+    if file_path is None:
+        return ManualBankUploadResult(parsed, recon, None, None)
+
+    await enrich_matched_transactions(recon)
+
+    upload = BankStatementUpload(
+        account_id=account.id,
+        bank=parsed.bank or account.bank,
+        filename=safe_name,
+        file_path=str(file_path),
+        status="parsed",
+        account_number=parsed.account_number,
+        account_holder_name=parsed.account_holder_name,
+        opening_balance=parsed.opening_balance,
+        closing_balance=parsed.closing_balance,
+        statement_period_start=parsed.statement_period_start,
+        statement_period_end=parsed.statement_period_end,
+        parsed_txn_count=len(recon["matched"]) + len(recon["missing"]),
+        matched_count=len(recon["matched"]),
+        missing_count=len(recon["missing"]),
+        reconciliation_data=reconciliation_to_json(recon),
+    )
+    session.add(upload)
+    await session.flush()
+
+    # One bad row must not abort the whole manual upload.
+    imported = len(
+        await import_missing_bank_txns(session, upload, parsed, account, recon)
+    )
+
+    upload.imported_count = imported
+    upload.missing_count = sum(1 for e in recon["missing"] if not e.get("imported"))
+    upload.reconciliation_data = reconciliation_to_json(recon)
+    if upload.missing_count == 0:
+        upload.status = "imported"
+    elif imported > 0:
+        upload.status = "partial_import"
+    _dupes, _errs, skip_error = import_skip_summary(recon)
+    if skip_error:
+        upload.error = skip_error
+    await emit_bank_snapshot(session, upload)
+    await session.commit()
+    await notify_balance_mismatches(upload, recon, account.label)
+    return ManualBankUploadResult(parsed, recon, upload, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1378,11 +1535,8 @@ async def process_bank_statement_email(
 
         if not parsed:
             # Save for manual retry
-            STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-            ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
-            safe_name = _safe_filename(filename)
-            file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
-            file_path.write_bytes(pdf_bytes)
+            safe_name = safe_upload_filename(filename)
+            file_path = save_statement_pdf(pdf_bytes, safe_name)
 
             # Only attach if there's exactly one bank account for this bank;
             # otherwise we'd mis-attribute the PDF and (worse) leak the hint to
@@ -1468,11 +1622,8 @@ async def process_bank_statement_email(
     enriched = await enrich_matched_transactions(recon)
 
     # Save the PDF to disk
-    STATEMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%d_%H%M%S")
-    safe_name = _safe_filename(filename)
-    file_path = STATEMENTS_DIR / f"{ts}_{safe_name}"
-    file_path.write_bytes(pdf_bytes)
+    safe_name = safe_upload_filename(filename)
+    file_path = save_statement_pdf(pdf_bytes, safe_name)
 
     # Create BankStatementUpload and import missing transactions
     async with async_session() as session:
@@ -1565,6 +1716,8 @@ async def process_bank_statement_email(
                 source="bank_statement",
                 txns=imported_txns,
             )
+
+    await notify_balance_mismatches(upload, recon, account.label)
 
     duplicate_count, import_error_count, _skip_msg = import_skip_summary(recon)
     logger.info(

@@ -113,7 +113,7 @@ async def test_process_cas_email_ingests_or_surfaces_ingest_error(
                 "financial_dashboard.integrations.parsers.parse_cas_pdf",
                 return_value=FakeCasStatement(),
             ),
-            patch("financial_dashboard.services.cas_emails.STATEMENTS_DIR", tmp_path),
+            patch("financial_dashboard.core.uploads.STATEMENTS_DIR", tmp_path),
         ):
             return await cas_emails.process_cas_email(
                 session, b"raw", source_id=src.id, log_ref=log_ref
@@ -188,10 +188,15 @@ async def test_cas_dispatcher_commits_only_on_success(mock_kwargs, error):
         fake_session.rollback.assert_awaited_once()
 
 
-@pytest.mark.parametrize("fetch_ok", [True, False])
-async def test_cas_cooldown_stamped_only_on_fetch_success(monkeypatch, fetch_ok):
+@pytest.mark.parametrize(
+    ("fetch_ok", "fetch_error"), [(True, None), (False, None), (False, OSError)]
+)
+async def test_cas_cooldown_stamped_only_on_fetch_success(
+    monkeypatch, fetch_ok, fetch_error
+):
     """A transient fetch failure must not stamp cas_last_polled_at. Else one
-    network blip locks CAS polling for 24h."""
+    network blip locks CAS polling for 24h. A fetch that raises fails only
+    its source, and the poll still completes."""
     engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     monkeypatch.setattr(orchestrator, "async_session", maker)
@@ -216,6 +221,7 @@ async def test_cas_cooldown_stamped_only_on_fetch_success(monkeypatch, fetch_ok)
     fake_provider = AsyncMock()
     # Shape: (results_by_rule, fetch_ok, backfill_ready_rule_ids).
     fake_provider.fetch_source.return_value = ({}, fetch_ok, set())
+    fake_provider.fetch_source.side_effect = fetch_error
 
     with patch.object(orchestrator, "get_provider", return_value=fake_provider):
         await orchestrator.poll_all(

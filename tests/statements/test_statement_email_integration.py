@@ -818,3 +818,81 @@ async def test_bank_notifications_single_vs_bulk_threshold(
     await process_bank_statement_email("icici", raw2, "Account statement")
     assert singles == []
     assert bulks == [6]
+
+    # A statement that does not tally sends one note when a match holds two
+    # balances or a row is held back as ambiguous.
+    notes = h.capture_balance_notes(monkeypatch)
+    acc_id = await h.add_bank_account(
+        maker, bank="idfc", label="IDFC", account_number="3333333333"
+    )
+    async with maker() as session:
+        for month in (8, 9, 10):
+            session.add(
+                Transaction(
+                    account_id=acc_id,
+                    bank="idfc",
+                    email_type="sms",
+                    direction="debit",
+                    amount=Decimal("500.00"),
+                    transaction_date=datetime.date(2026, month, 5),
+                    balance=Decimal("4321.00"),
+                )
+            )
+        await session.commit()
+
+    def _held_funds_statement(month, closing, narrations=("UPI-Debit",)):
+        return h.bank_parsed(
+            bank="idfc",
+            account_number="3333333333",
+            opening_balance="10,000.00",
+            closing_balance=closing,
+            statement_period_start=f"01/{month:02}/2026",
+            statement_period_end=f"30/{month:02}/2026",
+            transactions=[
+                h.bank_txn(
+                    date=f"05/{month:02}/2026",
+                    amount="500.00",
+                    narration=narration,
+                    balance="9,500.00",
+                )
+                for narration in narrations
+            ],
+        )
+
+    # The statement change is -1,000.00 but the DB net is -500.00: no tally.
+    monkeypatch.setattr(
+        bank_module,
+        "_parse_pdf_bytes_sync",
+        h.make_bank_parser(_held_funds_statement(8, "9,000.00")),
+    )
+    raw3 = h.email_with_pdf(subject="Account statement")
+    result = await process_bank_statement_email("idfc", raw3, "Account statement")
+    assert (result["matched"], result["imported"]) == (1, 0)
+    assert len(notes) == 1
+    assert "₹500.00" in notes[0]
+    assert "alert balance ₹4321.00 vs statement ₹9,500.00" in notes[0]
+    assert "held" not in notes[0]
+
+    notes.clear()
+    monkeypatch.setattr(
+        bank_module,
+        "_parse_pdf_bytes_sync",
+        h.make_bank_parser(_held_funds_statement(9, "9,500.40")),
+    )
+    raw4 = h.email_with_pdf(subject="Account statement")
+    result = await process_bank_statement_email("idfc", raw4, "Account statement")
+    assert (result["matched"], result["imported"]) == (1, 0)
+    assert notes == []
+
+    # Two statement rows contend for one alert. Both are held, nothing matches.
+    monkeypatch.setattr(
+        bank_module,
+        "_parse_pdf_bytes_sync",
+        h.make_bank_parser(_held_funds_statement(10, "9,000.00", ("SHOP A", "SHOP B"))),
+    )
+    raw5 = h.email_with_pdf(subject="Account statement")
+    result = await process_bank_statement_email("idfc", raw5, "Account statement")
+    assert (result["matched"], result["imported"]) == (0, 0)
+    assert len(notes) == 1
+    assert "alert balance" not in notes[0]
+    assert notes[0].count("05/10/2026 debit ₹500.00: held") == 2

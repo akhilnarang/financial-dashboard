@@ -6,22 +6,37 @@ from typing import Annotated
 
 from fastapi import APIRouter, Path, Query
 from fastapi.responses import FileResponse
+from pydantic import Field
 
 from financial_dashboard.api.query import validate_date_range
 from financial_dashboard.core.deps import AsyncSessionDep
-from financial_dashboard.exceptions import BadRequestException, NotFoundException
+from financial_dashboard.exceptions import (
+    BadRequestException,
+    ConflictException,
+    NotFoundException,
+)
 from financial_dashboard.schemas import transactions as transaction_schemas
 from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.schemas.transactions import (
     TransactionCategoryResponse,
     TransactionCategoryUpdate,
+    TransactionDeleteBatchRequest,
+    TransactionDeleteResponse,
     TransactionExcludeResponse,
     TransactionExcludeUpdate,
+    TransactionMergeBatchRequest,
+    TransactionMergeResponse,
     TransactionNoteResponse,
     TransactionNoteUpdate,
     TransactionRelinkResponse,
     TransactionRelinkUpdate,
 )
+from financial_dashboard.services.duplicate_merge import (
+    BatchRefused,
+    merge_duplicates,
+)
+from financial_dashboard.services.categorization.vocabulary import list_categories
+from financial_dashboard.services.phantom_delete import delete_phantoms
 from financial_dashboard.services.transaction_reads import (
     get_transaction_detail,
     get_transactions_by_ids,
@@ -29,6 +44,7 @@ from financial_dashboard.services.transaction_reads import (
 )
 from financial_dashboard.services.transactions import (
     RelinkError,
+    categorize_transactions,
     relink_transaction,
     set_transaction_excluded,
     update_transaction_category,
@@ -62,11 +78,20 @@ async def transactions_list(
     bank: Annotated[str | None, Query(min_length=1, max_length=64)] = None,
     email_type: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     source: Annotated[str | None, Query(min_length=1, max_length=32)] = None,
-    category: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+    category: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=128)]] | None,
+        Query(max_length=50),
+    ] = None,
+    q: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
+    exclude_from_cashflow: bool | None = None,
     review_status: Annotated[str | None, Query(min_length=1, max_length=32)] = None,
     reference_number: Annotated[str | None, Query(min_length=1, max_length=256)] = None,
 ) -> transaction_schemas.TransactionListResponse:
-    """List a bounded page of transactions matching optional exact filters."""
+    """List a bounded page of transactions matching optional filters.
+
+    ``category`` repeats to match any of several slugs. ``q`` is a
+    case-insensitive literal substring search over the row's text fields.
+    """
     validate_date_range(date_from, date_to)
 
     return await list_transactions(
@@ -87,9 +112,11 @@ async def transactions_list(
         bank=bank,
         email_type=email_type,
         source=source,
-        category=category,
+        categories=category,
         review_status=review_status,
         reference_number=reference_number,
+        search=q,
+        excluded=exclude_from_cashflow,
     )
 
 
@@ -100,6 +127,67 @@ async def transactions_batch(
 ) -> transaction_schemas.TransactionBatchResponse:
     """Return transaction summaries for an ordered, explicit set of IDs."""
     return await get_transactions_by_ids(session, payload.ids)
+
+
+@router.post("/transactions/merge-batch")
+async def transactions_merge_batch(
+    payload: TransactionMergeBatchRequest,
+    session: AsyncSessionDep,
+) -> TransactionMergeResponse:
+    """Merge duplicate rows into their keepers, all or nothing.
+
+    A dry run writes nothing. A refused pair refuses the whole batch.
+    """
+    try:
+        return await merge_duplicates(session, payload.pairs, dry_run=payload.dry_run)
+    except BatchRefused as exc:
+        raise ConflictException(detail={"refused": exc.refusals}) from exc
+
+
+@router.post("/transactions/delete-batch")
+async def transactions_delete_batch(
+    payload: TransactionDeleteBatchRequest,
+    session: AsyncSessionDep,
+) -> TransactionDeleteResponse:
+    """Delete phantom statement rows, all or nothing.
+
+    A dry run writes nothing. A refused row refuses the whole batch.
+    """
+    try:
+        return await delete_phantoms(
+            session, payload.ids, reason=payload.reason, dry_run=payload.dry_run
+        )
+    except BatchRefused as exc:
+        raise ConflictException(detail={"refused": exc.refusals}) from exc
+
+
+@router.post("/transactions/categorize")
+async def transactions_categorize(
+    payload: transaction_schemas.TransactionCategorizeRequest,
+    session: AsyncSessionDep,
+) -> transaction_schemas.TransactionCategorizeResponse:
+    """Change category, note and cashflow exclusion on many rows at once.
+
+    ``dry_run`` defaults to true. One invalid item rejects the whole request
+    with a 400 and per-item errors, and nothing is written.
+    """
+    try:
+        items = await categorize_transactions(
+            session, payload.items, dry_run=payload.dry_run
+        )
+    except ValueError as exc:
+        raise BadRequestException(detail={"errors": exc.args[0]}) from exc
+    return transaction_schemas.TransactionCategorizeResponse(
+        dry_run=payload.dry_run, items=items
+    )
+
+
+@router.get("/categories")
+async def categories_list(
+    session: AsyncSessionDep,
+) -> transaction_schemas.CategoryListResponse:
+    """List every category slug with its bank-scope cashflow bucket."""
+    return await list_categories(session)
 
 
 @router.get("/transactions/{txn_id}")

@@ -30,6 +30,7 @@ from financial_dashboard.core.dates import (
 )
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
+from financial_dashboard.services.cashflow.bridge import cash_bridge
 from financial_dashboard.services.cashflow.report import (
     cashflow_summary,
     resolve_range,
@@ -115,6 +116,7 @@ async def cashflow_index(
         {
             "active_page": "cashflow",
             "summary": summary,
+            "bridge": await cash_bridge(session, summary),
             # The resolved bounds, not the raw query params: an unparseable
             # ?date_from= must not leak back into the form or the drill links.
             "date_from": start.isoformat(),

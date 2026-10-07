@@ -8,7 +8,10 @@ from collections import defaultdict
 from sqlalchemy import select
 
 from financial_dashboard.db import Email, EmailSource, FetchRule, async_session
-from financial_dashboard.integrations.email.base import get_provider
+from financial_dashboard.integrations.email.base import (
+    FetchSourceResult,
+    get_provider,
+)
 from financial_dashboard.integrations.email.body import _cleanup_failed_spool
 from financial_dashboard.services.emails import _serialize_datetime, handle_polled_email
 from financial_dashboard.services.linker import build_link_context
@@ -147,17 +150,23 @@ async def poll_all(*, poll_lock: asyncio.Lock, poll_status: dict) -> dict:
                     ).scalars()
                     existing_remote_ids: set[str] = {r for r in rows if r is not None}
 
-                provider = get_provider(source)
-                (
-                    results_by_rule,
-                    fetch_ok,
-                    backfill_ready_rule_ids,
-                ) = await provider.fetch_source(
-                    source,
-                    source_rules,
-                    fetch_limit=fetch_limit,
-                    existing_remote_ids=existing_remote_ids,
-                )
+                try:
+                    (
+                        results_by_rule,
+                        fetch_ok,
+                        backfill_ready_rule_ids,
+                    ) = await get_provider(source).fetch_source(
+                        source,
+                        source_rules,
+                        fetch_limit=fetch_limit,
+                        existing_remote_ids=existing_remote_ids,
+                    )
+                except Exception:
+                    # An error fails only this source, not the poll.
+                    logger.exception("Email fetch failed for source %s", source_id)
+                    results_by_rule, fetch_ok, backfill_ready_rule_ids = (
+                        FetchSourceResult({}, False, set())
+                    )
                 logger.info(
                     "Email fetch completed for source %s, fetched %d total emails",
                     source_id,

@@ -925,6 +925,8 @@ async def test_embedded_json_cannot_break_out_of_its_script_block(client, sessio
 # The summary: the grouped bank-side bucket scan, the all-account expense
 # detail, transfers-in, uncategorized, and the six footnote reads.
 SUMMARY_QUERIES = 10
+# The cash bridge: one ordered read of the bank rows.
+BRIDGE_QUERIES = 1
 # The trend: the month/category/direction scan and the salary counts.
 TREND_QUERIES = 2
 
@@ -947,12 +949,12 @@ def count_transaction_reads():
 
 async def test_page_load_is_one_summary_plus_trend(client, session):
     """The page aggregates the range once. The breakdown chart reads the summary
-    from the page, and the trend is the only fetch."""
+    from the page, the bridge reuses it, and the trend is the only fetch."""
     await _add(session, amount="90000", direction="credit", category="salary")
     with count_transaction_reads() as page_queries:
         page = await client.get(f"/cashflow?{RANGE}")
     assert page.status_code == 200
-    assert len(page_queries) == SUMMARY_QUERIES
+    assert len(page_queries) == SUMMARY_QUERIES + BRIDGE_QUERIES
     assert "/api/cashflow/summary" not in page.text
 
     with count_transaction_reads() as trend_queries:

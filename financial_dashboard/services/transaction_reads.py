@@ -23,6 +23,7 @@ from financial_dashboard.services.cc_disambiguation import (
 from financial_dashboard.services.read_helpers import bound_text, order_batch
 
 _DETAIL_TEXT_LIMIT = 50_000
+_LIST_TEXT_LIMIT = 1_000
 
 
 def build_transaction_filter_clauses(
@@ -43,6 +44,7 @@ def build_transaction_filter_clauses(
     email_type: str | None = None,
     source: str | None = None,
     category: str | None = None,
+    categories: list[str] | None = None,
     review_status: str | None = None,
     reference_number: str | None = None,
     reference: str | None = None,
@@ -85,19 +87,30 @@ def build_transaction_filter_clauses(
     clauses.extend(
         column == value.strip() for column, value in text_filters if value is not None
     )
+    if categories:
+        clauses.append(
+            Transaction.category.in_([value.strip() for value in categories])
+        )
     if bank is not None:
         clauses.append(func.lower(Transaction.bank) == bank.strip().lower())
     if search is not None and search.strip():
-        term = f"%{search.strip().lower()}%"
+        term = search.strip().lower()
+        for char in ("\\", "%", "_"):
+            term = term.replace(char, "\\" + char)
         clauses.append(
             or_(
-                func.lower(Transaction.bank).like(term),
-                func.lower(Transaction.counterparty).like(term),
-                func.lower(Transaction.reference_number).like(term),
-                func.lower(Transaction.channel).like(term),
-                func.lower(Transaction.category).like(term),
-                func.lower(Transaction.note).like(term),
-                func.lower(Transaction.raw_description).like(term),
+                *(
+                    func.lower(column).like(f"%{term}%", escape="\\")
+                    for column in (
+                        Transaction.bank,
+                        Transaction.counterparty,
+                        Transaction.reference_number,
+                        Transaction.channel,
+                        Transaction.category,
+                        Transaction.note,
+                        Transaction.raw_description,
+                    )
+                )
             )
         )
     if excluded is True:
@@ -107,8 +120,15 @@ def build_transaction_filter_clauses(
     return clauses
 
 
-def _transaction_read(row: Transaction) -> transaction_schemas.TransactionRead:
-    """Map one ORM transaction to its redacted summary schema."""
+def transaction_read(row: Transaction) -> transaction_schemas.TransactionRead:
+    """Map one ORM transaction to its redacted summary schema.
+
+    Args:
+        row: The transaction to map.
+
+    Returns:
+        The summary that the JSON API returns for the row.
+    """
     return transaction_schemas.TransactionRead(
         id=row.id,
         bank=row.bank,
@@ -140,6 +160,29 @@ def _transaction_read(row: Transaction) -> transaction_schemas.TransactionRead:
     )
 
 
+def transaction_list_item(
+    row: Transaction, limit: int = _LIST_TEXT_LIMIT
+) -> transaction_schemas.TransactionListItem:
+    """Add bounded description and note text to the summary schema.
+
+    Args:
+        row: The transaction to map.
+        limit: Maximum characters kept for each text field.
+
+    Returns:
+        The summary with description and note text.
+    """
+    raw_description, raw_description_truncated = bound_text(row.raw_description, limit)
+    note, note_truncated = bound_text(row.note, limit)
+    return transaction_schemas.TransactionListItem(
+        **transaction_read(row).model_dump(),
+        raw_description=raw_description,
+        raw_description_truncated=raw_description_truncated,
+        note=note,
+        note_truncated=note_truncated,
+    )
+
+
 def _filters(
     *,
     transaction_id: int | None,
@@ -156,11 +199,13 @@ def _filters(
     bank: str | None,
     email_type: str | None,
     source: str | None,
-    category: str | None,
+    categories: list[str] | None,
     review_status: str | None,
     reference_number: str | None,
+    search: str | None,
+    excluded: bool | None,
 ) -> list:
-    """Build exact-match clauses for optional transaction filters."""
+    """Build clauses for optional transaction filters."""
     return build_transaction_filter_clauses(
         transaction_id=transaction_id,
         account_id=account_id,
@@ -176,9 +221,11 @@ def _filters(
         bank=bank,
         email_type=email_type,
         source=source,
-        category=category,
+        categories=categories,
         review_status=review_status,
         reference_number=reference_number,
+        search=search,
+        excluded=excluded,
     )
 
 
@@ -201,11 +248,13 @@ async def list_transactions(
     bank: str | None,
     email_type: str | None,
     source: str | None,
-    category: str | None,
+    categories: list[str] | None,
     review_status: str | None,
     reference_number: str | None,
+    search: str | None = None,
+    excluded: bool | None = None,
 ) -> transaction_schemas.TransactionListResponse:
-    """Return one stable transaction page matching optional exact filters."""
+    """Return one stable transaction page matching optional filters."""
     clauses = _filters(
         transaction_id=transaction_id,
         account_id=account_id,
@@ -221,9 +270,11 @@ async def list_transactions(
         bank=bank,
         email_type=email_type,
         source=source,
-        category=category,
+        categories=categories,
         review_status=review_status,
         reference_number=reference_number,
+        search=search,
+        excluded=excluded,
     )
     with session.no_autoflush:
         total_count = await session.scalar(
@@ -238,8 +289,6 @@ async def list_transactions(
                     .options(
                         noload(Transaction.account),
                         noload(Transaction.card),
-                        defer(Transaction.raw_description),
-                        defer(Transaction.note),
                         defer(Transaction.review_reason),
                     )
                     .where(*clauses)
@@ -254,7 +303,7 @@ async def list_transactions(
             .all()
         )
 
-    items = [_transaction_read(row) for row in rows]
+    items = [transaction_list_item(row) for row in rows]
     return transaction_schemas.TransactionListResponse(
         items=items,
         returned_count=len(items),
@@ -363,19 +412,11 @@ async def get_transaction_detail(
             return None
         email, sms, statement = await _source_links(session, row)
 
-    raw_description, raw_description_truncated = bound_text(
-        row.raw_description, _DETAIL_TEXT_LIMIT
-    )
-    note, note_truncated = bound_text(row.note, _DETAIL_TEXT_LIMIT)
-    summary = _transaction_read(row)
+    summary = transaction_list_item(row, _DETAIL_TEXT_LIMIT)
     account = row.account
     card = row.card
     return transaction_schemas.TransactionDetailResponse(
         **summary.model_dump(),
-        raw_description=raw_description,
-        raw_description_truncated=raw_description_truncated,
-        note=note,
-        note_truncated=note_truncated,
         category_confidence=row.category_confidence,
         category_model=row.category_model,
         category_input_hash=row.category_input_hash,
@@ -439,7 +480,7 @@ async def get_transactions_by_ids(
             .scalars()
             .all()
         )
-    ordered = order_batch(ids, {row.id: _transaction_read(row) for row in rows})
+    ordered = order_batch(ids, {row.id: transaction_read(row) for row in rows})
     return transaction_schemas.TransactionBatchResponse(
         items=ordered.items,
         missing_ids=ordered.missing_ids,

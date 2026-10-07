@@ -1,11 +1,12 @@
-"""Read-only JSON endpoints for credit-card and bank statements."""
+"""JSON endpoints for credit-card and bank statements."""
 
 import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Path, Query, Response
+from fastapi import APIRouter, File, Form, Path, Query, Response, UploadFile
 
 from financial_dashboard.api.query import inclusive_datetime_bounds
+from financial_dashboard.core.uploads import read_bounded_pdf
 from financial_dashboard.core.deps import AsyncSessionDep
 from financial_dashboard.exceptions import (
     ApiException,
@@ -15,10 +16,12 @@ from financial_dashboard.exceptions import (
     UnprocessableEntityException,
 )
 from financial_dashboard.schemas import statements as statement_schemas
+from financial_dashboard.db import Account
 from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.services.statement_previews import (
     preview_statement_parse,
     preview_statement_reconciliation,
+    reconciliation_lists,
 )
 from financial_dashboard.services.statement_reads import (
     get_bank_statement_detail,
@@ -28,12 +31,55 @@ from financial_dashboard.services.statement_reads import (
     list_bank_statements,
     list_cc_statements,
 )
+from financial_dashboard.services.statements.bank import upload_bank_statement
 from financial_dashboard.services.statements.shared import (
     retry_bank_statement_upload,
     retry_cc_statement_upload,
 )
 
 router = APIRouter()
+
+
+@router.post("/statements/bank/upload")
+async def bank_statement_upload(
+    session: AsyncSessionDep,
+    response: Response,
+    account_id: Annotated[DatabaseId, Form()],
+    file: Annotated[UploadFile, File()],
+    password: Annotated[str, Form(max_length=128)] = "",
+    dry_run: Annotated[bool, Form()] = True,
+) -> statement_schemas.BankStatementUploadResponse:
+    """Parse and reconcile one bank statement PDF against the account's rows.
+
+    ``dry_run`` defaults to true. A dry run writes nothing. A real run saves the
+    PDF, records the upload, enriches matched rows and imports missing rows.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    account = await session.get(Account, account_id)
+    if account is None or account.type != "bank_account":
+        raise NotFoundException(detail="Bank account not found")
+    content = await read_bounded_pdf(file)
+
+    result = await upload_bank_statement(
+        session, account, file.filename, content, password or None, dry_run=dry_run
+    )
+    if result.error is not None and result.upload is None:
+        raise UnprocessableEntityException(detail=f"Parse failed: {result.error}")
+
+    parsed, upload = result.parsed, result.upload
+    return statement_schemas.BankStatementUploadResponse(
+        **reconciliation_lists(result.recon or {}).model_dump(),
+        dry_run=dry_run,
+        account_id=account.id,
+        upload_id=upload.id if upload else None,
+        status=upload.status if upload else "preview",
+        error=upload.error if upload else None,
+        statement_period_start=parsed.statement_period_start if parsed else None,
+        statement_period_end=parsed.statement_period_end if parsed else None,
+        opening_balance=parsed.opening_balance if parsed else None,
+        closing_balance=parsed.closing_balance if parsed else None,
+        imported_count=(upload.imported_count or 0) if upload else 0,
+    )
 
 
 @router.get("/statements/cc")
@@ -139,6 +185,7 @@ async def cc_statement_reparse(
     """Reparse and reconcile one stored CC statement through the canonical path.
 
     The supplied password is used only for this operation and is never persisted.
+    An empty password uses the saved password of the account.
     A successful reparse may enrich matches, import missing transactions, update
     statement payment tracking, and emit the corresponding balance snapshot.
     """
@@ -255,6 +302,7 @@ async def bank_statement_reparse(
     """Reparse and reconcile one stored bank statement through the canonical path.
 
     The supplied password is used only for this operation and is never persisted.
+    An empty password uses the saved password of the account.
     A successful reparse may enrich matches, import missing transactions, and
     emit the corresponding account balance snapshot.
     """

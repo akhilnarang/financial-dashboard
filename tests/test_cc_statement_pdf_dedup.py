@@ -4,6 +4,8 @@ already have an upload row for must return the existing row and skip
 reconcile / PDF write / import.
 """
 
+import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -79,7 +81,9 @@ def _install_common_monkeypatches(monkeypatch, tmp_path, due_date, import_calls)
     )
 
     statements_dir = tmp_path / "statements"
-    monkeypatch.setattr(cc_module, "STATEMENTS_DIR", statements_dir)
+    monkeypatch.setattr(
+        "financial_dashboard.core.uploads.STATEMENTS_DIR", statements_dir
+    )
 
     async def _noop_snapshot(session, upload):
         return None
@@ -167,14 +171,27 @@ async def test_no_dedup_when_parsed_due_date_missing(
         await session.commit()
 
     import_calls: list = []
-    _install_common_monkeypatches(monkeypatch, tmp_path, None, import_calls)
-
-    result = await cc_module.process_statement_email(
-        "jupiter", b"raw", "Your Jupiter Card Statement"
+    statements_dir = _install_common_monkeypatches(
+        monkeypatch, tmp_path, None, import_calls
     )
 
-    assert result is not None
+    # The same attachment twice in one second must not overwrite the first PDF.
+    fixed = datetime.datetime(2026, 5, 1, tzinfo=datetime.UTC)
+    monkeypatch.setattr(
+        "financial_dashboard.core.uploads.datetime",
+        SimpleNamespace(
+            datetime=SimpleNamespace(now=lambda tz: fixed), UTC=datetime.UTC
+        ),
+    )
+    for _ in range(2):
+        result = await cc_module.process_statement_email(
+            "jupiter", b"raw", "Your Jupiter Card Statement"
+        )
+        assert result is not None
 
     async with session_factory() as session:
         rows = (await session.execute(select(StatementUpload))).scalars().all()
-        assert len(rows) == 2
+        assert len(rows) == 3
+        saved = {Path(r.file_path) for r in rows[1:]}
+        assert len(saved) == 2
+        assert all(p.parent == statements_dir and p.exists() for p in saved)

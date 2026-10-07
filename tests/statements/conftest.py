@@ -81,9 +81,5 @@ def _no_payment_tracking(monkeypatch):
 @pytest.fixture
 def statements_dir(monkeypatch, tmp_path):
     """Redirect on-disk PDF writes to a tmp dir."""
-    import financial_dashboard.services.statements.bank as bank_module
-    import financial_dashboard.services.statements.cc as cc_module
-
-    monkeypatch.setattr(cc_module, "STATEMENTS_DIR", tmp_path)
-    monkeypatch.setattr(bank_module, "STATEMENTS_DIR", tmp_path)
+    monkeypatch.setattr("financial_dashboard.core.uploads.STATEMENTS_DIR", tmp_path)
     return tmp_path

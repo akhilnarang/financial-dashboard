@@ -4,8 +4,11 @@ import asyncio
 import html
 import json
 import logging
+from collections.abc import Sequence
+from typing import NamedTuple
 
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, and_, func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import async_session
 from financial_dashboard.db.models import CategoryReviewDecision, Transaction, utc_now
@@ -21,6 +24,7 @@ from financial_dashboard.services.assistant.rendering import split_plain_text
 from financial_dashboard.services.settings import (
     get_active_llm_key,
     get_app_base_url,
+    get_setting_int,
     get_setting_bool,
     get_telegram_chat_id,
     is_telegram_configured,
@@ -115,23 +119,309 @@ async def run_llm_sweep(*, batch_limit: int = 100) -> int:
     return count
 
 
+class ImportKey(NamedTuple):
+    """The statement upload that created a row, by its dashboard page path."""
+
+    path: str
+    upload_id: int
+
+
+class PromptBatch(NamedTuple):
+    """Rows to prompt one by one, and the imports that went over the cap."""
+
+    prompt: list[Transaction]
+    overflow: list[ImportKey]
+
+
+def _import_key(txn: Transaction) -> ImportKey | None:
+    """Return the statement import of a row, or None for a single alert."""
+    if (upload_id := txn.statement_upload_id) is not None:
+        return ImportKey("/statements", upload_id)
+    if (upload_id := txn.bank_statement_upload_id) is not None:
+        return ImportKey("/statements/bank", upload_id)
+    return None
+
+
+def _in_import(key: ImportKey) -> ColumnElement[bool]:
+    """Match the rows of one statement import."""
+    column = (
+        Transaction.statement_upload_id
+        if key.path == "/statements"
+        else Transaction.bank_statement_upload_id
+    )
+    return column == key.upload_id
+
+
+def _needs_prompt(assistant_enabled: bool) -> ColumnElement[bool]:
+    """Match pending rows under the retry limit that the sweep may notify.
+
+    With the assistant on, a row that a conversation alone owns is left out.
+    """
+    clauses = [
+        Transaction.review_status == "pending",
+        Transaction.notify_attempts.is_(None)
+        | (Transaction.notify_attempts < _MAX_NOTIFY_ATTEMPTS),
+    ]
+    if assistant_enabled:
+        active = select(CategoryReviewDecision.id).where(
+            CategoryReviewDecision.transaction_id == Transaction.id,
+            CategoryReviewDecision.status == "active",
+        )
+        background = active.where(
+            CategoryReviewDecision.source_interaction_id.is_(None)
+        )
+        conversational = active.where(
+            CategoryReviewDecision.source_interaction_id.is_not(None)
+        )
+        clauses.append(~conversational.exists() | background.exists())
+    return and_(*clauses)
+
+
+async def _cap_per_import(
+    session: AsyncSession, rows: Sequence[Transaction]
+) -> PromptBatch:
+    """Split pending rows so one statement import sends a bounded prompt count.
+
+    Each import gets at most ``telegram.bulk_threshold`` prompts. Rows of the
+    import that an earlier sweep notified use up the same budget. A row that
+    had a prompt or a summary before goes to the summary.
+
+    Args:
+        session: Open session that owns ``rows``.
+        rows: Rows that need a prompt, in id order.
+
+    Returns:
+        The rows to prompt, and the imports that need a summary.
+    """
+    cap = get_setting_int("telegram.bulk_threshold", 5)
+    used: dict[ImportKey, int] = {}
+    batch = PromptBatch([], [])
+    for txn in rows:
+        if (key := _import_key(txn)) is None:
+            batch.prompt.append(txn)
+            continue
+        if key not in used:
+            used[key] = (
+                await session.scalar(
+                    select(func.count()).where(
+                        _in_import(key), Transaction.last_notified_at.is_not(None)
+                    )
+                )
+                or 0
+            )
+        if used[key] < cap and txn.last_notified_at is None:
+            used[key] += 1
+            batch.prompt.append(txn)
+        elif key not in batch.overflow:
+            batch.overflow.append(key)
+    return batch
+
+
+async def _send_overflow_summary(
+    session: AsyncSession,
+    chat_id: int,
+    key: ImportKey,
+    base_url: str,
+    eligible: ColumnElement[bool],
+) -> None:
+    """Send one line for the rows of an import above the prompt cap.
+
+    The overflow is read after the prompts are sent, so a row that a user or a
+    conversation took meanwhile is left out. It holds all eligible rows of the
+    import, also those past the sweep batch limit. The rows become 'notified'
+    as if each one had its own prompt. A failed send leaves them 'pending' for
+    the next sweep.
+
+    Args:
+        session: Open sweep session.
+        chat_id: Telegram chat to send to.
+        key: The import that the rows came from.
+        base_url: Dashboard base URL. Empty means no link.
+        eligible: Filter for the rows that still need a prompt or a summary.
+    """
+    from financial_dashboard.services.telegram import _send_with_retry, tg_app
+
+    ids = (
+        await session.scalars(select(Transaction.id).where(_in_import(key), eligible))
+    ).all()
+    if not ids:
+        return
+    noun = "row needs" if len(ids) == 1 else "rows need"
+    text = f"\U0001f50d {len(ids)} more {noun} a category"
+    if base_url:
+        text += f"\n{base_url}{key.path}/{key.upload_id}"
+    values: dict[str, object] = {
+        "notify_attempts": func.coalesce(Transaction.notify_attempts, 0) + 1
+    }
+    try:
+        await _send_with_retry(tg_app, chat_id=chat_id, text=text, parse_mode=None)
+        values |= {"review_status": "notified", "last_notified_at": utc_now()}
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Review summary failed for %s/%s", key.path, key.upload_id)
+    await session.execute(
+        update(Transaction)
+        .where(Transaction.id.in_(ids), eligible)
+        .values(values)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def _review_decision(
+    session: AsyncSession, txn: Transaction, assistant_enabled: bool
+) -> CategoryReviewDecision | None:
+    """Return the background decision of a row, made on demand for the assistant."""
+    decision = await session.scalar(
+        select(CategoryReviewDecision)
+        .where(
+            CategoryReviewDecision.transaction_id == txn.id,
+            CategoryReviewDecision.status == "active",
+            CategoryReviewDecision.source_interaction_id.is_(None),
+        )
+        .order_by(CategoryReviewDecision.id.desc())
+        .limit(1)
+    )
+    if decision is None and assistant_enabled:
+        # Rows created before durable review decisions existed still need a
+        # decision record so a later callback can fail closed. This path is
+        # deliberately zero-candidate and never invokes the LLM. A
+        # conversation can claim the row while an earlier prompt is sent, so
+        # check again before a competing decision is made.
+        if not await session.scalar(
+            select(Transaction.id).where(Transaction.id == txn.id, _needs_prompt(True))
+        ):
+            return None
+        decision = await ensure_legacy_decision(session, txn)
+    return decision
+
+
+async def _notify_assistant(
+    session: AsyncSession,
+    txn: Transaction,
+    decision: CategoryReviewDecision,
+    chat_id: int,
+    base_url: str,
+) -> bool:
+    """Queue and send the assistant prompt of one row. Returns True when sent."""
+    from financial_dashboard.services.telegram import dispatch_saved_delivery
+
+    candidates = json.loads(decision.candidates_json)
+    gate = decision.gate_reason or "manual review requested"
+    next_step = (
+        "Reply with context or choose a category below."
+        if 2 <= len(candidates) <= 3
+        else "Reply with context so I can categorize it."
+    )
+    proposed = decision.proposed_slug or (
+        str(candidates[0].get("category", "")) if candidates else ""
+    )
+    plain_id = f"#{txn.id}"
+    if base_url:
+        plain_id += f" ({base_url}/transactions/{txn.id})"
+    assistant_text = (
+        f"\U0001f50d Needs a category: {plain_id}\n"
+        f"{txn.direction or ''} {txn.amount} {txn.currency or 'INR'}\n"
+        f"{txn.counterparty or txn.raw_description or ''}\n"
+        f"Likely category: {proposed or 'uncertain'}\n"
+        f"Why I asked: {gate}\n"
+        f"Reasoning: {txn.review_reason or 'low confidence'}\n"
+        f"{next_step}"
+    )
+    deliveries = []
+    for ordinal, chunk in enumerate(split_plain_text(assistant_text, limit=4000)):
+        delivery = await ensure_decision_delivery(
+            session,
+            decision,
+            recipient_chat_id=chat_id,
+            transaction_id=txn.id,
+            text=chunk,
+            reply_markup_json=None,
+            ordinal=ordinal,
+            parse_mode=None,
+        )
+        if "\nRef: " not in delivery.text:
+            delivery.text = f"{delivery.text}\n\nRef: {delivery.delivery_token}"
+        deliveries.append(delivery)
+    first_delivery = deliveries[0]
+    if 2 <= len(candidates) <= 3 and first_delivery.reply_markup_json is None:
+        first_delivery.reply_markup_json = json.dumps(
+            [
+                [
+                    {
+                        "text": str(candidate.get("category", "")),
+                        "callback_data": (
+                            f"cat:v1:{decision.id}:{first_delivery.id}:{index}"
+                        ),
+                    }
+                ]
+                for index, candidate in enumerate(candidates)
+            ],
+            separators=(",", ":"),
+        )
+    await session.commit()
+    delivered = all(
+        [await dispatch_saved_delivery(delivery.id) for delivery in deliveries]
+    )
+    if not delivered:
+        txn.notify_attempts = (txn.notify_attempts or 0) + 1
+    return delivered
+
+
+async def _notify_plain(txn: Transaction, chat_id: int, base_url: str) -> bool:
+    """Send the HTML prompt of one row. Returns True when sent."""
+    from financial_dashboard.services.telegram import _send_with_retry, tg_app
+
+    # HTML parse mode: link the id to its transaction page when a base URL
+    # is configured. EVERY interpolated field is html-escaped — counterparty,
+    # reason, direction, currency and the base_url are free text (parser/user
+    # output) that could otherwise contain & or " or < and break Telegram's
+    # HTML parser, stranding the row — as is the literal <note>/<category>
+    # hint. txn.amount is a Decimal, so it's safe as-is.
+    if base_url:
+        href = html.escape(f"{base_url}/transactions/{txn.id}", quote=True)
+        id_label = f'<a href="{href}">#{txn.id}</a>'
+    else:
+        id_label = f"#{txn.id}"
+    detail = html.escape(txn.counterparty or txn.raw_description or "")
+    reason = html.escape(txn.review_reason or "low confidence")
+    direction = html.escape(txn.direction or "")
+    currency = html.escape(txn.currency or "INR")
+    text = (
+        f"\U0001f50d Needs a category: {id_label}\n"
+        f"{direction} {txn.amount} {currency}\n"
+        f"{detail}\n"
+        f"Reason: {reason}\n"
+        f"Reply with: &lt;note&gt;\n&lt;category&gt;"
+    )
+    try:
+        await _send_with_retry(tg_app, chat_id=chat_id, text=text, parse_mode="HTML")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Review notify failed for txn %s", txn.id)
+        txn.notify_attempts = (txn.notify_attempts or 0) + 1
+        return False
+    txn.review_status = "notified"
+    txn.last_notified_at = utc_now()
+    txn.notify_attempts = (txn.notify_attempts or 0) + 1
+    return True
+
+
 async def run_review_notify() -> int:
     """Push rows flagged review_status='pending' to the Telegram review queue.
 
     Sends each pending transaction, marks it 'notified', and bumps
     notify_attempts; a row is retried until it succeeds or hits _MAX_NOTIFY_ATTEMPTS,
-    so a transient send failure never strands it. Returns the number sent;
-    no-op (0) when Telegram isn't configured.
+    so a transient send failure never strands it. One statement import sends at
+    most ``telegram.bulk_threshold`` prompts and one summary line for the rest.
+    Returns the number of prompts sent; no-op (0) when Telegram isn't configured.
     """
-    from financial_dashboard.services.telegram import (
-        _send_with_retry,
-        dispatch_saved_delivery,
-        tg_app,
-    )
+    from financial_dashboard.services import telegram
 
     # is_telegram_configured() already covers chat_id != 0; tg_app is a separate
     # concern — the bot Application may be uninitialized in this process.
-    if not is_telegram_configured() or tg_app is None:
+    if not is_telegram_configured() or telegram.tg_app is None:
         return 0
     chat_id = get_telegram_chat_id()
     assistant_enabled = is_telegram_assistant_enabled()
@@ -139,153 +429,32 @@ async def run_review_notify() -> int:
     async with async_session() as session:
         stmt = (
             select(Transaction)
-            .where(
-                Transaction.review_status == "pending",
-                (Transaction.notify_attempts.is_(None))
-                | (Transaction.notify_attempts < _MAX_NOTIFY_ATTEMPTS),
-            )
+            .where(_needs_prompt(assistant_enabled))
+            .order_by(Transaction.id)
             .limit(50)
         )
         rows = (await session.execute(stmt)).scalars().all()
         base_url = get_app_base_url()
-        for txn in rows:
-            # Rows created before durable review decisions existed still need a
-            # decision record so a later callback can fail closed. This path is
-            # deliberately zero-candidate and never invokes the LLM.
-            decision = await session.scalar(
-                select(CategoryReviewDecision)
-                .where(
-                    CategoryReviewDecision.transaction_id == txn.id,
-                    CategoryReviewDecision.status == "active",
-                    CategoryReviewDecision.source_interaction_id.is_(None),
-                )
-                .order_by(CategoryReviewDecision.id.desc())
-                .limit(1)
-            )
-            if decision is None and assistant_enabled:
-                # A conversational proposal already owns the transaction's
-                # current review conversation. Never manufacture a separate
-                # zero-candidate background decision for the same row.
-                conversational = await session.scalar(
-                    select(CategoryReviewDecision)
-                    .where(
-                        CategoryReviewDecision.transaction_id == txn.id,
-                        CategoryReviewDecision.status == "active",
-                        CategoryReviewDecision.source_interaction_id.is_not(None),
-                    )
-                    .limit(1)
-                )
-                if conversational is not None:
-                    continue
-                decision = await ensure_legacy_decision(session, txn)
-            # HTML parse mode: link the id to its transaction page when a base URL
-            # is configured. EVERY interpolated field is html-escaped — counterparty,
-            # reason, direction, currency and the base_url are free text (parser/user
-            # output) that could otherwise contain & or " or < and break Telegram's
-            # HTML parser, stranding the row — as is the literal <note>/<category>
-            # hint. txn.amount is a Decimal, so it's safe as-is.
-            if base_url:
-                href = html.escape(f"{base_url}/transactions/{txn.id}", quote=True)
-                id_label = f'<a href="{href}">#{txn.id}</a>'
+        batch = await _cap_per_import(session, rows)
+        failed: set[ImportKey | None] = set()
+        for txn in batch.prompt:
+            decision = await _review_decision(session, txn, assistant_enabled)
+            if not assistant_enabled:
+                delivered = await _notify_plain(txn, chat_id, base_url)
             else:
-                id_label = f"#{txn.id}"
-            detail = html.escape(txn.counterparty or txn.raw_description or "")
-            reason = html.escape(txn.review_reason or "low confidence")
-            direction = html.escape(txn.direction or "")
-            currency = html.escape(txn.currency or "INR")
-            text = (
-                f"\U0001f50d Needs a category: {id_label}\n"
-                f"{direction} {txn.amount} {currency}\n"
-                f"{detail}\n"
-                f"Reason: {reason}\n"
-                f"Reply with: &lt;note&gt;\n&lt;category&gt;"
-            )
-            if assistant_enabled:
-                assert decision is not None
-                candidates = json.loads(decision.candidates_json)
-                gate = decision.gate_reason or "manual review requested"
-                next_step = (
-                    "Reply with context or choose a category below."
-                    if 2 <= len(candidates) <= 3
-                    else "Reply with context so I can categorize it."
+                delivered = decision is not None and await _notify_assistant(
+                    session, txn, decision, chat_id, base_url
                 )
-                proposed = decision.proposed_slug or (
-                    str(candidates[0].get("category", "")) if candidates else ""
-                )
-                plain_id = f"#{txn.id}"
-                if base_url:
-                    plain_id += f" ({base_url}/transactions/{txn.id})"
-                assistant_text = (
-                    f"\U0001f50d Needs a category: {plain_id}\n"
-                    f"{txn.direction or ''} {txn.amount} {txn.currency or 'INR'}\n"
-                    f"{txn.counterparty or txn.raw_description or ''}\n"
-                    f"Likely category: {proposed or 'uncertain'}\n"
-                    f"Why I asked: {gate}\n"
-                    f"Reasoning: {txn.review_reason or 'low confidence'}\n"
-                    f"{next_step}"
-                )
-                deliveries = []
-                for ordinal, chunk in enumerate(
-                    split_plain_text(assistant_text, limit=4000)
-                ):
-                    delivery = await ensure_decision_delivery(
-                        session,
-                        decision,
-                        recipient_chat_id=chat_id,
-                        transaction_id=txn.id,
-                        text=chunk,
-                        reply_markup_json=None,
-                        ordinal=ordinal,
-                        parse_mode=None,
-                    )
-                    if "\nRef: " not in delivery.text:
-                        delivery.text = (
-                            f"{delivery.text}\n\nRef: {delivery.delivery_token}"
-                        )
-                    deliveries.append(delivery)
-                first_delivery = deliveries[0]
-                if (
-                    2 <= len(candidates) <= 3
-                    and first_delivery.reply_markup_json is None
-                ):
-                    first_delivery.reply_markup_json = json.dumps(
-                        [
-                            [
-                                {
-                                    "text": str(candidate.get("category", "")),
-                                    "callback_data": (
-                                        f"cat:v1:{decision.id}:{first_delivery.id}:{index}"
-                                    ),
-                                }
-                            ]
-                            for index, candidate in enumerate(candidates)
-                        ],
-                        separators=(",", ":"),
-                    )
-                await session.commit()
-                delivered = all(
-                    [
-                        await dispatch_saved_delivery(delivery.id)
-                        for delivery in deliveries
-                    ]
-                )
-                if delivered:
-                    sent += 1
-                else:
-                    txn.notify_attempts = (txn.notify_attempts or 0) + 1
-                continue
-            try:
-                await _send_with_retry(
-                    tg_app, chat_id=chat_id, text=text, parse_mode="HTML"
-                )
-                txn.review_status = "notified"
-                txn.last_notified_at = utc_now()
-                txn.notify_attempts = (txn.notify_attempts or 0) + 1
+            if delivered:
                 sent += 1
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Review notify failed for txn %s", txn.id)
-                txn.notify_attempts = (txn.notify_attempts or 0) + 1
+            else:
+                failed.add(_import_key(txn))
+        # A failed prompt keeps its slot. The summary waits until every prompt
+        # of the import is sent, so the import gets one summary only.
+        prompted = {txn.id for txn in batch.prompt}
+        eligible = _needs_prompt(assistant_enabled) & Transaction.id.not_in(prompted)
+        for key in batch.overflow:
+            if key not in failed:
+                await _send_overflow_summary(session, chat_id, key, base_url, eligible)
         await session.commit()
     return sent

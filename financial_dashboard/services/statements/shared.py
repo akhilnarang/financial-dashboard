@@ -7,6 +7,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 
+from financial_dashboard.config import get_fernet
 from financial_dashboard.db import (
     Account,
     BankStatementUpload,
@@ -22,6 +23,7 @@ from financial_dashboard.services.statements.dates import (
 from financial_dashboard.services.statements.bank import (
     enrich_matched_transactions as enrich_bank_matched_transactions,
     import_missing_bank_txns,
+    notify_balance_mismatches,
     parse_bank_statement,
     reconcile_bank_statement,
 )
@@ -41,6 +43,27 @@ from financial_dashboard.services.statements.skip_summary import import_skip_sum
 logger = logging.getLogger(__name__)
 
 STMT_RECONCILE_DATE_BUFFER_DAYS = 7
+
+
+def decrypt_statement_password(account: Account | None) -> str | None:
+    """Return the saved statement password of an account in plain text.
+
+    Args:
+        account: The account that owns the statement, or None.
+
+    Returns:
+        The decrypted password. None when the account has no saved password
+        or the password does not decrypt.
+    """
+    if account is None or not (encrypted := account.statement_password):
+        return None
+    try:
+        return get_fernet().decrypt(encrypted.encode()).decode()
+    except Exception:
+        logger.warning(
+            "Could not decrypt statement password for account %d", account.id
+        )
+        return None
 
 
 async def retry_cc_statement_upload(
@@ -68,6 +91,13 @@ async def retry_cc_statement_upload(
             upload_id,
         )
         return False
+
+    async with async_session() as session:
+        password = (
+            password
+            or decrypt_statement_password(await session.get(Account, account_id))
+            or ""
+        )
 
     try:
         parsed = await asyncio.to_thread(
@@ -170,6 +200,11 @@ async def retry_bank_statement_upload(
         account_id = upload.account_id
         file_path = upload.file_path
         bank = upload.bank
+        password = (
+            password
+            or decrypt_statement_password(await session.get(Account, account_id))
+            or ""
+        )
 
     try:
         parsed = await asyncio.to_thread(
@@ -244,4 +279,5 @@ async def retry_bank_statement_upload(
         await emit_bank_snapshot(session, upload)
         await session.commit()
 
+    await notify_balance_mismatches(upload, recon, account.label)
     return True

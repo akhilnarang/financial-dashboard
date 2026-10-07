@@ -197,12 +197,12 @@ async def test_row_the_matcher_refused_is_not_imported(session_factory, monkeypa
 
 
 @pytest.mark.parametrize(
-    ("db_overrides", "stmt_rows"),
+    ("db_rows", "stmt_rows", "matched"),
     [
         # Contention is about candidate sets, not proximity: rows on 06 and
         # 08 Apr both reach the 07 Apr DB row through the ±1-day window.
         pytest.param(
-            {},
+            [{}],
             [
                 dict(
                     date="06/04/2026",
@@ -217,12 +217,13 @@ async def test_row_the_matcher_refused_is_not_imported(session_factory, monkeypa
                     counterparty="MERCHANT A",
                 ),
             ],
+            {},
             id="two-days-apart-rivals",
         ),
         # Counterparty is not the whole refresh identity: rows agreeing on it
         # but arriving through different channels are still a real choice.
         pytest.param(
-            {"amount": Decimal("1000.00"), "counterparty": "SLICE AUTOPAY"},
+            [{"amount": Decimal("1000.00"), "counterparty": "SLICE AUTOPAY"}],
             [
                 dict(
                     date="07/04/2026",
@@ -239,42 +240,146 @@ async def test_row_the_matcher_refused_is_not_imported(session_factory, monkeypa
                     channel="upi",
                 ),
             ],
+            {},
             id="differ-only-on-channel",
         ),
         # Interchangeability is judged on the value a refresh lands, not the
         # raw field: with no parsed counterparty the refresh falls back to
         # the narration, and the narrations name different taxes.
         pytest.param(
-            {"amount": Decimal("90.00"), "counterparty": None},
+            [{"amount": Decimal("90.00"), "counterparty": None}],
             [
                 dict(date="07/04/2026", amount="90.00", narration="CGST ON FEE"),
                 dict(date="07/04/2026", amount="90.00", narration="SGST ON FEE"),
             ],
+            {},
             id="told-apart-by-narration-fallback",
+        ),
+        # Twins with distinct references: each reference names one DB row, so
+        # the date overlap is no contest and both rows match.
+        pytest.param(
+            [
+                {
+                    "channel": "upi",
+                    "raw_description": "UPI KAPPASTORE",
+                    "reference_number": "700011112222",
+                },
+                {
+                    "channel": "upi",
+                    "raw_description": "UPI KAPPASTORE",
+                    "reference_number": "700033334444",
+                },
+            ],
+            [
+                dict(
+                    date="07/04/2026",
+                    amount="2,500.00",
+                    narration="UPI KAPPASTORE 700011112222",
+                    ref="700011112222",
+                    channel="upi",
+                ),
+                dict(
+                    date="07/04/2026",
+                    amount="2,500.00",
+                    narration="UPI KAPPASTORE 700033334444",
+                    ref="700033334444",
+                    channel="upi",
+                ),
+            ],
+            {0: 0, 1: 1},
+            id="twins-with-distinct-refs",
+        ),
+        # A reference that two DB rows carry does not name one of them, so a
+        # date rival still contests the match it made.
+        pytest.param(
+            [
+                {"reference_number": "700055556666"},
+                {
+                    "bank": "icici",
+                    "amount": Decimal("9900.00"),
+                    "reference_number": "700055556666",
+                },
+            ],
+            [
+                dict(
+                    date="07/04/2026",
+                    amount="2,500.00",
+                    narration="MERCHANT A RETAIL",
+                    ref="700055556666",
+                ),
+                dict(date="07/04/2026", amount="2,500.00", narration="MERCHANT B"),
+            ],
+            {},
+            id="shared-ref-still-contested",
+        ),
+        # Two lines carry the same reference at different zero-padded widths.
+        # The rival reaches the DB row by reference, so the match is contested.
+        pytest.param(
+            [{"reference_number": "700077778888"}],
+            [
+                dict(
+                    date="07/04/2026",
+                    amount="2,500.00",
+                    narration="MERCHANT A RETAIL",
+                    ref="00700077778888",
+                ),
+                dict(
+                    date="07/04/2026",
+                    amount="2,500.00",
+                    narration="MERCHANT B RETAIL",
+                    ref="700077778888",
+                ),
+            ],
+            {},
+            id="same-ref-rival-still-contests",
+        ),
+        # The reference match stands, but its line still reaches the
+        # ref-less DB row by date, so the date match it rivals is demoted.
+        pytest.param(
+            [
+                {"reference_number": "700099990000"},
+                {"counterparty": "MERCHANT B", "raw_description": "MERCHANT B"},
+            ],
+            [
+                dict(
+                    date="07/04/2026",
+                    amount="2,500.00",
+                    narration="MERCHANT A RETAIL",
+                    ref="700099990000",
+                ),
+                dict(date="07/04/2026", amount="2,500.00", narration="MERCHANT C"),
+            ],
+            {0: 0},
+            id="final-match-rivals-a-date-match",
         ),
     ],
 )
 @pytest.mark.anyio
-async def test_distinguishable_rivals_hold_back_winner_and_loser(
-    session_factory, monkeypatch, db_overrides, stmt_rows
+async def test_rivals_for_one_db_row(
+    session_factory, monkeypatch, db_rows, stmt_rows, matched
 ):
-    """One DB row, two statement rows that both reach it and would write
-    different things onto it. Neither pairing can be trusted: the loser must
-    not import as a duplicate, and the winner's order-decided match must not
-    be committed. The DB finishes with exactly the row it started with."""
+    """Statement rows that reach the same DB row and would write different
+    things onto it. An order-decided pairing cannot be trusted: the winner's
+    match is not committed and the loser does not import as a duplicate. A
+    reference that one DB row alone carries is not order-decided, so its
+    match stands. A second reparse lands the same DB rows."""
     await _seed_account(session_factory)
-    a_id = await _seed_txn(session_factory, **db_overrides)
+    db_ids = [await _seed_txn(session_factory, **row) for row in db_rows]
 
     parsed = _parsed([_stmt_txn(**row) for row in stmt_rows])
     recon = await _reconcile(session_factory, parsed)
-    assert recon["matched"] == []
-    assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
+    assert {e["stmt_idx"]: e["db_txn_id"] for e in recon["matched"]} == {
+        stmt_idx: db_ids[db_idx] for stmt_idx, db_idx in matched.items()
+    }
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [True] * (
+        len(stmt_rows) - len(matched)
+    )
 
-    rows, upload = await _run_real_reparse(session_factory, monkeypatch, parsed)
-
-    assert [row.id for row in rows] == [a_id]
-    assert upload.imported_count == 0
-    assert upload.missing_count == 2
+    for _ in range(2):
+        rows, upload = await _run_real_reparse(session_factory, monkeypatch, parsed)
+        assert sorted(row.id for row in rows) == sorted(db_ids)
+        assert upload.imported_count == 0
+        assert upload.missing_count == len(stmt_rows) - len(matched)
 
 
 @pytest.mark.anyio

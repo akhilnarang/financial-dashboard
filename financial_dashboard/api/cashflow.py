@@ -10,7 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.dates import DEFAULT_TREND_MONTHS
 from financial_dashboard.core.deps import get_session
-from financial_dashboard.schemas.cashflow import CashflowSummary, TrendPoint
+from financial_dashboard.schemas.cashflow import CashBridge, CashflowSummary, TrendPoint
+from financial_dashboard.services.cashflow.bridge import cash_bridge
 from financial_dashboard.services.cashflow.report import (
     MAX_TREND_MONTHS,
     cashflow_summary,
@@ -37,6 +38,21 @@ async def get_summary(
     """
     start, end = resolve_range(date_from, date_to)
     return await cashflow_summary(session, start, end)
+
+
+@router.get("/cashflow/bridge", response_model=CashBridge)
+async def get_bridge(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> CashBridge:
+    """Bank balance at the start of the range, the flows, and the balance at its end.
+
+    The bounds resolve as for ``/cashflow/summary``. The flow terms are the
+    summary's figures for the same range.
+    """
+    start, end = resolve_range(date_from, date_to)
+    return await cash_bridge(session, await cashflow_summary(session, start, end))
 
 
 @router.get("/cashflow/trend", response_model=list[TrendPoint])

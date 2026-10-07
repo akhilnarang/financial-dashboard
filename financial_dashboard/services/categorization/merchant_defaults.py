@@ -95,7 +95,7 @@ DEFAULT_MERCHANT_RULES: dict[str, list[str]] = {
     ],
     "refund": ["poweraccess cr"],
     "utilities": ["hathway", "airtel"],
-    "self_transfer": ["addmoney", "walletwithd"],
+    "self_transfer": ["addmoney", "walletwithd", "revolutpayments"],
     "gift": ["shaadi", "shagun", "birthday", "anniversary", "belated"],
     "tax": ["tin2", "dtax"],
     "tax_refund": ["itdtax refund"],
