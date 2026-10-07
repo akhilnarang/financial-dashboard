@@ -69,6 +69,9 @@ class _FakeGmail(imaplib.IMAP4):
         if literal and words[:2] != [b"UID", b"SEARCH"]:
             self._replies += tag + b" BAD Unexpected literal\r\n"
             return
+        if words == [b"EXAMINE", b'"Missing"']:
+            self._replies += tag + b" NO Unknown mailbox\r\n"
+            return
         if words[:2] == [b"UID", b"SEARCH"]:
             if b'FROM "alerts@refused.example"' in line:
                 self._refuse(tag)
@@ -100,8 +103,13 @@ class _FakeGmail(imaplib.IMAP4):
 @pytest.mark.parametrize(
     ("refusal", "fetch_ok", "fetched", "backfilled"),
     [
-        ("BAD", True, {1: ["91"], 2: [], 3: [], 4: [], 5: ["92"], 6: []}, {1, 5}),
-        ("drop", False, {1: [], 2: [], 3: [], 4: [], 5: [], 6: []}, set()),
+        (
+            "BAD",
+            True,
+            {1: ["91"], 2: [], 3: [], 4: [], 5: ["92"], 6: [], 7: []},
+            {1, 5},
+        ),
+        ("drop", False, {1: [], 2: [], 3: [], 4: [], 5: [], 6: [], 7: []}, set()),
     ],
 )
 def test_non_ascii_rule_searches_as_utf8_and_a_failed_rule_skips_alone(
@@ -130,6 +138,7 @@ def test_non_ascii_rule_searches_as_utf8_and_a_failed_rule_skips_alone(
         FetchRule(
             id=4, bank="refused", sender="alerts@refused.example", folder="INBOX"
         ),
+        FetchRule(id=7, bank="missing", sender=SENDERS[2], folder="Missing"),
         FetchRule(id=5, bank="plain", sender=SENDERS[2], folder="INBOX"),
         FetchRule(id=6, bank="both", sender="Bänk", subject="Zahlung ✅"),
     ]

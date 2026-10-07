@@ -97,7 +97,8 @@ def _build_search_query(rule: FetchRule, since_str: str | None) -> _SearchQuery:
 def _select_folder(conn: imaplib.IMAP4, folder: str) -> bool:
     """Select one folder read-only.
 
-    An error fails only this folder. A dropped connection still aborts the
+    A failed SELECT leaves no folder selected. An error fails only this
+    folder. A dropped connection still aborts the
     whole source.
 
     Args:
@@ -207,6 +208,7 @@ def _fetch_gmail_source_sync(
             folder = rule.folder or "[Gmail]/All Mail"
             if folder != current_folder:
                 if not _select_folder(conn, folder):
+                    current_folder = None
                     continue
                 current_folder = folder
 
@@ -238,6 +240,7 @@ def _fetch_gmail_source_sync(
         for folder, uids in folder_uids.items():
             if folder != current_folder:
                 if not _select_folder(conn, folder):
+                    current_folder = None
                     continue
                 current_folder = folder
 
@@ -366,6 +369,7 @@ def _fetch_gmail_source_sync(
         for folder, keys in folder_new_keys.items():
             if folder != current_folder:
                 if not _select_folder(conn, folder):
+                    current_folder = None
                     continue
                 current_folder = folder
 
