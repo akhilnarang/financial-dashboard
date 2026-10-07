@@ -35,8 +35,8 @@ async def test_create_sets_email_kind_and_pages_show_it(
     edit = await client.get(f"/rules/{rule.id}/edit")
     assert edit.status_code == 200
     kind_select = edit.text.split('name="email_kind"')[1].split("</select>")[0]
-    selected = re.search(r'value="(\w+)" selected', kind_select)
-    assert selected is not None and selected[1] == "cc_statement"
+    selected = re.findall(r'<option value="(\w+)"[^>]*\bselected\b', kind_select)
+    assert selected == ["cc_statement"]
 
 
 async def test_edit_changes_clears_and_preserves_email_kind(
