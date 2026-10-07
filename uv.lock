@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.14"
 
 [options]
@@ -136,7 +136,7 @@ dependencies = [
 [[package]]
 name = "cc-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/cc-parser#a49973d9e5d1ace1626b2b7e809525a74d2d819b" }
+source = { git = "https://github.com/akhilnarang/cc-parser#73e1e1d6a6fffde81db8a2d2bff9dca31660244a" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },

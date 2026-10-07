@@ -1729,6 +1729,35 @@ def _parse_pdf_bytes_sync(
         tmp_path.unlink(missing_ok=True)
 
 
+async def _upload_for_due_date(
+    account_id: int, due_date: str | None
+) -> StatementUpload | None:
+    """Find an earlier upload of the statement cycle that ends on a due date.
+
+    Only a real date identifies a cycle. SBI prints "NO PAYMENT REQUIRED" on
+    every zero-due statement, so that text identifies no cycle.
+    """
+    if not due_date:
+        return None
+    try:
+        parse_cc_date(due_date)
+    except ValueError, OverflowError:
+        return None
+    async with async_session() as session:
+        return (
+            (
+                await session.execute(
+                    select(StatementUpload).where(
+                        StatementUpload.account_id == account_id,
+                        StatementUpload.due_date == due_date,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+
 async def _find_account(bank: str, parsed) -> Account | None:
     """Find an existing credit_card account matching the statement's card.
 
@@ -1979,35 +2008,23 @@ async def process_statement_email(
     if account is None:
         return None
 
-    if parsed.due_date is not None:
-        async with async_session() as session:
-            existing = (
-                (
-                    await session.execute(
-                        select(StatementUpload).where(
-                            StatementUpload.account_id == account.id,
-                            StatementUpload.due_date == parsed.due_date,
-                        )
-                    )
-                )
-                .scalars()
-                .first()
-            )
-        if existing is not None:
-            logger.info(
-                "duplicate CC statement email ignored: existing upload id=%s "
-                "source_id=%s account_id=%s due_date=%s",
-                existing.id,
-                source_id,
-                account.id,
-                parsed.due_date,
-            )
-            return {
-                "statement_upload_id": existing.id,
-                "matched": 0,
-                "missing": 0,
-                "imported": 0,
-            }
+    if (
+        existing := await _upload_for_due_date(account.id, parsed.due_date)
+    ) is not None:
+        logger.info(
+            "duplicate CC statement email ignored: existing upload id=%s "
+            "source_id=%s account_id=%s due_date=%s",
+            existing.id,
+            source_id,
+            account.id,
+            parsed.due_date,
+        )
+        return {
+            "statement_upload_id": existing.id,
+            "matched": 0,
+            "missing": 0,
+            "imported": 0,
+        }
 
     # Reconcile
     async with async_session() as session:

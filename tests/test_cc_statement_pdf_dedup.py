@@ -152,8 +152,9 @@ async def test_pdf_dedups_against_prior_upload_for_same_due_date(
 
 
 @pytest.mark.anyio
-async def test_no_dedup_when_parsed_due_date_missing(
-    session_factory, monkeypatch, tmp_path
+@pytest.mark.parametrize("due_date", [None, "NO PAYMENT REQUIRED"])
+async def test_no_dedup_when_parsed_due_date_is_not_a_date(
+    session_factory, monkeypatch, tmp_path, due_date
 ):
     acc_id = await _add_cc_account(session_factory)
     async with session_factory() as session:
@@ -164,7 +165,7 @@ async def test_no_dedup_when_parsed_due_date_missing(
             file_path="x",
             source_kind="pdf",
             status="parsed",
-            due_date=None,
+            due_date=due_date,
             payment_status="pending",
         )
         session.add(existing)
@@ -172,7 +173,7 @@ async def test_no_dedup_when_parsed_due_date_missing(
 
     import_calls: list = []
     statements_dir = _install_common_monkeypatches(
-        monkeypatch, tmp_path, None, import_calls
+        monkeypatch, tmp_path, due_date, import_calls
     )
 
     # The same attachment twice in one second must not overwrite the first PDF.
