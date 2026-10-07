@@ -514,7 +514,8 @@ async def test_conversation_timestamp_survives_sqlite_round_trip(session):
     [
         ("y", "saved"),
         ("n", "saved"),
-        # The send failed after Telegram showed the message. The Ref recovers it.
+        # The send failed after Telegram showed the message, and the worker
+        # crashed after the claim. The replay finds the binding from the Ref.
         ("y", "ref"),
         # A Yes from a different message must not authorize the change.
         ("y", "other"),
@@ -525,6 +526,7 @@ async def test_unclear_change_asks_with_yes_no_buttons(
 ):
     import financial_dashboard.db as db_package
     from financial_dashboard.services import telegram
+    from financial_dashboard.services.assistant import orchestrator
 
     session.add(Setting(key="telegram.chat_id", value="7"))
     await ensure_category(session, "self_transfer")
@@ -615,19 +617,43 @@ async def test_unclear_change_asks_with_yes_no_buttons(
         return True
 
     monkeypatch.setattr(telegram, "dispatch_saved_delivery", fake_dispatch)
+    callback_data = next(
+        button["callback_data"]
+        for button in buttons
+        if button["callback_data"].endswith(f":{choice}")
+    )
+    if mapping == "ref":
+
+        async def crash(**kwargs) -> None:
+            raise RuntimeError("worker crashed")
+
+        async def bot_user() -> SimpleNamespace:
+            return SimpleNamespace(id=1)
+
+        monkeypatch.setattr(orchestrator, "_process_callback_interaction", crash)
+        tapped = SimpleNamespace(
+            chat=SimpleNamespace(id=7),
+            message_id=700,
+            text=delivery.text,
+            from_user=SimpleNamespace(id=1),
+        )
+        with pytest.raises(RuntimeError):
+            await orchestrator._handle_assistant_callback(
+                SimpleNamespace(
+                    update_id=1,
+                    callback_query=SimpleNamespace(data=callback_data, message=tapped),
+                ),
+                SimpleNamespace(bot=SimpleNamespace(get_me=bot_user)),
+                trigger="confirm_button",
+            )
 
     await _process_callback_interaction(
         interaction_id=callback.id,
         worker_token="callback-worker",
         trigger="confirm_button",
-        callback_data=next(
-            button["callback_data"]
-            for button in buttons
-            if button["callback_data"].endswith(f":{choice}")
-        ),
+        callback_data=callback_data,
         recipient_chat_id=7,
         physical_message_id=700,
-        message_text=delivery.text,
     )
 
     async with maker() as verification:
@@ -649,7 +675,9 @@ async def test_unclear_change_asks_with_yes_no_buttons(
         # An incomplete patch must not hide it either.
         'Set note to "lunch" and category self transfer; don\'t make changes',
         "Keep the note unchanged",
-        "Self transfer? Leave the category as is",
+        # A guess must not offer the category that the user keeps.
+        'Set note to "new"; keep the category unchanged',
+        "Exclude from cashflow; keep the cashflow exclusion unchanged",
         "Keep it as is",
     ],
 )
@@ -672,6 +700,7 @@ async def test_forbidden_change_is_refused_not_offered(session, message):
                         "changes": {
                             "category": {"op": "set", "value": "self_transfer"},
                             "note": {"op": "set", "value": "new"},
+                            "exclude_from_cashflow": {"op": "set", "value": True},
                         },
                     }
                 ],
@@ -691,3 +720,4 @@ async def test_forbidden_change_is_refused_not_offered(session, message):
     assert conversation.pending_confirmation_json is None
     assert txn.category is None
     assert txn.note is None
+    assert txn.exclude_from_cashflow is False

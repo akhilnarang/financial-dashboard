@@ -692,6 +692,8 @@ async def run_turn(
                     ):
                         # A reply that names only a category keeps the old note.
                         call = _without(call, "note")
+                    # A guess drops the category. Check the vetoes first.
+                    await raise_vetoes(session, call, user_message)
                     guessed = await unnamed_category(session, call, user_message)
                     if guessed is not None:
                         call = _without(call, "category")
@@ -2053,7 +2055,6 @@ async def _process_callback_interaction(
     callback_data: str,
     recipient_chat_id: int,
     physical_message_id: int | None,
-    message_text: str | None = None,
 ) -> None:
     from financial_dashboard.db import async_session
     from financial_dashboard.services.assistant.delivery import (
@@ -2186,7 +2187,6 @@ async def _process_callback_interaction(
                     callback_data=callback_data,
                     recipient_chat_id=recipient_chat_id,
                     physical_message_id=physical_message_id,
-                    message_text=message_text,
                 )
             else:
                 try:
@@ -2301,7 +2301,6 @@ async def _confirm_from_button(
     callback_data: str,
     recipient_chat_id: int,
     physical_message_id: int | None,
-    message_text: str | None,
 ) -> OrchestrationResult:
     """Apply or dismiss the pending confirmation that a Yes/No button shows."""
     from financial_dashboard.db.models import TelegramOutboundDelivery
@@ -2312,10 +2311,7 @@ async def _confirm_from_button(
         settle_delivery_from_callback,
         validate_delivery_proof,
     )
-    from financial_dashboard.services.assistant.message_context import (
-        recover_ref_context,
-        resolve_reply,
-    )
+    from financial_dashboard.services.assistant.message_context import resolve_reply
 
     stale = OrchestrationResult(
         Error(
@@ -2330,20 +2326,13 @@ async def _confirm_from_button(
     except ValueError:
         return stale
     # The tapped message must be the confirmation delivery itself.
-    tapped = None
-    if physical_message_id is not None:
-        tapped = await resolve_reply(
+    tapped = (
+        await resolve_reply(
             session, chat_id=recipient_chat_id, message_id=physical_message_id
         )
-        if tapped is None and message_text:
-            # The send can fail after Telegram shows the message. Its Ref
-            # footer then binds the message to the delivery.
-            tapped = await recover_ref_context(
-                session,
-                chat_id=recipient_chat_id,
-                message_id=physical_message_id,
-                message_text=message_text,
-            )
+        if physical_message_id is not None
+        else None
+    )
     delivery = await session.get(TelegramOutboundDelivery, delivery_id)
     if (
         choice not in {"y", "n"}
@@ -2386,6 +2375,10 @@ async def _handle_assistant_callback(update, context, *, trigger: str) -> None:
         claim_interaction,
         claim_processing,
     )
+    from financial_dashboard.services.assistant.message_context import (
+        recover_ref_context,
+        resolve_reply,
+    )
 
     query = update.callback_query
     message = query.message
@@ -2407,6 +2400,23 @@ async def _handle_assistant_callback(update, context, *, trigger: str) -> None:
             trigger=trigger,
             user_text=query.data,
         )
+        if (
+            trigger == "confirm_button"
+            and message.text
+            and await resolve_reply(
+                session, chat_id=message.chat.id, message_id=message.message_id
+            )
+            is None
+        ):
+            # The send can fail after Telegram shows the message. Its Ref
+            # footer then binds the message to the delivery. Save the binding
+            # with the claim, so that a replay after a crash finds it.
+            await recover_ref_context(
+                session,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                message_text=message.text,
+            )
         await session.commit()
         if not is_new:
             await query.answer("Already handled")
@@ -2423,6 +2433,5 @@ async def _handle_assistant_callback(update, context, *, trigger: str) -> None:
             callback_data=query.data,
             recipient_chat_id=message.chat.id,
             physical_message_id=message.message_id,
-            message_text=message.text,
         )
     await query.answer()

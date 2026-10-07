@@ -192,6 +192,13 @@ async def unnamed_category(
     return patch.value
 
 
+_PRESERVE_TARGETS = (
+    ("note", "note|description|desc|memo"),
+    ("category", "category"),
+    ("exclude_from_cashflow", "(?:cashflow|cash flow)(?: exclusion)?|exclusion"),
+)
+
+
 async def raise_vetoes(
     session: AsyncSession,
     request: ApplyTransactionChanges,
@@ -220,13 +227,9 @@ async def raise_vetoes(
         raise ExplicitlyDenied("the current message forbids transaction changes")
     # A note payload can contain these words, so look only outside it.
     kept_text = raw if instruction.note_payload is None else instruction_text
-    if (
-        preserves_target(kept_text, "it|this|everything")
-        or (
-            changes.note is not None
-            and preserves_target(kept_text, "note|description|desc|memo")
-        )
-        or (changes.category is not None and preserves_target(kept_text, "category"))
+    if preserves_target(kept_text, "it|this|everything") or any(
+        getattr(changes, field) is not None and preserves_target(kept_text, target)
+        for field, target in _PRESERVE_TARGETS
     ):
         raise ExplicitlyDenied("the current message asks to keep this unchanged")
     if changes.note is not None and any(
