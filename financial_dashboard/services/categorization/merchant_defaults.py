@@ -87,7 +87,9 @@ DEFAULT_MERCHANT_RULES: dict[str, list[str]] = {
     "travel": ["makemytrip", "irctc", "loungeone", "pay www lou", "pax innovat"],
     "entertainment": ["bookmyshow", "orbgen"],
     "cashback_rewards": [
-        "supermoney",
+        # SuperMoney pays its rewards from this handle. A friend who pays you
+        # through the app shows "Paid via SuperMoney", which is not cashback.
+        "supermoney1",
         "converted to statement credit",
         "cashback",
         "poweraccess pa",
