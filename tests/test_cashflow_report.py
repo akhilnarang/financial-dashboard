@@ -605,43 +605,27 @@ async def test_bridge_api_estimates_from_a_running_balance_and_skips_unknown(
         )
 
     # The May statement prints June 1 rows: one it imported and one it matched
-    # to an alert. Its closing and the June opening both include them. An older
-    # statement that also ends on May 31 has no such rows.
+    # to an alert. Its closing and the June opening both include them. It is the
+    # newest, so its closing gives the opening. The June statement and an older
+    # statement that also ends on May 31 must agree with it.
     late = await ensure_account(session, 6, "bank_account")
-    for start, opening in (("01/04/2026", "970.00"), ("01/05/2026", None)):
-        session.add(
-            BankStatementUpload(
-                account_id=late,
-                bank="hdfc",
-                filename="may.pdf",
-                file_path="/synthetic/may.pdf",
-                opening_balance=opening,
-                closing_balance="970.00" if opening else "1,000.00",
-                statement_period_start=start,
-                statement_period_end="31/05/2026",
-            )
-        )
-    session.add(
-        BankStatementUpload(
+    for start, end, opening, closing in (
+        ("01/04/2026", "31/05/2026", "970.00", "970.00"),
+        ("01/06/2026", "30/06/2026", "1,000.00", "1,070.00"),
+        ("01/05/2026", "31/05/2026", "1,000.00", "1,000.00"),
+    ):
+        may = BankStatementUpload(
             account_id=late,
             bank="hdfc",
-            filename="june.pdf",
-            file_path="/synthetic/june.pdf",
-            opening_balance="1,000.00",
-            closing_balance="1,070.00",
-            statement_period_start="01/06/2026",
-            statement_period_end="30/06/2026",
+            filename="late.pdf",
+            file_path="/synthetic/late.pdf",
+            opening_balance=opening,
+            closing_balance=closing,
+            statement_period_start=start,
+            statement_period_end=end,
         )
-    )
-    await session.flush()
-    may = (
-        await session.execute(
-            select(BankStatementUpload).where(
-                BankStatementUpload.account_id == late,
-                BankStatementUpload.opening_balance.is_(None),
-            )
-        )
-    ).scalar_one()
+        session.add(may)
+        await session.flush()
     rows = [
         await _add(
             session,
