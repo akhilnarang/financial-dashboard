@@ -549,17 +549,6 @@ def _contested_winners(
     alone carries. The reference names that DB row, so a rival that reaches
     it only by date does not contest the match. A rival with the same
     reference still does. The row still counts as a rival for a date match.
-
-    Args:
-        claimed_ids: DB row ID claimed by each matched statement row.
-        contention_sets: DB row IDs each statement row could claim.
-        reference_sets: DB row IDs each statement row could claim by
-            reference.
-        txn_by_idx: Parsed statement rows keyed by statement index.
-        final_indices: Statement rows with a final reference match.
-
-    Returns:
-        Statement indices whose match must be demoted.
     """
     contested = []
     for stmt_idx, db_id in claimed_ids.items():
@@ -886,9 +875,7 @@ def reconcile_bank_statement(
     # Exception: rivals with equal refresh identities are interchangeable as
     # winners (either pairing lands the same values), so the winner keeps its
     # match. The loser is held back regardless — it is a second statement row
-    # for a transaction the DB holds once. A pass-1 match by a reference that
-    # one DB row alone carries did not win on order, so only a rival with the
-    # same reference contests it.
+    # for a transaction the DB holds once.
     contested = _contested_winners(
         claimed_ids,
         contention_sets,
