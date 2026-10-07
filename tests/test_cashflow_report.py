@@ -514,7 +514,8 @@ async def test_bridge_api_estimates_from_a_running_balance_and_skips_unknown(
     later rows of its own day included. A statement that covers a day wins over
     a nearer running balance, whose same-day order can be wrong. Statements that
     do not cover the day do not hide a nearer snapshot. An account with no
-    balance at all stays out of the totals, and its rows do too.
+    balance at all stays out of the totals, and its rows do too. A row that a
+    statement prints after its period end counts once, on its own date.
     """
     await _add(
         session,
@@ -600,10 +601,48 @@ async def test_bridge_api_estimates_from_a_running_balance_and_skips_unknown(
             )
         )
 
+    # The May statement prints a June 1 row. Its closing and the next opening
+    # both include that row.
+    late = await ensure_account(session, 6, "bank_account")
+    may = BankStatementUpload(
+        account_id=late,
+        bank="hdfc",
+        filename="may.pdf",
+        file_path="/synthetic/may.pdf",
+        opening_balance="0.00",
+        closing_balance="1,000.00",
+        statement_period_start="01/05/2026",
+        statement_period_end="31/05/2026",
+    )
+    session.add(may)
+    session.add(
+        BankStatementUpload(
+            account_id=late,
+            bank="hdfc",
+            filename="june.pdf",
+            file_path="/synthetic/june.pdf",
+            opening_balance="1,000.00",
+            closing_balance="1,070.00",
+            statement_period_start="01/06/2026",
+            statement_period_end="30/06/2026",
+        )
+    )
+    await session.flush()
+    for amount, upload_id in ((D("30"), may.id), (D("70"), None)):
+        await _add(
+            session,
+            direction="credit",
+            amount=amount,
+            category="interest",
+            account_id=late,
+            transaction_date=JUN,
+            bank_statement_upload_id=upload_id,
+        )
+
     r = await client.get("/api/cashflow/bridge?date_from=2026-06-01&date_to=2026-06-30")
     assert r.status_code == 200
     body = r.json()
-    known, unknown, statement, snapshot = body["accounts"]
+    known, unknown, statement, snapshot, spilled = body["accounts"]
     assert (known["opening"]["source"], D(str(known["opening"]["amount"]))) == (
         "estimated",
         D("1000"),
@@ -616,7 +655,9 @@ async def test_bridge_api_estimates_from_a_running_balance_and_skips_unknown(
     assert statement["closing"]["as_of"] == "2026-03-31"
     assert D(str(snapshot["opening"]["amount"])) == D("500")
     assert snapshot["opening"]["as_of"] == "2026-05-31"
-    assert D(str(body["opening"])) == D("1500")
-    assert D(str(body["actual_closing"])) == D("1680")
+    assert D(str(spilled["opening"]["amount"])) == D("970")
+    assert D(str(spilled["gap"])) == 0
+    assert D(str(body["opening"])) == D("2470")
+    assert D(str(body["actual_closing"])) == D("2750")
     assert D(str(body["gap"])) == 0
     assert any(unknown["label"] in w for w in body["warnings"])

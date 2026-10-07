@@ -168,6 +168,7 @@ class BankFlows(NamedTuple):
     net_flow: dict[int, Decimal]
     extra: dict[str, Decimal]
     day_end: dict[tuple[int, datetime.date], Decimal]
+    by_upload: dict[int, dict[datetime.date, Decimal]]
 
 
 async def _bank_flows(
@@ -183,6 +184,7 @@ async def _bank_flows(
         defaultdict(Decimal),
         defaultdict(Decimal),
         {},
+        defaultdict(lambda: defaultdict(Decimal)),
     )
     # ponytail: rows with no time sort by id, so the order in a day is a guess.
     rows = await session.execute(
@@ -192,12 +194,15 @@ async def _bank_flows(
             FLOW_KIND,
             SIGNED_AMOUNT,
             Transaction.balance,
+            Transaction.bank_statement_upload_id,
         )
         .where(BANK_SCOPE, Transaction.transaction_date.is_not(None))
         .order_by(Transaction.transaction_time.nulls_first(), Transaction.id)
     )
-    for account_id, day, kind, flow, balance in rows:
+    for account_id, day, kind, flow, balance, upload_id in rows:
         flows.daily[account_id][day] += flow
+        if upload_id is not None:
+            flows.by_upload[upload_id][day] += flow
         if date_from <= day <= date_to:
             flows.net_flow[account_id] += flow
             if kind != "report":
@@ -221,7 +226,15 @@ async def _known(
     session: AsyncSession,
     account_ids: list[int],
     day_end: dict[tuple[int, datetime.date], Decimal],
+    by_upload: dict[int, dict[datetime.date, Decimal]],
 ) -> Known:
+    """Read each account's statements and point balances.
+
+    A statement can print rows dated after its period end. Its closing balance
+    includes them, and so does the opening balance of the next statement. Each
+    statement balance at the end of that day takes them out again, so that the
+    rows count once, on their own dates.
+    """
     periods: dict[int, list[Period]] = defaultdict(list)
     anchors: dict[int, list[Anchor]] = defaultdict(list)
     uploads = (
@@ -231,8 +244,20 @@ async def _known(
             .order_by(BankStatementUpload.id.desc())
         )
     ).scalars()
-    for upload in uploads:
-        ends = _statement_anchors(upload)
+    statements = [(upload, _statement_anchors(upload)) for upload in uploads]
+    late: dict[tuple[int, datetime.date], Decimal] = {}
+    for upload, ends in statements:
+        if len(ends) == 2 and (
+            flow := _flow_between(
+                by_upload.get(upload.id, {}), ends[1].day, datetime.date.max
+            )
+        ):
+            late[(upload.account_id, ends[1].day)] = flow
+    for upload, ends in statements:
+        ends = [
+            a._replace(value=a.value - late.get((upload.account_id, a.day), Decimal(0)))
+            for a in ends
+        ]
         anchors[upload.account_id].extend(ends)
         if len(ends) == 2:
             periods[upload.account_id].append(
@@ -279,8 +304,12 @@ async def cash_bridge(session: AsyncSession, summary: CashflowSummary) -> CashBr
         .scalars()
         .all()
     )
-    daily, net_flow, extra, day_end = await _bank_flows(session, date_from, date_to)
-    periods, anchors = await _known(session, [a.id for a in accounts], day_end)
+    daily, net_flow, extra, day_end, by_upload = await _bank_flows(
+        session, date_from, date_to
+    )
+    periods, anchors = await _known(
+        session, [a.id for a in accounts], day_end, by_upload
+    )
     # The first date has no day before it. No row can exist there.
     opening_day = max(date_from, datetime.date.min + ONE_DAY) - ONE_DAY
     lines: list[BridgeAccount] = []
