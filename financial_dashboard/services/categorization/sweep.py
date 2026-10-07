@@ -177,16 +177,6 @@ def _needs_prompt(assistant_enabled: bool) -> ColumnElement[bool]:
     return and_(*clauses)
 
 
-async def _notified_count(session: AsyncSession, key: ImportKey) -> int:
-    """Count the rows of an import that already had a prompt or a summary."""
-    count = await session.scalar(
-        select(func.count()).where(
-            _in_import(key), Transaction.last_notified_at.is_not(None)
-        )
-    )
-    return count or 0
-
-
 async def _cap_per_import(
     session: AsyncSession, rows: Sequence[Transaction]
 ) -> PromptBatch:
@@ -211,7 +201,14 @@ async def _cap_per_import(
             batch.prompt.append(txn)
             continue
         if key not in used:
-            used[key] = await _notified_count(session, key)
+            used[key] = (
+                await session.scalar(
+                    select(func.count()).where(
+                        _in_import(key), Transaction.last_notified_at.is_not(None)
+                    )
+                )
+                or 0
+            )
         if used[key] < cap and txn.last_notified_at is None:
             used[key] += 1
             batch.prompt.append(txn)
@@ -411,22 +408,6 @@ async def _notify_plain(txn: Transaction, chat_id: int, base_url: str) -> bool:
     return True
 
 
-async def _notify_row(
-    session: AsyncSession,
-    txn: Transaction,
-    chat_id: int,
-    base_url: str,
-    assistant_enabled: bool,
-) -> bool:
-    """Send the review prompt of one row. Returns True when sent."""
-    decision = await _review_decision(session, txn, assistant_enabled)
-    if not assistant_enabled:
-        return await _notify_plain(txn, chat_id, base_url)
-    return decision is not None and await _notify_assistant(
-        session, txn, decision, chat_id, base_url
-    )
-
-
 async def run_review_notify() -> int:
     """Push rows flagged review_status='pending' to the Telegram review queue.
 
@@ -457,7 +438,14 @@ async def run_review_notify() -> int:
         batch = await _cap_per_import(session, rows)
         failed: set[ImportKey | None] = set()
         for txn in batch.prompt:
-            if await _notify_row(session, txn, chat_id, base_url, assistant_enabled):
+            decision = await _review_decision(session, txn, assistant_enabled)
+            if not assistant_enabled:
+                delivered = await _notify_plain(txn, chat_id, base_url)
+            else:
+                delivered = decision is not None and await _notify_assistant(
+                    session, txn, decision, chat_id, base_url
+                )
+            if delivered:
                 sent += 1
             else:
                 failed.add(_import_key(txn))
