@@ -38,7 +38,11 @@ from financial_dashboard.services.cashflow.report import (
     UNCATEGORIZED,
 )
 from financial_dashboard.services.cashflow.scope import BANK_ACCOUNT_TYPES, BANK_SCOPE
-from financial_dashboard.services.statements.bank import _parse_amount, _parse_date
+from financial_dashboard.services.statements.bank import (
+    _parse_amount,
+    _parse_date,
+    reconciliation_from_json,
+)
 
 ONE_DAY = datetime.timedelta(days=1)
 
@@ -64,23 +68,17 @@ class Anchor(NamedTuple):
     kind: str
 
 
-def _statement_anchors(upload: BankStatementUpload) -> list[Anchor]:
-    anchors = []
-    for raw_day, raw_value, shift in (
-        (upload.statement_period_start, upload.opening_balance, -ONE_DAY),
-        (upload.statement_period_end, upload.closing_balance, datetime.timedelta()),
-    ):
-        if not raw_day or not raw_value:
-            continue
-        try:
-            anchors.append(
-                Anchor(
-                    _parse_date(raw_day) + shift, _parse_amount(raw_value), "statement"
-                )
-            )
-        except InvalidOperation, ValueError:
-            continue
-    return anchors
+def _statement_anchor(
+    raw_day: str | None, raw_value: str | None, shift: datetime.timedelta
+) -> Anchor | None:
+    if not raw_day or not raw_value:
+        return None
+    try:
+        return Anchor(
+            _parse_date(raw_day) + shift, _parse_amount(raw_value), "statement"
+        )
+    except InvalidOperation, ValueError:
+        return None
 
 
 def _flow_between(
@@ -168,7 +166,8 @@ class BankFlows(NamedTuple):
     net_flow: dict[int, Decimal]
     extra: dict[str, Decimal]
     day_end: dict[tuple[int, datetime.date], Decimal]
-    by_upload: dict[int, dict[datetime.date, Decimal]]
+    row_flow: dict[int, tuple[datetime.date, Decimal]]
+    upload_rows: dict[int | None, list[int]]
 
 
 async def _bank_flows(
@@ -184,11 +183,13 @@ async def _bank_flows(
         defaultdict(Decimal),
         defaultdict(Decimal),
         {},
-        defaultdict(lambda: defaultdict(Decimal)),
+        {},
+        defaultdict(list),
     )
     # ponytail: rows with no time sort by id, so the order in a day is a guess.
     rows = await session.execute(
         select(
+            Transaction.id,
             Transaction.account_id,
             Transaction.transaction_date,
             FLOW_KIND,
@@ -199,10 +200,10 @@ async def _bank_flows(
         .where(BANK_SCOPE, Transaction.transaction_date.is_not(None))
         .order_by(Transaction.transaction_time.nulls_first(), Transaction.id)
     )
-    for account_id, day, kind, flow, balance, upload_id in rows:
+    for txn_id, account_id, day, kind, flow, balance, upload_id in rows:
         flows.daily[account_id][day] += flow
-        if upload_id is not None:
-            flows.by_upload[upload_id][day] += flow
+        flows.row_flow[txn_id] = (day, flow)
+        flows.upload_rows[upload_id].append(txn_id)
         if date_from <= day <= date_to:
             flows.net_flow[account_id] += flow
             if kind != "report":
@@ -215,6 +216,23 @@ async def _bank_flows(
     return flows
 
 
+def _late_flow(
+    upload: BankStatementUpload, end: datetime.date, flows: BankFlows
+) -> Decimal:
+    """Signed flow of the statement's rows that are dated after ``end``.
+
+    The statement's rows are the rows it imported and the rows it matched.
+    """
+    members: set[int | None] = set(flows.upload_rows.get(upload.id, ()))
+    try:
+        recon = reconciliation_from_json(upload.reconciliation_data or "{}")
+    except ValueError:
+        recon = {}
+    members.update(entry.get("db_txn_id") for entry in recon.get("matched", []))
+    dated = (flows.row_flow[i] for i in members if i in flows.row_flow)
+    return sum((flow for day, flow in dated if day > end), Decimal(0))
+
+
 class Known(NamedTuple):
     """Each account's statements and point balances."""
 
@@ -223,17 +241,14 @@ class Known(NamedTuple):
 
 
 async def _known(
-    session: AsyncSession,
-    account_ids: list[int],
-    day_end: dict[tuple[int, datetime.date], Decimal],
-    by_upload: dict[int, dict[datetime.date, Decimal]],
+    session: AsyncSession, account_ids: list[int], flows: BankFlows
 ) -> Known:
     """Read each account's statements and point balances.
 
     A statement can print rows dated after its period end. Its closing balance
-    includes them, and so does the opening balance of the next statement. Each
-    statement balance at the end of that day takes them out again, so that the
-    rows count once, on their own dates.
+    includes them. The opening balance of the next statement also includes the
+    rows of the newest statement that ends on that day. Both balances take these
+    rows out again, so that the rows count once, on their own dates.
     """
     periods: dict[int, list[Period]] = defaultdict(list)
     anchors: dict[int, list[Anchor]] = defaultdict(list)
@@ -244,24 +259,28 @@ async def _known(
             .order_by(BankStatementUpload.id.desc())
         )
     ).scalars()
-    statements = [(upload, _statement_anchors(upload)) for upload in uploads]
-    late: dict[tuple[int, datetime.date], Decimal] = {}
-    for upload, ends in statements:
-        if len(ends) == 2 and (
-            flow := _flow_between(
-                by_upload.get(upload.id, {}), ends[1].day, datetime.date.max
-            )
-        ):
-            late[(upload.account_id, ends[1].day)] = flow
-    for upload, ends in statements:
-        ends = [
-            a._replace(value=a.value - late.get((upload.account_id, a.day), Decimal(0)))
-            for a in ends
-        ]
-        anchors[upload.account_id].extend(ends)
-        if len(ends) == 2:
-            periods[upload.account_id].append(
-                Period(ends[0].day, ends[1].day, ends[0].value, ends[1].value)
+    statements: list[tuple[int, Anchor | None, Anchor | None]] = []
+    late_at: dict[tuple[int, datetime.date], Decimal] = {}
+    for upload in uploads:
+        closing = _statement_anchor(
+            upload.statement_period_end, upload.closing_balance, datetime.timedelta()
+        )
+        if closing:
+            late = _late_flow(upload, closing.day, flows)
+            late_at.setdefault((upload.account_id, closing.day), late)
+            closing = closing._replace(value=closing.value - late)
+        opening = _statement_anchor(
+            upload.statement_period_start, upload.opening_balance, -ONE_DAY
+        )
+        statements.append((upload.account_id, opening, closing))
+    for account_id, opening, closing in statements:
+        if opening:
+            late = late_at.get((account_id, opening.day), Decimal(0))
+            opening = opening._replace(value=opening.value - late)
+        anchors[account_id].extend(a for a in (opening, closing) if a)
+        if opening and closing:
+            periods[account_id].append(
+                Period(opening.day, closing.day, opening.value, closing.value)
             )
 
     snapshots = await session.execute(
@@ -276,7 +295,7 @@ async def _known(
     )
     for account_id, as_of, value in snapshots:
         anchors[account_id].append(Anchor(as_of, value, "snapshot"))
-    for (account_id, day), balance in day_end.items():
+    for (account_id, day), balance in flows.day_end.items():
         anchors[account_id].append(Anchor(day, balance, "transaction"))
     return Known(periods, anchors)
 
@@ -304,12 +323,9 @@ async def cash_bridge(session: AsyncSession, summary: CashflowSummary) -> CashBr
         .scalars()
         .all()
     )
-    daily, net_flow, extra, day_end, by_upload = await _bank_flows(
-        session, date_from, date_to
-    )
-    periods, anchors = await _known(
-        session, [a.id for a in accounts], day_end, by_upload
-    )
+    flows = await _bank_flows(session, date_from, date_to)
+    daily, net_flow, extra = flows.daily, flows.net_flow, flows.extra
+    periods, anchors = await _known(session, [a.id for a in accounts], flows)
     # The first date has no day before it. No row can exist there.
     opening_day = max(date_from, datetime.date.min + ONE_DAY) - ONE_DAY
     lines: list[BridgeAccount] = []

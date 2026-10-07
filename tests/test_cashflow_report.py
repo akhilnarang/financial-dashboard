@@ -1,4 +1,5 @@
 import datetime
+import json
 from decimal import Decimal
 
 import pytest
@@ -51,8 +52,10 @@ async def _add(session, **kw):
         account_id=await bank_account(session),
     )
     base.update(kw)
-    session.add(Transaction(**base))
+    txn = Transaction(**base)
+    session.add(txn)
     await session.flush()
+    return txn
 
 
 async def test_null_currency_treated_as_inr(session: AsyncSession):
@@ -601,20 +604,23 @@ async def test_bridge_api_estimates_from_a_running_balance_and_skips_unknown(
             )
         )
 
-    # The May statement prints a June 1 row. Its closing and the next opening
-    # both include that row.
+    # The May statement prints June 1 rows: one it imported and one it matched
+    # to an alert. Its closing and the June opening both include them. An older
+    # statement that also ends on May 31 has no such rows.
     late = await ensure_account(session, 6, "bank_account")
-    may = BankStatementUpload(
-        account_id=late,
-        bank="hdfc",
-        filename="may.pdf",
-        file_path="/synthetic/may.pdf",
-        opening_balance="0.00",
-        closing_balance="1,000.00",
-        statement_period_start="01/05/2026",
-        statement_period_end="31/05/2026",
-    )
-    session.add(may)
+    for start, opening in (("01/04/2026", "970.00"), ("01/05/2026", None)):
+        session.add(
+            BankStatementUpload(
+                account_id=late,
+                bank="hdfc",
+                filename="may.pdf",
+                file_path="/synthetic/may.pdf",
+                opening_balance=opening,
+                closing_balance="970.00" if opening else "1,000.00",
+                statement_period_start=start,
+                statement_period_end="31/05/2026",
+            )
+        )
     session.add(
         BankStatementUpload(
             account_id=late,
@@ -628,7 +634,15 @@ async def test_bridge_api_estimates_from_a_running_balance_and_skips_unknown(
         )
     )
     await session.flush()
-    for amount, upload_id in ((D("30"), may.id), (D("70"), None)):
+    may = (
+        await session.execute(
+            select(BankStatementUpload).where(
+                BankStatementUpload.account_id == late,
+                BankStatementUpload.opening_balance.is_(None),
+            )
+        )
+    ).scalar_one()
+    rows = [
         await _add(
             session,
             direction="credit",
@@ -638,6 +652,10 @@ async def test_bridge_api_estimates_from_a_running_balance_and_skips_unknown(
             transaction_date=JUN,
             bank_statement_upload_id=upload_id,
         )
+        for amount, upload_id in ((D("20"), may.id), (D("10"), None), (D("70"), None))
+    ]
+    may.reconciliation_data = json.dumps({"matched": [{"db_txn_id": rows[1].id}]})
+    await session.flush()
 
     r = await client.get("/api/cashflow/bridge?date_from=2026-06-01&date_to=2026-06-30")
     assert r.status_code == 200
@@ -657,6 +675,7 @@ async def test_bridge_api_estimates_from_a_running_balance_and_skips_unknown(
     assert snapshot["opening"]["as_of"] == "2026-05-31"
     assert D(str(spilled["opening"]["amount"])) == D("970")
     assert D(str(spilled["gap"])) == 0
+    assert not any("disagree" in w for w in body["warnings"])
     assert D(str(body["opening"])) == D("2470")
     assert D(str(body["actual_closing"])) == D("2750")
     assert D(str(body["gap"])) == 0
