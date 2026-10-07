@@ -68,10 +68,11 @@ class _SearchQuery(NamedTuple):
 def _build_search_query(rule: FetchRule, since_str: str | None) -> _SearchQuery:
     """Build the UID SEARCH criteria for one rule.
 
-    An IMAP quoted string holds ASCII only. The first non-ASCII filter value
-    goes last, as a UTF-8 literal under CHARSET UTF-8. imaplib sends one
-    literal per command, so the search leaves out any other non-ASCII
-    filter. The local rule filter checks every filter after the fetch.
+    An IMAP quoted string holds ASCII only. A non-ASCII filter value goes
+    last, as a UTF-8 literal under CHARSET UTF-8. imaplib sends one literal
+    per command, so a rule with two non-ASCII filters raises ValueError.
+    The search must not drop a filter: the fetch limit applies before the
+    local rule filter, so a broad search can starve the matching emails.
 
     Args:
         rule: The fetch rule.
@@ -87,6 +88,8 @@ def _build_search_query(rule: FetchRule, since_str: str | None) -> _SearchQuery:
         parts.append(f"SINCE {since_str}")
     if not wide:
         return _SearchQuery(" ".join(parts) or "ALL", None)
+    if len(wide) > 1:
+        raise ValueError("only one non-ASCII filter per rule is supported")
     key, value = wide[0]
     return _SearchQuery(" ".join(["CHARSET UTF-8", *parts, key]), value.encode())
 

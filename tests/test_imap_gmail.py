@@ -100,8 +100,8 @@ class _FakeGmail(imaplib.IMAP4):
 @pytest.mark.parametrize(
     ("refusal", "fetch_ok", "fetched", "backfilled"),
     [
-        ("BAD", True, {1: ["91"], 2: [], 3: [], 4: [], 5: ["92"]}, {1, 5}),
-        ("drop", False, {1: [], 2: [], 3: [], 4: [], 5: []}, set()),
+        ("BAD", True, {1: ["91"], 2: [], 3: [], 4: [], 5: ["92"], 6: []}, {1, 5}),
+        ("drop", False, {1: [], 2: [], 3: [], 4: [], 5: [], 6: []}, set()),
     ],
 )
 def test_non_ascii_rule_searches_as_utf8_and_a_failed_rule_skips_alone(
@@ -114,7 +114,8 @@ def test_non_ascii_rule_searches_as_utf8_and_a_failed_rule_skips_alone(
     """A "✅" subject searches with a UTF-8 literal and fetches its email.
 
     A SELECT or SEARCH that imaplib or the server rejects skips only its
-    rule, and that rule does not finish its backfill. A dropped connection
+    rule, and that rule does not finish its backfill. A rule with two
+    non-ASCII filters is skipped, because the search cannot carry both. A dropped connection
     still fails the whole source.
     """
     monkeypatch.setattr(
@@ -130,6 +131,7 @@ def test_non_ascii_rule_searches_as_utf8_and_a_failed_rule_skips_alone(
             id=4, bank="refused", sender="alerts@refused.example", folder="INBOX"
         ),
         FetchRule(id=5, bank="plain", sender=SENDERS[2], folder="INBOX"),
+        FetchRule(id=6, bank="both", sender="Bänk", subject="Zahlung ✅"),
     ]
 
     result = imap_gmail._fetch_gmail_source_sync(
