@@ -403,6 +403,19 @@ async def test_override_merges_only_what_todays_parse_backs(
         assert shared.json()["detail"]["refused"][0]["reasons"] == [
             f"{name} matches no line to the keeper"
         ]
+    if keep_statement:
+        # A statement already matched the alert. The merge would drop that link.
+        alert = await session.get(Transaction, alert_id)
+        assert alert is not None
+        alert.bank_statement_upload_id = upload_id
+        await session.commit()
+        linked = await client.post("/api/transactions/merge-batch", json=request)
+        assert linked.json()["detail"]["refused"][0]["reasons"] == [
+            "an override needs a statement row as the duplicate, "
+            "or as the keeper of a row no statement matched"
+        ]
+        alert.bank_statement_upload_id = None
+        await session.commit()
     response = await client.post("/api/transactions/merge-batch", json=request)
     preview = await client.post(f"/api/statements/bank/{upload_id}/reconcile-preview")
 
@@ -450,9 +463,7 @@ async def test_override_merges_only_what_todays_parse_backs(
     assert json.loads(record.before_json or "{}")["reference_number"] == (
         None
         if keep_statement
-        else "654321"
-        if override == "references"
-        else "UTR000123456"
+        else {"references": "654321", "dates": "UTR000123456"}[override]
     )
 
 

@@ -348,14 +348,22 @@ async def _cc_cycle(
     return cycle, []
 
 
+def _checked_statement(keep: Transaction, dup: Transaction) -> StatementRef | None:
+    """Return the statement whose reparse must back an override of the pair.
+
+    A card statement can post a purchase days after its alert. The keeper can
+    then be the statement row. A duplicate that a statement already matched
+    must be that statement's own row: the merge keeps one statement link.
+    """
+    if (statement := statement_of(dup)) or _from_statement(dup):
+        return statement
+    return statement_of(keep)
+
+
 async def _parse_statements(
     session: AsyncSession, pairs: list[TransactionMergePair]
 ) -> dict[int, ParsedStoredStatement | str]:
     """Parse the statement of each pair that an override lifts.
-
-    The duplicate's statement comes first, then the keeper's. A card statement
-    can post a purchase days after its alert. The keeper is then the statement
-    row, and the alert folds into it.
 
     The parse runs before the write lock. A PDF parse can take seconds.
     Each duplicate id maps to today's parse, or to why it cannot be checked.
@@ -368,8 +376,11 @@ async def _parse_statements(
         dup = await session.get(Transaction, pair.duplicate_id)
         if keep is None or dup is None:
             continue
-        if (statement := statement_of(dup) or statement_of(keep)) is None:
-            parses[pair.duplicate_id] = "an override needs a statement row"
+        if (statement := _checked_statement(keep, dup)) is None:
+            parses[pair.duplicate_id] = (
+                "an override needs a statement row as the duplicate, "
+                "or as the keeper of a row no statement matched"
+            )
             continue
         name = f"{statement.kind} statement {statement.id}"
         try:
@@ -387,7 +398,7 @@ async def _reparse_refusal(
     dup: Transaction,
     stored: ParsedStoredStatement | str,
 ) -> str | None:
-    """Return why a reparse of the duplicate's statement would import it again.
+    """Return why a reparse of the pair's statement would import a row again.
 
     The merge must be flushed. Today's parse must match a line to the keeper.
     It must leave no line unmatched that could be the keeper or the duplicate
@@ -397,7 +408,7 @@ async def _reparse_refusal(
         return stored
     statement = StatementRef(stored.kind, stored.statement_id)
     name = f"{statement.kind} statement {statement.id}"
-    if statement not in (statement_of(dup), statement_of(keep)):
+    if _checked_statement(keep, dup) != statement:
         return "the pair changed during the check; try again"
     try:
         recon = await reconcile_parsed_statement(session, stored, as_reparse=True)
