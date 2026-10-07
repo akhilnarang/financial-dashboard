@@ -7,9 +7,10 @@ import imaplib
 import logging
 import re
 from collections import defaultdict
-from typing import cast
+from typing import NamedTuple, cast
 
 from financial_dashboard.core.crypto import decrypt_credentials
+from financial_dashboard.db.models import FetchRule
 from financial_dashboard.integrations.email.base import (
     INITIAL_BACKFILL_DAYS,
     FetchedEmail,
@@ -34,6 +35,124 @@ def _imap_since_date(last_synced_at: datetime.datetime | None) -> str | None:
         return since.strftime("%d-%b-%Y")
     since = last_synced_at - datetime.timedelta(days=2)
     return since.strftime("%d-%b-%Y")
+
+
+class _SearchQuery(NamedTuple):
+    """UID SEARCH criteria, and the UTF-8 literal that follows them."""
+
+    criteria: str
+    literal: bytes | None
+
+
+def _build_search_query(rule: FetchRule, since_str: str | None) -> _SearchQuery:
+    """Build the UID SEARCH criteria for one rule.
+
+    An IMAP quoted string holds ASCII only. A non-ASCII filter value goes
+    last, as a UTF-8 literal under CHARSET UTF-8. imaplib sends one literal
+    per command, so a rule with two non-ASCII filters raises ValueError.
+    The search must not drop a filter: the fetch limit applies before the
+    local rule filter, so a broad search can starve the matching emails.
+
+    Args:
+        rule: The fetch rule.
+        since_str: The IMAP SINCE date, or None.
+
+    Returns:
+        The criteria string and the literal to send after it, if any.
+    """
+    filters = [("FROM", rule.sender), ("SUBJECT", rule.subject)]
+    parts = [f'{key} "{value}"' for key, value in filters if value and value.isascii()]
+    wide = [(key, value) for key, value in filters if value and not value.isascii()]
+    if since_str:
+        parts.append(f"SINCE {since_str}")
+    if not wide:
+        return _SearchQuery(" ".join(parts) or "ALL", None)
+    if len(wide) > 1:
+        raise ValueError("only one non-ASCII filter per rule is supported")
+    key, value = wide[0]
+    return _SearchQuery(" ".join(["CHARSET UTF-8", *parts, key]), value.encode())
+
+
+def _select_folder(conn: imaplib.IMAP4, folder: str) -> bool:
+    """Select one folder read-only.
+
+    A failed SELECT leaves no folder selected. An error fails only this
+    folder. A dropped connection still aborts the
+    whole source.
+
+    Args:
+        conn: The IMAP connection.
+        folder: The Gmail folder name.
+
+    Returns:
+        True when the folder is selected.
+    """
+    try:
+        typ, _ = conn.select(f'"{folder}"', readonly=True)
+    except imaplib.IMAP4.abort:
+        raise
+    except (imaplib.IMAP4.error, ValueError) as e:
+        logger.error("Could not select Gmail folder %s: %s", folder, e)
+        return False
+    if typ != "OK":
+        logger.error("Could not select Gmail folder %s: %s", folder, typ)
+    return typ == "OK"
+
+
+def _search_rule(
+    conn: imaplib.IMAP4, rule: FetchRule, since_str: str | None
+) -> list[bytes] | None:
+    """Run the UID SEARCH for one rule.
+
+    An error skips only this rule. A dropped connection still aborts the
+    whole source.
+
+    Args:
+        conn: The IMAP connection, with the rule's folder selected.
+        rule: The fetch rule.
+        since_str: The source-wide IMAP SINCE date, or None.
+
+    Returns:
+        The matching UIDs, or None when the SEARCH fails.
+    """
+    if rule.initial_backfill_done_at is None:
+        # A rule without a finished initial backfill scans the last 3 months.
+        backfill_since = datetime.datetime.now(
+            datetime.timezone.utc
+        ) - datetime.timedelta(days=INITIAL_BACKFILL_DAYS)
+        since_str = backfill_since.strftime("%d-%b-%Y")
+        logger.info(
+            "Rule %s (bank=%s, sender=%s) initial backfill — SINCE %s",
+            rule.id,
+            rule.bank,
+            rule.sender,
+            since_str,
+        )
+    try:
+        query = _build_search_query(rule, since_str)
+        # The stub types literal as str. imaplib sends it as raw bytes.
+        conn.literal = cast(str | None, query.literal)
+        typ, data = conn.uid("SEARCH", query.criteria)
+    except imaplib.IMAP4.abort:
+        raise
+    except (imaplib.IMAP4.error, ValueError) as e:
+        logger.error(
+            "Gmail: SEARCH failed for rule %s (bank=%s): %s", rule.id, rule.bank, e
+        )
+        return None
+    finally:
+        # A failed command can leave the literal set for the next command.
+        conn.literal = None
+    uids = data[0].split() if typ == "OK" and data[0] else []
+    logger.info(
+        "Gmail: SEARCH for rule %s (bank=%s): criteria=%s -> result=%s count=%s",
+        rule.id,
+        rule.bank,
+        query.criteria,
+        typ,
+        len(uids),
+    )
+    return uids if typ == "OK" else None
 
 
 def _fetch_gmail_source_sync(
@@ -80,60 +199,21 @@ def _fetch_gmail_source_sync(
         for rule in rules:
             folder = rule.folder or "[Gmail]/All Mail"
             if folder != current_folder:
-                typ, _ = conn.select(f'"{folder}"', readonly=True)
-                if typ != "OK":
-                    logger.error("Could not select Gmail folder: %s", folder)
+                if not _select_folder(conn, folder):
+                    current_folder = None
                     continue
                 current_folder = folder
 
-            # For rules that haven't completed their initial backfill, cap the
-            # historical scan at 3 months rather than a full-history search.
-            needs_backfill = rule.initial_backfill_done_at is None
-            if needs_backfill:
-                backfill_since = datetime.datetime.now(
-                    datetime.timezone.utc
-                ) - datetime.timedelta(days=INITIAL_BACKFILL_DAYS)
-                rule_since_str = backfill_since.strftime("%d-%b-%Y")
-                logger.info(
-                    "Rule %s (bank=%s, sender=%s) initial backfill — SINCE %s",
-                    rule.id,
-                    rule.bank,
-                    rule.sender,
-                    rule_since_str,
-                )
-            else:
-                rule_since_str = since_str
-
-            criteria_parts = []
-            if rule.sender:
-                criteria_parts.append(f'FROM "{rule.sender}"')
-            if rule.subject:
-                criteria_parts.append(f'SUBJECT "{rule.subject}"')
-            if rule_since_str:
-                criteria_parts.append(f"SINCE {rule_since_str}")
-            criteria = " ".join(criteria_parts) if criteria_parts else "ALL"
-
-            # stdlib runtime accepts None for the optional CHARSET arg
-            # ("no charset"); the type stub narrows it to str. Cast keeps
-            # the documented IMAP semantics without sprinkling ignores.
-            typ, data = conn.uid("SEARCH", cast(str, None), criteria)
-            logger.info(
-                "Gmail: SEARCH for rule %s (bank=%s): criteria=%s -> result=%s count=%s",
-                rule.id,
-                rule.bank,
-                criteria,
-                typ,
-                len(data[0].split()) if typ == "OK" and data[0] else 0,
-            )
-            if typ != "OK" or not data[0]:
+            if (rule_uids := _search_rule(conn, rule, since_str)) is None:
+                continue
+            if not rule_uids:
                 # SEARCH completed OK but returned zero results — this
                 # rule genuinely has no matching emails, so its backfill
                 # is complete.
-                if needs_backfill and typ == "OK":
+                if rule.initial_backfill_done_at is None:
                     backfill_searched_rule_ids.add(rule.id)
                 continue
 
-            rule_uids = data[0].split()
             for uid in rule_uids:
                 uid_to_rules.setdefault((folder, uid), []).append(rule)
 
@@ -151,8 +231,8 @@ def _fetch_gmail_source_sync(
 
         for folder, uids in folder_uids.items():
             if folder != current_folder:
-                typ, _ = conn.select(f'"{folder}"', readonly=True)
-                if typ != "OK":
+                if not _select_folder(conn, folder):
+                    current_folder = None
                     continue
                 current_folder = folder
 
@@ -280,8 +360,8 @@ def _fetch_gmail_source_sync(
         current_folder = None
         for folder, keys in folder_new_keys.items():
             if folder != current_folder:
-                typ, _ = conn.select(f'"{folder}"', readonly=True)
-                if typ != "OK":
+                if not _select_folder(conn, folder):
+                    current_folder = None
                     continue
                 current_folder = folder
 

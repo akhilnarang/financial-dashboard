@@ -22,6 +22,7 @@ from financial_dashboard.services.accounts import (
     ensure_default_primary_card,
     retry_password_required_statements as accounts_retry_password_required_statements,
 )
+from financial_dashboard.services.statements.shared import decrypt_statement_password
 
 logging.basicConfig(
     level=logging.INFO,
@@ -130,14 +131,7 @@ async def account_edit_form(
     banks = sorted(bank_set)
 
     # Decrypt statement password for display
-    statement_password_plain = ""
-    if account.statement_password:
-        try:
-            statement_password_plain = (
-                get_fernet().decrypt(account.statement_password.encode()).decode()
-            )
-        except Exception:
-            pass
+    statement_password_plain = decrypt_statement_password(account) or ""
 
     return templates.TemplateResponse(
         request,

@@ -14,6 +14,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
+from financial_dashboard.config import get_fernet
 from financial_dashboard.db import (
     BankStatementUpload,
     StatementUpload,
@@ -63,7 +64,9 @@ async def test_retry_cc_wrong_password_then_import_is_idempotent(
     import financial_dashboard.services.statements.cc as cc_module
     from financial_dashboard.services.statements import shared as shared_module
 
-    acc_id = await h.add_cc_account(maker)
+    acc_id = await h.add_cc_account(
+        maker, statement_password=get_fernet().encrypt(b"secret").decode()
+    )
     pdf = tmp_path / "cc.pdf"
     pdf.write_bytes(b"%PDF fake")
     upload_id = await _seed_cc_upload(maker, acc_id, file_path=str(pdf))
@@ -80,13 +83,15 @@ async def test_retry_cc_wrong_password_then_import_is_idempotent(
     monkeypatch.setattr(cc_module, "parse_statement", _parse)
     monkeypatch.setattr(shared_module, "parse_statement", _parse)
 
+    # A supplied password wins over the saved one.
     assert await retry_cc_statement_upload(upload_id, "wrongpw") is False
     async with maker() as session:
         upload = await session.get(StatementUpload, upload_id)
         assert upload.status == "password_required"
         assert upload.error
 
-    assert await retry_cc_statement_upload(upload_id, "secret") is True
+    # An empty password falls back to the saved one.
+    assert await retry_cc_statement_upload(upload_id, "") is True
     async with maker() as session:
         upload = await session.get(StatementUpload, upload_id)
         assert upload.status == "imported"
@@ -110,27 +115,33 @@ async def test_retry_bank_parse_errors_set_status_by_kind(
     import financial_dashboard.services.statements.bank as bank_module
     from financial_dashboard.services.statements import shared as shared_module
 
-    acc_id = await h.add_bank_account(maker)
+    acc_id = await h.add_bank_account(
+        maker, statement_password=get_fernet().encrypt(b"saved-pw").decode()
+    )
     pdf = tmp_path / "bank.pdf"
     pdf.write_bytes(b"%PDF fake")
     upload_id = await _seed_bank_upload(maker, acc_id, file_path=str(pdf))
+    received = []
 
-    for message, expected_status in (
-        ("The PDF is encrypted and needs a password", "password_required"),
-        ("unexpected EOF in PDF", "parse_error"),
+    # An empty password falls back to the saved one; a supplied one wins.
+    for supplied, message, expected_status in (
+        ("", "The PDF is encrypted and needs a password", "password_required"),
+        ("typed-pw", "unexpected EOF in PDF", "parse_error"),
     ):
 
         def _bad(path, bank, password, message=message):
+            received.append(password)
             raise ValueError(message)
 
         monkeypatch.setattr(bank_module, "parse_bank_statement", _bad)
         monkeypatch.setattr(shared_module, "parse_bank_statement", _bad)
 
-        assert await retry_bank_statement_upload(upload_id, "wrongpw") is False
+        assert await retry_bank_statement_upload(upload_id, supplied) is False
         async with maker() as session:
             upload = await session.get(BankStatementUpload, upload_id)
             assert upload.status == expected_status
             assert upload.error == message
+    assert received == ["saved-pw", "typed-pw"]
 
 
 @pytest.mark.anyio

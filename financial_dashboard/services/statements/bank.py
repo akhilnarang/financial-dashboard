@@ -847,11 +847,15 @@ def reconcile_bank_statement(
     # match. The loser is held back regardless — it is a second statement row
     # for a transaction the DB holds once.
     txn_by_idx = {stmt_idx: txn for stmt_idx, _direction, txn, *_rest in parsed_rows}
+    final = {
+        i for i in reference_matched_indices if len(reference_evidence_sets[i]) == 1
+    }
     contested = []
     for stmt_idx, db_id in claimed_ids.items():
+        reach = compatible_reference_ids if stmt_idx in final else contention_sets
         rivals = [
             other_idx
-            for other_idx, candidates in contention_sets.items()
+            for other_idx, candidates in reach.items()
             if other_idx != stmt_idx and db_id in candidates
         ]
         if not rivals:

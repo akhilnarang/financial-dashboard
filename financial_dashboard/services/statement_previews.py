@@ -14,7 +14,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import status
 
-from financial_dashboard.config import get_fernet
 from financial_dashboard.core.dates import parse_date
 from financial_dashboard.core.masks import display_mask
 from financial_dashboard.db import (
@@ -40,6 +39,7 @@ from financial_dashboard.services.statements.dates import (
 )
 from financial_dashboard.services.statements.shared import (
     STMT_RECONCILE_DATE_BUFFER_DAYS,
+    decrypt_statement_password,
 )
 
 logger = logging.getLogger(__name__)
@@ -154,19 +154,7 @@ async def _load_statement(
             status.HTTP_413_CONTENT_TOO_LARGE, "Statement PDF exceeds preview limit"
         )
 
-    password = None
-    if account is not None and account.statement_password:
-        try:
-            password = (
-                get_fernet().decrypt(account.statement_password.encode()).decode()
-            )
-        except Exception:
-            logger.warning(
-                "Could not decrypt password for %s statement %d",
-                kind,
-                statement_id,
-            )
-            password = None
+    password = decrypt_statement_password(account)
     loaded = _LoadedStatement(
         kind=kind,
         statement_id=statement_id,
