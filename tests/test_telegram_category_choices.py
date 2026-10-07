@@ -463,13 +463,40 @@ async def test_notifier_does_not_duplicate_active_conversational_decision(
         category_input_hash="hash",
         candidates_json=json.dumps([{"category": "groceries", "confidence": 0.5}]),
     )
-    session.add(decision)
+    # A conversation claims the second alert while the first prompt is sent.
+    first, claimed = (
+        Transaction(
+            bank="hdfc",
+            email_type="purchase",
+            direction="debit",
+            amount=amount,
+            review_status="pending",
+            review_reason="ambiguous",
+        )
+        for amount in ("12.00", "34.00")
+    )
+    session.add_all([decision, first, claimed])
     await session.commit()
     maker = async_sessionmaker(
         session.bind, class_=AsyncSession, expire_on_commit=False
     )
     monkeypatch.setattr(sweep, "async_session", maker)
     monkeypatch.setattr(telegram, "tg_app", object())
+
+    async def claiming_dispatch(delivery_id):
+        async with maker() as claim:
+            claim.add(
+                CategoryReviewDecision(
+                    transaction_id=claimed.id,
+                    source_interaction_id=source.id,
+                    category_input_hash="hash",
+                    candidates_json="[]",
+                )
+            )
+            await claim.commit()
+        return True
+
+    monkeypatch.setattr(telegram, "dispatch_saved_delivery", claiming_dispatch)
     settings_service._cache.update(
         {
             "telegram.enabled": "true",
@@ -489,20 +516,21 @@ async def test_notifier_does_not_duplicate_active_conversational_decision(
 
     monkeypatch.setattr(telegram, "_send_with_retry", fake_send)
 
-    assert await sweep.run_review_notify() == 0
+    assert await sweep.run_review_notify() == 1
     assert sent == []
 
     async with maker() as verification:
         assert (
             await verification.get(Transaction, transaction.id)
         ).review_status == "pending"
-        active_count = await verification.scalar(
-            select(func.count(CategoryReviewDecision.id)).where(
-                CategoryReviewDecision.transaction_id == transaction.id,
-                CategoryReviewDecision.status == "active",
+        for owned in (transaction, claimed):
+            active_count = await verification.scalar(
+                select(func.count(CategoryReviewDecision.id)).where(
+                    CategoryReviewDecision.transaction_id == owned.id,
+                    CategoryReviewDecision.status == "active",
+                )
             )
-        )
-    assert active_count == 1
+            assert active_count == 1
 
 
 @pytest.mark.anyio

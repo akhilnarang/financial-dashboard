@@ -288,8 +288,13 @@ async def _review_decision(
     if decision is None and assistant_enabled:
         # Rows created before durable review decisions existed still need a
         # decision record so a later callback can fail closed. This path is
-        # deliberately zero-candidate and never invokes the LLM. A row that a
-        # conversational proposal owns never reaches here.
+        # deliberately zero-candidate and never invokes the LLM. A
+        # conversation can claim the row while an earlier prompt is sent, so
+        # check again before a competing decision is made.
+        if not await session.scalar(
+            select(Transaction.id).where(Transaction.id == txn.id, _needs_prompt(True))
+        ):
+            return None
         decision = await ensure_legacy_decision(session, txn)
     return decision
 
