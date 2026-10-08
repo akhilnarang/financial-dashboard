@@ -12,9 +12,9 @@ from financial_dashboard.web.transactions import _date_presets
 pytestmark = pytest.mark.anyio
 
 
-def _currency_summary(page: str, currency: str) -> str:
+def _totals_card(page: str) -> str:
     match = re.search(
-        rf'<article[^>]+data-currency="{re.escape(currency)}".*?</article>',
+        r'<section aria-label="Filtered transaction totals".*?</section>',
         page,
         flags=re.DOTALL,
     )
@@ -105,17 +105,11 @@ async def test_filtered_transaction_totals_cover_all_pages(client, session):
     )
 
     assert response.status_code == 200
-    summary = _currency_summary(response.text, "INR")
+    summary = _totals_card(response.text)
     assert _summary_total(summary, "credits") == "+₹5.00"
     assert _summary_total(summary, "debits") == "−₹51.00"
     assert _summary_total(summary, "net") == "−₹46.00"
-    foreign_summary = _currency_summary(response.text, "EUR")
-    assert _summary_total(foreign_summary, "credits") == "+EUR10.00"
-    assert _summary_total(foreign_summary, "debits") == "−EUR2.00"
-    assert _summary_total(foreign_summary, "net") == "+EUR8.00"
-    assert response.text.count('data-currency="EUR"') == 1
-    assert 'data-currency="eur"' not in response.text
-    assert "₹10.00" not in foreign_summary
+    assert "2 foreign-currency rows not counted." in summary
     assert "54 results" in response.text
     assert "Showing 1&ndash;50 of 54" in response.text
     assert "999.00" not in summary
