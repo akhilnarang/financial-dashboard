@@ -42,6 +42,8 @@ PASSTHROUGH_SLUG = "passthrough"
 PERSONAL_LOAN_SLUG = "personal_loan"
 # Family members' spending routed through the owner's cards, and the repayments.
 FAMILY_SLUG = "family"
+# A gift the owner gives is spend. A gift the owner receives is income.
+GIFT_SLUG = "gift"
 # Credits that reduce spend rather than count as income.
 CONTRA_EXPENSE_SLUGS = frozenset({"refund", "cashback_rewards", "reimbursement"})
 INTERNAL_SLUGS = frozenset(
@@ -96,7 +98,9 @@ LABEL_OVERRIDES = {
 }
 
 
-def bucket_for_slug(slug: str | None, *, scope: Scope | None = None) -> str:
+def bucket_for_slug(
+    slug: str | None, *, scope: Scope | None = None, direction: str | None = None
+) -> str:
     """Name the report bucket a category slug belongs on, under an account scope.
 
     Returns one of ``income``, ``expense``, ``investment``, ``transfers_in``,
@@ -115,11 +119,15 @@ def bucket_for_slug(slug: str | None, *, scope: Scope | None = None) -> str:
     ``internal`` and into ``expense``: over the bank, paying the card bill is
     the moment the money is gone. The default is every account, where the same
     slug stays internal so it cannot double-count the swipes it settles.
+
+    A ``gift`` credit is income. Without the direction, ``gift`` is expense.
     """
     if not slug or slug == UNKNOWN_SLUG:
         return "uncategorized"
     if scope == "bank" and slug == CREDIT_CARD_PAYMENT_SLUG:
         return "expense"
+    if slug == GIFT_SLUG and direction == "credit":
+        return "income"
     bucket = BUCKET_BY_SLUG.get(slug)
     if bucket is None:
         logger.warning("cashflow: unmapped category slug %r -> uncategorized", slug)
