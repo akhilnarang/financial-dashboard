@@ -156,7 +156,7 @@ class TransactionBatchResponse(BaseModel):
     missing_ids: Annotated[list[int], Field(max_length=100)]
 
 
-MergeOverride = Literal["references", "dates"]
+MergeOverride = Literal["references", "dates", "currency"]
 
 
 class TransactionMergePair(BaseModel):

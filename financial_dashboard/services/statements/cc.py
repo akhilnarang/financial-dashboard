@@ -81,6 +81,7 @@ from financial_dashboard.services.categorization.self_transfer import (
 )
 from financial_dashboard.services.linker import build_link_context, link_transaction
 from financial_dashboard.services.snapshots import emit_cc_snapshot
+from financial_dashboard.services.txn_merge import _normalized_currency
 from financial_dashboard.services.statements.contention import (
     candidate_evidence,
     contended_miss,
@@ -635,6 +636,136 @@ _CC_RECONCILIATION_GATES = (
     "unique_unconsumed_candidate",
     "contention",
 )
+_CC_FOREIGN_GATES = (
+    "account_scope",
+    "direction",
+    "date_window_plus_minus_one_day",
+    "registered_card_compatibility",
+    "whole_word_merchant",
+    "certain_pairing",
+)
+
+
+def _foreign_candidates(
+    txn: ParsedCcTransaction,
+    direction: str,
+    foreign: list[Transaction],
+    account_card_masks: list[str],
+) -> frozenset[int]:
+    """Return the foreign-currency rows that can be this rupee statement line.
+
+    No amount can pair the two. Thus the card, direction, date and merchant must.
+    The row's counterparty must occur in the line as a whole word.
+    """
+    try:
+        txn_date = parse_cc_date(txn.date)
+        parse_cc_amount(txn.amount)
+    except ValueError, InvalidOperation:
+        return frozenset()
+    return frozenset(
+        row.id
+        for row in foreign
+        if row.direction == direction
+        and row.transaction_date is not None
+        and abs(row.transaction_date - txn_date) <= timedelta(days=1)
+        and cc_card_compatible(row.card_mask, account_card_masks)
+        and _counterparty_singles_out(txn.narration, row)
+    )
+
+
+def _certain_group(
+    lines: list[int],
+    rows: frozenset[int],
+    users: dict[int, set[int]],
+    stmt_txns: list,
+    db_by_id: dict[int, Transaction],
+) -> bool:
+    """Tell if any pairing of the lines and the rows lands the same values.
+
+    The lines must name only these rows, and no other line may name them.
+    Equal counts of equal lines and equal rows are interchangeable.
+    """
+    if any(users[row_id] - set(lines) for row_id in rows) or len(lines) != len(rows):
+        return False
+    line_values = {
+        (parse_cc_amount(stmt_txns[i][2].amount), _refresh_identity(stmt_txns[i][2]))
+        for i in lines
+    }
+    row_values = {
+        (db_by_id[r].amount, _normalized_currency(db_by_id[r].currency)) for r in rows
+    }
+    return len(line_values) == len(row_values) == 1
+
+
+_LINE_KEYS = (
+    "stmt_idx",
+    "stmt_list",
+    "date",
+    "amount",
+    "direction",
+    "narration",
+    "card_number",
+    "person",
+)
+
+
+def _foreign_match(entry: dict, row: Transaction) -> dict:
+    """Return the matched entry of a statement line paired with a foreign row."""
+    return {key: entry[key] for key in _LINE_KEYS} | {
+        "db_txn_id": row.id,
+        "db_counterparty": row.counterparty,
+        "db_reference": row.reference_number,
+        "db_date": str(row.transaction_date),
+        "foreign_amount": str(row.amount),
+        **candidate_evidence(
+            {row.id}, reason="matched_foreign_currency", gates=_CC_FOREIGN_GATES
+        ),
+    }
+
+
+def _pair_foreign_alerts(
+    stmt_txns: list,
+    db_transactions: list,
+    account_card_masks: list[str],
+    matched: list[dict],
+    missing: list[dict],
+) -> None:
+    """Pair unmatched rupee statement lines with foreign-currency alert rows.
+
+    An alert for a foreign spend carries the foreign amount. The statement
+    prints the rupee amount. A certain pairing moves the line to ``matched``.
+    Any other line stays as it is and imports. A merge with the currency
+    override can then fold its alert into it. A matched or held line still
+    contends for the rows it names.
+    """
+    foreign = [r for r in db_transactions if _normalized_currency(r.currency) != "INR"]
+    if not foreign:
+        return
+    # Every line contends for the rows it names. Only an unmatched line that
+    # nothing holds may pair.
+    links = {
+        idx: rows
+        for idx, (_list, direction, txn) in enumerate(stmt_txns)
+        if (rows := _foreign_candidates(txn, direction, foreign, account_card_masks))
+    }
+    users: dict[int, set[int]] = {}
+    for idx, rows in links.items():
+        for row_id in rows:
+            users.setdefault(row_id, set()).add(idx)
+    db_by_id = {row.id: row for row in foreign}
+    entries = {entry["stmt_idx"]: entry for entry in missing}
+    held = set(links) - {
+        idx for idx, entry in entries.items() if not entry.get("ambiguous")
+    }
+    for rows in {named for idx, named in links.items() if idx not in held}:
+        lines = sorted(
+            idx for idx, named in links.items() if named == rows and idx not in held
+        )
+        if not _certain_group(lines, rows, users, stmt_txns, db_by_id):
+            continue
+        for idx, row_id in zip(lines, sorted(rows)):
+            matched.append(_foreign_match(entries[idx], db_by_id[row_id]))
+            missing.remove(entries[idx])
 
 
 def reconcile_statement(
@@ -675,7 +806,7 @@ def reconcile_statement(
     db_pool: dict[MatchKey, list] = {}
     for db_txn in db_transactions:
         # Only a rupee row can match a statement row.
-        if (db_txn.currency or "INR") != "INR":
+        if _normalized_currency(db_txn.currency) != "INR":
             continue
         if db_txn.transaction_date and db_txn.amount is not None:
             key = _match_key(
@@ -916,6 +1047,9 @@ def reconcile_statement(
                 ),
             }
         )
+    _pair_foreign_alerts(
+        stmt_txns, db_transactions, account_card_masks, matched, missing
+    )
     # Demoted rows are appended after the rows that missed outright; restore
     # statement order so the operator reads the sheet in the order it arrived.
     missing.sort(key=lambda entry: entry["stmt_idx"])
@@ -979,37 +1113,48 @@ def _calculate_adjustment_total(pairs, direction: str) -> str:
 _GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment done"}
 
 
-async def enrich_matched_transactions(recon: dict) -> int:
-    """Update DB transaction counterparty from statement narration for matched transactions.
+def _take_statement_rupees(txn: Transaction, entry: dict) -> bool:
+    """Write the statement's rupee amount over a paired foreign-currency row.
 
-    Enriches when the DB counterparty is NULL, empty, or a generic placeholder.
+    The row keeps the foreign amount in its raw description.
+    """
+    if "foreign_amount" not in entry or _normalized_currency(txn.currency) == "INR":
+        return False
+    txn.amount = parse_cc_amount(entry["amount"])
+    txn.currency = "INR"
+    return True
+
+
+def _takes_narration(txn: Transaction, narration: str) -> bool:
+    existing = (txn.counterparty or "").strip()
+    return bool(narration) and (
+        not existing
+        or existing.lower() in _GENERIC_COUNTERPARTIES
+        or txn.counterparty_source == "user_alias"
+    )
+
+
+async def enrich_matched_transactions(recon: dict) -> int:
+    """Update matched DB transactions from their statement lines.
+
+    The counterparty takes the statement narration when it is NULL, empty, or a
+    generic placeholder. A foreign-currency row takes the rupee amount.
     Returns the count of transactions that were updated.
     """
     enriched = 0
     async with async_session() as session:
         for entry in recon.get("matched", []):
-            narration = (entry.get("narration") or "").strip()
-            if not narration:
-                continue
-
             db_txn_id = entry.get("db_txn_id")
-            if not db_txn_id:
+            if not db_txn_id or not (txn := await session.get(Transaction, db_txn_id)):
                 continue
 
-            txn = await session.get(Transaction, db_txn_id)
-            if not txn:
+            converted = _take_statement_rupees(txn, entry)
+            narration = (entry.get("narration") or "").strip()
+            if named := _takes_narration(txn, narration):
+                txn.counterparty = narration
+                txn.counterparty_source = "bank"
+            if not (converted or named):
                 continue
-
-            existing = (txn.counterparty or "").strip()
-            if (
-                existing
-                and existing.lower() not in _GENERIC_COUNTERPARTIES
-                and txn.counterparty_source != "user_alias"
-            ):
-                continue  # already has a meaningful counterparty
-
-            txn.counterparty = narration
-            txn.counterparty_source = "bank"
             await requeue_after_enrichment(session, txn)
             enriched += 1
             entry["enriched"] = True

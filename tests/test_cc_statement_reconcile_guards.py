@@ -40,6 +40,7 @@ from financial_dashboard.services.statement_settlement import (
     row_digest,
 )
 from financial_dashboard.services.statements.cc import (
+    enrich_matched_transactions,
     reconciliation_to_json,
     import_missing_cc_txns,
     load_account_card_masks,
@@ -1324,27 +1325,154 @@ async def test_two_exact_matches_inside_the_band_both_match(session_factory):
 
 
 @pytest.mark.anyio
-async def test_a_row_in_another_currency_is_not_a_candidate(session_factory):
-    """Verifies that foreign currency transactions are not candidates for domestic
-    statement rows.
+async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
+    """Verifies that a statement line pairs with the foreign-currency alert of
+    its merchant, and that the alert row takes the rupee amount.
 
-    Without this guard, mismatched currencies trigger invalid settlement prompts.
+    Without this rule, the statement imports a second row for the same spend.
     """
     await _seed_account(session_factory)
-    await _seed_txn(
+    async with session_factory() as session:
+        session.add(
+            Card(account_id=ACCOUNT_ID, card_mask="4111XXXXXXXX7788", label="Add-on")
+        )
+        await session.commit()
+    # The statement stamps the primary card on the add-on's line.
+    alert_id = await _seed_txn(
         session_factory,
-        amount=Decimal("2500.00"),
+        amount=Decimal("30.00"),
         currency="USD",
         counterparty="SWIGGY LIMITED",
+        card_mask="4111XXXXXXXX7788",
+    )
+    # A name inside a longer word is another merchant.
+    other_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("12.00"),
+        currency="USD",
+        counterparty="CAF",
     )
     parsed = _parsed(
-        [_stmt_txn(date="07/04/2026", amount="2,529.00", narration=NARRATION)]
+        [
+            _stmt_txn(date="07/04/2026", amount="2,529.00", narration=NARRATION),
+            _stmt_txn(date="07/04/2026", amount="999.00", narration="SAMPLE CAFE"),
+        ]
     )
 
     recon = await _reconcile(session_factory, parsed)
-    imported, rows = await _import(session_factory, parsed, recon)
+    imported, _rows = await _import(session_factory, parsed, recon)
+    await enrich_matched_transactions(recon)
+    again = await _reconcile(session_factory, parsed)
 
-    # The statement row is new, so it imports. The foreign row is untouched.
+    assert [entry["db_txn_id"] for entry in recon["matched"]] == [alert_id]
+    # A line with no foreign candidate is new and imports.
     assert [entry["ambiguous"] for entry in recon["missing"]] == [False]
-    assert len(imported) == 1
-    assert {row.currency for row in rows} == {"USD", "INR"}
+    assert [txn.amount for txn in imported] == [Decimal("999.00")]
+    async with session_factory() as session:
+        rows = {
+            row.id: (row.amount, row.currency)
+            for row in (await session.scalars(select(Transaction))).all()
+        }
+    assert rows[alert_id] == (Decimal("2529.00"), "INR")
+    assert rows[other_id] == (Decimal("12.00"), "USD")
+    assert len(rows) == 3
+    # A reprocess pairs the converted row by amount and imports nothing.
+    assert sorted(entry["db_txn_id"] for entry in again["matched"]) == sorted(
+        [alert_id, imported[0].id]
+    )
+    assert again["missing"] == []
+
+
+@pytest.mark.parametrize(
+    ("alerts", "lines", "paired"),
+    [
+        pytest.param(
+            [("13.00", "EUR", "07/04/2026"), ("13.00", " eur ", "07/04/2026")],
+            [("07/04/2026", "1,300.00")] * 2,
+            True,
+            id="interchangeable",
+        ),
+        pytest.param(
+            [("13.00", "EUR", "07/04/2026"), ("26.00", "EUR", "07/04/2026")],
+            [("07/04/2026", "1,300.00")] * 2,
+            False,
+            id="unequal-amounts",
+        ),
+        pytest.param(
+            [("13.00", "EUR", "07/04/2026"), ("13.00", "EUR", "09/04/2026")],
+            [("06/04/2026", "1,300.00"), ("08/04/2026", "1,300.00")],
+            False,
+            id="overlapping-lines",
+        ),
+        pytest.param(
+            [("1005.00", "INR", "07/04/2026"), ("13.00", "EUR", "07/04/2026")],
+            [("07/04/2026", "1,000.00"), ("07/04/2026", "1,300.00")],
+            False,
+            id="held-rupee-line-contends",
+        ),
+        pytest.param(
+            [("1300.00", "INR", "07/04/2026"), ("13.00", "EUR", "07/04/2026")],
+            [("07/04/2026", "1,300.00"), ("07/04/2026", "2,600.00")],
+            False,
+            id="matched-rupee-line-contends",
+        ),
+        pytest.param(
+            [("1300.00", " inr ", "07/04/2026")],
+            [("07/04/2026", "2,600.00")],
+            False,
+            id="rupee-row-with-loose-currency",
+        ),
+    ],
+)
+@pytest.mark.anyio
+async def test_alike_foreign_alerts_pair_only_when_certain(
+    session_factory, alerts, lines, paired
+):
+    """Verifies that lines and alerts of one merchant pair only when every line
+    that can name an alert agrees on the pairing, and that a reprocess adds no row.
+
+    Without this rule, a line can take the rupee amount of another spend.
+    """
+    await _seed_account(session_factory)
+    alert_ids = [
+        await _seed_txn(
+            session_factory,
+            amount=Decimal(amount),
+            currency=currency,
+            transaction_date=parse_cc_date(date),
+            counterparty="SAMPLE BAR",
+        )
+        for amount, currency, date in alerts
+    ]
+    foreign_ids = [
+        txn_id
+        for txn_id, alert in zip(alert_ids, alerts)
+        if alert[1].strip().upper() != "INR"
+    ]
+    parsed = _parsed(
+        [
+            _stmt_txn(date=date, amount=amount, narration="SAMPLE BAR")
+            for date, amount in lines
+        ]
+    )
+
+    recon = await _reconcile(session_factory, parsed)
+
+    paired_ids = [e["db_txn_id"] for e in recon["matched"] if "foreign_amount" in e]
+    await _import(session_factory, parsed, recon)
+    await enrich_matched_transactions(recon)
+    again = await _reconcile(session_factory, parsed)
+    reimported, rows = await _import(session_factory, parsed, again)
+
+    # An uncertain line pairs with nothing and imports as before.
+    assert sorted(paired_ids) == (foreign_ids if paired else [])
+    stored = {row.id: (row.amount, row.currency) for row in rows}
+    if paired:
+        assert {stored[i] for i in foreign_ids} == {(Decimal("1300.00"), "INR")}
+    else:
+        # An unpaired alert keeps its own amount and currency.
+        assert [stored[i] for i in alert_ids] == [
+            (Decimal(amount), currency) for amount, currency, _date in alerts
+        ]
+    # A reprocess imports nothing more.
+    assert reimported == []
