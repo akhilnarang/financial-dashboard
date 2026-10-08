@@ -1,5 +1,7 @@
 """Database initialization and inline migrations."""
 
+import json
+
 from sqlalchemy import Table, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
@@ -7,6 +9,7 @@ from financial_dashboard.db.models import Base, InvestmentLot
 
 _INVESTMENT_LOT_BACKFILL_MARKER = "migrations.investment_lots_backfill_v1"
 _SUPERMONEY_RULE_MARKER = "migrations.retire_supermoney_cashback_rule"
+_CARD_HOLDER_MARKER = "migrations.card_holder_backfill"
 
 
 #: Core tables whose changes dirty an extension's reconciled projection.
@@ -194,6 +197,56 @@ async def _retire_bare_supermoney_rule(conn: AsyncConnection) -> None:
     )
 
 
+async def _backfill_card_holders(conn: AsyncConnection) -> None:
+    """Name the cardholder on each row that a card statement holds, once.
+
+    The stored reconciliation of a statement names the person of each line.
+    Thus the backfill needs no statement PDF.
+    """
+    from financial_dashboard.services.statements.cc import card_holder_name
+
+    marker = (
+        await conn.execute(
+            text("SELECT 1 FROM settings WHERE key = :key"),
+            {"key": _CARD_HOLDER_MARKER},
+        )
+    ).first()
+    if marker is not None:
+        return
+    uploads = await conn.execute(
+        text(
+            "SELECT reconciliation_data FROM statement_uploads "
+            "WHERE reconciliation_data IS NOT NULL"
+        )
+    )
+    for (data,) in uploads.all():
+        # A malformed reconciliation must not stop boot.
+        try:
+            recon = json.loads(data)
+            holders = [
+                (
+                    entry.get("db_txn_id") or entry.get("imported_txn_id"),
+                    card_holder_name(entry.get("person")),
+                )
+                for entry in (*recon.get("matched", []), *recon.get("missing", []))
+            ]
+        except ValueError, TypeError, AttributeError:
+            continue
+        for txn_id, holder in holders:
+            if isinstance(txn_id, int) and holder:
+                await conn.execute(
+                    text(
+                        "UPDATE transactions SET card_holder = :holder "
+                        "WHERE id = :id AND card_holder IS NULL"
+                    ),
+                    {"holder": holder, "id": txn_id},
+                )
+    await conn.execute(
+        text("INSERT INTO settings (key, value) VALUES (:key, '1')"),
+        {"key": _CARD_HOLDER_MARKER},
+    )
+
+
 async def init_db(engine, *, paisa_enabled: bool = True) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -273,6 +326,12 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                     "ALTER TABLE transactions ADD COLUMN "
                     "identifies_by VARCHAR NOT NULL DEFAULT 'counterparty'"
                 )
+            )
+        try:
+            await conn.execute(text("SELECT card_holder FROM transactions LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE transactions ADD COLUMN card_holder VARCHAR")
             )
         try:
             await conn.execute(
@@ -857,6 +916,7 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
         )
 
         await _retire_bare_supermoney_rule(conn)
+        await _backfill_card_holders(conn)
 
         for _category, _patterns in DEFAULT_MERCHANT_RULES.items():
             for _pattern in _patterns:

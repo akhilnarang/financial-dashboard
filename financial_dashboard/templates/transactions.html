@@ -236,7 +236,7 @@
                         {% endif %}
                     </td>
                     <td class="text-sm">{{ txn.note or "" }}</td>
-                    <td class="text-sm text-muted">{% if txn.card %}<a href="/accounts/{{ txn.card.account_id }}/edit" onclick="event.stopPropagation();">{% if txn.account %}{{ txn.account.label }} - {% endif %}{{ txn.card.label or txn.card.card_mask }}{% if txn.card.label and not txn.card.is_primary %} (addon){% endif %}</a>{% elif txn.account %}<a href="/accounts/{{ txn.account.id }}/edit" onclick="event.stopPropagation();">{{ txn.account.label }}</a>{% else %}{{ txn.card_mask or txn.account_mask or "&mdash;"|safe }}{% endif %}</td>
+                    <td class="text-sm text-muted">{% if txn.card %}<a href="/accounts/{{ txn.card.account_id }}/edit" onclick="event.stopPropagation();">{% if txn.account %}{{ txn.account.label }} - {% endif %}{{ txn.card.label or txn.card.card_mask }}{% if txn.card.label and not txn.card.is_primary %} (addon){% endif %}</a>{% elif txn.account %}<a href="/accounts/{{ txn.account.id }}/edit" onclick="event.stopPropagation();">{{ txn.account.label }}</a>{% else %}{{ txn.card_mask or txn.account_mask or "&mdash;"|safe }}{% endif %}{% if txn.card_holder %} · <a href="/transactions?card_holder={{ txn.card_holder|urlencode }}" onclick="event.stopPropagation();">{{ txn.card_holder }}</a>{% endif %}</td>
                     <td class="text-sm text-muted" style="font-family: var(--font-mono);">{{ txn.reference_number or "&mdash;"|safe }}</td>
                 </tr>
                 {% endfor %}

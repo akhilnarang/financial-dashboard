@@ -248,6 +248,9 @@ async def transaction_list(
         str | None,
         Query(description="Filter by counterparty; blank matches no counterparty"),
     ] = None,
+    card_holder: Annotated[
+        str | None, Query(description="Filter by the statement's cardholder")
+    ] = None,
     uncategorized: Annotated[
         str | None, Query(description="Set to 1 for rows with no usable category")
     ] = None,
@@ -301,6 +304,7 @@ async def transaction_list(
         category: Optional exact category-slug filter.
         counterparty: Optional exact counterparty; a blank value selects rows with
             no counterparty.
+        card_holder: Optional cardholder that the card statement names.
         uncategorized: ``"1"`` selects rows outside the known category buckets.
         category_null: ``"1"`` selects rows whose category is null or blank.
         internal: ``"1"`` selects internal movement categories for the scope.
@@ -378,6 +382,8 @@ async def transaction_list(
             stmt = stmt.where(BLANK_COUNTERPARTY)
         else:
             stmt = stmt.where(Transaction.counterparty == counterparty)
+    if card_holder:
+        stmt = stmt.where(Transaction.card_holder == card_holder)
     if uncategorized == "1":
         # Uncategorized means "has no category the bucket map can place": blank,
         # the 'unknown' sentinel, or a runtime slug the map does not know. The
@@ -565,6 +571,7 @@ async def transaction_list(
     drill_filters = {
         "category": category,
         "counterparty": counterparty,
+        "card_holder": card_holder,
         "uncategorized": uncategorized,
         "category_null": category_null,
         "internal": internal,

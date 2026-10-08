@@ -640,6 +640,10 @@ class Transaction(Base):
     of 1 minute in place of 10 minutes."""
     counterparty: Mapped[str | None] = mapped_column(String)
     card_mask: Mapped[str | None] = mapped_column(String)
+    card_holder: Mapped[str | None] = mapped_column(String)
+    """The cardholder that the card statement names for this row. A bank can
+    print one card number for the primary card and each add-on. The holder
+    then shows whose card made the purchase."""
     account_mask: Mapped[str | None] = mapped_column(String)
     reference_number: Mapped[str | None] = mapped_column(String)
     channel: Mapped[str | None] = mapped_column(String)
