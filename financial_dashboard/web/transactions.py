@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Query, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -83,19 +83,19 @@ class LoadedTransaction(NamedTuple):
 
 
 class TransactionTotal(TypedDict):
-    """Aggregated amounts for one normalized currency.
+    """INR amounts of the filtered rows.
 
     Attributes:
-        currency: Uppercase ISO-style currency code.
-        credits: Sum of filtered credit transactions.
-        debits: Sum of filtered debit transactions.
+        credits: Sum of filtered INR credit transactions.
+        debits: Sum of filtered INR debit transactions.
         net: Credits minus debits.
+        foreign_count: Number of filtered non-INR rows, which the sums omit.
     """
 
-    currency: str
     credits: Decimal
     debits: Decimal
     net: Decimal
+    foreign_count: int
 
 
 SORT_COLUMNS = {
@@ -435,47 +435,41 @@ async def transaction_list(
     count_stmt = select(func.count()).select_from(filtered)
     total_count = (await session.execute(count_stmt)).scalar() or 0
 
-    currency_col = func.coalesce(
-        func.nullif(func.upper(func.trim(filtered.c.currency)), ""),
-        "INR",
-    )
-    totals_result = await session.execute(
-        select(
-            currency_col.label("currency"),
-            filtered.c.direction,
-            func.sum(filtered.c.amount).label("amount"),
+    # Totals are INR only. A foreign-currency row is a card alert that no
+    # statement converted to rupees yet.
+    is_inr = (
+        func.coalesce(
+            func.nullif(func.upper(func.trim(filtered.c.currency)), ""), "INR"
         )
-        .where(filtered.c.direction.in_(("credit", "debit")))
-        .group_by(currency_col, filtered.c.direction)
+        == "INR"
     )
-    totals_by_currency: dict[str, TransactionTotal] = {}
-    for row in totals_result:
-        currency = row.currency or "INR"
-        summary = totals_by_currency.setdefault(
-            currency,
-            {
-                "currency": currency,
-                "credits": Decimal("0"),
-                "debits": Decimal("0"),
-                "net": Decimal("0"),
-            },
+    totals_row = (
+        await session.execute(
+            select(
+                func.sum(
+                    case(
+                        (is_inr & (filtered.c.direction == "credit"), filtered.c.amount)
+                    )
+                ).label("credits"),
+                func.sum(
+                    case(
+                        (is_inr & (filtered.c.direction == "debit"), filtered.c.amount)
+                    )
+                ).label("debits"),
+                func.count()
+                .filter(~is_inr & filtered.c.direction.in_(("credit", "debit")))
+                .label("foreign"),
+            )
         )
-        summary["credits" if row.direction == "credit" else "debits"] = Decimal(
-            str(row.amount or 0)
-        )
-    if not totals_by_currency:
-        totals_by_currency["INR"] = {
-            "currency": "INR",
-            "credits": Decimal("0"),
-            "debits": Decimal("0"),
-            "net": Decimal("0"),
-        }
-    for summary in totals_by_currency.values():
-        summary["net"] = summary["credits"] - summary["debits"]
-    transaction_totals = sorted(
-        totals_by_currency.values(),
-        key=lambda item: (item["currency"] != "INR", str(item["currency"])),
-    )
+    ).one()
+    credits = Decimal(str(totals_row.credits or 0))
+    debits = Decimal(str(totals_row.debits or 0))
+    transaction_totals: TransactionTotal = {
+        "credits": credits,
+        "debits": debits,
+        "net": credits - debits,
+        "foreign_count": totals_row.foreign,
+    }
 
     if sort not in SORT_COLUMNS:
         sort = "date"

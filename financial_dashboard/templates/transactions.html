@@ -176,19 +176,21 @@
 </nav>
 
 <section aria-label="Filtered transaction totals" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: 0.75rem; margin-bottom: 1rem;">
-    {% for summary in transaction_totals %}
-    <article class="card" data-currency="{{ summary.currency }}" style="margin: 0; padding: 0.85rem 1rem;">
-        <div class="text-sm text-muted" style="margin-bottom: 0.45rem;">Filtered totals &middot; {{ summary.currency }}</div>
+    {% set summary = transaction_totals %}
+    <article class="card" style="margin: 0; padding: 0.85rem 1rem;">
+        <div class="text-sm text-muted" style="margin-bottom: 0.45rem;">Filtered totals</div>
         <dl style="display: grid; grid-template-columns: auto 1fr; gap: 0.3rem 0.75rem; margin: 0;">
             <dt>Credits</dt>
-            <dd class="amt amt-credit" data-total="credits" style="margin: 0; text-align: right;">+{{ summary.currency|currency_symbol }}{{ "{:,.2f}".format(summary.credits) }}</dd>
+            <dd class="amt amt-credit" data-total="credits" style="margin: 0; text-align: right;">+₹{{ "{:,.2f}".format(summary.credits) }}</dd>
             <dt>Debits</dt>
-            <dd class="amt amt-debit" data-total="debits" style="margin: 0; text-align: right;">&minus;{{ summary.currency|currency_symbol }}{{ "{:,.2f}".format(summary.debits) }}</dd>
+            <dd class="amt amt-debit" data-total="debits" style="margin: 0; text-align: right;">&minus;₹{{ "{:,.2f}".format(summary.debits) }}</dd>
             <dt>Net</dt>
-            <dd class="amt {% if summary.net < 0 %}amt-debit{% else %}amt-credit{% endif %}" data-total="net" style="margin: 0; text-align: right;">{% if summary.net < 0 %}&minus;{% else %}+{% endif %}{{ summary.currency|currency_symbol }}{{ "{:,.2f}".format(summary.net|abs) }}</dd>
+            <dd class="amt {% if summary.net < 0 %}amt-debit{% else %}amt-credit{% endif %}" data-total="net" style="margin: 0; text-align: right;">{% if summary.net < 0 %}&minus;{% else %}+{% endif %}₹{{ "{:,.2f}".format(summary.net|abs) }}</dd>
         </dl>
+        {% if summary.foreign_count %}
+        <p class="text-sm text-muted" data-total="foreign" style="margin: 0.45rem 0 0;">{{ summary.foreign_count }} foreign-currency {{ "row" if summary.foreign_count == 1 else "rows" }} not counted.</p>
+        {% endif %}
     </article>
-    {% endfor %}
 </section>
 
 <section>

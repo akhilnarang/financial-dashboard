@@ -89,6 +89,7 @@ _CATEGORY_FIELDS = (
 _OVERRIDABLE: dict[str, MergeOverride] = {
     "dates are more than 1 day apart": "dates",
     "references prove distinct events": "references",
+    "currency differs": "currency",
 }
 
 
@@ -176,17 +177,20 @@ def _refusal_reasons(
         else None
     )
     balances = {_quantize_balance(keep.balance), _quantize_balance(dup.balance)}
+    keep_currency = _normalized_currency(keep.currency)
+    same_currency = keep_currency == _normalized_currency(dup.currency)
     checks = [
         (
             keep.account_id is None or keep.account_id != dup.account_id,
             "rows are not on the same account",
         ),
         (keep.direction != dup.direction, "direction differs"),
+        (not same_currency, "currency differs"),
+        (same_currency and keep.amount != dup.amount, "amount differs"),
         (
-            _normalized_currency(keep.currency) != _normalized_currency(dup.currency),
-            "currency differs",
+            not same_currency and not (keep_currency == "INR" and statement_of(keep)),
+            "a foreign-currency row folds only into a rupee statement row",
         ),
-        (keep.amount != dup.amount, "amount differs"),
         (days_apart is None, "a row has no date"),
         (
             days_apart is not None and days_apart > _DATE_WINDOW,

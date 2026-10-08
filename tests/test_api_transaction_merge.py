@@ -467,6 +467,63 @@ async def test_override_merges_only_what_todays_parse_backs(
     )
 
 
+async def test_currency_override_folds_a_foreign_alert_into_the_statement_row(
+    client, session, monkeypatch, tmp_path
+):
+    alert_id, statement_id, upload_id = await _seed_pair(session, alert_ref=None)
+    alert = await session.get(Transaction, alert_id)
+    upload = await session.get(BankStatementUpload, upload_id)
+    assert alert is not None and upload is not None
+    alert.currency, alert.amount = "EUR", Decimal("14.00")
+    pdf = tmp_path / "stmt.pdf"
+    pdf.write_bytes(b"synthetic PDF bytes")
+    upload.file_path, upload.parsed_txn_count = str(pdf), 1
+    await session.commit()
+    monkeypatch.setattr(
+        "financial_dashboard.services.statement_previews.parse_bank_statement",
+        lambda path, _bank, _password: ParsedBankStatement(
+            file=path.name,
+            bank="testbank",
+            statement_period_start="01/03/2030",
+            statement_period_end="31/03/2030",
+            transactions=[
+                BankTransaction(
+                    date="05/03/2030",
+                    narration="UPI/SYNTHETIC SHOP",
+                    amount="1234.00",
+                    transaction_type="debit",
+                    reference_number="UTR000123456",
+                )
+            ],
+        ),
+    )
+    checked = {"override": ["currency"], "reason": "checked by hand"}
+
+    plain = await client.post(
+        "/api/transactions/merge-batch", json=_batch((statement_id, alert_id))
+    )
+    foreign_keeper = await client.post(
+        "/api/transactions/merge-batch",
+        json=_batch((alert_id, statement_id), **checked),
+    )
+    response = await client.post(
+        "/api/transactions/merge-batch",
+        json=_batch((statement_id, alert_id), **checked),
+    )
+
+    assert plain.json()["detail"]["refused"][0]["reasons"] == ["currency differs"]
+    assert foreign_keeper.json()["detail"]["refused"][0]["reasons"] == [
+        "a foreign-currency row folds only into a rupee statement row"
+    ]
+    assert response.status_code == 200
+    session.expire_all()
+    assert await session.get(Transaction, alert_id) is None
+    keeper = await session.get(Transaction, statement_id)
+    assert keeper is not None
+    assert (keeper.amount, keeper.currency) == (Decimal("1234.00"), "INR")
+    assert keeper.sms_message_id is not None
+
+
 @pytest.mark.parametrize(
     ("case", "conflict"),
     [
