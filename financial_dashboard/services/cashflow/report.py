@@ -241,7 +241,7 @@ async def cashflow_summary(
 
     for slug, direction, flow, count in grouped:
         signed = _decimal(flow)
-        bucket = bucket_for_slug(slug, scope=REPORT_SCOPE)
+        bucket = bucket_for_slug(slug, scope=REPORT_SCOPE, direction=direction)
         if bucket == "income":
             _merge(income, slug, signed, count)
         elif bucket == "expense":
@@ -429,20 +429,21 @@ async def _expense_detail(
 
     INR-or-null, like every other rupee figure, so the drill-through link that
     lists these rows can carry ``non_inr=0`` and match the total on the page.
-    Direction does not split an expense line, so one group per category is
-    enough; the signed sum is negated, which is what makes a refund read as the
-    contra it is.
+    The rows group by direction too, because a ``gift`` credit is income, not
+    expense. ``_merge`` folds both directions of any other slug into one line.
+    The signed sum is negated, which is what makes a refund read as the contra
+    it is.
     """
     rows = (
         await session.execute(
-            select(Transaction.category, SIGNED_FLOW, ROW_COUNT)
+            select(Transaction.category, Transaction.direction, SIGNED_FLOW, ROW_COUNT)
             .where(in_range, INR_OR_NULL, INCLUDED)
-            .group_by(Transaction.category)
+            .group_by(Transaction.category, Transaction.direction)
         )
     ).all()
     lines: dict[str | None, CategoryLine] = {}
-    for slug, flow, count in rows:
-        if bucket_for_slug(slug) == "expense":
+    for slug, direction, flow, count in rows:
+        if bucket_for_slug(slug, direction=direction) == "expense":
             _merge(lines, slug, -_decimal(flow), count)
     return _bucket(sorted(lines.values(), key=_by_magnitude))
 
@@ -623,10 +624,10 @@ async def cashflow_trend(
         for key in keys
     }
 
-    for month, slug, _direction, flow in rows:
+    for month, slug, direction, flow in rows:
         point = points[month]
         signed = _decimal(flow)
-        bucket = bucket_for_slug(slug, scope=REPORT_SCOPE)
+        bucket = bucket_for_slug(slug, scope=REPORT_SCOPE, direction=direction)
         if bucket == "income":
             point.income += signed
         elif bucket == "expense":

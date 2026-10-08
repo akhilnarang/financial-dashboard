@@ -107,6 +107,9 @@ async def test_reconciliation_identity(session: AsyncSession):
     # Bank income: 1000 + 50 = 1050.
     await _add(session, direction="credit", amount=D("1000"), category="salary")
     await _add(session, direction="credit", amount=D("50"), category="interest")
+    # A received gift is income; a given gift is spend.
+    await _add(session, direction="credit", amount=D("70"), category="gift")
+    await _add(session, direction="debit", amount=D("60"), category="gift")
     # Transfers in: 200.
     await _add(session, direction="credit", amount=D("200"), category="repayment")
     # Bank expense: 300 dining - 50 refund - 20 cashback + (400 - 100) of card
@@ -154,19 +157,21 @@ async def test_reconciliation_identity(session: AsyncSession):
 
     s = await cashflow_summary(session, JUN, JUN_END)
 
-    assert s.income.total == D("1050")
+    assert s.income.total == D("1120")
     assert s.transfers_in.total == D("200")
-    assert s.expense.total == D("530")
+    assert s.expense.total == D("590")
     assert s.investment.net == D("45")
     assert s.investment.contributions == D("100")
     assert s.investment.redemptions == D("55")
-    # 1050 + 200 - 530 - 45, to the paisa.
-    assert s.net_cash_retained == D("675")
+    # 1120 + 200 - 590 - 45, to the paisa.
+    assert s.net_cash_retained == D("685")
 
     # A line total is its effect on the bucket: a contra line is negative.
     expense = {ln.slug: ln.total for ln in s.expense.lines}
     assert expense["dining"] == D("300")
     assert expense["refund"] == D("-50")
+    assert expense["gift"] == D("60")
+    assert {ln.slug: ln.total for ln in s.income.lines}["gift"] == D("70")
     assert expense["credit_card_payment"] == D("300")
     by_kind = {
         ln.kind: ln.total for ln in s.investment.lines if ln.slug == "investment"
@@ -174,9 +179,9 @@ async def test_reconciliation_identity(session: AsyncSession):
     assert by_kind == {"contribution": D("100"), "redemption": D("-15")}
 
     # The detail is a different question over a different population: every
-    # account's expense-bucket rows (300 - 50 - 20 + 900 + 111). The card bill is
-    # internal here, or the swipe it settled would count twice.
-    assert s.expense_detail.total == D("1241")
+    # account's expense-bucket rows (300 - 50 - 20 + 60 + 900 + 111). The card
+    # bill is internal here, or the swipe it settled would count twice.
+    assert s.expense_detail.total == D("1301")
     assert "credit_card_payment" not in {ln.slug for ln in s.expense_detail.lines}
 
     assert s.footnotes.internal_count == 2
@@ -232,6 +237,14 @@ async def test_trend_is_bank_scoped_zero_filled_and_stops_at_today(
         category="repayment",
         transaction_date=datetime.date(2026, 6, 8),
     )
+    # A received gift is income.
+    await _add(
+        session,
+        direction="credit",
+        amount=D("300"),
+        category="gift",
+        transaction_date=datetime.date(2026, 6, 9),
+    )
     # A row after today is out of the partial month.
     await _add(
         session,
@@ -257,7 +270,7 @@ async def test_trend_is_bank_scoped_zero_filled_and_stops_at_today(
         assert (empty.income, empty.expense, empty.net_invested) == (0, 0, 0)
         assert empty.salary_count == 0
     jun = pts[-1]
-    assert jun.income == D("2000")
+    assert jun.income == D("2300")
     assert jun.salary_count == 3
     assert jun.expense == D("2500")  # the bank's card bill, not the card swipe
 

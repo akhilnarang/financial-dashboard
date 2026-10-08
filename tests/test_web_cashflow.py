@@ -581,16 +581,24 @@ async def test_expense_detail_counts_the_swipes_over_every_account(client, sessi
     await _add(
         session, amount="9100", direction="debit", category="credit_card_payment"
     )
+    # A gift given is spend. A gift received is income, so it is not on this line.
+    await _add(session, amount="60", direction="debit", category="gift")
+    await _add(session, amount="70", direction="credit", category="gift")
 
     page = (await client.get(f"/cashflow?{RANGE}")).text
     detail = _region(page, "data-section", "expense_detail")
 
-    # 4,000 of swipes + 20,000 of rent. The card bill is internal here, so it is
+    # 4,000 of swipes + 20,000 of rent + 60 of gift. The card bill is internal here, so it is
     # neither a line nor part of the total...
-    assert "₹24,000.00" in detail
+    assert "₹24,060.00" in detail
     assert "Card bills" not in detail
     # ...but it *is* the headline, which counts the bill and not the swipe.
-    assert "₹29,100.00" in _region(page, "data-section", "expense")
+    assert "₹29,160.00" in _region(page, "data-section", "expense")
+
+    gift = _row_with(detail, ">Gift<")
+    gifts = await _listed(client, gift)
+    assert gifts.count(DETAIL) == _line_count(gift) == 1
+    assert "70.00" not in gifts
 
     row = _row_with(detail, ">Dining<")
 

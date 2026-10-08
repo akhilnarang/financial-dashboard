@@ -319,7 +319,7 @@
                             link up by: the bars are a drawing of exactly these rows, so they
                             take the row's href rather than rebuilding the URL a second time
                             in JavaScript, where it could drift from this one. -#}
-                        <td><a data-line="income" data-key="{{ line.slug }}" href="/transactions?category={{ line.slug|urlencode }}&amp;{{ core_qs }}">{{ line.label }}</a></td>
+                        <td><a data-line="income" data-key="{{ line.slug }}" href="/transactions?category={{ line.slug|urlencode }}{% if line.slug == 'gift' %}&amp;direction=credit{% endif %}&amp;{{ core_qs }}">{{ line.label }}</a></td>
                         <td class="text-sm text-muted">{{ line.count }}</td>
                         <td class="amt {% if line.total < 0 %}amt-debit{% else %}amt-credit{% endif %}" style="text-align: right;">{{ line.total|inr_exact }}</td>
                     </tr>
@@ -341,7 +341,7 @@
                 <tbody>
                     {% for line in summary.expense.lines %}
                     <tr>
-                        <td><a data-line="expense" data-key="{{ line.slug }}" href="/transactions?category={{ line.slug|urlencode }}&amp;{{ core_qs }}">{{ line.label }}</a></td>
+                        <td><a data-line="expense" data-key="{{ line.slug }}" href="/transactions?category={{ line.slug|urlencode }}{% if line.slug == 'gift' %}&amp;direction=debit{% endif %}&amp;{{ core_qs }}">{{ line.label }}</a></td>
                         <td class="text-sm text-muted">{{ line.count }}</td>
                         {#- A negative expense line is a refund/cashback credit netting against spend. -#}
                         <td class="amt {% if line.total < 0 %}amt-credit{% else %}amt-debit{% endif %}" style="text-align: right;">{{ line.total|inr_exact }}</td>
@@ -476,7 +476,7 @@
                     {#- No `data-line`: the breakdown chart draws the five headline tiles,
                         and an anchor in a sixth namespace would be a bar no tile can
                         select. The row still drills, which is what the figure owes. -#}
-                    <td><a href="/transactions?category={{ line.slug|urlencode }}&amp;{{ detail_qs }}">{{ line.label }}</a></td>
+                    <td><a href="/transactions?category={{ line.slug|urlencode }}{% if line.slug == 'gift' %}&amp;direction=debit{% endif %}&amp;{{ detail_qs }}">{{ line.label }}</a></td>
                     <td class="text-sm text-muted">{{ line.count }}</td>
                     <td class="amt {% if line.total < 0 %}amt-credit{% else %}amt-debit{% endif %}" style="text-align: right;">{{ line.total|inr_exact }}</td>
                 </tr>
