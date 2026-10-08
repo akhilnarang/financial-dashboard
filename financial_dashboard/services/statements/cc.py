@@ -99,6 +99,65 @@ from financial_dashboard.services.telegram import (
     send_transaction_notification,
 )
 
+# A fuel surcharge adds about 1% at settlement.
+SETTLEMENT_BAND = Decimal("0.012")
+
+# cc-parser tags a credit row that is bank-internal bookkeeping, not money
+# that reached the card. HSBC prints one such ``CR`` row before each billed
+# EMI instalment (``emi_installment_transfer``): it moves the instalment off
+# the loan ledger, the debit twin bills it, and the payable amount does not
+# change. Such a row is not a card transaction, so it must not become one.
+INTERNAL_TRANSFER_CREDIT_REASONS = frozenset({"emi_installment_transfer"})
+
+# ZWNJ / ZWJ: zero-width join controls that sit within a word in Indic and
+# Perso-Arabic scripts, so they continue a word rather than bound it.
+_JOIN_CONTROLS = ("\u200c", "\u200d")
+
+# The similarity two merchant names need when neither contains the other.
+MERCHANT_SIMILARITY = 0.8
+
+_CC_RECONCILIATION_GATES = (
+    "account_scope",
+    "direction_amount",
+    "date_window_plus_minus_one_day",
+    "registered_card_compatibility",
+    "unique_unconsumed_candidate",
+    "contention",
+)
+
+_CC_FOREIGN_GATES = (
+    "account_scope",
+    "direction",
+    "date_window_plus_minus_one_day",
+    "registered_card_compatibility",
+    "whole_word_merchant",
+    "certain_pairing",
+)
+
+# A statement line as the reconciler holds it: (source list, direction, line).
+StatementLine = tuple[str, str, ParsedCcTransaction]
+
+_LINE_KEYS = (
+    "stmt_idx",
+    "stmt_list",
+    "date",
+    "amount",
+    "direction",
+    "narration",
+    "card_number",
+    "person",
+)
+
+_GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment done"}
+
+_SKIP_PDF_NAMES = {
+    "most important terms",
+    "mitc",
+    "terms & conditions",
+    "terms and conditions",
+    "tnc",
+}
+
 
 class MatchKey(NamedTuple):
     """What a statement row and a stored row must share to pair."""
@@ -291,10 +350,6 @@ def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> MatchKey
     return MatchKey(txn_date, amount, direction)
 
 
-# A fuel surcharge adds about 1% at settlement.
-SETTLEMENT_BAND = Decimal("0.012")
-
-
 def settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
     """Returns whether the difference between two amounts is within the settlement band.
 
@@ -302,14 +357,6 @@ def settles_within_band(settled: Decimal, authorised: Decimal) -> bool:
     """
     gap, larger = abs(settled - authorised), max(abs(settled), abs(authorised))
     return gap <= larger * SETTLEMENT_BAND
-
-
-# cc-parser tags a credit row that is bank-internal bookkeeping, not money
-# that reached the card. HSBC prints one such ``CR`` row before each billed
-# EMI instalment (``emi_installment_transfer``): it moves the instalment off
-# the loan ledger, the debit twin bills it, and the payable amount does not
-# change. Such a row is not a card transaction, so it must not become one.
-INTERNAL_TRANSFER_CREDIT_REASONS = frozenset({"emi_installment_transfer"})
 
 
 def _ledger_twin_key(txn: ParsedCcTransaction) -> TwinKey:
@@ -374,11 +421,6 @@ def _normalize_narration(text: str | None) -> str:
     return unicodedata.normalize("NFC", " ".join(text.split()).casefold())
 
 
-# ZWNJ / ZWJ: zero-width join controls that sit within a word in Indic and
-# Perso-Arabic scripts, so they continue a word rather than bound it.
-_JOIN_CONTROLS = ("\u200c", "\u200d")
-
-
 def _is_word_char(ch: str) -> bool:
     """Whether a character continues a word, for boundary checks.
 
@@ -415,10 +457,6 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
             return True
         start = index + 1
     return False
-
-
-# The similarity two merchant names need when neither contains the other.
-MERCHANT_SIMILARITY = 0.8
 
 
 def _same_merchant(row_narration: str | None, db_txn: Transaction) -> bool:
@@ -628,34 +666,26 @@ def _resolve_contested_by_counterparty(
     return resolved
 
 
-_CC_RECONCILIATION_GATES = (
-    "account_scope",
-    "direction_amount",
-    "date_window_plus_minus_one_day",
-    "registered_card_compatibility",
-    "unique_unconsumed_candidate",
-    "contention",
-)
-_CC_FOREIGN_GATES = (
-    "account_scope",
-    "direction",
-    "date_window_plus_minus_one_day",
-    "registered_card_compatibility",
-    "whole_word_merchant",
-    "certain_pairing",
-)
-
-
 def _foreign_candidates(
     txn: ParsedCcTransaction,
     direction: str,
     foreign: list[Transaction],
     account_card_masks: list[str],
 ) -> frozenset[int]:
-    """Return the foreign-currency rows that can be this rupee statement line.
+    """Return the foreign-currency rows that can be one rupee statement line.
 
-    No amount can pair the two. Thus the card, direction, date and merchant must.
-    The row's counterparty must occur in the line as a whole word.
+    No amount can pair the two, so the card, direction, date and merchant must.
+    The row's counterparty must occur in the line's narration as a whole word.
+
+    Args:
+        txn: The statement line.
+        direction: The line's direction, ``debit`` or ``credit``.
+        foreign: The account's foreign-currency rows.
+        account_card_masks: Every card the account answers to.
+
+    Returns:
+        The IDs of the rows that can be this line. Empty when the line's date
+        or amount does not parse.
     """
     try:
         txn_date = parse_cc_date(txn.date)
@@ -677,13 +707,24 @@ def _certain_group(
     lines: list[int],
     rows: frozenset[int],
     users: dict[int, set[int]],
-    stmt_txns: list,
+    stmt_txns: list[StatementLine],
     db_by_id: dict[int, Transaction],
 ) -> bool:
-    """Tell if any pairing of the lines and the rows lands the same values.
+    """Tell if every pairing of the lines with the rows writes the same values.
 
-    The lines must name only these rows, and no other line may name them.
-    Equal counts of equal lines and equal rows are interchangeable.
+    No other line may name these rows, and the counts must be equal. All lines
+    must have one amount and narration, and all rows one amount and currency.
+
+    Args:
+        lines: The indexes of the lines that name exactly ``rows``.
+        rows: The IDs of the foreign rows these lines name.
+        users: Each foreign row ID mapped to the indexes of every line that
+            names it.
+        stmt_txns: The statement's lines, indexed by ``stmt_idx``.
+        db_by_id: The foreign rows by ID.
+
+    Returns:
+        True when the lines can pair with the rows in any order.
     """
     if any(users[row_id] - set(lines) for row_id in rows) or len(lines) != len(rows):
         return False
@@ -697,20 +738,17 @@ def _certain_group(
     return len(line_values) == len(row_values) == 1
 
 
-_LINE_KEYS = (
-    "stmt_idx",
-    "stmt_list",
-    "date",
-    "amount",
-    "direction",
-    "narration",
-    "card_number",
-    "person",
-)
-
-
 def _foreign_match(entry: dict, row: Transaction) -> dict:
-    """Return the matched entry of a statement line paired with a foreign row."""
+    """Return the ``matched`` entry for a line paired with a foreign row.
+
+    Args:
+        entry: The line's ``missing`` entry.
+        row: The foreign-currency row the line pairs with.
+
+    Returns:
+        The entry. ``foreign_amount`` tells enrichment to write the rupee
+        amount onto the row.
+    """
     return {key: entry[key] for key in _LINE_KEYS} | {
         "db_txn_id": row.id,
         "db_counterparty": row.counterparty,
@@ -724,8 +762,8 @@ def _foreign_match(entry: dict, row: Transaction) -> dict:
 
 
 def _pair_foreign_alerts(
-    stmt_txns: list,
-    db_transactions: list,
+    stmt_txns: list[StatementLine],
+    db_transactions: list[Transaction],
     account_card_masks: list[str],
     matched: list[dict],
     missing: list[dict],
@@ -733,10 +771,17 @@ def _pair_foreign_alerts(
     """Pair unmatched rupee statement lines with foreign-currency alert rows.
 
     An alert for a foreign spend carries the foreign amount. The statement
-    prints the rupee amount. A certain pairing moves the line to ``matched``.
-    Any other line stays as it is and imports. A merge with the currency
-    override can then fold its alert into it. A matched or held line still
-    contends for the rows it names.
+    prints the rupee amount. A certain pairing moves the line from ``missing``
+    to ``matched``. Any other line stays and imports. A merge with the
+    ``currency`` override can then fold its alert into it. A matched or held
+    line does not pair, but it still contends for the rows it names.
+
+    Args:
+        stmt_txns: The statement's lines, indexed by ``stmt_idx``.
+        db_transactions: The account's rows.
+        account_card_masks: Every card the account answers to.
+        matched: The matched entries. Paired lines are added.
+        missing: The missing entries. Paired lines are removed.
     """
     foreign = [r for r in db_transactions if _normalized_currency(r.currency) != "INR"]
     if not foreign:
@@ -1110,13 +1155,17 @@ def _calculate_adjustment_total(pairs, direction: str) -> str:
     return format_cc_amount(total)
 
 
-_GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment done"}
-
-
 def _take_statement_rupees(txn: Transaction, entry: dict) -> bool:
     """Write the statement's rupee amount over a paired foreign-currency row.
 
     The row keeps the foreign amount in its raw description.
+
+    Args:
+        txn: The matched row.
+        entry: The line's ``matched`` entry.
+
+    Returns:
+        True when the row changed.
     """
     if "foreign_amount" not in entry or _normalized_currency(txn.currency) == "INR":
         return False
@@ -1126,6 +1175,16 @@ def _take_statement_rupees(txn: Transaction, entry: dict) -> bool:
 
 
 def _takes_narration(txn: Transaction, narration: str) -> bool:
+    """Tell if the row's counterparty must take the statement narration.
+
+    Args:
+        txn: The matched row.
+        narration: The line's narration, stripped.
+
+    Returns:
+        True when the narration is set and the counterparty is empty, a
+        generic placeholder or a user alias.
+    """
     existing = (txn.counterparty or "").strip()
     return bool(narration) and (
         not existing
@@ -1137,9 +1196,16 @@ def _takes_narration(txn: Transaction, narration: str) -> bool:
 async def enrich_matched_transactions(recon: dict) -> int:
     """Update matched DB transactions from their statement lines.
 
-    The counterparty takes the statement narration when it is NULL, empty, or a
-    generic placeholder. A foreign-currency row takes the rupee amount.
-    Returns the count of transactions that were updated.
+    The counterparty takes the statement narration when it is empty, a generic
+    placeholder or a user alias. A paired foreign-currency row takes the
+    statement's rupee amount.
+
+    Args:
+        recon: The reconciliation from ``reconcile_statement``. Each updated
+            ``matched`` entry gets ``enriched=True``.
+
+    Returns:
+        The count of transactions that changed.
     """
     enriched = 0
     async with async_session() as session:
@@ -1471,14 +1537,6 @@ def group_recon_by_person(recon: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Email-based statement processing
 # ---------------------------------------------------------------------------
-
-_SKIP_PDF_NAMES = {
-    "most important terms",
-    "mitc",
-    "terms & conditions",
-    "terms and conditions",
-    "tnc",
-}
 
 
 def _format_cc_date(value: date_type | None) -> str | None:
