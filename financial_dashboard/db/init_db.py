@@ -10,6 +10,7 @@ from financial_dashboard.db.models import Base, InvestmentLot
 _INVESTMENT_LOT_BACKFILL_MARKER = "migrations.investment_lots_backfill_v1"
 _SUPERMONEY_RULE_MARKER = "migrations.retire_supermoney_cashback_rule"
 _CARD_HOLDER_MARKER = "migrations.card_holder_backfill"
+_ADDON_LABEL_MARKER = "migrations.card_holder_addon_labels"
 
 
 #: Core tables whose changes dirty an extension's reconciled projection.
@@ -244,6 +245,50 @@ async def _backfill_card_holders(conn: AsyncConnection) -> None:
     await conn.execute(
         text("INSERT INTO settings (key, value) VALUES (:key, '1')"),
         {"key": _CARD_HOLDER_MARKER},
+    )
+
+
+async def _label_addon_card_holders(conn: AsyncConnection) -> None:
+    """Replace an add-on number holder with the label of its card, once.
+
+    Some statements name an add-on holder only as ``ADDON`` and the card's
+    last 4 digits. The account's card with those digits names the person.
+    """
+    from financial_dashboard.services.statements.cc import addon_card_label
+
+    marker = (
+        await conn.execute(
+            text("SELECT 1 FROM settings WHERE key = :key"),
+            {"key": _ADDON_LABEL_MARKER},
+        )
+    ).first()
+    if marker is not None:
+        return
+    cards: dict[int, list[tuple[str, str | None]]] = {}
+    for account_id, mask, label in await conn.execute(
+        text("SELECT account_id, card_mask, label FROM cards ORDER BY id")
+    ):
+        cards.setdefault(account_id, []).append((mask, label))
+    rows = await conn.execute(
+        text(
+            "SELECT id, account_id, card_holder FROM transactions "
+            "WHERE card_holder LIKE 'addon%' AND account_id IS NOT NULL"
+        )
+    )
+    for txn_id, account_id, holder in rows.all():
+        # An odd card row must not stop boot.
+        try:
+            label = addon_card_label(holder, cards.get(account_id, []))
+        except AttributeError, TypeError:
+            continue
+        if label:
+            await conn.execute(
+                text("UPDATE transactions SET card_holder = :label WHERE id = :id"),
+                {"label": label, "id": txn_id},
+            )
+    await conn.execute(
+        text("INSERT INTO settings (key, value) VALUES (:key, '1')"),
+        {"key": _ADDON_LABEL_MARKER},
     )
 
 
@@ -917,6 +962,7 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
 
         await _retire_bare_supermoney_rule(conn)
         await _backfill_card_holders(conn)
+        await _label_addon_card_holders(conn)
 
         for _category, _patterns in DEFAULT_MERCHANT_RULES.items():
             for _pattern in _patterns:

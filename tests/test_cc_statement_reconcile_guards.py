@@ -249,7 +249,11 @@ async def test_an_addon_cards_transaction_matches_the_primarys_statement(
     await _seed_account(session_factory)
     async with session_factory() as session:
         session.add(
-            Card(account_id=ACCOUNT_ID, card_mask="4111XXXXXXXX7788", label="Add-on")
+            Card(
+                account_id=ACCOUNT_ID,
+                card_mask="4111XXXXXXXX7788",
+                label="Sample Person",
+            )
         )
         await session.commit()
     addon_txn_id = await _seed_txn(session_factory, card_mask="4111XXXXXXXX7788")
@@ -260,7 +264,7 @@ async def test_an_addon_cards_transaction_matches_the_primarys_statement(
                 date="07/04/2026",
                 amount="450.00",
                 narration=NARRATION,
-                person="ADDON  HOLDER",
+                person="ADDON 7788",
             )
         ]
     )
@@ -275,7 +279,7 @@ async def test_an_addon_cards_transaction_matches_the_primarys_statement(
 
     assert imported == []
     assert [(row.id, row.card_holder) for row in rows] == [
-        (addon_txn_id, "Addon Holder")
+        (addon_txn_id, "Sample Person")
     ]
 
 
@@ -577,9 +581,22 @@ async def test_new_rows_with_no_db_candidate_still_import(session_factory):
     """The ordinary-miss guarantee: two same-day, same-amount statement rows
     with nothing in the DB to claim have empty candidate sets, so neither is
     contended and both import. Refusing them would silently drop real
-    spending from the ledger."""
+    spending from the ledger. An add-on number takes the label of the
+    account's card with those digits; a card on another account does not
+    count."""
     await _seed_account(session_factory)
     await _seed_txn(session_factory)  # unrelated ₹450 row
+    async with session_factory() as session:
+        session.add(Account(id=2, bank="hdfc", label="Other", type="credit_card"))
+        session.add_all(
+            [
+                Card(account_id=2, card_mask="XXXX9999", label="Other Person"),
+                Card(
+                    account_id=ACCOUNT_ID, card_mask="XXXX7788", label="Sample Person"
+                ),
+            ]
+        )
+        await session.commit()
 
     parsed = _parsed(
         [
@@ -595,19 +612,33 @@ async def test_new_rows_with_no_db_candidate_still_import(session_factory):
                 narration="NEW MERCHANT TWO",
                 person="ADDON HOLDER",
             ),
+            _stmt_txn(
+                date="07/04/2026",
+                amount="999.00",
+                narration="NEW MERCHANT THREE",
+                person="addon 7788",
+            ),
+            _stmt_txn(
+                date="07/04/2026",
+                amount="999.00",
+                narration="NEW MERCHANT FOUR",
+                person="ADDON 9999",
+            ),
         ]
     )
     recon = await _reconcile(session_factory, parsed)
     assert recon["matched"] == []
-    assert [entry["ambiguous"] for entry in recon["missing"]] == [False, False]
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [False] * 4
 
     imported, rows = await _import(session_factory, parsed, recon)
 
     assert sorted((txn.counterparty, txn.card_holder) for txn in imported) == [
+        ("NEW MERCHANT FOUR", "Addon 9999"),
         ("NEW MERCHANT ONE", "Primary Holder"),
+        ("NEW MERCHANT THREE", "Sample Person"),
         ("NEW MERCHANT TWO", "Addon Holder"),
     ]
-    assert len(rows) == 3
+    assert len(rows) == 5
 
 
 async def _seed_cc_account(
@@ -1074,16 +1105,29 @@ async def test_a_reprocess_keeps_the_question_open(session_factory):
 
     Without this check, repeated processing drops unresolved rows and leaves duplicate
     records. Each held row keeps the copy of its own holder, and a copy with no
-    holder takes the holder that a reprocess names.
+    holder takes the holder that a reprocess names. A copy that holds an add-on
+    number takes the label that its card gets later, and a new label replaces
+    an old one.
     """
     await _seed_account(session_factory)
     await _seed_txn(session_factory, amount=Decimal("90.00"), counterparty="MERCHANT A")
+    addon = ("ADDON 0000", "PRIMARY HOLDER")
+    copies = []
 
-    for persons in (
-        ("PRIMARY HOLDER", None),
-        ("ADDON HOLDER", "PRIMARY HOLDER"),
-        ("ADDON HOLDER", "PRIMARY HOLDER"),
+    for persons, label in (
+        (("PRIMARY HOLDER", None), None),
+        (addon, None),
+        (addon, "Old Label"),
+        (addon, "Sample Person"),
     ):
+        if label:
+            async with session_factory() as session:
+                card = await session.scalar(select(Card)) or Card(
+                    account_id=ACCOUNT_ID, card_mask="XX0000"
+                )
+                card.label = label
+                session.add(card)
+                await session.commit()
         parsed = _parsed(
             [
                 _stmt_txn(
@@ -1096,14 +1140,22 @@ async def test_a_reprocess_keeps_the_question_open(session_factory):
         _imported, rows = await _import(
             session_factory, parsed, recon, due_date="20/05/2026"
         )
+        copies.append(
+            {
+                e["person"]: e["imported_txn_id"]
+                for e in held_rows(cast(Reconciliation, recon))
+            }
+        )
 
     held = held_rows(cast(Reconciliation, recon))
     by_id = {row.id: row for row in rows}
 
     assert len(rows) == 3
+    # The add-on row keeps its copy when its card gets a label.
+    assert copies[1] == copies[2]
     assert sorted(
         (by_id[entry["imported_txn_id"]].card_holder, entry["person"]) for entry in held
-    ) == [("Addon Holder", "ADDON HOLDER"), ("Primary Holder", "PRIMARY HOLDER")]
+    ) == [("Primary Holder", "PRIMARY HOLDER"), ("Sample Person", "ADDON 0000")]
 
 
 @pytest.mark.anyio

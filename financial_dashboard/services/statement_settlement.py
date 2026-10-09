@@ -22,11 +22,11 @@ from financial_dashboard.services.categorization.decision_lifecycle import (
 )
 from financial_dashboard.services.categorization.engine import requeue_after_enrichment
 from financial_dashboard.services.statements.cc import (
-    card_holder_name,
     parse_cc_amount,
     parse_cc_date,
     reconciliation_from_json,
     reconciliation_to_json,
+    statement_card_holder,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,7 +145,9 @@ def _claimed(recon: Reconciliation) -> set[int]:
     return claimed
 
 
-def _merge(entry: HeldRow, target: Transaction, upload_id: int) -> None:
+def _merge(
+    entry: HeldRow, target: Transaction, upload_id: int, holder: str | None
+) -> None:
     """Writes the statement's amount, date, merchant and cardholder onto the stored row.
 
     The reconciler applied every pairing rule when it offered this row, so the
@@ -161,7 +163,7 @@ def _merge(entry: HeldRow, target: Transaction, upload_id: int) -> None:
 
     if entry["narration"]:
         target.counterparty = entry["narration"]
-    if holder := card_holder_name(entry.get("person")):
+    if holder:
         target.card_holder = holder
     target.statement_upload_id = upload_id
 
@@ -201,7 +203,10 @@ async def answer(
         if recorded is None or target is None:
             return SettlementResult("stale", None)
 
-        _merge(entry, target, upload.id)
+        holder = await statement_card_holder(
+            session, target.account_id, entry.get("person")
+        )
+        _merge(entry, target, upload.id, holder)
         if target.attachment_path is None:
             target.attachment_path = recorded.attachment_path
         elif recorded.attachment_path is not None:
