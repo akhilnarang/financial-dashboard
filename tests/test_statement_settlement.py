@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from financial_dashboard.db import Account, StatementUpload, Transaction
+from financial_dashboard.db import Account, Card, StatementUpload, Transaction
 from financial_dashboard.db.models import (
     AuditInteraction,
     TelegramConversation,
@@ -145,10 +145,14 @@ async def test_a_fold_states_what_the_statement_states(maker):
     """Verifies that merging overwrites stored transaction fields with statement data.
 
     Without this merge, stored records retain outdated amounts, dates, and merchant
-    descriptions.
+    descriptions. An add-on number takes the label of the account's card.
     """
-    upload_id = await _seed(maker)
+    addon = _row(person="ADDON 0000")
+    upload_id = await _seed(maker, recon=_recon([addon]))
     async with maker() as session:
+        session.add(
+            Card(account_id=ACCOUNT_ID, card_mask="XXXX0000", label="Sample Person")
+        )
         alert = await session.get(Transaction, 1)
         alert.transaction_date = datetime.date(2026, 4, 6)
         recorded = await session.get(Transaction, 2)
@@ -180,7 +184,7 @@ async def test_a_fold_states_what_the_statement_states(maker):
         await session.commit()
 
     async with maker() as session:
-        result = await answer(session, upload_id, 0, row_digest(_row()), 1)
+        result = await answer(session, upload_id, 0, row_digest(addon), 1)
 
     assert result.outcome == "merged"
     [row] = await _rows(maker)
@@ -190,7 +194,7 @@ async def test_a_fold_states_what_the_statement_states(maker):
         row.transaction_date,
         row.counterparty,
         row.card_holder,
-    ) == (1, Decimal("2529.00"), datetime.date(2026, 4, 7), NARRATION, "Addon Holder")
+    ) == (1, Decimal("2529.00"), datetime.date(2026, 4, 7), NARRATION, "Sample Person")
     # SQLite can reuse id 2. A reply to the old message must reach the survivor.
     async with maker() as session:
         context = await session.scalar(select(TelegramMessageContext))

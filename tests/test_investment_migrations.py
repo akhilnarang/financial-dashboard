@@ -12,6 +12,7 @@ from financial_dashboard.db.init_db import init_db
 from financial_dashboard.db.models import (
     Account,
     Base,
+    Card,
     CasUpload,
     InvestmentLot,
     StatementUpload,
@@ -177,7 +178,9 @@ async def test_legacy_cas_payloads_backfill_once_and_isolate_malformed_json(
 async def test_stored_reconciliations_backfill_card_holders_once(tmp_path, monkeypatch):
     """Old statement rows take the cardholder that their stored reconciliation
     names. A holder already set stays, malformed JSON does not stop boot, and
-    the backfill runs once."""
+    the backfill runs once. An add-on number takes the first non-blank label
+    of a card on its own account whose mask ends in those digits. Else the
+    number stays."""
     _stub_init_caches(monkeypatch)
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/legacy-holder.db")
     try:
@@ -185,7 +188,20 @@ async def test_stored_reconciliations_backfill_card_holders_once(tmp_path, monke
             await conn.run_sync(Base.metadata.create_all)
         maker = async_sessionmaker(engine, expire_on_commit=False)
         async with maker() as session:
-            session.add(Account(id=1, bank="hdfc", label="Card", type="credit_card"))
+            session.add_all(
+                Account(id=i, bank="hdfc", label="Card", type="credit_card")
+                for i in (1, 2)
+            )
+            session.add_all(
+                Card(account_id=account_id, card_mask=mask, label=label)
+                for account_id, mask, label in (
+                    (2, "XXXX9999", "Other Person"),
+                    (1, "XXXX0000", " "),
+                    (1, "4111XXXXXXXX0000", " Sample Person "),
+                    (1, "9999XXXXXXXXXXXX", "Other Person"),
+                    (1, "XXXX9999", " "),
+                )
+            )
             txns = [
                 Transaction(
                     account_id=1,
@@ -197,15 +213,16 @@ async def test_stored_reconciliations_backfill_card_holders_once(tmp_path, monke
                     transaction_date=datetime.date(2026, 4, 7),
                     card_holder=holder,
                 )
-                for holder in (None, None, "Kept Holder")
+                for holder in (None, None, "Kept Holder", None, "Addon 9999")
             ]
             session.add_all(txns)
             await session.flush()
-            matched, imported, kept = (txn.id for txn in txns)
+            matched, imported, kept, addon, unlabelled = (txn.id for txn in txns)
             recon = {
                 "matched": [
                     {"db_txn_id": matched, "person": "ADDON  HOLDER"},
                     {"db_txn_id": kept, "person": "OTHER HOLDER"},
+                    {"db_txn_id": addon, "person": "ADDON 0000"},
                 ],
                 "missing": [{"imported_txn_id": imported, "person": "PRIMARY HOLDER"}],
             }
@@ -250,6 +267,8 @@ async def test_stored_reconciliations_backfill_card_holders_once(tmp_path, monke
             matched: "Addon Holder",
             imported: "Primary Holder",
             kept: "Kept Holder",
+            addon: "Sample Person",
+            unlabelled: "Addon 9999",
         }
         assert marker_count == 1
     finally:

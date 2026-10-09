@@ -35,9 +35,10 @@ used inside async functions to avoid circular import issues.
 import asyncio
 import email as email_lib
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 import json
 import logging
+import re
 import tempfile
 import unicodedata
 from difflib import SequenceMatcher
@@ -149,6 +150,9 @@ _LINE_KEYS = (
 )
 
 _GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment done"}
+
+# Some statements name an add-on holder only by the card's last 4 digits.
+_ADDON_PERSON = re.compile(r"\s*addon\s*(\d{4})\s*", re.IGNORECASE)
 
 _SKIP_PDF_NAMES = {
     "most important terms",
@@ -1173,6 +1177,53 @@ def card_holder_name(person: str | None) -> str | None:
     return " ".join(person.split()).title() if person and person.strip() else None
 
 
+def addon_card_label(
+    person: str | None, cards: Iterable[tuple[str, str | None]]
+) -> str | None:
+    """Return the label of the add-on card that a statement names by its digits.
+
+    Args:
+        person: The person that the statement prints, such as ``ADDON 0000``.
+        cards: The ``(card_mask, label)`` pairs that the account registers.
+
+    Returns:
+        The first non-blank label of a card whose mask ends in those digits,
+        or None when the person is not an add-on number or no such card exists.
+    """
+    if (match := _ADDON_PERSON.fullmatch(person or "")) is None:
+        return None
+    for mask, label in cards:
+        if normalize_mask(mask).endswith(match[1]) and (label := (label or "").strip()):
+            return label
+    return None
+
+
+async def statement_card_holder(
+    session: AsyncSession, account_id: int | None, person: str | None
+) -> str | None:
+    """Return the cardholder that a statement line names.
+
+    An add-on number takes the label of the account's card with those digits.
+
+    Args:
+        session: Open async session. Only read.
+        account_id: The account of the row, or None when it is unknown.
+        person: The person that the statement prints for the line.
+
+    Returns:
+        The card label, else the title-cased person, else None.
+    """
+    if account_id is not None and _ADDON_PERSON.fullmatch(person or ""):
+        cards = await session.execute(
+            select(Card.card_mask, Card.label)
+            .where(Card.account_id == account_id)
+            .order_by(Card.id)
+        )
+        if label := addon_card_label(person, cards.tuples()):
+            return label
+    return card_holder_name(person)
+
+
 def _take_statement_rupees(txn: Transaction, entry: dict) -> bool:
     """Write the statement's rupee amount over a paired foreign-currency row.
 
@@ -1238,7 +1289,9 @@ async def enrich_matched_transactions(recon: dict) -> int:
             if named := _takes_narration(txn, narration):
                 txn.counterparty = narration
                 txn.counterparty_source = "bank"
-            holder = card_holder_name(entry.get("person"))
+            holder = await statement_card_holder(
+                session, txn.account_id, entry.get("person")
+            )
             if held := holder is not None and txn.card_holder != holder:
                 txn.card_holder = holder
             if not (converted or named or held):
@@ -1251,6 +1304,34 @@ async def enrich_matched_transactions(recon: dict) -> int:
             await session.commit()
 
     return enriched
+
+
+def _take_copy(
+    copies: list[Transaction], holder: str | None, number_holder: str | None
+) -> Transaction | None:
+    """Pick the recorded copy of a held row and name its holder.
+
+    Args:
+        copies: The unclaimed copies of the row.
+        holder: The holder that the row names now.
+        number_holder: The title-cased statement person. A copy recorded
+            before its add-on card had a label holds this name.
+
+    Returns:
+        The copy that holds the person, else the copy of this holder, else a
+        copy with no holder, else any copy. None when there is no copy.
+    """
+    order = (number_holder, holder, None)
+    copy = min(
+        copies,
+        key=lambda txn: (
+            order.index(txn.card_holder) if txn.card_holder in order else len(order)
+        ),
+        default=None,
+    )
+    if copy is not None and holder is not None:
+        copy.card_holder = holder
+    return copy
 
 
 async def resolve_cc_card_mask(
@@ -1397,6 +1478,9 @@ async def import_missing_cc_txns(
     for entry in recon["missing"]:
         if entry.get("imported"):
             continue
+        holder = await statement_card_holder(
+            session, upload.account_id, entry.get("person")
+        )
         # A held row that a statement recorded before names that copy, and is not
         # imported again.
         if entry.get("ambiguous"):
@@ -1411,18 +1495,12 @@ async def import_missing_cc_txns(
                 copies = []
             else:
                 copies = recorded.get(key, [])
-            holder = card_holder_name(entry.get("person"))
-            # The copy of this holder comes first, then a copy with no holder.
-            copy = min(
-                (txn for txn in copies if txn.id not in claimed),
-                key=lambda txn: (
-                    txn.card_holder != holder,
-                    txn.card_holder is not None,
-                ),
-                default=None,
+            copy = _take_copy(
+                [txn for txn in copies if txn.id not in claimed],
+                holder,
+                card_holder_name(entry.get("person")),
             )
             if copy is not None:
-                copy.card_holder = copy.card_holder or holder
                 entry["imported"] = True
                 entry["imported_txn_id"] = copy.id
                 entry["import_error"] = None
@@ -1449,7 +1527,7 @@ async def import_missing_cc_txns(
             ),
             channel="cc_statement",
             raw_description=entry.get("narration"),
-            card_holder=card_holder_name(entry.get("person")),
+            card_holder=holder,
         )
         try:
             async with session.begin_nested():
