@@ -22,6 +22,7 @@ from financial_dashboard.services.categorization.decision_lifecycle import (
 )
 from financial_dashboard.services.categorization.engine import requeue_after_enrichment
 from financial_dashboard.services.statements.cc import (
+    card_holder_name,
     parse_cc_amount,
     parse_cc_date,
     reconciliation_from_json,
@@ -40,6 +41,7 @@ class HeldRow(TypedDict):
     direction: str
     narration: str | None
     card_number: str | None
+    person: NotRequired[str | None]
     imported: bool
     imported_txn_id: int | None
     ambiguous: NotRequired[bool]
@@ -81,6 +83,7 @@ def row_digest(entry: HeldRow) -> str:
             entry["direction"],
             entry["narration"] or "",
             entry["card_number"] or "",
+            entry.get("person") or "",
         ]
     )
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
@@ -143,7 +146,7 @@ def _claimed(recon: Reconciliation) -> set[int]:
 
 
 def _merge(entry: HeldRow, target: Transaction, upload_id: int) -> None:
-    """Writes the statement's amount, date and merchant onto the stored row.
+    """Writes the statement's amount, date, merchant and cardholder onto the stored row.
 
     The reconciler applied every pairing rule when it offered this row, so the
     fold does not check them again.
@@ -158,6 +161,8 @@ def _merge(entry: HeldRow, target: Transaction, upload_id: int) -> None:
 
     if entry["narration"]:
         target.counterparty = entry["narration"]
+    if holder := card_holder_name(entry.get("person")):
+        target.card_holder = holder
     target.statement_upload_id = upload_id
 
 

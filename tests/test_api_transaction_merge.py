@@ -85,6 +85,7 @@ async def _seed_pair(
         currency="INR",
         transaction_date=statement_date,
         counterparty="SYNTHETIC SHOP",
+        card_holder="Addon Holder",
         raw_description="UPI/SYNTHETIC SHOP/UTR000123456",
         reference_number=statement_ref,
         balance=statement_balance,
@@ -197,6 +198,7 @@ async def test_batch_merges_each_pair_once(client, session):
     assert keeper is not None
     assert keeper.bank_statement_upload_id == upload_id
     assert keeper.raw_description == "UPI/SYNTHETIC SHOP/UTR000123456"
+    assert keeper.card_holder == "Addon Holder"
     assert keeper.transaction_date == DAY
     assert keeper.balance == Decimal("5000.00")
     assert (keeper.category, keeper.category_method) == ("groceries", "manual")

@@ -140,6 +140,7 @@ def transaction_read(row: Transaction) -> transaction_schemas.TransactionRead:
         transaction_time=row.transaction_time,
         counterparty=row.counterparty,
         card_mask=display_mask(row.card_mask),
+        card_holder=row.card_holder,
         account_mask=display_mask(row.account_mask),
         reference_number=row.reference_number,
         channel=row.channel,

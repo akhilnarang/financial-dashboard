@@ -50,6 +50,7 @@ def _row(
     amount: str = SETTLED,
     candidates: tuple[int, ...] = (1,),
     recorded: int = 2,
+    person: str = "ADDON HOLDER",
 ) -> HeldRow:
     """Returns a test dictionary for an ambiguous imported statement row."""
     return {
@@ -59,6 +60,7 @@ def _row(
         "direction": "debit",
         "narration": NARRATION,
         "card_number": None,
+        "person": person,
         "imported": True,
         "imported_txn_id": recorded,
         "ambiguous": True,
@@ -182,12 +184,13 @@ async def test_a_fold_states_what_the_statement_states(maker):
 
     assert result.outcome == "merged"
     [row] = await _rows(maker)
-    assert (row.id, row.amount, row.transaction_date, row.counterparty) == (
-        1,
-        Decimal("2529.00"),
-        datetime.date(2026, 4, 7),
-        NARRATION,
-    )
+    assert (
+        row.id,
+        row.amount,
+        row.transaction_date,
+        row.counterparty,
+        row.card_holder,
+    ) == (1, Decimal("2529.00"), datetime.date(2026, 4, 7), NARRATION, "Addon Holder")
     # SQLite can reuse id 2. A reply to the old message must reach the survivor.
     async with maker() as session:
         context = await session.scalar(select(TelegramMessageContext))
@@ -205,7 +208,8 @@ async def test_a_fold_states_what_the_statement_states(maker):
 async def test_only_the_row_the_prompt_showed_is_folded_once(maker):
     """Verifies that a fold applies only to the row the prompt showed, and only once.
 
-    Without this check, a tap can fold a changed row, or fold one row twice.
+    Without this check, a tap can fold a changed row, or fold one row twice. A
+    row of another holder is a changed row.
     """
     upload_id = await _seed(maker)
 
@@ -214,15 +218,20 @@ async def test_only_the_row_the_prompt_showed_is_folded_once(maker):
             session, upload_id, 0, row_digest(_row(amount="9,999.00")), 1
         )
     async with maker() as session:
+        other_holder = await answer(
+            session, upload_id, 0, row_digest(_row(person="PRIMARY HOLDER")), 1
+        )
+    async with maker() as session:
         first = await answer(session, upload_id, 0, row_digest(_row()), 1)
     async with maker() as session:
         second = await answer(session, upload_id, 0, row_digest(_row()), 1)
 
-    assert (changed.outcome, first.outcome, second.outcome) == (
-        "stale",
-        "merged",
-        "stale",
-    )
+    assert (
+        changed.outcome,
+        other_holder.outcome,
+        first.outcome,
+        second.outcome,
+    ) == ("stale", "stale", "merged", "stale")
     assert [row.amount for row in await _rows(maker)] == [Decimal("2529.00")]
 
 

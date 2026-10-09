@@ -76,12 +76,14 @@ def _stmt_txn(
     amount: str,
     narration: str,
     direction: Literal["debit", "credit"] = "debit",
+    person: str | None = None,
 ) -> CcTransaction:
     return CcTransaction(
         date=date,
         narration=narration,
         amount=amount,
         card_number=CARD_NUMBER,
+        person=person,
         transaction_type=direction,
     )
 
@@ -253,7 +255,14 @@ async def test_an_addon_cards_transaction_matches_the_primarys_statement(
     addon_txn_id = await _seed_txn(session_factory, card_mask="4111XXXXXXXX7788")
 
     parsed = _parsed(
-        [_stmt_txn(date="07/04/2026", amount="450.00", narration=NARRATION)]
+        [
+            _stmt_txn(
+                date="07/04/2026",
+                amount="450.00",
+                narration=NARRATION,
+                person="ADDON  HOLDER",
+            )
+        ]
     )
     recon = await _reconcile(session_factory, parsed)
 
@@ -261,10 +270,13 @@ async def test_an_addon_cards_transaction_matches_the_primarys_statement(
     assert recon["matched"][0]["db_txn_id"] == addon_txn_id
     assert recon["missing"] == []
 
+    await enrich_matched_transactions(recon)
     imported, rows = await _import(session_factory, parsed, recon)
 
     assert imported == []
-    assert [row.id for row in rows] == [addon_txn_id]
+    assert [(row.id, row.card_holder) for row in rows] == [
+        (addon_txn_id, "Addon Holder")
+    ]
 
 
 @pytest.mark.anyio
@@ -571,8 +583,18 @@ async def test_new_rows_with_no_db_candidate_still_import(session_factory):
 
     parsed = _parsed(
         [
-            _stmt_txn(date="07/04/2026", amount="999.00", narration="NEW MERCHANT ONE"),
-            _stmt_txn(date="07/04/2026", amount="999.00", narration="NEW MERCHANT TWO"),
+            _stmt_txn(
+                date="07/04/2026",
+                amount="999.00",
+                narration="NEW MERCHANT ONE",
+                person="PRIMARY HOLDER",
+            ),
+            _stmt_txn(
+                date="07/04/2026",
+                amount="999.00",
+                narration="NEW MERCHANT TWO",
+                person="ADDON HOLDER",
+            ),
         ]
     )
     recon = await _reconcile(session_factory, parsed)
@@ -581,9 +603,9 @@ async def test_new_rows_with_no_db_candidate_still_import(session_factory):
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert sorted(txn.counterparty for txn in imported) == [
-        "NEW MERCHANT ONE",
-        "NEW MERCHANT TWO",
+    assert sorted((txn.counterparty, txn.card_holder) for txn in imported) == [
+        ("NEW MERCHANT ONE", "Primary Holder"),
+        ("NEW MERCHANT TWO", "Addon Holder"),
     ]
     assert len(rows) == 3
 
@@ -701,13 +723,23 @@ async def test_find_account_aggregates_conflicts_across_both_routes(session_fact
     assert await cc_module._find_account("hdfc", parsed) is None
 
 
+@pytest.mark.parametrize(
+    ("persons", "winner"),
+    [
+        pytest.param(("SAME HOLDER", "SAME HOLDER"), [0], id="same-holder"),
+        pytest.param(("PRIMARY HOLDER", "ADDON HOLDER"), [], id="other-holder"),
+    ],
+)
 @pytest.mark.anyio
-async def test_interchangeable_rivals_leave_the_winners_match_alone(session_factory):
+async def test_interchangeable_rivals_leave_the_winners_match_alone(
+    session_factory, persons, winner
+):
     """A pairing with no wrong answer is not worth refusing: two identical
-    autopay rows contend for one DB row, but the narration — the only thing a
-    refresh writes here — is the same either way, so the winner keeps its
+    autopay rows contend for one DB row, but the narration and holder — what a
+    refresh writes here — are the same either way, so the winner keeps its
     match. The loser is still held back; interchangeable rivals do not make a
-    second copy any less of a duplicate."""
+    second copy any less of a duplicate. Rows of two holders are not
+    interchangeable: the refresh would name the wrong holder."""
     await _seed_account(session_factory)
     a_id = await _seed_txn(
         session_factory, amount=Decimal("1000.00"), counterparty="SLICE AUTOPAY"
@@ -715,13 +747,21 @@ async def test_interchangeable_rivals_leave_the_winners_match_alone(session_fact
 
     parsed = _parsed(
         [
-            _stmt_txn(date="07/04/2026", amount="1000.00", narration="SLICE AUTOPAY"),
-            _stmt_txn(date="07/04/2026", amount="1000.00", narration="SLICE AUTOPAY"),
+            _stmt_txn(
+                date="07/04/2026",
+                amount="1000.00",
+                narration="SLICE AUTOPAY",
+                person=person,
+            )
+            for person in persons
         ]
     )
     recon = await _reconcile(session_factory, parsed)
 
-    assert [entry["stmt_idx"] for entry in recon["matched"]] == [0]
+    assert [entry["stmt_idx"] for entry in recon["matched"]] == winner
+    if not winner:
+        assert all(entry["ambiguous"] for entry in recon["missing"])
+        return
     assert recon["matched"][0]["db_txn_id"] == a_id
     assert [entry["stmt_idx"] for entry in recon["missing"]] == [1]
     assert recon["missing"][0]["ambiguous"] is True
@@ -1033,30 +1073,37 @@ async def test_a_reprocess_keeps_the_question_open(session_factory):
     """Verifies that reprocessing a statement keeps held rows open for user resolution.
 
     Without this check, repeated processing drops unresolved rows and leaves duplicate
-    records.
+    records. Each held row keeps the copy of its own holder, and a copy with no
+    holder takes the holder that a reprocess names.
     """
     await _seed_account(session_factory)
     await _seed_txn(session_factory, amount=Decimal("90.00"), counterparty="MERCHANT A")
-    parsed = _parsed(
-        [
-            _stmt_txn(date="07/04/2026", amount="90.00", narration="MERCHANT A"),
-            _stmt_txn(date="07/04/2026", amount="90.00", narration="MERCHANT A BRANCH"),
-        ]
-    )
 
-    for _ in range(3):
+    for persons in (
+        ("PRIMARY HOLDER", None),
+        ("ADDON HOLDER", "PRIMARY HOLDER"),
+        ("ADDON HOLDER", "PRIMARY HOLDER"),
+    ):
+        parsed = _parsed(
+            [
+                _stmt_txn(
+                    date="07/04/2026", amount="90.00", narration="MERCHANT A", person=p
+                )
+                for p in persons
+            ]
+        )
         recon = await _reconcile(session_factory, parsed)
         _imported, rows = await _import(
             session_factory, parsed, recon, due_date="20/05/2026"
         )
 
     held = held_rows(cast(Reconciliation, recon))
-    recorded = [row.id for row in rows if row.statement_upload_id is not None]
+    by_id = {row.id: row for row in rows}
 
     assert len(rows) == 3
-    assert len(held) == 2
-    held_ids = [i for entry in held if (i := entry["imported_txn_id"]) is not None]
-    assert sorted(held_ids) == sorted(recorded)
+    assert sorted(
+        (by_id[entry["imported_txn_id"]].card_holder, entry["person"]) for entry in held
+    ) == [("Addon Holder", "ADDON HOLDER"), ("Primary Holder", "PRIMARY HOLDER")]
 
 
 @pytest.mark.anyio

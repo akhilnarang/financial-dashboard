@@ -190,6 +190,13 @@ class StoredAmount(NamedTuple):
     txn_id: int
 
 
+class RefreshIdentity(NamedTuple):
+    """What a refresh writes onto the stored row that a statement row wins."""
+
+    narration: str
+    holder: str | None
+
+
 class CopyKey(NamedTuple):
     """What a statement row states, and so what its recorded copy states."""
 
@@ -335,15 +342,14 @@ def _confirmed_different_card(stmt_card: str | None, db_card_mask: str | None) -
     return bool(stmt_mask) and bool(db_mask) and not mask_matches(stmt_mask, db_mask)
 
 
-def _refresh_identity(txn: ParsedCcTransaction) -> str:
+def _refresh_identity(txn: ParsedCcTransaction) -> RefreshIdentity:
     """Everything a refresh would write onto the DB row a statement row wins.
 
     Two statement rows with equal identities are interchangeable as *winners*:
     pairing either with the same DB row leaves it holding the same value. On
-    this path a refresh writes the narration and nothing else, so the
-    narration is the whole identity.
+    this path a refresh writes the narration and the cardholder.
     """
-    return (txn.narration or "").strip()
+    return RefreshIdentity((txn.narration or "").strip(), card_holder_name(txn.person))
 
 
 def _match_key(txn_date: date_type, amount: Decimal, direction: str) -> MatchKey:
@@ -1155,6 +1161,18 @@ def _calculate_adjustment_total(pairs, direction: str) -> str:
     return format_cc_amount(total)
 
 
+def card_holder_name(person: str | None) -> str | None:
+    """Return a statement's cardholder name in title case.
+
+    Args:
+        person: The person that the statement prints for a line.
+
+    Returns:
+        The name, or None when the statement names nobody.
+    """
+    return " ".join(person.split()).title() if person and person.strip() else None
+
+
 def _take_statement_rupees(txn: Transaction, entry: dict) -> bool:
     """Write the statement's rupee amount over a paired foreign-currency row.
 
@@ -1198,7 +1216,8 @@ async def enrich_matched_transactions(recon: dict) -> int:
 
     The counterparty takes the statement narration when it is empty, a generic
     placeholder or a user alias. A paired foreign-currency row takes the
-    statement's rupee amount.
+    statement's rupee amount. The row takes the cardholder that the statement
+    names for the line.
 
     Args:
         recon: The reconciliation from ``reconcile_statement``. Each updated
@@ -1219,7 +1238,10 @@ async def enrich_matched_transactions(recon: dict) -> int:
             if named := _takes_narration(txn, narration):
                 txn.counterparty = narration
                 txn.counterparty_source = "bank"
-            if not (converted or named):
+            holder = card_holder_name(entry.get("person"))
+            if held := holder is not None and txn.card_holder != holder:
+                txn.card_holder = holder
+            if not (converted or named or held):
                 continue
             await requeue_after_enrichment(session, txn)
             enriched += 1
@@ -1288,20 +1310,14 @@ async def resolve_cc_card_mask(
 
 async def _recorded_by_a_statement(
     session: AsyncSession, upload: StatementUpload
-) -> dict[CopyKey, list[int]]:
-    """Maps (amount, date, direction, merchant) to the IDs of the rows a statement recorded.
+) -> dict[CopyKey, list[Transaction]]:
+    """Maps (amount, date, direction, merchant) to the rows a statement recorded.
 
     Filters by ``cc_statement`` to prevent reusing merged card alerts as statement
     copies.
     """
-    result = await session.execute(
-        select(
-            Transaction.id,
-            Transaction.amount,
-            Transaction.transaction_date,
-            Transaction.direction,
-            Transaction.counterparty,
-        )
+    result = await session.scalars(
+        select(Transaction)
         .where(
             Transaction.account_id == upload.account_id,
             Transaction.statement_upload_id.is_not(None),
@@ -1309,15 +1325,17 @@ async def _recorded_by_a_statement(
         )
         .order_by(Transaction.id)
     )
-    by_key: dict[CopyKey, list[int]] = {}
-    for txn_id, amount, txn_date, direction, counterparty in result:
+    by_key: dict[CopyKey, list[Transaction]] = {}
+    for txn in result:
+        if txn.transaction_date is None:
+            continue
         key = CopyKey(
-            Decimal(str(amount)),
-            txn_date,
-            direction,
-            _normalize_narration(counterparty),
+            Decimal(str(txn.amount)),
+            txn.transaction_date,
+            txn.direction,
+            _normalize_narration(txn.counterparty),
         )
-        by_key.setdefault(key, []).append(txn_id)
+        by_key.setdefault(key, []).append(txn)
     return by_key
 
 
@@ -1393,12 +1411,22 @@ async def import_missing_cc_txns(
                 copies = []
             else:
                 copies = recorded.get(key, [])
-            copy = next((txn_id for txn_id in copies if txn_id not in claimed), None)
+            holder = card_holder_name(entry.get("person"))
+            # The copy of this holder comes first, then a copy with no holder.
+            copy = min(
+                (txn for txn in copies if txn.id not in claimed),
+                key=lambda txn: (
+                    txn.card_holder != holder,
+                    txn.card_holder is not None,
+                ),
+                default=None,
+            )
             if copy is not None:
+                copy.card_holder = copy.card_holder or holder
                 entry["imported"] = True
-                entry["imported_txn_id"] = copy
+                entry["imported_txn_id"] = copy.id
                 entry["import_error"] = None
-                claimed.add(copy)
+                claimed.add(copy.id)
                 continue
         try:
             amount = parse_cc_amount(entry["amount"])
@@ -1421,6 +1449,7 @@ async def import_missing_cc_txns(
             ),
             channel="cc_statement",
             raw_description=entry.get("narration"),
+            card_holder=card_holder_name(entry.get("person")),
         )
         try:
             async with session.begin_nested():

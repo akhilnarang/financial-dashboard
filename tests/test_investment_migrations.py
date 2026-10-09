@@ -1,4 +1,4 @@
-"""Inline investment schema migration and historical CAS lot backfill."""
+"""Inline schema migrations and one-time backfills from stored JSON."""
 
 import datetime
 import json
@@ -10,9 +10,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from financial_dashboard.db.init_db import init_db
 from financial_dashboard.db.models import (
+    Account,
     Base,
     CasUpload,
     InvestmentLot,
+    StatementUpload,
+    Transaction,
 )
 from financial_dashboard.services.investments import create_investment_lots
 
@@ -166,6 +169,88 @@ async def test_legacy_cas_payloads_backfill_once_and_isolate_malformed_json(
         assert len(lots) == 1
         assert lots[0].cas_upload_id == 1
         assert lots[0].source_occurrence == 0
+        assert marker_count == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_stored_reconciliations_backfill_card_holders_once(tmp_path, monkeypatch):
+    """Old statement rows take the cardholder that their stored reconciliation
+    names. A holder already set stays, malformed JSON does not stop boot, and
+    the backfill runs once."""
+    _stub_init_caches(monkeypatch)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/legacy-holder.db")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with maker() as session:
+            session.add(Account(id=1, bank="hdfc", label="Card", type="credit_card"))
+            txns = [
+                Transaction(
+                    account_id=1,
+                    bank="hdfc",
+                    email_type="cc_statement",
+                    direction="debit",
+                    amount=Decimal("10.00"),
+                    currency="INR",
+                    transaction_date=datetime.date(2026, 4, 7),
+                    card_holder=holder,
+                )
+                for holder in (None, None, "Kept Holder")
+            ]
+            session.add_all(txns)
+            await session.flush()
+            matched, imported, kept = (txn.id for txn in txns)
+            recon = {
+                "matched": [
+                    {"db_txn_id": matched, "person": "ADDON  HOLDER"},
+                    {"db_txn_id": kept, "person": "OTHER HOLDER"},
+                ],
+                "missing": [{"imported_txn_id": imported, "person": "PRIMARY HOLDER"}],
+            }
+            session.add_all(
+                StatementUpload(
+                    account_id=1,
+                    bank="hdfc",
+                    filename=f"{name}.pdf",
+                    file_path=f"/nonexistent/{name}.pdf",
+                    reconciliation_data=data,
+                )
+                for name, data in (
+                    ("good", json.dumps(recon)),
+                    ("broken", "{broken"),
+                    ("no-rows", '{"matched": null}'),
+                    (
+                        "bad-id",
+                        '{"matched": [{"db_txn_id": {"id": 1}, "person": "X"}]}',
+                    ),
+                )
+            )
+            await session.commit()
+
+        await init_db(engine)
+        await init_db(engine)
+
+        async with maker() as session:
+            holders = dict(
+                (await session.execute(select(Transaction.id, Transaction.card_holder)))
+                .tuples()
+                .all()
+            )
+            marker_count = (
+                await session.execute(
+                    text(
+                        "SELECT count(*) FROM settings WHERE key = "
+                        "'migrations.card_holder_backfill'"
+                    )
+                )
+            ).scalar_one()
+        assert holders == {
+            matched: "Addon Holder",
+            imported: "Primary Holder",
+            kept: "Kept Holder",
+        }
         assert marker_count == 1
     finally:
         await engine.dispose()

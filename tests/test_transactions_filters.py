@@ -296,19 +296,24 @@ async def test_paging_and_sorting_keep_every_drill_filter(client, session):
                 category="repayment",
                 # Both blank spellings belong to the same "(no counterparty)" group.
                 counterparty=None if i % 2 else "",
+                card_holder="Addon Holder",
                 currency="INR",
                 transaction_date=DATED,
                 account_id=bank,
             )
         )
     await session.flush()
-    # Decoys: a named counterparty, another category, and a card row.
+    # Decoys: a named counterparty, another category, a card row, and no holder.
     repayment = {"category": "repayment", "direction": "credit"}
     await _add(session, amount="999", account_id=bank, counterparty="MOM", **repayment)
     await _add(session, amount="998", account_id=bank)
     await _add(session, amount="997", account_id=card, **repayment)
+    await _add(session, amount="996", account_id=bank, counterparty="", **repayment)
 
-    query = "/transactions?category=repayment&counterparty=&scope=bank"
+    query = (
+        "/transactions?category=repayment&counterparty=&scope=bank"
+        "&card_holder=Addon+Holder"
+    )
     r = await client.get(query)
     assert r.status_code == 200
     assert _count_rows(r.text) == 50  # a full first page, so pagination renders
@@ -320,5 +325,5 @@ async def test_paging_and_sorting_keep_every_drill_filter(client, session):
     by_amount = await client.get(next(h for h in hrefs if "sort=amount" in h))
     assert _count_rows(by_amount.text) == 50
     for listing in (page_two.text, by_amount.text):
-        for decoy in ("999.00", "998.00", "997.00"):
+        for decoy in ("999.00", "998.00", "997.00", "996.00"):
             assert decoy not in _transaction_rows_html(listing)

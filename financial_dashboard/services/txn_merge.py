@@ -172,6 +172,7 @@ _ENRICHMENT_FIELDS = (
     "transaction_time",
     "counterparty",
     "card_mask",
+    "card_holder",
     "account_mask",
     "reference_number",
     "channel",

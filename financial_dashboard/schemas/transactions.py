@@ -66,6 +66,7 @@ class TransactionRead(BaseModel):
     transaction_time: datetime.time | None
     counterparty: str | None
     card_mask: str | None
+    card_holder: str | None
     account_mask: str | None
     reference_number: str | None
     channel: str | None
