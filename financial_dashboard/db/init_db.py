@@ -477,15 +477,6 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                     "ALTER TABLE statement_uploads ADD COLUMN payment_paid_amount NUMERIC(12,2) DEFAULT 0"
                 )
             )
-        await conn.execute(
-            text(
-                "UPDATE statement_uploads SET payment_status = 'unpaid' "
-                "WHERE due_date IS NOT NULL AND due_date != '' "
-                "AND total_amount_due IS NOT NULL AND total_amount_due != '' "
-                "AND payment_status IS NULL "
-                "AND created_at >= date('now', 'start of month')"
-            )
-        )
         try:
             await conn.execute(
                 text("SELECT bank_statement_upload_id FROM transactions LIMIT 0")

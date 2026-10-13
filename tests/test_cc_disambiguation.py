@@ -289,13 +289,14 @@ async def test_resolver_outstanding_match_both_outstanding_same(session):
     assert out is not None
 
 
-# ---------- resolve: sole-outstanding fallback ----------
+# ---------- resolve: no sole-outstanding guess ----------
 
 
 @pytest.mark.anyio
-async def test_resolver_sole_outstanding(session):
-    """Only one card has remaining balance > 0. Payment is less than
-    that balance."""
+async def test_resolver_does_not_guess_sole_outstanding_card(session):
+    """Only one card has a statement balance, but the payment does not match
+    it exactly. The payment can clear unbilled spend on a paid card, so the
+    resolver must prompt, not guess the card with the balance."""
     a, b, c = await _seed_three_indusind_ccs(session)
     session.add_all(
         [
@@ -319,47 +320,14 @@ async def test_resolver_sole_outstanding(session):
     await session.flush()
     t = await _txn(session, amount=Decimal("4000"))
     out = await resolve_cc_payment_account(session, t)
-    assert out is None
-    assert t.account_id == a
-
-
-@pytest.mark.anyio
-async def test_resolver_sole_outstanding_rejects_overpayment(session):
-    """Payment is more than the sole outstanding balance. The resolver
-    must fall through to the prompt."""
-    a, b, c = await _seed_three_indusind_ccs(session)
-    session.add_all(
-        [
-            _stmt(
-                account_id=a,
-                total="6,200.00",
-                status=PaymentStatus.PARTIALLY_PAID,
-                paid=Decimal("2200"),
-            ),
-            _stmt(
-                account_id=b,
-                total="512.00",
-                status=PaymentStatus.PAID,
-                paid=Decimal("512"),
-            ),
-            _stmt(
-                account_id=c, total="0.00", status=PaymentStatus.PAID, paid=Decimal("0")
-            ),
-        ]
-    )
-    await session.flush()
-    t = await _txn(session, amount=Decimal("5000"))
-    out = await resolve_cc_payment_account(session, t)
     assert t.account_id is None
     assert out is not None
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("amount", [Decimal("2500"), Decimal("4000")])
-async def test_resolver_sole_outstanding_skips_untracked(session, amount):
+async def test_resolver_outstanding_match_skips_untracked(session):
     """An untracked candidate (payment_status=None) blocks the
-    sole-outstanding and outstanding-match tiers. The resolver must fall
-    through to the prompt."""
+    outstanding-match tier. The resolver must fall through to the prompt."""
     a, b, c = await _seed_three_indusind_ccs(session)
     session.add_all(
         [
@@ -376,7 +344,7 @@ async def test_resolver_sole_outstanding_skips_untracked(session, amount):
         ]
     )
     await session.flush()
-    t = await _txn(session, amount=amount)
+    t = await _txn(session, amount=Decimal("4000"))
     out = await resolve_cc_payment_account(session, t)
     assert t.account_id is None
     assert out is not None
