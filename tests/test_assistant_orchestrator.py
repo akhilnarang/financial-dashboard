@@ -6,6 +6,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.db.models import (
+    Account,
+    CategoryReviewDecision,
     AuditInteraction,
     Setting,
     TelegramConversation,
@@ -41,6 +43,7 @@ class FakeProvider:
 
     async def complete(self, context):
         self.calls += 1
+        self.context = context
         response = next(self.responses)
         return StructuredResult(
             response, "prompt", "json_schema", "fake", "test", 1, {}
@@ -721,3 +724,49 @@ async def test_forbidden_change_is_refused_not_offered(session, message):
     assert txn.category is None
     assert txn.note is None
     assert txn.exclude_from_cashflow is False
+
+
+@pytest.mark.anyio
+async def test_proposal_keeps_only_categories_that_fit(session):
+    for slug in ("tax_refund", "refund"):
+        await ensure_category(session, slug)
+    card = Account(bank="test", label="Card", type="credit_card")
+    session.add(card)
+    await session.flush()
+    txn = Transaction(
+        bank="test",
+        email_type="test",
+        direction="credit",
+        amount=10,
+        account_id=card.id,
+    )
+    session.add(txn)
+    await session.flush()
+    provider = FakeProvider(
+        [
+            CategoryProposal(
+                outcome="category_proposal",
+                transaction_id=txn.id,
+                explanation="A VAT refund.",
+                candidates=[
+                    # A tax refund cannot be a credit on a card.
+                    {"slug": "tax_refund", "reason": "VAT", "confidence": 0.8},
+                    {"slug": "refund", "reason": "refund", "confidence": 0.2},
+                ],
+            )
+        ]
+    )
+
+    result = await run_turn(
+        session, provider, user_message="mom dubai vat refund", transaction_id=txn.id
+    )
+
+    # The model sees which categories fit, and can still use any active one.
+    assert "tax_refund" not in provider.context.fitting_categories
+    assert "refund" in provider.context.fitting_categories
+    assert "tax_refund" in provider.context.categories
+    assert isinstance(result.response, CategoryProposal)
+    assert [c.slug for c in result.response.candidates] == ["refund"]
+    decision = await session.get(CategoryReviewDecision, result.decision_id)
+    # A button index must select the same slug that the decision stores.
+    assert [c["slug"] for c in json.loads(decision.candidates_json)] == ["refund"]
