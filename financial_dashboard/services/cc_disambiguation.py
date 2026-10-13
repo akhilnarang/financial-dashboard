@@ -125,16 +125,13 @@ async def _load_cc_candidates(
 async def _latest_statements(
     session: AsyncSession, candidate_ids: list[int]
 ) -> list[StatementUpload]:
-    """Get the latest statement (by due_date) per candidate account.
-    Does not filter on payment_status."""
-    from financial_dashboard.services.reminders import latest_per_account
-
+    """Get the active statement per candidate account, any payment status."""
     uploads = (
         (
             await session.execute(
                 select(StatementUpload).where(
                     StatementUpload.account_id.in_(candidate_ids),
-                    StatementUpload.due_date.isnot(None),
+                    StatementUpload.is_active.is_(True),
                     StatementUpload.total_amount_due.isnot(None),
                 )
             )
@@ -142,7 +139,7 @@ async def _latest_statements(
         .scalars()
         .all()
     )
-    return latest_per_account(list(uploads))
+    return list(uploads)
 
 
 def _parse_outstanding(upload: StatementUpload) -> Decimal | None:
@@ -179,10 +176,7 @@ async def _find_cc_account_by_total_due(
     total matches ``amount`` exactly. Returns ``None`` on zero or
     multiple hits (caller falls back to outstanding-based fallbacks).
     """
-    from financial_dashboard.services.reminders import (
-        ACTIVE_STATUSES,
-        latest_per_account,
-    )
+    from financial_dashboard.services.reminders import ACTIVE_STATUSES
     from financial_dashboard.services.statements.cc import parse_cc_amount
 
     uploads = (
@@ -190,7 +184,8 @@ async def _find_cc_account_by_total_due(
             await session.execute(
                 select(StatementUpload).where(
                     StatementUpload.account_id.in_(candidate_ids),
-                    StatementUpload.due_date.isnot(None),
+                    StatementUpload.is_active.is_(True),
+                    StatementUpload.payment_status.in_(ACTIVE_STATUSES),
                     StatementUpload.total_amount_due.isnot(None),
                 )
             )
@@ -198,17 +193,10 @@ async def _find_cc_account_by_total_due(
         .scalars()
         .all()
     )
-    # Only the most recent cycle per account is eligible: older unpaid
-    # balances roll into the new statement.
-    latest = [
-        u
-        for u in latest_per_account(list(uploads))
-        if u.payment_status in ACTIVE_STATUSES
-    ]
 
     target = Decimal(str(amount))
     matches: list[int] = []
-    for upload in latest:
+    for upload in uploads:
         if upload.total_amount_due is None:
             continue
         try:

@@ -592,3 +592,18 @@ async def test_same_due_date_newer_upload_is_latest(session_maker):
         pdf = await s.get(StatementUpload, pdf_id)
         assert pdf.payment_paid_amount == Decimal("200.00")
         assert pdf.payment_status == PaymentStatus.PARTIALLY_PAID
+
+
+async def test_one_active_statement_follows_latest_due_date(session_maker):
+    """Only the latest statement by due date is active. A backfilled older bill
+    does not take over, and deleting the active bill hands it to the next."""
+    async with session_maker() as s:
+        account = await _cc_account(s)
+        newest = await _upload(s, account, due="23/10/2026")
+        older = await _upload(s, account, due="23/02/2026")
+        await s.commit()
+        assert (newest.is_active, older.is_active) == (True, False)
+
+        await s.delete(newest)
+        await s.commit()
+        assert older.is_active is True

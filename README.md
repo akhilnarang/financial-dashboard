@@ -515,6 +515,7 @@ erDiagram
         datetime payment_last_reminded_at
         decimal payment_paid_amount
         datetime payment_paid_at
+        bool is_active
     }
 
     BANK_STATEMENT_UPLOADS {
@@ -886,6 +887,7 @@ Relationship notes:
 - `transactions.card_holder` is the cardholder that a card statement names for the row. Some banks print one card number for the primary card and each add-on, so `card_mask` alone cannot tell them apart. Statement import and enrichment set it; a one-time migration fills it from each stored statement reconciliation.
 - `transactions` has a composite lookup index on `(category, transaction_date)`. Category first because a category filter with no date bounds — a drill-through from a category link, say — would otherwise scan the table, both for the rows and for the `count()` the pager needs; `transaction_date` second so a filter carrying both a category and a date range satisfies them from the one index instead of narrowing on dates and re-checking the category per row.
 - `(account_id, card_mask)` is unique on `cards`.
+- `statement_uploads` has a partial unique index on `account_id` where `is_active = 1`: each card has at most one active statement. The active statement is the latest by due date (a tie goes to the newer upload). An `after_flush` hook keeps the flag current. Only the active statement takes payment actions.
 - `balance_snapshots` has a check constraint requiring exactly one source foreign key among `account_id`, `cas_upload_id`, and `manual_item_id`.
 - `balance_snapshots` has SQLite partial unique indexes for account, investment, and manual snapshot upserts: `(account_id, category, as_of_date)`, `(portfolio_key, category, as_of_date)`, and `(manual_item_id, as_of_date)`.
 - `telegram_outbound_deliveries` requires exactly one owner (`interaction_id` or `category_review_decision_id`) and has partial unique indexes on `(interaction_id, ordinal)` and `(category_review_decision_id, ordinal)`.

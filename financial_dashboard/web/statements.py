@@ -499,7 +499,7 @@ async def statement_payment(
     """
 
     upload = await session.get(StatementUpload, upload_id)
-    if not upload:
+    if not upload or not upload.is_active:
         return RedirectResponse(url="/statements", status_code=303)
 
     if action == "mark_paid":
@@ -582,6 +582,9 @@ async def statement_settle_sms(
         upload = await session.get(StatementUpload, upload_id)
         if upload is None:
             return RedirectResponse(url="/statements", status_code=303)
+        # Inside the write transaction, so a newer statement cannot slip in.
+        if not upload.is_active:
+            return _fail("A newer statement replaced this one.")
         sms = await session.get(SmsMessage, sms_id)
         if sms is None:
             return _fail("Payment SMS not found.")

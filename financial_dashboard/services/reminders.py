@@ -56,32 +56,10 @@ ACTIVE_STATUSES = (
 STALE_DAYS = 7  # stop reminding after this many days past due
 
 
-def latest_per_account(uploads: list[StatementUpload]) -> list[StatementUpload]:
-    """Collapse a list of StatementUploads to at most one per account — the latest by due_date.
-
-    Why: a newer statement supersedes all older cycles (any unpaid balance rolls into it),
-    so reminders and payment auto-match should only ever act on the most recent cycle per
-    account. Uploads with unparseable due_date are skipped entirely since we can't rank them.
-    """
-    latest: dict[int, tuple[date, StatementUpload]] = {}
-    for upload in uploads:
-        if not upload.due_date:
-            continue
-        try:
-            due = parse_cc_date(upload.due_date)
-        except ValueError, InvalidOperation:
-            continue
-        current = latest.get(upload.account_id)
-        # A due-date tie (email summary, then its PDF) goes to the newer upload.
-        if current is None or (due, upload.id) > (current[0], current[1].id):
-            latest[upload.account_id] = (due, upload)
-    return [pair[1] for pair in latest.values()]
-
-
 async def init_payment_tracking(statement_upload_id: int) -> bool:
     """Set payment_status on a StatementUpload if it has a valid due date.
 
-    Skips if: no due_date, unparseable, more than 1 day past, already tracked, or not the latest statement for its account.
+    Skips if: no due_date, unparseable, more than 1 day past, already tracked, or not the active statement for its account.
     Never raises — logs errors internally.
     """
     try:
@@ -104,8 +82,7 @@ async def init_payment_tracking(statement_upload_id: int) -> bool:
             today = date.today()
             if due < today.replace(day=1):
                 return False
-            latest = await _latest_cycle(session, upload.account_id)
-            if latest is None or latest.id != upload.id:
+            if not upload.is_active:
                 return False
 
             if amount_due <= 0:
@@ -155,24 +132,18 @@ async def check_and_send_reminders() -> int:
     sent_count = 0
 
     async with async_session() as session:
-        all_uploads = (
+        uploads = (
             (
                 await session.execute(
                     select(StatementUpload).where(
-                        StatementUpload.due_date.isnot(None),
+                        StatementUpload.is_active.is_(True),
+                        StatementUpload.payment_status.in_(ACTIVE_STATUSES),
                     )
                 )
             )
             .scalars()
             .all()
         )
-        # Why: only remind on the latest cycle per account; older superseded statements
-        # are no longer actionable (any outstanding rolls into the new statement).
-        uploads = [
-            u
-            for u in latest_per_account(list(all_uploads))
-            if u.payment_status in ACTIVE_STATUSES
-        ]
 
         for upload in uploads:
             if not upload.due_date:
@@ -332,6 +303,10 @@ async def handle_mark_paid_callback(update, context) -> None:
             await query.answer("Statement not found")
             return
 
+        if not upload.is_active:
+            await query.answer("A newer statement replaced this one")
+            return
+
         if upload.payment_status == PaymentStatus.PAID:
             await query.answer("Already marked as paid")
             return
@@ -438,43 +413,27 @@ async def recompute_cc_payment_state(
     return recomputed
 
 
-async def _latest_cycle(session, account_id: int) -> StatementUpload | None:
-    """Return the latest CC statement for ``account_id`` by due date, any status.
-
-    Only this cycle is actionable. Once a newer statement exists, an older
-    cycle is over: its unpaid balance rolls into the new statement.
-    """
-    candidates = (
-        (
-            await session.execute(
-                select(StatementUpload).where(
-                    StatementUpload.account_id == account_id,
-                    StatementUpload.due_date.isnot(None),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    latest = latest_per_account(list(candidates))
-    return latest[0] if latest else None
-
-
 async def _latest_active_cycle(
     session, account_id: int, *, include_paid: bool = False
 ) -> StatementUpload | None:
-    """Return the latest CC statement cycle for ``account_id`` if it is active.
+    """Return the active CC statement for ``account_id`` if its payment is open.
 
-    Active means UNPAID / PARTIALLY_PAID / LATE. ``include_paid=True`` also
+    Open means UNPAID / PARTIALLY_PAID / LATE. ``include_paid=True`` also
     accepts PAID — needed on the delete path, where removing an over-payment
-    that had pushed the cycle to PAID must be able to reopen it. An older
-    active cycle never stands in for a latest one that fails the filter.
+    that had pushed the cycle to PAID must be able to reopen it.
     """
     statuses = (
         (*ACTIVE_STATUSES, PaymentStatus.PAID) if include_paid else ACTIVE_STATUSES
     )
-    latest = await _latest_cycle(session, account_id)
-    return latest if latest and latest.payment_status in statuses else None
+    return (
+        await session.execute(
+            select(StatementUpload).where(
+                StatementUpload.account_id == account_id,
+                StatementUpload.is_active.is_(True),
+                StatementUpload.payment_status.in_(statuses),
+            )
+        )
+    ).scalar_one_or_none()
 
 
 async def resync_tracked_cc_payment_state(session, upload: StatementUpload) -> bool:
@@ -488,8 +447,7 @@ async def resync_tracked_cc_payment_state(session, upload: StatementUpload) -> b
     """
     if upload.payment_status not in ACTIVE_STATUSES:
         return False
-    latest = await _latest_cycle(session, upload.account_id)
-    if latest is None or latest.id != upload.id:
+    if not upload.is_active:
         return False
     if upload.total_amount_due is None:
         return False

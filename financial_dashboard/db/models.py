@@ -186,8 +186,22 @@ class StatementUpload(Base):
     payment_paid_amount: Mapped[Decimal | None] = mapped_column(
         Numeric(precision=12, scale=2), default=0
     )
+    # The latest statement by due date. Only it takes payment actions. The
+    # after_flush hook in db/__init__.py keeps this current.
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
 
     account: Mapped["Account"] = relationship(lazy="joined")
+
+    __table_args__ = (
+        Index(
+            "uq_statement_uploads_one_active",
+            "account_id",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+        ),
+    )
 
 
 class BankStatementUpload(Base):
