@@ -425,6 +425,7 @@ async def run_turn(
             tuple(sorted(read_transaction_ids)),
         )
 
+    active_categories = list(categories) or await get_active_slugs(session)
     while calls_used < 4:
         if calls_used and renew_lease is not None and not await renew_lease():
             raise ProcessingLeaseLost
@@ -433,7 +434,12 @@ async def run_turn(
             history=bounded_history(history),
             transaction=serialize_tool_result(target) if target is not None else None,
             tool_results=tool_results,
-            categories=list(categories) or await get_active_slugs(session),
+            categories=active_categories,
+            fitting_categories=(
+                await _fitting_slugs(session, target, active_categories)
+                if target is not None
+                else ()
+            ),
         )
         if context_size(prompt_context._asdict()) > MAX_CONTEXT_CHARS:
             return completed(
@@ -588,7 +594,7 @@ async def run_turn(
                         )
             if isinstance(response, CategoryProposal):
                 try:
-                    decision_id = await _save_proposal(
+                    saved = await _save_proposal(
                         session, response, target, interaction_id
                     )
                 except MutationRejected as exc:
@@ -599,7 +605,7 @@ async def run_turn(
                             code="proposal_rejected",
                         )
                     )
-                return completed(response, None, decision_id)
+                return completed(saved.proposal, None, saved.decision_id)
             return completed(response, mutation)
         if isinstance(response, ToolCalls):
             mutation_calls = [
@@ -743,7 +749,7 @@ async def run_turn(
                             ],
                         )
                         try:
-                            decision_id = await _save_proposal(
+                            saved = await _save_proposal(
                                 session, proposal, call_target, interaction_id
                             )
                         except MutationRejected:
@@ -751,7 +757,7 @@ async def run_turn(
                                 raise
                             # The note is saved. An unsafe guess gets no button.
                             return completed(response, mutation)
-                        return completed(proposal, mutation, decision_id)
+                        return completed(saved.proposal, mutation, saved.decision_id)
             except MutationRejected as exc:
                 return completed(
                     Error(
@@ -917,32 +923,51 @@ async def run_pending_confirmation(
     return result
 
 
+async def _fitting_slugs(
+    session: AsyncSession,
+    target: AssistantTransaction,
+    slugs: Sequence[str],
+) -> list[str]:
+    """Return the slugs that the target transaction can take, in order."""
+    account_type = None
+    if target.account_id is not None:
+        account = await session.get(Account, target.account_id)
+        account_type = account.type if account is not None else None
+    return [
+        slug
+        for slug in slugs
+        if resolve_direction(slug, target.direction, account_type).slug == slug
+    ]
+
+
+class SavedProposal(NamedTuple):
+    decision_id: int
+    proposal: CategoryProposal
+
+
 async def _save_proposal(
     session: AsyncSession,
     response: CategoryProposal,
     target: object,
     interaction_id: int | None,
-) -> int:
+) -> SavedProposal:
+    """Save the valid candidates of a proposal, and drop the rest.
+
+    The caller must render buttons from the returned proposal. Its candidate
+    order is the order that the saved decision stores.
+    """
     target = cast(AssistantTransaction | None, target)
     if target is None:
         raise MutationRejected("category proposal target is not trusted")
     if response.transaction_id != target.id:
         raise MutationRejected("category proposal target is not trusted")
-    active = set(await get_active_slugs(session))
-    if any(candidate.slug not in active for candidate in response.candidates):
-        raise MutationRejected("category proposal contains an unknown category")
-    account_type = None
-    if target.account_id is not None:
-        account = await session.get(Account, target.account_id)
-        account_type = account.type if account is not None else None
-    for candidate in response.candidates:
-        if (
-            resolve_direction(candidate.slug, target.direction, account_type).slug
-            != candidate.slug
-        ):
-            raise MutationRejected(
-                "category proposal contains an incompatible category"
-            )
+    fitting = set(
+        await _fitting_slugs(session, target, await get_active_slugs(session))
+    )
+    candidates = [c for c in response.candidates if c.slug in fitting]
+    if not candidates:
+        raise MutationRejected("no proposed category fits this transaction")
+    response = response.model_copy(update={"candidates": candidates})
     await supersede_active_decisions(session, target.id)
     state_hash = await current_transaction_state_hash(session, target.id)
     if state_hash is None:
@@ -961,7 +986,7 @@ async def _save_proposal(
     )
     session.add(decision)
     await session.flush()
-    return decision.id
+    return SavedProposal(decision.id, response)
 
 
 def _named_transaction_ids(text: str) -> set[int]:

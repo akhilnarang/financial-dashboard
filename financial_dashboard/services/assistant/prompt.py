@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v4"
+PROMPT_VERSION = "telegram-assistant-v5"
 
 
 class PromptContext(NamedTuple):
@@ -13,6 +13,7 @@ class PromptContext(NamedTuple):
     transaction: Mapping[str, object] | None = None
     tool_results: Sequence[Mapping[str, object]] = ()
     categories: Sequence[str] = ()
+    fitting_categories: Sequence[str] = ()
 
 
 def _quoted(value: object, limit: int = 2000) -> str:
@@ -58,6 +59,9 @@ def build_prompt(context: PromptContext) -> str:
         "whole message and set your best category. The application asks the user",
         "to confirm a category that the message does not name.",
         "A reply that is only a category name sets the category and not the note.",
+        "A category_proposal never saves a note. To save a note, use APPLY.",
+        "When you infer a category, choose it from CATEGORIES THAT FIT THIS",
+        "TRANSACTION. Use another active slug only when the user names it.",
         "Change exclude_from_cashflow only when the user asks for it.",
         "The TRUSTED TRANSACTION TARGET is the transaction to change. A number",
         "inside context, such as 'Cashback received for 8864', is part of the",
@@ -87,6 +91,14 @@ def build_prompt(context: PromptContext) -> str:
                 "",
                 "=== ACTIVE CATEGORY SLUGS (quoted data) ===",
                 ", ".join(context.categories),
+            ]
+        )
+    if context.fitting_categories:
+        lines.extend(
+            [
+                "",
+                "=== CATEGORIES THAT FIT THIS TRANSACTION (quoted data) ===",
+                ", ".join(context.fitting_categories),
             ]
         )
     if context.history:
