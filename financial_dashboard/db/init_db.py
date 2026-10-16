@@ -5,6 +5,7 @@ import json
 from sqlalchemy import Table, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
+from financial_dashboard.db.active_statement import set_active_statement
 from financial_dashboard.db.models import Base, InvestmentLot
 
 _INVESTMENT_LOT_BACKFILL_MARKER = "migrations.investment_lots_backfill_v1"
@@ -452,6 +453,28 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                     "ALTER TABLE statement_uploads ADD COLUMN email_id INTEGER REFERENCES emails(id)"
                 )
             )
+        try:
+            await conn.execute(text("SELECT is_active FROM statement_uploads LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE statement_uploads "
+                    "ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT 0"
+                )
+            )
+            account_ids = (
+                await conn.execute(
+                    text("SELECT DISTINCT account_id FROM statement_uploads")
+                )
+            ).scalars()
+            for account_id in list(account_ids):
+                await conn.run_sync(set_active_statement, account_id)
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_statement_uploads_one_active "
+                "ON statement_uploads (account_id) WHERE is_active = 1"
+            )
+        )
         for col in (
             "payment_status",
             "payment_sent_offsets",
@@ -477,15 +500,6 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                     "ALTER TABLE statement_uploads ADD COLUMN payment_paid_amount NUMERIC(12,2) DEFAULT 0"
                 )
             )
-        await conn.execute(
-            text(
-                "UPDATE statement_uploads SET payment_status = 'unpaid' "
-                "WHERE due_date IS NOT NULL AND due_date != '' "
-                "AND total_amount_due IS NOT NULL AND total_amount_due != '' "
-                "AND payment_status IS NULL "
-                "AND created_at >= date('now', 'start of month')"
-            )
-        )
         try:
             await conn.execute(
                 text("SELECT bank_statement_upload_id FROM transactions LIMIT 0")

@@ -32,6 +32,7 @@ from financial_dashboard.services.reminders import (
     check_payment_received,
     recompute_cc_payment_for_account,
     recompute_cc_payment_state,
+    resync_tracked_cc_payment_state,
 )
 from tests.conftest import new_test_engine
 
@@ -350,8 +351,6 @@ async def test_resync_preserves_manually_paid_statement(session_maker):
     """The reparse self-heal must NOT revert a manually 'Mark as Paid' statement.
     Such a statement is PAID with no backing credit; a blind recompute would
     zero it. resync leaves any PAID statement untouched."""
-    from financial_dashboard.services.reminders import resync_tracked_cc_payment_state
-
     async with session_maker() as s:
         account = await _cc_account(s)
         upload = await _upload(s, account, total_due="5000.00")
@@ -371,8 +370,6 @@ async def test_resync_preserves_manually_paid_statement(session_maker):
 async def test_resync_heals_active_prepaid_statement(session_maker):
     """resync recomputes an ACTIVE (unpaid) statement, so a reparse marks paid a
     bill whose credit already exists — the prod #450 remediation path."""
-    from financial_dashboard.services.reminders import resync_tracked_cc_payment_state
-
     async with session_maker() as s:
         account = await _cc_account(s)
         upload = await _upload(s, account, total_due="750.00")  # UNPAID
@@ -546,3 +543,67 @@ async def test_delete_self_heal_recomputes_down(session):
     ).scalar_one()
     # max(total_due - recomputed_paid, 0) = 10000 - 6000.
     assert snapshot.value == Decimal("4000.00")
+
+
+async def test_backfilled_old_unpaid_cycle_does_not_take_payment(session_maker):
+    """Regression: an old statement backfilled as UNPAID sat behind a newer PAID
+    statement. The credit path picked the old cycle, whose window excludes the
+    new payment, and sent a false "partial payment" against the old bill."""
+    async with session_maker() as s:
+        account = await _cc_account(s)
+        old = await _upload(s, account, total_due="5000.00", due="23/02/2026")
+        newest = await _upload(s, account, total_due="500.00", due="23/10/2026")
+        newest.payment_status = PaymentStatus.PAID
+        newest.payment_paid_amount = Decimal("500.00")
+        s.add(_credit(account, "8000.00", txn_date=dt.date(2026, 10, 13)))
+        await s.commit()
+        account_id, old_id = account.id, old.id
+
+    assert await check_payment_received(1, account_id, Decimal("8000.00")) is False
+
+    async with session_maker() as s:
+        old = await s.get(StatementUpload, old_id)
+        assert old.payment_status == PaymentStatus.UNPAID
+        # A reparse of the old statement must not touch it either.
+        assert await resync_tracked_cc_payment_state(s, old) is False
+
+
+async def test_same_due_date_newer_upload_is_latest(session_maker):
+    """An email summary and its later PDF share a due date. The newer upload
+    must be the latest cycle, or a payment check acts on the stale summary."""
+    async with session_maker() as s:
+        account = await _cc_account(s)
+        summary = await _upload(s, account, total_due="500.00")
+        summary.payment_status = PaymentStatus.PAID
+        pdf = await _upload(
+            s,
+            account,
+            total_due="500.00",
+            created_at=CYCLE_CREATED + dt.timedelta(days=5),
+        )
+        # Paid between the summary and the PDF ingestion.
+        s.add(_credit(account, "200.00", txn_date=dt.date(2026, 5, 12)))
+        await s.commit()
+        account_id, pdf_id = account.id, pdf.id
+
+    await check_payment_received(1, account_id, Decimal("200.00"))
+
+    async with session_maker() as s:
+        pdf = await s.get(StatementUpload, pdf_id)
+        assert pdf.payment_paid_amount == Decimal("200.00")
+        assert pdf.payment_status == PaymentStatus.PARTIALLY_PAID
+
+
+async def test_one_active_statement_follows_latest_due_date(session_maker):
+    """Only the latest statement by due date is active. A backfilled older bill
+    does not take over, and deleting the active bill hands it to the next."""
+    async with session_maker() as s:
+        account = await _cc_account(s)
+        newest = await _upload(s, account, due="23/10/2026")
+        older = await _upload(s, account, due="23/02/2026")
+        await s.commit()
+        assert (newest.is_active, older.is_active) == (True, False)
+
+        await s.delete(newest)
+        await s.commit()
+        assert older.is_active is True

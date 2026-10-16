@@ -3,6 +3,8 @@
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session as _Session
+from sqlalchemy.orm import UOWTransaction
+from sqlalchemy.orm.attributes import set_committed_value
 
 from financial_dashboard.config import settings
 from financial_dashboard.db.enums import (
@@ -15,6 +17,7 @@ from financial_dashboard.db.enums import (
     SnapshotKind,
     SnapshotSource,
 )
+from financial_dashboard.db.active_statement import set_active_statement
 from financial_dashboard.db.init_db import init_db as _init_db
 from financial_dashboard.db.models import (
     Account,
@@ -85,6 +88,28 @@ def _signal_commit_wake(session) -> None:  # noqa: ANN001
     from financial_dashboard.services.paisa.wakeup import _fire_commit_wake
 
     _fire_commit_wake()
+
+
+@event.listens_for(_Session, "after_flush")
+def _refresh_active_statements(
+    session: _Session, flush_context: UOWTransaction
+) -> None:
+    """Re-derive the active statement of every account whose statements changed.
+
+    One hook covers every write path, so no caller can leave two active
+    statements or a stale one. The flag is written with plain SQL, then
+    copied onto loaded objects so they do not read a stale value.
+    """
+    changed = (*session.new, *session.dirty, *session.deleted)
+    account_ids = {o.account_id for o in changed if isinstance(o, StatementUpload)}
+    if not account_ids:
+        return
+    conn = session.connection()
+    active_ids = {a: set_active_statement(conn, a) for a in account_ids}
+    # New rows join the identity map only after this hook, so check both.
+    for obj in (*session.identity_map.values(), *session.new):
+        if isinstance(obj, StatementUpload) and obj.account_id in active_ids:
+            set_committed_value(obj, "is_active", obj.id == active_ids[obj.account_id])
 
 
 async def init_db() -> None:
