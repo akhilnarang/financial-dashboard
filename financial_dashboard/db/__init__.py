@@ -3,6 +3,7 @@
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session as _Session
+from sqlalchemy.orm import UOWTransaction
 from sqlalchemy.orm.attributes import set_committed_value
 
 from financial_dashboard.config import settings
@@ -90,7 +91,9 @@ def _signal_commit_wake(session) -> None:  # noqa: ANN001
 
 
 @event.listens_for(_Session, "after_flush")
-def _refresh_active_statements(session, flush_context) -> None:  # noqa: ANN001
+def _refresh_active_statements(
+    session: _Session, flush_context: UOWTransaction
+) -> None:
     """Re-derive the active statement of every account whose statements changed.
 
     One hook covers every write path, so no caller can leave two active
