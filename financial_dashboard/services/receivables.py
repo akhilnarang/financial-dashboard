@@ -131,6 +131,19 @@ async def _linkable(
     return txn
 
 
+async def _write_lock(session: AsyncSession) -> None:
+    """Take the SQLite write lock. It holds until the commit or rollback.
+
+    Args:
+        session: A session that holds no write yet.
+
+    Returns:
+        None.
+    """
+    if session.get_bind().dialect.name == "sqlite":
+        await session.execute(text("BEGIN IMMEDIATE"))
+
+
 async def _new_links(
     session: AsyncSession, wanted: list[tuple[int, ReceivableRole]]
 ) -> list[ReceivableLink]:
@@ -149,8 +162,7 @@ async def _new_links(
     Raises:
         ValueError: A row does not fit its role.
     """
-    if session.get_bind().dialect.name == "sqlite":
-        await session.execute(text("BEGIN IMMEDIATE"))
+    await _write_lock(session)
     try:
         return [
             ReceivableLink(transaction=await _linkable(session, i, role), role=role)
@@ -274,27 +286,37 @@ async def add_link(
 
 
 async def remove_link(
-    session: AsyncSession, receivable: Receivable, transaction_id: int
-) -> bool:
+    session: AsyncSession, receivable_id: int, transaction_id: int
+) -> Receivable | None:
     """Unlink a transaction from a receivable, and commit.
 
+    The delete names the receivable and the row, not the link id. SQLite can
+    give a deleted link id to a new link of another receivable.
+
     Args:
-        session: The request session.
-        receivable: The receivable to change.
+        session: The request session. It must not hold a write yet.
+        receivable_id: The receivable to change.
         transaction_id: The row to unlink.
 
     Returns:
-        False when the receivable does not link the row.
+        The changed receivable, or ``None`` when it does not link the row.
     """
-    link = next(
-        (link for link in receivable.links if link.transaction_id == transaction_id),
-        None,
+    await _write_lock(session)
+    result = await session.execute(
+        delete(ReceivableLink).where(
+            ReceivableLink.receivable_id == receivable_id,
+            ReceivableLink.transaction_id == transaction_id,
+        )
     )
-    if link is None:
-        return False
-    receivable.links.remove(link)
+    if not cast(CursorResult, result).rowcount:
+        await session.rollback()
+        return None
     await session.commit()
-    return True
+    return await session.scalar(
+        select(Receivable)
+        .where(Receivable.id == receivable_id)
+        .execution_options(populate_existing=True)
+    )
 
 
 async def move_receivable_links(

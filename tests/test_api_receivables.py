@@ -4,6 +4,7 @@ import datetime as dt
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import text
 
 from financial_dashboard.db import Transaction
 
@@ -62,6 +63,34 @@ async def test_payment_link_lowers_outstanding(client, session):
     )
     assert reused.status_code == 409
     assert unlinked.json()["outstanding"] == "1500.00"
+
+    # A late unlink must not delete another receivable's link that took the id.
+    await client.post(
+        f"/api/receivables/{rid}/links",
+        json={"transaction_id": payment, "role": "payment"},
+    )
+    other = await _row(session, "credit", "300.00")
+    rid_b = (
+        await client.post("/api/receivables", json={"person": "B", "amount": "300"})
+    ).json()["id"]
+    await session.execute(
+        text(
+            "UPDATE receivable_links SET receivable_id = :b, transaction_id = :t "
+            "WHERE receivable_id = :a AND transaction_id = :p"
+        ),
+        {"a": rid, "p": payment, "b": rid_b, "t": other},
+    )
+    await session.commit()
+
+    late = await client.delete(f"/api/receivables/{rid}/links/{payment}")
+    session.expire_all()
+    listed = (await client.get("/api/receivables")).json()["items"]
+
+    assert late.status_code == 404
+    assert [(item["id"], item["paid"]) for item in listed] == [
+        (rid, "0.00"),
+        (rid_b, "300.00"),
+    ]
 
 
 # A debit cannot pay back. An id past the 64-bit SQLite range must not 500.

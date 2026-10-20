@@ -155,7 +155,7 @@ async def receivables_unlink(
     Returns:
         The changed receivable.
     """
-    receivable = await _get(session, receivable_id)
-    if not await remove_link(session, receivable, transaction_id):
+    receivable = await remove_link(session, receivable_id, transaction_id)
+    if receivable is None:
         raise NotFoundException(detail="Link not found")
     return receivable_read(receivable)
