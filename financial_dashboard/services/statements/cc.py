@@ -843,7 +843,12 @@ def reconcile_statement(
     Returns a dict with matched, missing, and extra lists.
     """
     # A voided charge never posts, so a same-amount statement row is a new charge.
-    db_transactions = [txn for txn in db_transactions if not txn.voided]
+    # A row a statement imported did post, so it stays a candidate.
+    db_transactions = [
+        txn
+        for txn in db_transactions
+        if not txn.voided or txn.statement_upload_id is not None
+    ]
     # Build all statement transactions (debits + credits)
     # Adjustment pairs reference the same Transaction objects already in
     # parsed.transactions / parsed.payments_refunds, so we do NOT re-add them.

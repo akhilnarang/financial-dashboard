@@ -35,6 +35,7 @@ from financial_dashboard.services.cashflow.report import (
     INCLUDED,
     INR_OR_NULL,
     NON_INR,
+    NOT_VOIDED,
     UNCATEGORIZED,
     is_blank_counterparty,
 )
@@ -312,7 +313,8 @@ async def transaction_list(
         internal: ``"1"`` selects internal movement categories for the scope.
         non_inr: ``"1"`` selects foreign currencies and ``"0"`` selects INR or
             legacy rows without a currency.
-        undated: ``"1"`` selects rows without a transaction date.
+        undated: ``"1"`` selects rows without a transaction date that are not
+            voided.
         scope: Optional account perimeter used by cash-flow drill-down links.
         sort: Requested sort key; invalid values fall back to transaction date.
         order: Sort direction; invalid values fall back to descending.
@@ -422,7 +424,7 @@ async def transaction_list(
         # list foreign rows its own total left out.
         stmt = stmt.where(INR_OR_NULL)
     if undated == "1":
-        stmt = stmt.where(Transaction.transaction_date.is_(None))
+        stmt = stmt.where(Transaction.transaction_date.is_(None), NOT_VOIDED)
     if excluded == "1":
         # The rows the Excluded footnote counts. `is_(True)` selects the flagged
         # rows alone. A legacy NULL is an unflagged row and stays out.

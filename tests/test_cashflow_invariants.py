@@ -218,7 +218,15 @@ async def _seed_rich_population(session: AsyncSession) -> None:
         exclude_from_cashflow=True,
     )
 
-    # --- voided rows: in no figure, not even the Excluded footnote ---
+    # --- voided rows: in no figure, not even the Excluded or Undated footnote ---
+    await _add(
+        session,
+        direction="debit",
+        amount=D("555"),
+        category="groceries",
+        transaction_date=None,
+        voided=True,
+    )
     await _add(
         session, direction="debit", amount=D("777"), category="groceries", voided=True
     )

@@ -393,7 +393,9 @@ async def test_the_same_card_matches_and_an_unknown_card_does_not_block(
 @pytest.mark.anyio
 async def test_a_voided_row_is_no_candidate_so_the_line_imports(session_factory):
     """A voided charge never posts. A same-amount statement line is then a new
-    charge: it must import, not pair with the voided row or wait as ambiguous."""
+    charge: it must import, not pair with the voided row or wait as ambiguous.
+    A row the statement imported did post. It stays a candidate even when
+    voided by mistake, so a reprocess does not import it twice."""
     await _seed_account(session_factory)
     voided_id = await _seed_txn(session_factory, voided=True)
 
@@ -410,6 +412,13 @@ async def test_a_voided_row_is_no_candidate_so_the_line_imports(session_factory)
     assert len(imported) == 1
     assert sorted(row.voided for row in rows) == [False, True]
     assert voided_id in [row.id for row in rows]
+
+    async with session_factory() as session:
+        (await session.get(Transaction, imported[0].id)).voided = True
+        await session.commit()
+    again = await _reconcile(session_factory, parsed)
+    assert [entry["db_txn_id"] for entry in again["matched"]] == [imported[0].id]
+    assert again["missing"] == []
 
 
 @pytest.mark.anyio

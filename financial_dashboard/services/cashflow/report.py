@@ -95,8 +95,8 @@ NON_INR = Transaction.currency.is_not(None) & (Transaction.currency != "INR")
 # flagged row is still counted and shown. `is_not(True)` keeps a legacy NULL in,
 # because a NULL row is not flagged. `is_(True)` selects the flagged rows alone.
 # A voided row is in neither set: no money moved, so no figure counts it.
-# The Undated footnote does not filter. An excluded row with no date is in no
-# range, so the Undated line is the only place it shows.
+# The Undated footnote skips only voided rows. An excluded row with no date is
+# in no range, so the Undated line is the only place it shows.
 NOT_VOIDED = Transaction.voided.is_not(True)
 INCLUDED = Transaction.exclude_from_cashflow.is_not(True) & NOT_VOIDED
 EXCLUDED = Transaction.exclude_from_cashflow.is_(True) & NOT_VOIDED
@@ -495,7 +495,9 @@ async def _footnotes(session: AsyncSession, in_range: ColumnElement[bool]) -> Fo
     # sits, and its drill-through carries neither a range nor a scope.
     undated_count, undated_net = (
         await session.execute(
-            select(ROW_COUNT, SIGNED_FLOW).where(Transaction.transaction_date.is_(None))
+            select(ROW_COUNT, SIGNED_FLOW).where(
+                Transaction.transaction_date.is_(None), NOT_VOIDED
+            )
         )
     ).one()
     unaccounted_count, unaccounted_net = (
