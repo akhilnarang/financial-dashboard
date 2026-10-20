@@ -47,7 +47,6 @@ from financial_dashboard.services.transaction_reads import (
 from financial_dashboard.services.transactions import (
     RelinkError,
     apply_transaction_changes,
-    categorize_transactions,
     relink_transaction,
     set_transaction_excluded,
     set_transaction_voided,
@@ -163,27 +162,6 @@ async def transactions_delete_batch(
         )
     except BatchRefused as exc:
         raise ConflictException(detail={"refused": exc.refusals}) from exc
-
-
-@router.post("/transactions/categorize")
-async def transactions_categorize(
-    payload: transaction_schemas.TransactionCategorizeRequest,
-    session: AsyncSessionDep,
-) -> transaction_schemas.TransactionCategorizeResponse:
-    """Change category, note and cashflow exclusion on many rows at once.
-
-    ``dry_run`` defaults to true. One invalid item rejects the whole request
-    with a 400 and per-item errors, and nothing is written.
-    """
-    try:
-        items = await categorize_transactions(
-            session, payload.items, dry_run=payload.dry_run
-        )
-    except ValueError as exc:
-        raise BadRequestException(detail={"errors": exc.args[0]}) from exc
-    return transaction_schemas.TransactionCategorizeResponse(
-        dry_run=payload.dry_run, items=items
-    )
 
 
 @router.post("/transactions/apply")

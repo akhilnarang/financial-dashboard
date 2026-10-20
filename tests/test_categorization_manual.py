@@ -1,9 +1,11 @@
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import Category, Transaction
+from financial_dashboard.db.models import Category, CategoryReviewDecision, Transaction
+from financial_dashboard.services.assistant.delivery import make_delivery
 from financial_dashboard.services.categorization.manual import (
     CategoryDirectionPolicy,
     assign_category_manual,
@@ -136,87 +138,16 @@ async def test_apply_reviewed_rows(session: AsyncSession):
         assert txn.category_method != "manual"
 
 
-async def test_bulk_categorize_and_category_list(client, session: AsyncSession):
-    """A dry run and a rejected batch write nothing. One bad slug or id rejects
-    every item. A real run applies each field and leaves null fields alone. The
-    category list names each slug's bank-scope bucket."""
-    for slug in ("groceries", "dining", "credit_card_payment"):
-        await ensure_category(session, slug)
-    first = await _txn(session)
-    second = await _txn(session, category="dining", note="old note")
-    await session.commit()
-    items = [
-        {"id": first.id, "category": "groceries", "exclude_from_cashflow": True},
-        {"id": second.id, "note": "new note"},
-    ]
-
-    async def _rows():
-        await session.refresh(first)
-        await session.refresh(second)
-        return [
-            (t.category, t.category_method, t.note, t.exclude_from_cashflow)
-            for t in (first, second)
-        ]
-
-    untouched = [(None, None, None, False), ("dining", None, "old note", False)]
-
-    preview = await client.post("/api/transactions/categorize", json={"items": items})
-    assert preview.status_code == 200, preview.text
-    assert preview.json()["dry_run"] is True
-    row = preview.json()["items"][0]
-    assert (row["category"], row["category_method"], row["exclude_from_cashflow"]) == (
-        "groceries",
-        "manual",
-        True,
-    )
-    assert await _rows() == untouched
-
-    bad = await client.post(
-        "/api/transactions/categorize",
-        json={
-            "dry_run": False,
-            "items": [
-                items[0],
-                {"id": second.id, "category": "nope"},
-                {"id": 999999, "category": "groceries"},
-            ],
-        },
-    )
-    assert bad.status_code == 400
-    assert [e["index"] for e in bad.json()["detail"]["errors"]] == [1, 2]
-    assert await _rows() == untouched
-
-    applied = await client.post(
-        "/api/transactions/categorize", json={"dry_run": False, "items": items}
-    )
-    assert applied.status_code == 200, applied.text
-    assert await _rows() == [
-        ("groceries", "manual", None, True),
-        ("dining", None, "new note", False),
-    ]
-
-    categories = await client.get("/api/categories")
-    buckets = {item["slug"]: item["bucket"] for item in categories.json()["items"]}
-    assert buckets["credit_card_payment"] == "expense"
-
-
 async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     client, session: AsyncSession
 ):
-    """A dry run and a rejected batch write nothing. One invalid change rejects
-    every change and the 400 names each invalid id. A real run writes every
-    change, and a category lands with the same side effects as /category."""
-    for slug in ("groceries", "dining"):
+    """A dry run is the default and writes nothing. One invalid change rejects
+    the batch before any write, and the 400 names each invalid id. A real run
+    writes every change with the side effects of /category. The category list
+    names each slug's bank-scope bucket."""
+    for slug in ("groceries", "dining", "credit_card_payment"):
         await ensure_category(session, slug)
     first = await _txn(
-        session,
-        category="dining",
-        category_method="llm",
-        category_confidence=0.5,
-        category_model="llm-x",
-        review_status="notified",
-    )
-    twin = await _txn(
         session,
         category="dining",
         category_method="llm",
@@ -227,8 +158,21 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     second = await _txn(session, note="old note")
     credit = await _txn(session)
     credit.direction = "credit"
+    decision = CategoryReviewDecision(
+        transaction_id=first.id, category_input_hash="hash", candidates_json="[]"
+    )
+    session.add(decision)
+    await session.flush()
+    delivery = make_delivery(
+        recipient_chat_id=7,
+        text="choose",
+        ordinal=0,
+        category_review_decision_id=decision.id,
+        transaction_id=first.id,
+    )
+    session.add(delivery)
     await session.commit()
-    first_id, second_id, credit_id, twin_id = first.id, second.id, credit.id, twin.id
+    first_id, second_id, credit_id = first.id, second.id, credit.id
     changes = [
         {"id": first_id, "category": "groceries"},
         {"id": second_id, "note": None, "exclude_from_cashflow": True, "voided": True},
@@ -236,18 +180,17 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     ]
 
     async def _rows():
-        for txn in (first, second, credit):
-            await session.refresh(txn)
+        for row in (first, second, credit, decision, delivery):
+            await session.refresh(row)
         return [
             (t.category, t.category_method, t.note, t.exclude_from_cashflow, t.voided)
             for t in (first, second, credit)
-        ]
+        ] + [decision.status, delivery.status]
 
     untouched = await _rows()
-    preview = await client.post(
-        "/api/transactions/apply", json={"dry_run": True, "changes": changes}
-    )
+    preview = await client.post("/api/transactions/apply", json={"changes": changes})
     assert preview.status_code == 200, preview.text
+    assert preview.json()["dry_run"] is True
     version = preview.json()["changed"][0]["changes"]["category_vocab_version"]
     expected = [
         {
@@ -275,21 +218,33 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     assert preview.json()["unchanged"] == [credit_id]
     assert await _rows() == untouched
 
-    bad = await client.post(
-        "/api/transactions/apply",
-        json={
-            "dry_run": False,
-            "changes": [
-                changes[0],
-                {"id": second_id, "category": "nope"},
-                {"id": credit_id, "voided": True},
-                {"id": 999999, "note": "x"},
-            ],
-        },
-    )
+    writes: list[str] = []
+
+    def record_write(_conn, _cursor, statement, _parameters, _context, _many):
+        if not statement.lstrip().upper().startswith("SELECT"):
+            writes.append(statement)
+
+    bind = session.get_bind()
+    event.listen(bind, "before_cursor_execute", record_write)
+    try:
+        bad = await client.post(
+            "/api/transactions/apply",
+            json={
+                "dry_run": False,
+                "changes": [
+                    changes[0],
+                    {"id": second_id, "category": "nope"},
+                    {"id": credit_id, "voided": True},
+                    {"id": 999999, "note": "x"},
+                ],
+            },
+        )
+    finally:
+        event.remove(bind, "before_cursor_execute", record_write)
     assert bad.status_code == 400
     errors = bad.json()["detail"]["errors"]
     assert [e["id"] for e in errors] == [second_id, credit_id, 999999]
+    assert writes == []
     assert await _rows() == untouched
     duplicate = await client.post(
         "/api/transactions/apply", json={"changes": [changes[0], changes[0]]}
@@ -305,6 +260,8 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         ("groceries", "manual", None, False, False),
         (None, None, None, True, True),
         (None, None, None, False, False),
+        "superseded",
+        "cancelled",
     ]
     again = await client.post(
         "/api/transactions/apply", json={"dry_run": False, "changes": changes}
@@ -312,20 +269,6 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     assert again.json()["changed"] == []
     assert again.json()["unchanged"] == [first_id, second_id, credit_id]
 
-    single = await client.post(
-        f"/api/transactions/{twin_id}/category", json={"category": "groceries"}
-    )
-    assert single.status_code == 200, single.text
-    await session.refresh(twin)
-
-    def _category_state(t: Transaction) -> tuple:
-        return (
-            t.category,
-            t.category_method,
-            t.category_confidence,
-            t.category_model,
-            t.category_vocab_version,
-            t.review_status,
-        )
-
-    assert _category_state(first) == _category_state(twin)
+    categories = await client.get("/api/categories")
+    buckets = {item["slug"]: item["bucket"] for item in categories.json()["items"]}
+    assert buckets["credit_card_payment"] == "expense"

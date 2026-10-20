@@ -77,6 +77,24 @@ async def resolve_assistant_category_slug(
     return AssistantCategoryResolution(ranked[0][1], True)
 
 
+async def find_manual_category(
+    session: AsyncSession, raw_category: str
+) -> Category | None:
+    """Find the vocabulary row that a manual category names. Do not write.
+
+    Args:
+        session: The request session.
+        raw_category: The category as the operator typed it. It must not be blank.
+
+    Returns:
+        The category row, or None when the slug is invalid or unknown.
+    """
+    slug = canonicalize_slug(raw_category.strip())
+    if not is_valid_slug(slug):
+        return None
+    return await session.scalar(select(Category).where(Category.slug == slug))
+
+
 async def assign_category_manual(
     session: AsyncSession,
     txn_id: int,
@@ -122,15 +140,10 @@ async def assign_category_no_commit(
         )
         return CategoryAssignment(True, None)
 
-    slug = canonicalize_slug(cleaned)
-    if not is_valid_slug(slug):
-        return CategoryAssignment(False, None)
-
-    existing_category = await session.scalar(
-        select(Category).where(Category.slug == slug)
-    )
+    existing_category = await find_manual_category(session, cleaned)
     if existing_category is None:
         return CategoryAssignment(False, None)
+    slug = existing_category.slug
     if (
         direction_policy == CategoryDirectionPolicy.INFERRED_STRICT
         and not existing_category.active

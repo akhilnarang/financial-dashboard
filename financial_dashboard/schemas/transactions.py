@@ -258,31 +258,6 @@ class TransactionDeleteResponse(BaseModel):
     deletions: list[TransactionDeleteReport]
 
 
-class TransactionCategorizeItem(BaseModel):
-    """One row change. A null or absent field stays unchanged.
-
-    An empty ``category`` clears the category. An empty ``note`` clears the
-    note.
-    """
-
-    id: DatabaseId
-    category: Annotated[str | None, Field(max_length=128)] = None
-    note: str | None = None
-    exclude_from_cashflow: bool | None = None
-
-
-class TransactionCategorizeRequest(BaseModel):
-    dry_run: bool = True
-    items: Annotated[
-        list[TransactionCategorizeItem], Field(min_length=1, max_length=100)
-    ]
-
-
-class TransactionCategorizeResponse(BaseModel):
-    dry_run: bool
-    items: list[TransactionListItem]
-
-
 class TransactionApplyChange(BaseModel):
     """One row change. An absent field stays unchanged.
 

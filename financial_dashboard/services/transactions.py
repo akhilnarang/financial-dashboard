@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import Account, Card, Transaction
 from financial_dashboard.schemas import transactions as transaction_schemas
-from financial_dashboard.services.transaction_reads import transaction_list_item
 from financial_dashboard.services.cc_disambiguation import (
     should_auto_reconcile_statement,
 )
@@ -115,6 +114,21 @@ class VoidResult(NamedTuple):
     voided: bool
 
 
+def check_voidable(txn: Transaction, voided: bool) -> None:
+    """Refuse to void a credit.
+
+    Args:
+        txn: The row to change.
+        voided: The new state.
+
+    Raises:
+        ValueError: The row is a credit. Only a charge can be voided.
+    """
+    # A credit can be a card bill payment, and its paid state would go stale.
+    if voided and txn.direction != "debit":
+        raise ValueError("Only a debit can be voided")
+
+
 async def set_transaction_voided(
     session: AsyncSession, txn_id: int, voided: bool
 ) -> VoidResult:
@@ -159,9 +173,7 @@ async def set_transaction_voided_no_commit(
     txn = await session.get(Transaction, txn_id)
     if txn is None:
         return VoidResult(ok=False, voided=False)
-    # A credit can be a card bill payment, and its paid state would go stale.
-    if voided and txn.direction != "debit":
-        raise ValueError("Only a debit can be voided")
+    check_voidable(txn, voided)
     txn.voided = voided
     return VoidResult(ok=True, voided=voided)
 
@@ -186,69 +198,40 @@ async def update_transaction_category(
     return True, slug
 
 
-async def categorize_transactions(
-    session: AsyncSession,
-    items: list[transaction_schemas.TransactionCategorizeItem],
-    *,
-    dry_run: bool,
-) -> list[transaction_schemas.TransactionListItem]:
-    """Apply category, note and exclusion changes to many rows in one transaction.
-
-    Each change goes through the same per-row function as the single endpoints.
-    The function commits only when every item is valid and ``dry_run`` is False.
-    Otherwise it rolls back, so nothing is written.
-
-    Args:
-        session: Request session. This function commits or rolls it back.
-        items: Row changes. A None field stays unchanged.
-        dry_run: Roll back after computing the result.
-
-    Returns:
-        The state of each row after its change.
-
-    Raises:
-        ValueError: One or more items are invalid. ``args[0]`` holds one
-            ``{"index", "id", "error"}`` dict per invalid item.
-    """
-    from financial_dashboard.services.categorization.manual import (
-        assign_category_no_commit,
-    )
-
-    after: list[transaction_schemas.TransactionListItem] = []
-    errors: list[dict] = []
-    for index, item in enumerate(items):
-        txn = await session.get(Transaction, item.id)
-        if txn is None:
-            errors.append(
-                {"index": index, "id": item.id, "error": "Transaction not found"}
-            )
-            continue
-        if item.note is not None:
-            await update_transaction_note_no_commit(session, item.id, item.note)
-        if item.category is not None:
-            ok, _ = await assign_category_no_commit(session, item.id, item.category)
-            if not ok:
-                error = f"Invalid category: {item.category!r}"
-                errors.append({"index": index, "id": item.id, "error": error})
-                continue
-        if item.exclude_from_cashflow is not None:
-            await set_transaction_excluded_no_commit(
-                session, item.id, item.exclude_from_cashflow
-            )
-        after.append(transaction_list_item(txn))
-
-    if errors or dry_run:
-        await session.rollback()
-    else:
-        await session.commit()
-    if errors:
-        raise ValueError(errors)
-    return after
-
-
 class ApplyResult(NamedTuple):
     changed: list[transaction_schemas.TransactionApplyRow]
     unchanged: list[int]
+
+
+async def _validate_change(
+    session: AsyncSession, change: transaction_schemas.TransactionApplyChange
+) -> str | None:
+    """Check one change against the single-endpoint rules. Do not write.
+
+    Args:
+        session: Request session.
+        change: The fields to set.
+
+    Returns:
+        The reason the change is invalid, or None when it is valid.
+    """
+    from financial_dashboard.services.categorization.manual import (
+        find_manual_category,
+    )
+
+    txn = await session.get(Transaction, change.id)
+    if txn is None:
+        return "Transaction not found"
+    category = change.category
+    if category and category.strip():
+        if await find_manual_category(session, category) is None:
+            return f"Invalid category: {category!r}"
+    if change.voided is not None:
+        try:
+            check_voidable(txn, change.voided)
+        except ValueError as exc:
+            return str(exc)
+    return None
 
 
 async def _apply_change_no_commit(
@@ -296,10 +279,11 @@ async def apply_transaction_changes(
 ) -> ApplyResult:
     """Apply note, category, exclusion and void changes to many rows as one unit.
 
-    Each change goes through the same per-row function as the single endpoints,
-    so the side effects are the same. The function commits only when every
-    change is valid and ``dry_run`` is False. Otherwise it rolls back, so
-    nothing is written.
+    The function checks every change before it changes a row, so a rejected
+    batch takes no write lock. Each change then goes through the same per-row
+    function as the single endpoints, so the side effects are the same. The
+    function commits only when every change is valid and ``dry_run`` is False.
+    Otherwise it rolls back, so nothing is written.
 
     Args:
         session: Request session. This function commits or rolls it back.
@@ -314,9 +298,17 @@ async def apply_transaction_changes(
         ValueError: One or more changes are invalid. ``args[0]`` holds one
             ``{"id", "error"}`` dict per invalid change.
     """
+    errors = [
+        {"id": change.id, "error": error}
+        for change in changes
+        if (error := await _validate_change(session, change)) is not None
+    ]
+    if errors:
+        await session.rollback()
+        raise ValueError(errors)
+
     changed: list[transaction_schemas.TransactionApplyRow] = []
     unchanged: list[int] = []
-    errors: list[dict] = []
     for change in changes:
         txn = await session.get(Transaction, change.id)
         if txn is None:
