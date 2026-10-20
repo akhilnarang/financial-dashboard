@@ -198,3 +198,115 @@ async def test_bulk_categorize_and_category_list(client, session: AsyncSession):
     categories = await client.get("/api/categories")
     buckets = {item["slug"]: item["bucket"] for item in categories.json()["items"]}
     assert buckets["credit_card_payment"] == "expense"
+
+
+async def test_apply_previews_rejects_and_applies_like_single_endpoints(
+    client, session: AsyncSession
+):
+    """A dry run and a rejected batch write nothing. One invalid change rejects
+    every change and the 400 names each invalid id. A real run writes every
+    change, and a category lands with the same side effects as /category."""
+    for slug in ("groceries", "dining"):
+        await ensure_category(session, slug)
+    first = await _txn(
+        session, category="dining", category_method="llm", review_status="notified"
+    )
+    twin = await _txn(
+        session, category="dining", category_method="llm", review_status="notified"
+    )
+    second = await _txn(session, note="old note")
+    credit = await _txn(session)
+    credit.direction = "credit"
+    await session.commit()
+    first_id, second_id, credit_id, twin_id = first.id, second.id, credit.id, twin.id
+    changes = [
+        {"id": first_id, "category": "groceries"},
+        {"id": second_id, "note": None, "exclude_from_cashflow": True, "voided": True},
+        {"id": credit_id, "exclude_from_cashflow": False},
+    ]
+
+    async def _rows():
+        for txn in (first, second, credit):
+            await session.refresh(txn)
+        return [
+            (t.category, t.category_method, t.note, t.exclude_from_cashflow, t.voided)
+            for t in (first, second, credit)
+        ]
+
+    untouched = await _rows()
+    expected = [
+        {
+            "id": first_id,
+            "changes": {
+                "category": {"before": "dining", "after": "groceries"},
+                "category_method": {"before": "llm", "after": "manual"},
+                "review_status": {"before": "notified", "after": "resolved"},
+            },
+        },
+        {
+            "id": second_id,
+            "changes": {
+                "note": {"before": "old note", "after": None},
+                "exclude_from_cashflow": {"before": False, "after": True},
+                "voided": {"before": False, "after": True},
+            },
+        },
+    ]
+
+    preview = await client.post(
+        "/api/transactions/apply", json={"dry_run": True, "changes": changes}
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["changed"] == expected
+    assert preview.json()["unchanged"] == [credit_id]
+    assert await _rows() == untouched
+
+    bad = await client.post(
+        "/api/transactions/apply",
+        json={
+            "dry_run": False,
+            "changes": [
+                changes[0],
+                {"id": second_id, "category": "nope"},
+                {"id": credit_id, "voided": True},
+                {"id": 999999, "note": "x"},
+            ],
+        },
+    )
+    assert bad.status_code == 400
+    errors = bad.json()["detail"]["errors"]
+    assert [e["id"] for e in errors] == [second_id, credit_id, 999999]
+    assert await _rows() == untouched
+    duplicate = await client.post(
+        "/api/transactions/apply", json={"changes": [changes[0], changes[0]]}
+    )
+    assert duplicate.status_code == 422
+
+    applied = await client.post(
+        "/api/transactions/apply", json={"dry_run": False, "changes": changes}
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["changed"] == expected
+    assert await _rows() == [
+        ("groceries", "manual", None, False, False),
+        (None, None, None, True, True),
+        (None, None, None, False, False),
+    ]
+
+    single = await client.post(
+        f"/api/transactions/{twin_id}/category", json={"category": "groceries"}
+    )
+    assert single.status_code == 200, single.text
+    await session.refresh(twin)
+
+    def _category_state(t: Transaction) -> tuple:
+        return (
+            t.category,
+            t.category_method,
+            t.category_confidence,
+            t.category_model,
+            t.category_vocab_version,
+            t.review_status,
+        )
+
+    assert _category_state(first) == _category_state(twin)

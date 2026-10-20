@@ -15,6 +15,16 @@ from financial_dashboard.services.cc_disambiguation import (
 
 logger = logging.getLogger(__name__)
 
+# Stored fields that the apply endpoint can change, directly or as a side effect.
+APPLY_DIFF_FIELDS = (
+    "category",
+    "category_method",
+    "review_status",
+    "note",
+    "exclude_from_cashflow",
+    "voided",
+)
+
 
 class NoteResult(NamedTuple):
     ok: bool
@@ -120,6 +130,28 @@ async def set_transaction_voided(
     Raises:
         ValueError: The row is a credit. Only a charge can be voided.
     """
+    result = await set_transaction_voided_no_commit(session, txn_id, voided)
+    if result.ok:
+        await session.commit()
+    return result
+
+
+async def set_transaction_voided_no_commit(
+    session: AsyncSession, txn_id: int, voided: bool
+) -> VoidResult:
+    """Void a transaction, or undo the void, and leave the commit to the caller.
+
+    Args:
+        session: The request session.
+        txn_id: The transaction to change.
+        voided: The new state.
+
+    Returns:
+        The stored state. ``ok`` is False when no such row exists.
+
+    Raises:
+        ValueError: The row is a credit. Only a charge can be voided.
+    """
     txn = await session.get(Transaction, txn_id)
     if txn is None:
         return VoidResult(ok=False, voided=False)
@@ -127,7 +159,6 @@ async def set_transaction_voided(
     if voided and txn.direction != "debit":
         raise ValueError("Only a debit can be voided")
     txn.voided = voided
-    await session.commit()
     return VoidResult(ok=True, voided=voided)
 
 
@@ -209,6 +240,110 @@ async def categorize_transactions(
     if errors:
         raise ValueError(errors)
     return after
+
+
+class ApplyResult(NamedTuple):
+    changed: list[transaction_schemas.TransactionApplyRow]
+    unchanged: list[int]
+
+
+async def _apply_change_no_commit(
+    session: AsyncSession,
+    txn_id: int,
+    change: transaction_schemas.TransactionApplyChange,
+) -> str | None:
+    """Apply one change through the single-field functions.
+
+    Args:
+        session: Request session. This function does not commit.
+        txn_id: The row to change. It must exist.
+        change: The fields to set.
+
+    Returns:
+        The reason the change is invalid, or None when it applied.
+    """
+    from financial_dashboard.services.categorization.manual import (
+        assign_category_no_commit,
+    )
+
+    if "note" in change.model_fields_set:
+        await update_transaction_note_no_commit(session, txn_id, change.note or "")
+    if change.category is not None:
+        ok, _ = await assign_category_no_commit(session, txn_id, change.category)
+        if not ok:
+            return f"Invalid category: {change.category!r}"
+    if change.exclude_from_cashflow is not None:
+        await set_transaction_excluded_no_commit(
+            session, txn_id, change.exclude_from_cashflow
+        )
+    if change.voided is not None:
+        try:
+            await set_transaction_voided_no_commit(session, txn_id, change.voided)
+        except ValueError as exc:
+            return str(exc)
+    return None
+
+
+async def apply_transaction_changes(
+    session: AsyncSession,
+    changes: list[transaction_schemas.TransactionApplyChange],
+    *,
+    dry_run: bool,
+) -> ApplyResult:
+    """Apply note, category, exclusion and void changes to many rows as one unit.
+
+    Each change goes through the same per-row function as the single endpoints,
+    so the side effects are the same. The function commits only when every
+    change is valid and ``dry_run`` is False. Otherwise it rolls back, so
+    nothing is written.
+
+    Args:
+        session: Request session. This function commits or rolls it back.
+        changes: Row changes with unique ids. An absent field stays unchanged.
+        dry_run: Roll back after computing the diff.
+
+    Returns:
+        The before and after value of each stored field that changes, per row,
+        and the ids of rows where no tracked field changes.
+
+    Raises:
+        ValueError: One or more changes are invalid. ``args[0]`` holds one
+            ``{"id", "error"}`` dict per invalid change.
+    """
+    changed: list[transaction_schemas.TransactionApplyRow] = []
+    unchanged: list[int] = []
+    errors: list[dict] = []
+    for change in changes:
+        txn = await session.get(Transaction, change.id)
+        if txn is None:
+            errors.append({"id": change.id, "error": "Transaction not found"})
+            continue
+        before = {field: getattr(txn, field) for field in APPLY_DIFF_FIELDS}
+        error = await _apply_change_no_commit(session, txn.id, change)
+        if error is not None:
+            errors.append({"id": change.id, "error": error})
+            continue
+        diff = {
+            field: transaction_schemas.TransactionFieldDiff(
+                before=before[field], after=getattr(txn, field)
+            )
+            for field in APPLY_DIFF_FIELDS
+            if getattr(txn, field) != before[field]
+        }
+        if diff:
+            changed.append(
+                transaction_schemas.TransactionApplyRow(id=txn.id, changes=diff)
+            )
+        else:
+            unchanged.append(txn.id)
+
+    if errors or dry_run:
+        await session.rollback()
+    else:
+        await session.commit()
+    if errors:
+        raise ValueError(errors)
+    return ApplyResult(changed=changed, unchanged=unchanged)
 
 
 async def relink_transaction(

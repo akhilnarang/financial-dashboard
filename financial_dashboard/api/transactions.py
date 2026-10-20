@@ -46,6 +46,7 @@ from financial_dashboard.services.transaction_reads import (
 )
 from financial_dashboard.services.transactions import (
     RelinkError,
+    apply_transaction_changes,
     categorize_transactions,
     relink_transaction,
     set_transaction_excluded,
@@ -182,6 +183,29 @@ async def transactions_categorize(
         raise BadRequestException(detail={"errors": exc.args[0]}) from exc
     return transaction_schemas.TransactionCategorizeResponse(
         dry_run=payload.dry_run, items=items
+    )
+
+
+@router.post("/transactions/apply")
+async def transactions_apply(
+    payload: transaction_schemas.TransactionApplyRequest,
+    session: AsyncSessionDep,
+) -> transaction_schemas.TransactionApplyResponse:
+    """Apply note, category, exclusion and void changes to many rows at once.
+
+    ``dry_run`` defaults to true and writes nothing. One invalid change rejects
+    the whole request with a 400 that lists each invalid change, and nothing is
+    written. The response shows the before and after value of each field that
+    changes, and the ids where nothing changes.
+    """
+    try:
+        result = await apply_transaction_changes(
+            session, payload.changes, dry_run=payload.dry_run
+        )
+    except ValueError as exc:
+        raise BadRequestException(detail={"errors": exc.args[0]}) from exc
+    return transaction_schemas.TransactionApplyResponse(
+        dry_run=payload.dry_run, changed=result.changed, unchanged=result.unchanged
     )
 
 
