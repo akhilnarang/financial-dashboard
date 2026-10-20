@@ -114,6 +114,11 @@ INTERNAL_TRANSFER_CREDIT_REASONS = frozenset({"emi_installment_transfer"})
 # Perso-Arabic scripts, so they continue a word rather than bound it.
 _JOIN_CONTROLS = ("\u200c", "\u200d")
 
+# Plain separators in a merchant name. A run of them is one word break, so
+# ``SAMPLE.COM`` names ``SAMPLE COM``. Other symbols, such as ``+`` or ``&``,
+# stay part of the name.
+_MERCHANT_SEPARATORS = re.compile(r"[\s.,/*-]+")
+
 # The similarity two merchant names need when neither contains the other.
 MERCHANT_SIMILARITY = 0.8
 
@@ -470,20 +475,17 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
 
 
 def _word_text(text: str | None) -> str:
-    """Normalize a narration and turn each non-word run into one space.
+    """Normalize a narration and turn each run of plain separators into one space.
 
     Args:
         text: The raw narration or counterparty.
 
     Returns:
-        The words of ``text`` joined by single spaces, judged by
-        ``_is_word_char``. ``PURELY.MAIL`` and ``PURELY MAIL`` give the same
-        text. Empty when ``text`` has no word character.
+        The normalized text with each ``_MERCHANT_SEPARATORS`` run as one
+        space and no outer space. ``SAMPLE.COM`` and ``SAMPLE COM`` give the
+        same text. ``SAMPLE+`` keeps its ``+``.
     """
-    normalized = _normalize_narration(text)
-    return " ".join(
-        "".join(ch if _is_word_char(ch) else " " for ch in normalized).split()
-    )
+    return _MERCHANT_SEPARATORS.sub(" ", _normalize_narration(text)).strip()
 
 
 def _same_merchant(row_narration: str | None, db_txn: Transaction) -> bool:
@@ -511,8 +513,8 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     normalization. Token overlap is deliberately avoided, and containment is
     word-bounded so a short counterparty cannot match inside an unrelated
     longer word (``MOB`` must not be read inside ``MOBILE`` or ``MOBILÉ``, nor
-    ``राम`` inside ``रामा``). Containment treats any run of punctuation or
-    spaces as one separator, so ``SAMPLE.COM`` names ``SAMPLE COM``.
+    ``राम`` inside ``रामा``). Containment treats a run of plain separators as
+    one space, so ``SAMPLE.COM`` names ``SAMPLE COM``.
 
     Args:
         row_narration: The statement row's narration.

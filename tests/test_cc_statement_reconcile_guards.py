@@ -1458,12 +1458,12 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
         currency="USD",
         counterparty="SAMPLEMAIL.COM",
     )
-    # A name that ends another word stays another merchant.
+    # A symbol is part of the name, so this alert is another merchant.
     rival_id = await _seed_txn(
         session_factory,
         amount=Decimal("20.00"),
         currency="USD",
-        counterparty="MAIL.COM",
+        counterparty="SAMPLEMAIL+",
     )
     parsed = _parsed(
         [
