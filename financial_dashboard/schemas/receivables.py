@@ -1,38 +1,15 @@
 """Request and response bodies for the receivables ledger."""
 
 import datetime
-import math
 from decimal import Decimal
 from typing import Annotated
 
-from pydantic import BaseModel, BeforeValidator, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints
 
 from financial_dashboard.db.enums import ReceivableRole, ReceivableStatus
 from financial_dashboard.schemas.common import DatabaseId
 
-
-def _infinity_as_text(value: object) -> object:
-    """Turn a non-finite float into text before the Decimal check.
-
-    JSON reads ``1e999`` as infinity. The 422 body echoes the input, and
-    JSON cannot hold infinity, so the response would fail with a 500.
-
-    Args:
-        value: The raw input.
-
-    Returns:
-        ``str(value)`` for a non-finite float, else ``value``.
-    """
-    if isinstance(value, float) and not math.isfinite(value):
-        return str(value)
-    return value
-
-
-Amount = Annotated[
-    Decimal,
-    BeforeValidator(_infinity_as_text),
-    Field(gt=0, max_digits=12, decimal_places=2),
-]
+Amount = Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)]
 Person = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
 ]

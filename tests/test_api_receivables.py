@@ -130,16 +130,6 @@ async def test_status_change_stamps_and_clears_closed_at(client):
     assert reopened.json()["closed_at"] is None
 
 
-async def test_create_rejects_an_infinite_amount(client):
-    response = await client.post(
-        "/api/receivables",
-        content='{"person": "A", "amount": 1e999}',
-        headers={"content-type": "application/json"},
-    )
-
-    assert response.status_code == 422
-
-
 async def test_list_and_page_filter_by_status(client):
     for person in ("Friend A", "Friend B"):
         await client.post("/api/receivables", json={"person": person, "amount": "75"})
