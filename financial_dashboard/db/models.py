@@ -1021,3 +1021,58 @@ class AuditAction(Base):
     error_code: Mapped[str | None] = mapped_column(String)
 
     __table_args__ = (Index("ix_audit_actions_created_at", "created_at"),)
+
+
+class Receivable(Base):
+    """Money a person owes the user. Paid and outstanding are computed."""
+
+    __tablename__ = "receivables"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    person: Mapped[str] = mapped_column(String, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="open", server_default="open", index=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    closed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+
+    links: Mapped[list["ReceivableLink"]] = relationship(
+        back_populates="receivable", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_receivable_amount_positive"),
+        CheckConstraint(
+            "status IN ('open', 'settled', 'written_off')",
+            name="ck_receivable_status",
+        ),
+    )
+
+
+class ReceivableLink(Base):
+    """A transaction a receivable is for (charge) or that pays it (payment)."""
+
+    __tablename__ = "receivable_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receivable_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("receivables.id"), nullable=False, index=True
+    )
+    transaction_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("transactions.id"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String, nullable=False)
+
+    receivable: Mapped[Receivable] = relationship(back_populates="links")
+    transaction: Mapped[Transaction] = relationship(lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("receivable_id", "transaction_id", name="uq_receivable_link"),
+        CheckConstraint(
+            "role IN ('charge', 'payment')", name="ck_receivable_link_role"
+        ),
+    )

@@ -13,6 +13,8 @@ from financial_dashboard.db import (
     AuditAction,
     BankStatementUpload,
     PaymentStatus,
+    Receivable,
+    ReceivableLink,
     SmsMessage,
     StatementUpload,
     TelegramMessageContext,
@@ -173,6 +175,17 @@ async def test_batch_merges_each_pair_once(client, session):
     session.add(email_copy)
     await session.commit()
     email_copy_id = email_copy.id
+    shared, own = (
+        Receivable(person=f"Friend {name}", amount=Decimal("100.00")) for name in "AB"
+    )
+    shared.links = [
+        ReceivableLink(transaction_id=alert_id, role="charge"),
+        ReceivableLink(transaction_id=statement_id, role="charge"),
+    ]
+    own.links = [ReceivableLink(transaction_id=statement_id, role="charge")]
+    session.add_all([shared, own])
+    await session.commit()
+    shared_id, own_id = shared.id, own.id
     request = _batch(
         (alert_id, statement_id),
         (other_alert, other_statement),
@@ -186,11 +199,16 @@ async def test_batch_merges_each_pair_once(client, session):
     assert repeat.status_code == 409
     report = response.json()["merges"][0]
     assert report["moved_references"] == {
+        "receivable_links": 2,
         "sms_messages": 1,
         "audit_actions": 1,
         "bank_statement_uploads.reconciliation_data": 1,
     }
     session.expire_all()
+    links = await session.execute(
+        select(ReceivableLink.receivable_id, ReceivableLink.transaction_id)
+    )
+    assert sorted(links) == [(shared_id, alert_id), (own_id, alert_id)]
     assert await session.get(Transaction, statement_id) is None
     assert await session.get(Transaction, other_statement) is None
     assert await session.get(Transaction, email_copy_id) is None
@@ -680,6 +698,13 @@ async def test_delete_batch_removes_only_phantom_statement_rows(
                 context_kind="transaction_alert",
                 transaction_id=rows["phantom"].id,
             ),
+            Receivable(
+                person="Friend A",
+                amount=Decimal("9000.00"),
+                links=[
+                    ReceivableLink(transaction_id=rows["phantom"].id, role="charge")
+                ],
+            ),
         ]
     )
     real_id, phantom_id = rows["real"].id, rows["phantom"].id
@@ -837,6 +862,7 @@ async def test_delete_batch_removes_only_phantom_statement_rows(
     report = response.json()["deletions"][0]
     assert report["transaction"]["counterparty"] == "SYNTHETIC PHANTOM"
     assert report["cleaned_references"] == {
+        "receivable_links": 1,
         "audit_actions": 1,
         "bank_statement_uploads.reconciliation_data": 1,
     }
@@ -844,6 +870,7 @@ async def test_delete_batch_removes_only_phantom_statement_rows(
     remaining = await session.scalars(select(Transaction.id))
     assert sorted(remaining) == sorted(set(ids.values()) - {phantom_id})
     assert await session.scalar(select(TelegramMessageContext.transaction_id)) is None
+    assert await session.scalar(select(func.count(ReceivableLink.id))) == 0
     record = await session.scalar(
         select(AuditAction).where(AuditAction.action_type == "delete_transaction")
     )
