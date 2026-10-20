@@ -114,10 +114,11 @@ INTERNAL_TRANSFER_CREDIT_REASONS = frozenset({"emi_installment_transfer"})
 # Perso-Arabic scripts, so they continue a word rather than bound it.
 _JOIN_CONTROLS = ("\u200c", "\u200d")
 
-# Plain separators in a merchant name. A run of them is one word break, so
-# ``SAMPLE.COM`` names ``SAMPLE COM``. Other symbols, such as ``+`` or ``&``,
-# stay part of the name.
-_MERCHANT_SEPARATORS = re.compile(r"[\s.,/*-]+")
+# A run of plain separators between two other characters of a merchant name.
+# Each run is one word break, so ``SAMPLE.COM`` names ``SAMPLE COM``. Other
+# symbols, such as ``+`` or ``&``, and a separator at an edge, such as the
+# ``*`` in ``SAMPLE*``, stay part of the name.
+_MERCHANT_SEPARATORS = re.compile(r"(?<=[^\s.,/*-])[\s.,/*-]+(?=[^\s.,/*-])")
 
 # The similarity two merchant names need when neither contains the other.
 MERCHANT_SIMILARITY = 0.8
@@ -474,18 +475,17 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
     return False
 
 
-def _word_text(text: str | None) -> str:
-    """Normalize a narration and turn each run of plain separators into one space.
+def _fold_separators(text: str) -> str:
+    """Turn each inner run of plain separators into one space.
 
     Args:
-        text: The raw narration or counterparty.
+        text: A narration already passed through ``_normalize_narration``.
 
     Returns:
-        The normalized text with each ``_MERCHANT_SEPARATORS`` run as one
-        space and no outer space. ``SAMPLE.COM`` and ``SAMPLE COM`` give the
-        same text. ``SAMPLE+`` keeps its ``+``.
+        ``text`` with each ``_MERCHANT_SEPARATORS`` run as one space.
+        ``sample.com`` gives ``sample com``. ``sample*`` stays ``sample*``.
     """
-    return _MERCHANT_SEPARATORS.sub(" ", _normalize_narration(text)).strip()
+    return _MERCHANT_SEPARATORS.sub(" ", text)
 
 
 def _same_merchant(row_narration: str | None, db_txn: Transaction) -> bool:
@@ -513,8 +513,8 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     normalization. Token overlap is deliberately avoided, and containment is
     word-bounded so a short counterparty cannot match inside an unrelated
     longer word (``MOB`` must not be read inside ``MOBILE`` or ``MOBILÉ``, nor
-    ``राम`` inside ``रामा``). Containment treats a run of plain separators as
-    one space, so ``SAMPLE.COM`` names ``SAMPLE COM``.
+    ``राम`` inside ``रामा``). Containment also holds when each inner run of
+    plain separators is one space, so ``SAMPLE.COM`` names ``SAMPLE COM``.
 
     Args:
         row_narration: The statement row's narration.
@@ -526,8 +526,13 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     narration = _normalize_narration(row_narration)
     if not narration:
         return False
-    counterparty = _word_text(db_txn.counterparty)
-    if counterparty and _contains_whole_token(_word_text(row_narration), counterparty):
+    counterparty = _normalize_narration(db_txn.counterparty)
+    if counterparty and (
+        _contains_whole_token(narration, counterparty)
+        or _contains_whole_token(
+            _fold_separators(narration), _fold_separators(counterparty)
+        )
+    ):
         return True
     db_narration = _normalize_narration(db_txn.raw_description)
     return bool(db_narration) and db_narration == narration
