@@ -4,7 +4,7 @@ from typing import Annotated
 
 from pydantic import AfterValidator, Field
 
-# SQLite stores an integer key in 64 signed bits.
+# SQLite stores a signed 64-bit integer.
 DatabaseId = Annotated[int, Field(ge=1, le=2**63 - 1)]
 
 
