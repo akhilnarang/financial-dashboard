@@ -34,7 +34,18 @@ router = APIRouter()
 
 
 async def _get(session: AsyncSessionDep, receivable_id: int) -> Receivable:
-    """Return the receivable, or raise 404."""
+    """Load a receivable for a route.
+
+    Args:
+        session: The request session.
+        receivable_id: The receivable to load.
+
+    Returns:
+        The receivable with its links.
+
+    Raises:
+        NotFoundException: No such receivable exists.
+    """
     receivable = await session.get(Receivable, receivable_id)
     if receivable is None:
         raise NotFoundException(detail="Receivable not found")

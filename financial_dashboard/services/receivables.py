@@ -7,7 +7,7 @@ computed from the linked rows on each read.
 from decimal import Decimal
 from typing import NamedTuple, cast
 
-from sqlalchemy import CursorResult, delete, or_, select, update
+from sqlalchemy import CursorResult, delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -105,7 +105,19 @@ async def list_receivables(
 async def _linkable(
     session: AsyncSession, transaction_id: int, role: ReceivableRole
 ) -> Transaction:
-    """Return the row a link can name, or raise ValueError with the reason."""
+    """Load the row a link names and check that it fits the role.
+
+    Args:
+        session: The request session.
+        transaction_id: The row to link.
+        role: The role the link takes.
+
+    Returns:
+        The transaction.
+
+    Raises:
+        ValueError: The row is unknown, the wrong direction, or not in INR.
+    """
     txn = await session.get(Transaction, transaction_id)
     if txn is None:
         raise ValueError(f"Transaction {transaction_id} not found")
@@ -119,8 +131,48 @@ async def _linkable(
     return txn
 
 
+async def _new_links(
+    session: AsyncSession, wanted: list[tuple[int, ReceivableRole]]
+) -> list[ReceivableLink]:
+    """Build links under the write lock. Roll back and raise on a bad row.
+
+    The SQLite write lock holds until the commit, so a merge or delete
+    cannot remove a linked row first.
+
+    Args:
+        session: The request session. It must not hold a write yet.
+        wanted: The row id and role of each link.
+
+    Returns:
+        The new, unsaved links.
+
+    Raises:
+        ValueError: A row does not fit its role.
+    """
+    if session.get_bind().dialect.name == "sqlite":
+        await session.execute(text("BEGIN IMMEDIATE"))
+    try:
+        return [
+            ReceivableLink(transaction=await _linkable(session, i, role), role=role)
+            for i, role in wanted
+        ]
+    except ValueError:
+        await session.rollback()
+        raise
+
+
 async def _commit_links(session: AsyncSession) -> None:
-    """Commit, and turn a duplicate link into a conflict."""
+    """Commit, and turn a duplicate link into a conflict.
+
+    Args:
+        session: The session that holds the new links.
+
+    Returns:
+        None.
+
+    Raises:
+        LinkConflict: A unique index refused a link.
+    """
     try:
         await session.commit()
     except IntegrityError as exc:
@@ -149,16 +201,14 @@ async def create_receivable(
     """
     wanted = [(i, ReceivableRole.charge) for i in payload.charge_transaction_ids]
     wanted += [(i, ReceivableRole.payment) for i in payload.payment_transaction_ids]
-    seen = set()
-    links = []
-    for transaction_id, role in wanted:
-        if transaction_id in seen:
-            raise ValueError(f"Transaction {transaction_id} is listed twice")
-        seen.add(transaction_id)
-        txn = await _linkable(session, transaction_id, role)
-        links.append(ReceivableLink(transaction=txn, role=role))
+    ids = [transaction_id for transaction_id, _ in wanted]
+    if len(ids) != len(set(ids)):
+        raise ValueError("A transaction is listed twice")
     receivable = Receivable(
-        person=payload.person, amount=payload.amount, note=payload.note, links=links
+        person=payload.person,
+        amount=payload.amount,
+        note=payload.note,
+        links=await _new_links(session, wanted),
     )
     session.add(receivable)
     await _commit_links(session)
@@ -218,8 +268,7 @@ async def add_link(
     """
     if any(link.transaction_id == transaction_id for link in receivable.links):
         raise LinkConflict(f"Transaction {transaction_id} is already linked")
-    txn = await _linkable(session, transaction_id, role)
-    receivable.links.append(ReceivableLink(transaction=txn, role=role))
+    receivable.links.extend(await _new_links(session, [(transaction_id, role)]))
     await _commit_links(session)
     return receivable
 

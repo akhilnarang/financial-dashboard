@@ -4,7 +4,8 @@ from typing import Annotated
 
 from pydantic import AfterValidator, Field
 
-DatabaseId = Annotated[int, Field(ge=1)]
+# SQLite stores an integer key in 64 signed bits.
+DatabaseId = Annotated[int, Field(ge=1, le=2**63 - 1)]
 
 
 def _require_unique_ids(values: list[DatabaseId]) -> list[DatabaseId]:

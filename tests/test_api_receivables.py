@@ -64,19 +64,17 @@ async def test_payment_link_lowers_outstanding(client, session):
     assert unlinked.json()["outstanding"] == "1500.00"
 
 
-@pytest.mark.parametrize(
-    ("direction", "role"), [(None, "payment"), ("debit", "payment")]
-)
-async def test_link_rejects_unknown_or_wrong_direction_row(
-    client, session, direction, role
-):
-    txn_id = await _row(session, direction, "100.00") if direction else 9999
+# A debit cannot pay back. An id past the 64-bit SQLite range must not 500.
+@pytest.mark.parametrize("missing_id", [None, 9999, 2**63])
+async def test_link_rejects_unknown_or_wrong_direction_row(client, session, missing_id):
+    txn_id = missing_id or await _row(session, "debit", "100.00")
     rid = (
         await client.post("/api/receivables", json={"person": "A", "amount": "100"})
     ).json()["id"]
 
     response = await client.post(
-        f"/api/receivables/{rid}/links", json={"transaction_id": txn_id, "role": role}
+        f"/api/receivables/{rid}/links",
+        json={"transaction_id": txn_id, "role": "payment"},
     )
     created = await client.post(
         "/api/receivables",
