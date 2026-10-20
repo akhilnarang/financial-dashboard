@@ -1075,4 +1075,11 @@ class ReceivableLink(Base):
         CheckConstraint(
             "role IN ('charge', 'payment')", name="ck_receivable_link_role"
         ),
+        # A payment row pays one receivable, so its money counts once.
+        Index(
+            "uq_receivable_payment_link",
+            "transaction_id",
+            unique=True,
+            sqlite_where=text("role = 'payment'"),
+        ),
     )

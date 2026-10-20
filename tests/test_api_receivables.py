@@ -47,6 +47,10 @@ async def test_payment_link_lowers_outstanding(client, session):
         f"/api/receivables/{rid}/links",
         json={"transaction_id": payment, "role": "payment"},
     )
+    reused = await client.post(
+        "/api/receivables",
+        json={"person": "B", "amount": "600", "payment_transaction_ids": [payment]},
+    )
     unlinked = await client.delete(f"/api/receivables/{rid}/links/{payment}")
 
     assert linked.status_code == 201
@@ -56,6 +60,7 @@ async def test_payment_link_lowers_outstanding(client, session):
         [charge],
         [payment],
     )
+    assert reused.status_code == 409
     assert unlinked.json()["outstanding"] == "1500.00"
 
 

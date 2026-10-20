@@ -73,6 +73,8 @@ async def receivables_create(
     """
     try:
         receivable = await create_receivable(session, payload)
+    except LinkConflict as exc:
+        raise ConflictException(detail=str(exc)) from exc
     except ValueError as exc:
         raise UnprocessableEntityException(detail=str(exc)) from exc
     return receivable_read(receivable)

@@ -175,17 +175,20 @@ async def test_batch_merges_each_pair_once(client, session):
     session.add(email_copy)
     await session.commit()
     email_copy_id = email_copy.id
-    shared, own = (
-        Receivable(person=f"Friend {name}", amount=Decimal("100.00")) for name in "AB"
+    # A receivable links a row once, and a payment row pays one receivable.
+    shared, own, paid, paid_twice = (
+        Receivable(person=f"Friend {name}", amount=Decimal("100.00")) for name in "ABCD"
     )
     shared.links = [
         ReceivableLink(transaction_id=alert_id, role="charge"),
         ReceivableLink(transaction_id=statement_id, role="charge"),
     ]
     own.links = [ReceivableLink(transaction_id=statement_id, role="charge")]
-    session.add_all([shared, own])
+    paid.links = [ReceivableLink(transaction_id=alert_id, role="payment")]
+    paid_twice.links = [ReceivableLink(transaction_id=statement_id, role="payment")]
+    session.add_all([shared, own, paid, paid_twice])
     await session.commit()
-    shared_id, own_id = shared.id, own.id
+    shared_id, own_id, paid_id = shared.id, own.id, paid.id
     request = _batch(
         (alert_id, statement_id),
         (other_alert, other_statement),
@@ -199,7 +202,7 @@ async def test_batch_merges_each_pair_once(client, session):
     assert repeat.status_code == 409
     report = response.json()["merges"][0]
     assert report["moved_references"] == {
-        "receivable_links": 2,
+        "receivable_links": 3,
         "sms_messages": 1,
         "audit_actions": 1,
         "bank_statement_uploads.reconciliation_data": 1,
@@ -208,7 +211,11 @@ async def test_batch_merges_each_pair_once(client, session):
     links = await session.execute(
         select(ReceivableLink.receivable_id, ReceivableLink.transaction_id)
     )
-    assert sorted(links) == [(shared_id, alert_id), (own_id, alert_id)]
+    assert sorted(links) == [
+        (shared_id, alert_id),
+        (own_id, alert_id),
+        (paid_id, alert_id),
+    ]
     assert await session.get(Transaction, statement_id) is None
     assert await session.get(Transaction, other_statement) is None
     assert await session.get(Transaction, email_copy_id) is None

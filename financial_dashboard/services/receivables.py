@@ -7,7 +7,8 @@ computed from the linked rows on each read.
 from decimal import Decimal
 from typing import NamedTuple, cast
 
-from sqlalchemy import CursorResult, delete, select, update
+from sqlalchemy import CursorResult, delete, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.enums import ReceivableRole, ReceivableStatus
@@ -27,7 +28,7 @@ ROLE_DIRECTION = {ReceivableRole.charge: "debit", ReceivableRole.payment: "credi
 
 
 class LinkConflict(ValueError):
-    """The receivable already links the transaction."""
+    """The link exists, or the payment row already pays another receivable."""
 
 
 class ReceivableTotals(NamedTuple):
@@ -118,6 +119,17 @@ async def _linkable(
     return txn
 
 
+async def _commit_links(session: AsyncSession) -> None:
+    """Commit, and turn a duplicate link into a conflict."""
+    try:
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise LinkConflict(
+            "A payment row pays one receivable, and a receivable links a row once"
+        ) from exc
+
+
 async def create_receivable(
     session: AsyncSession, payload: ReceivableCreate
 ) -> Receivable:
@@ -131,6 +143,7 @@ async def create_receivable(
         The new receivable.
 
     Raises:
+        LinkConflict: A payment row already pays another receivable.
         ValueError: A transaction id is unknown, listed twice, or the wrong
             direction for its role.
     """
@@ -148,7 +161,7 @@ async def create_receivable(
         person=payload.person, amount=payload.amount, note=payload.note, links=links
     )
     session.add(receivable)
-    await session.commit()
+    await _commit_links(session)
     return receivable
 
 
@@ -199,14 +212,15 @@ async def add_link(
         The changed receivable.
 
     Raises:
-        LinkConflict: The receivable already links the row.
+        LinkConflict: The receivable already links the row, or the payment
+            row already pays another receivable.
         ValueError: The row is unknown or the wrong direction for the role.
     """
     if any(link.transaction_id == transaction_id for link in receivable.links):
         raise LinkConflict(f"Transaction {transaction_id} is already linked")
     txn = await _linkable(session, transaction_id, role)
     receivable.links.append(ReceivableLink(transaction=txn, role=role))
-    await session.commit()
+    await _commit_links(session)
     return receivable
 
 
@@ -239,8 +253,9 @@ async def move_receivable_links(
 ) -> int:
     """Point the links of a deleted transaction at its keeper, or drop them.
 
-    A link whose receivable already links the keeper is dropped, because a
-    receivable links a row once.
+    A link is dropped when its receivable already links the keeper, or when
+    it is a payment link and the keeper already pays a receivable. Both rows
+    show one event, so its money counts once.
 
     Args:
         session: The session that deletes ``old_id``.
@@ -255,11 +270,19 @@ async def move_receivable_links(
     if new_id is None:
         result = await session.execute(delete(ReceivableLink).where(stale))
         return cast(CursorResult, result).rowcount
-    linked = select(ReceivableLink.receivable_id).where(
-        ReceivableLink.transaction_id == new_id
+    keeper = ReceivableLink.transaction_id == new_id
+    linked = select(ReceivableLink.receivable_id).where(keeper)
+    pays = select(ReceivableLink.id).where(
+        keeper, ReceivableLink.role == ReceivableRole.payment
     )
     dropped = await session.execute(
-        delete(ReceivableLink).where(stale, ReceivableLink.receivable_id.in_(linked))
+        delete(ReceivableLink).where(
+            stale,
+            or_(
+                ReceivableLink.receivable_id.in_(linked),
+                (ReceivableLink.role == ReceivableRole.payment) & pays.exists(),
+            ),
+        )
     )
     moved = await session.execute(
         update(ReceivableLink).where(stale).values(transaction_id=new_id)
