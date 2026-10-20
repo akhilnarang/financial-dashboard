@@ -672,6 +672,12 @@ class Transaction(Base):
     The row stays in every other view. The cashflow figures skip it. The
     "Excluded" footnote counts it. Use it for a row the category must not touch,
     such as a reversal-and-redo pair, or money paid for someone and returned."""
+    voided: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
+    """True when the bank voided the charge before it settled. The user sets it.
+    A voided row never counts as money. A statement row never matches it. An
+    alert that arrives again still matches it, so a reparse does not add it again."""
     category: Mapped[str | None] = mapped_column(String)
     category_method: Mapped[str | None] = mapped_column(String)
     category_confidence: Mapped[float | None] = mapped_column(Float)

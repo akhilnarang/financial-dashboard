@@ -37,6 +37,8 @@ class StubDbTxn:
     raw_description: str | None = None
     channel: str | None = None
     balance: Decimal | None = None
+    voided: bool = False
+    bank_statement_upload_id: int | None = None
 
 
 def _stmt(

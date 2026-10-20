@@ -114,6 +114,12 @@ INTERNAL_TRANSFER_CREDIT_REASONS = frozenset({"emi_installment_transfer"})
 # Perso-Arabic scripts, so they continue a word rather than bound it.
 _JOIN_CONTROLS = ("\u200c", "\u200d")
 
+# A run of plain separators between two other characters of a merchant name.
+# Each run is one word break, so ``SAMPLE.COM`` names ``SAMPLE COM``. Other
+# symbols, such as ``+`` or ``&``, and a separator at an edge, such as the
+# ``*`` in ``SAMPLE*``, stay part of the name.
+_MERCHANT_SEPARATORS = re.compile(r"(?<=[^\s.,/*-])[\s.,/*-]+(?=[^\s.,/*-])")
+
 # The similarity two merchant names need when neither contains the other.
 MERCHANT_SIMILARITY = 0.8
 
@@ -469,6 +475,19 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
     return False
 
 
+def _fold_separators(text: str) -> str:
+    """Turn each inner run of plain separators into one space.
+
+    Args:
+        text: A narration already passed through ``_normalize_narration``.
+
+    Returns:
+        ``text`` with each ``_MERCHANT_SEPARATORS`` run as one space.
+        ``sample.com`` gives ``sample com``. ``sample*`` stays ``sample*``.
+    """
+    return _MERCHANT_SEPARATORS.sub(" ", text)
+
+
 def _same_merchant(row_narration: str | None, db_txn: Transaction) -> bool:
     """Returns whether a statement description and a stored transaction match the same
     merchant.
@@ -494,13 +513,26 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     normalization. Token overlap is deliberately avoided, and containment is
     word-bounded so a short counterparty cannot match inside an unrelated
     longer word (``MOB`` must not be read inside ``MOBILE`` or ``MOBILÉ``, nor
-    ``राम`` inside ``रामा``).
+    ``राम`` inside ``रामा``). Containment also holds when each inner run of
+    plain separators is one space, so ``SAMPLE.COM`` names ``SAMPLE COM``.
+
+    Args:
+        row_narration: The statement row's narration.
+        db_txn: The stored candidate transaction.
+
+    Returns:
+        True when the row names the candidate.
     """
     narration = _normalize_narration(row_narration)
     if not narration:
         return False
     counterparty = _normalize_narration(db_txn.counterparty)
-    if counterparty and _contains_whole_token(narration, counterparty):
+    if counterparty and (
+        _contains_whole_token(narration, counterparty)
+        or _contains_whole_token(
+            _fold_separators(narration), _fold_separators(counterparty)
+        )
+    ):
         return True
     db_narration = _normalize_narration(db_txn.raw_description)
     return bool(db_narration) and db_narration == narration
@@ -842,6 +874,13 @@ def reconcile_statement(
 
     Returns a dict with matched, missing, and extra lists.
     """
+    # A voided charge never posts, so a same-amount statement row is a new charge.
+    # A row a statement imported did post, so it stays a candidate.
+    db_transactions = [
+        txn
+        for txn in db_transactions
+        if not txn.voided or txn.statement_upload_id is not None
+    ]
     # Build all statement transactions (debits + credits)
     # Adjustment pairs reference the same Transaction objects already in
     # parsed.transactions / parsed.payments_refunds, so we do NOT re-add them.

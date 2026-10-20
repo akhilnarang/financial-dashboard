@@ -270,14 +270,14 @@ def build_report(
             count toward coverage.
         rows: Transactions on those accounts, from ``date_from`` minus
             ``PAIR_WINDOW`` to ``date_to`` plus ``PAIR_WINDOW``. The extra days
-            let a leg near the range edge find its partner. Undated rows are
-            ignored.
+            let a leg near the range edge find its partner. Undated and voided
+            rows are ignored.
 
     Returns:
         The report: statement gaps, months without a statement, unpaired
         self-transfers and duplicate candidates.
     """
-    rows = [r for r in rows if r.transaction_date is not None]
+    rows = [r for r in rows if r.transaction_date is not None and not r.voided]
     periods: dict[int, list[_Period]] = defaultdict(list)
     checked = []
     for statement in statements:
@@ -319,6 +319,7 @@ async def statement_gap(
             select(Transaction).where(
                 Transaction.account_id == statement.account_id,
                 Transaction.transaction_date.between(period.start, period.end),
+                Transaction.voided.is_not(True),
             )
         )
     ).all()

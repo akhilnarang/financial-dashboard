@@ -391,6 +391,37 @@ async def test_the_same_card_matches_and_an_unknown_card_does_not_block(
 
 
 @pytest.mark.anyio
+async def test_a_voided_row_is_no_candidate_so_the_line_imports(session_factory):
+    """A voided charge never posts. A same-amount statement line is then a new
+    charge: it must import, not pair with the voided row or wait as ambiguous.
+    A row the statement imported did post. It stays a candidate even when
+    voided by mistake, so a reprocess does not import it twice."""
+    await _seed_account(session_factory)
+    voided_id = await _seed_txn(session_factory, voided=True)
+
+    parsed = _parsed(
+        [_stmt_txn(date="07/04/2026", amount="450.00", narration=NARRATION)]
+    )
+    recon = await _reconcile(session_factory, parsed)
+
+    assert recon["matched"] == []
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [False]
+
+    imported, rows = await _import(session_factory, parsed, recon)
+
+    assert len(imported) == 1
+    assert sorted(row.voided for row in rows) == [False, True]
+    assert voided_id in [row.id for row in rows]
+
+    async with session_factory() as session:
+        (await session.get(Transaction, imported[0].id)).voided = True
+        await session.commit()
+    again = await _reconcile(session_factory, parsed)
+    assert [entry["db_txn_id"] for entry in again["matched"]] == [imported[0].id]
+    assert again["missing"] == []
+
+
+@pytest.mark.anyio
 async def test_statement_side_collision_is_not_imported_as_a_duplicate(
     session_factory,
 ):
@@ -1451,10 +1482,25 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
         currency="USD",
         counterparty="CAF",
     )
+    # Punctuation is a word separator, so this alert pairs with "SAMPLEMAIL COM".
+    mail_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("20.00"),
+        currency="USD",
+        counterparty="SAMPLEMAIL.COM",
+    )
+    # An edge symbol is part of the name, so this alert is another merchant.
+    rival_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("20.00"),
+        currency="USD",
+        counterparty="SAMPLEMAIL*",
+    )
     parsed = _parsed(
         [
             _stmt_txn(date="07/04/2026", amount="2,529.00", narration=NARRATION),
             _stmt_txn(date="07/04/2026", amount="999.00", narration="SAMPLE CAFE"),
+            _stmt_txn(date="07/04/2026", amount="1,650.00", narration="SAMPLEMAIL COM"),
         ]
     )
 
@@ -1463,7 +1509,10 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
     await enrich_matched_transactions(recon)
     again = await _reconcile(session_factory, parsed)
 
-    assert [entry["db_txn_id"] for entry in recon["matched"]] == [alert_id]
+    assert sorted(entry["db_txn_id"] for entry in recon["matched"]) == [
+        alert_id,
+        mail_id,
+    ]
     # A line with no foreign candidate is new and imports.
     assert [entry["ambiguous"] for entry in recon["missing"]] == [False]
     assert [txn.amount for txn in imported] == [Decimal("999.00")]
@@ -1474,10 +1523,12 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
         }
     assert rows[alert_id] == (Decimal("2529.00"), "INR")
     assert rows[other_id] == (Decimal("12.00"), "USD")
-    assert len(rows) == 3
+    assert rows[mail_id] == (Decimal("1650.00"), "INR")
+    assert rows[rival_id] == (Decimal("20.00"), "USD")
+    assert len(rows) == 5
     # A reprocess pairs the converted row by amount and imports nothing.
     assert sorted(entry["db_txn_id"] for entry in again["matched"]) == sorted(
-        [alert_id, imported[0].id]
+        [alert_id, mail_id, imported[0].id]
     )
     assert again["missing"] == []
 

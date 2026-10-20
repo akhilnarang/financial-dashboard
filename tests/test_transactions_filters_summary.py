@@ -87,6 +87,16 @@ async def test_filtered_transaction_totals_cover_all_pages(client, session):
                 bank=account.bank,
                 email_type="synthetic_alert",
                 direction="debit",
+                amount=Decimal("7.00"),
+                currency="INR",
+                transaction_date=datetime.date(2030, 4, 14),
+                voided=True,
+            ),
+            Transaction(
+                account_id=account.id,
+                bank=account.bank,
+                email_type="synthetic_alert",
+                direction="debit",
                 amount=Decimal("999.00"),
                 currency="INR",
                 transaction_date=datetime.date(2030, 5, 1),
@@ -110,8 +120,10 @@ async def test_filtered_transaction_totals_cover_all_pages(client, session):
     assert _summary_total(summary, "debits") == "−₹51.00"
     assert _summary_total(summary, "net") == "−₹46.00"
     assert "2 foreign-currency rows not counted." in summary
-    assert "54 results" in response.text
-    assert "Showing 1&ndash;50 of 54" in response.text
+    # The voided row stays listed and labelled, but no total counts it.
+    assert "55 results" in response.text
+    assert "Showing 1&ndash;50 of 55" in response.text
+    assert "Voided" in response.text
     assert "999.00" not in summary
 
 

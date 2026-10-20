@@ -1,6 +1,6 @@
-"""Tests for POST /api/transactions/{id}/exclude.
+"""Tests for POST /api/transactions/{id}/exclude and /void.
 
-The endpoint sets the flag to a given value, not a toggle. A repeated request
+Each endpoint sets the flag to a given value, not a toggle. A repeated request
 lands the same state. The flag drops a row from the cashflow report only. The
 row keeps its category and every other view. Each test reads the state back
 through the API, not the database.
@@ -31,39 +31,52 @@ async def _seed(session) -> int:
     return txn.id
 
 
-async def _read_flag(client, txn_id: int) -> bool:
+async def _read_flag(client, txn_id: int, field: str) -> bool:
     """Read the flag back through the list API, the way a client sees it."""
     r = await client.get(f"/api/transactions?transaction_id={txn_id}")
     assert r.status_code == 200, r.text
-    return r.json()["items"][0]["exclude_from_cashflow"]
+    return r.json()["items"][0][field]
 
 
-async def test_set_and_clear_is_observable_and_idempotent(client, session):
+@pytest.mark.parametrize(
+    ("endpoint", "field"), [("exclude", "exclude_from_cashflow"), ("void", "voided")]
+)
+async def test_set_and_clear_is_observable_and_idempotent(
+    client, session, endpoint, field
+):
     txn_id = await _seed(session)
-    # A fresh row reads as included.
-    assert await _read_flag(client, txn_id) is False
+    # A fresh row reads as unflagged.
+    assert await _read_flag(client, txn_id, field) is False
 
     # Set it, twice. The repeat lands the same state. It does not toggle.
     for _ in range(2):
         r = await client.post(
-            f"/api/transactions/{txn_id}/exclude",
-            json={"exclude_from_cashflow": True},
+            f"/api/transactions/{txn_id}/{endpoint}", json={field: True}
         )
         assert r.status_code == 200, r.text
-        assert r.json() == {"ok": True, "exclude_from_cashflow": True}
-    assert await _read_flag(client, txn_id) is True
+        assert r.json() == {"ok": True, field: True}
+    assert await _read_flag(client, txn_id, field) is True
 
     # Clear it.
-    r = await client.post(
-        f"/api/transactions/{txn_id}/exclude",
-        json={"exclude_from_cashflow": False},
-    )
+    r = await client.post(f"/api/transactions/{txn_id}/{endpoint}", json={field: False})
     assert r.status_code == 200, r.text
-    assert r.json() == {"ok": True, "exclude_from_cashflow": False}
-    assert await _read_flag(client, txn_id) is False
+    assert r.json() == {"ok": True, field: False}
+    assert await _read_flag(client, txn_id, field) is False
 
     missing = await client.post(
-        "/api/transactions/999999/exclude",
-        json={"exclude_from_cashflow": True},
+        f"/api/transactions/999999/{endpoint}", json={field: True}
     )
     assert missing.status_code == 404
+
+
+async def test_a_credit_cannot_be_voided(client, session):
+    """A credit can be a card bill payment. Voiding it would leave the paid
+    state stale, so the endpoint refuses it and the row stays counted."""
+    txn_id = await _seed(session)
+    txn = await session.get(Transaction, txn_id)
+    txn.direction = "credit"
+    await session.commit()
+
+    r = await client.post(f"/api/transactions/{txn_id}/void", json={"voided": True})
+    assert r.status_code == 400
+    assert await _read_flag(client, txn_id, "voided") is False

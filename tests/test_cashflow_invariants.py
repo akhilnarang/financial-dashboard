@@ -60,8 +60,8 @@ async def _seed_rich_population(session: AsyncSession) -> None:
     fee reversal), investment contributions and redemptions, internal
     self-transfers, card swipes, card credits, unaccounted rows, NULL/blank/
     whitespace/unknown/unmapped categories, blank counterparties, INR/NULL/
-    non-INR currencies, undated rows, an excluded row, out-of-range rows, and a
-    row on a debit_card (the other bank-side account type).
+    non-INR currencies, undated rows, an excluded row, voided rows, out-of-range
+    rows, and a row on a debit_card (the other bank-side account type).
     """
     card = await card_account(session)
     debit_card = await ensure_account(session, 7, "debit_card")
@@ -216,6 +216,27 @@ async def _seed_rich_population(session: AsyncSession) -> None:
         amount=D("999"),
         category="groceries",
         exclude_from_cashflow=True,
+    )
+
+    # --- voided rows: in no figure, not even the Excluded or Undated footnote ---
+    await _add(
+        session,
+        direction="debit",
+        amount=D("555"),
+        category="groceries",
+        transaction_date=None,
+        voided=True,
+    )
+    await _add(
+        session, direction="debit", amount=D("777"), category="groceries", voided=True
+    )
+    await _add(
+        session,
+        direction="debit",
+        amount=D("666"),
+        category="groceries",
+        exclude_from_cashflow=True,
+        voided=True,
     )
 
     # --- out-of-range rows: in scope and bucketable, but not in this range ---

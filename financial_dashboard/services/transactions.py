@@ -96,6 +96,41 @@ async def set_transaction_excluded_no_commit(
     return ExcludeResult(ok=True, exclude_from_cashflow=excluded)
 
 
+class VoidResult(NamedTuple):
+    ok: bool
+    voided: bool
+
+
+async def set_transaction_voided(
+    session: AsyncSession, txn_id: int, voided: bool
+) -> VoidResult:
+    """Void a transaction, or undo the void, and commit.
+
+    A voided charge never settled. The row then counts as no money, and no
+    statement row matches it. A repeated request lands the same value.
+
+    Args:
+        session: The request session.
+        txn_id: The transaction to change.
+        voided: The new state.
+
+    Returns:
+        The stored state. ``ok`` is False when no such row exists.
+
+    Raises:
+        ValueError: The row is a credit. Only a charge can be voided.
+    """
+    txn = await session.get(Transaction, txn_id)
+    if txn is None:
+        return VoidResult(ok=False, voided=False)
+    # A credit can be a card bill payment, and its paid state would go stale.
+    if voided and txn.direction != "debit":
+        raise ValueError("Only a debit can be voided")
+    txn.voided = voided
+    await session.commit()
+    return VoidResult(ok=True, voided=voided)
+
+
 async def update_transaction_category(
     session: AsyncSession,
     txn_id: int,

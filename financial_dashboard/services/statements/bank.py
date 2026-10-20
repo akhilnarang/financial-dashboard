@@ -675,6 +675,14 @@ def reconcile_bank_statement(
             continue
         parsed_rows.append((stmt_idx, direction, txn, amount, txn_date))
 
+    # A voided charge never posts, so a same-amount statement row is a new charge.
+    # A row a statement imported did post, so it stays a candidate.
+    db_transactions = [
+        txn
+        for txn in db_transactions
+        if not txn.voided or txn.bank_statement_upload_id is not None
+    ]
+
     # Build DB candidate pools.
     # ref_pool: (reference key, direction) — UPI refunds may reuse the
     # same ref with the opposite direction, so direction stays in the key.

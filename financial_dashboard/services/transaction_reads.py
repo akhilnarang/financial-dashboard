@@ -17,6 +17,7 @@ from financial_dashboard.db import (
     Transaction,
 )
 from financial_dashboard.schemas import transactions as transaction_schemas
+from financial_dashboard.services.cashflow.report import EXCLUDED, INCLUDED
 from financial_dashboard.services.cc_disambiguation import (
     should_auto_reconcile_statement,
 )
@@ -114,9 +115,9 @@ def build_transaction_filter_clauses(
             )
         )
     if excluded is True:
-        clauses.append(Transaction.exclude_from_cashflow.is_(True))
+        clauses.append(EXCLUDED)
     elif excluded is False:
-        clauses.append(Transaction.exclude_from_cashflow.is_not(True))
+        clauses.append(INCLUDED)
     return clauses
 
 
@@ -155,6 +156,7 @@ def transaction_read(row: Transaction) -> transaction_schemas.TransactionRead:
         category=row.category,
         category_method=row.category_method,
         exclude_from_cashflow=row.exclude_from_cashflow,
+        voided=row.voided,
         review_status=row.review_status,
         created_at=row.created_at,
         enriched_at=row.enriched_at,

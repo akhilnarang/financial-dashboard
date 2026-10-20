@@ -682,6 +682,7 @@ erDiagram
         text note
         text attachment_path
         boolean exclude_from_cashflow
+        boolean voided
         string category
         string category_method
         float category_confidence
@@ -885,6 +886,7 @@ Relationship notes:
 - `transactions` also has a partial lookup index on `reference_number` where it is non-null; ingest uses it to find an opposite-direction leg on a different linked or masked account and mark both transactions as `self_transfer`.
 - `transactions.counterparty_source` is non-null and defaults to `bank`. It says where `counterparty` came from. A parser sets `user_alias` when the bank prints a label the user chose, such as an HDFC payee nickname. A label does not replace a name a bank states, and a bank name replaces a stored label. The column follows the name: a writer that changes one changes the other.
 - `transactions.card_holder` is the cardholder that a card statement names for the row. Some banks print one card number for the primary card and each add-on, so `card_mask` alone cannot tell them apart. Statement import and enrichment set it; a one-time migration fills it from each stored statement reconciliation.
+- `transactions.voided` marks a card charge that the bank cancelled before it settled. The user sets it. Cashflow figures, list totals and the bank cash bridge skip a voided row. Card statement matching skips it too, but alert de-duplication still matches it, so a reparse does not add the row again.
 - `transactions` has a composite lookup index on `(category, transaction_date)`. Category first because a category filter with no date bounds — a drill-through from a category link, say — would otherwise scan the table, both for the rows and for the `count()` the pager needs; `transaction_date` second so a filter carrying both a category and a date range satisfies them from the one index instead of narrowing on dates and re-checking the category per row.
 - `(account_id, card_mask)` is unique on `cards`.
 - `statement_uploads` has a partial unique index on `account_id` where `is_active = 1`: each card has at most one active statement. The active statement is the latest by due date (a tie goes to the newer upload). An `after_flush` hook keeps the flag current. Only the active statement takes payment actions.
