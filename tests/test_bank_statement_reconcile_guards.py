@@ -441,7 +441,9 @@ async def test_new_rows_import_beside_an_incompatible_db_row(
 @pytest.mark.anyio
 async def test_a_voided_alert_is_no_candidate(session_factory):
     """A voided charge never posts. A same-amount statement line is a new charge
-    and must be missing, not matched or held back."""
+    and must be missing, not matched or held back. A row a statement imported
+    did post. It stays a candidate even when voided by mistake, so a reprocess
+    does not import it twice."""
     await _seed_account(session_factory)
     await _seed_txn(session_factory, email_type="transaction", voided=True)
 
@@ -452,6 +454,24 @@ async def test_a_voided_alert_is_no_candidate(session_factory):
 
     assert recon["matched"] == []
     assert [entry["ambiguous"] for entry in recon["missing"]] == [False]
+
+    async with session_factory() as session:
+        upload = BankStatementUpload(
+            account_id=ACCOUNT_ID,
+            bank="hdfc",
+            filename="statement.pdf",
+            file_path="/nonexistent/statement.pdf",
+            status="imported",
+        )
+        session.add(upload)
+        await session.commit()
+        upload_id = upload.id
+    imported_id = await _seed_txn(
+        session_factory, voided=True, bank_statement_upload_id=upload_id
+    )
+    again = await _reconcile(session_factory, parsed)
+    assert [entry["db_txn_id"] for entry in again["matched"]] == [imported_id]
+    assert again["missing"] == []
 
 
 @pytest.mark.anyio

@@ -104,7 +104,7 @@ class VoidResult(NamedTuple):
 async def set_transaction_voided(
     session: AsyncSession, txn_id: int, voided: bool
 ) -> VoidResult:
-    """Set whether one transaction is voided, and commit.
+    """Void a transaction, or undo the void, and commit.
 
     A voided charge never settled. The row then counts as no money, and no
     statement row matches it. A repeated request lands the same value.
