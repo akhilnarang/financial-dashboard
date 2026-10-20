@@ -439,6 +439,22 @@ async def test_new_rows_import_beside_an_incompatible_db_row(
 
 
 @pytest.mark.anyio
+async def test_a_voided_alert_is_no_candidate(session_factory):
+    """A voided charge never posts. A same-amount statement line is a new charge
+    and must be missing, not matched or held back."""
+    await _seed_account(session_factory)
+    await _seed_txn(session_factory, email_type="transaction", voided=True)
+
+    parsed = _parsed(
+        [_stmt_txn(date="07/04/2026", amount="2,500.00", narration="MERCHANT A")]
+    )
+    recon = await _reconcile(session_factory, parsed)
+
+    assert recon["matched"] == []
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [False]
+
+
+@pytest.mark.anyio
 async def test_one_statement_row_facing_two_db_rows_on_one_reference(
     session_factory, monkeypatch
 ):

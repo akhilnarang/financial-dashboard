@@ -353,7 +353,6 @@ async def _qualifying_payment_credit_sum(session, upload: StatementUpload) -> De
                 select(Transaction).where(
                     Transaction.account_id == upload.account_id,
                     Transaction.direction == "credit",
-                    Transaction.voided.is_not(True),
                     transactions_in_cycle(window),
                 )
             )

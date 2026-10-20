@@ -116,10 +116,16 @@ async def set_transaction_voided(
 
     Returns:
         The stored state. ``ok`` is False when no such row exists.
+
+    Raises:
+        ValueError: The row is a credit. Only a charge can be voided.
     """
     txn = await session.get(Transaction, txn_id)
     if txn is None:
         return VoidResult(ok=False, voided=False)
+    # A credit can be a card bill payment, and its paid state would go stale.
+    if voided and txn.direction != "debit":
+        raise ValueError("Only a debit can be voided")
     txn.voided = voided
     await session.commit()
     return VoidResult(ok=True, voided=voided)

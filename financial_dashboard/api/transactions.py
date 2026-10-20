@@ -289,7 +289,10 @@ async def update_void(
     session: AsyncSessionDep,
 ) -> TransactionVoidResponse:
     """Set whether one transaction is voided."""
-    ok, state = await set_transaction_voided(session, txn_id, payload.voided)
+    try:
+        ok, state = await set_transaction_voided(session, txn_id, payload.voided)
+    except ValueError as exc:
+        raise BadRequestException(detail=str(exc)) from exc
     if ok:
         return TransactionVoidResponse(ok=True, voided=state)
 

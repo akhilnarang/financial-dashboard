@@ -155,6 +155,7 @@
     <small class="text-muted" style="display: block; margin-top: 0.2rem; font-size: 0.75rem;">Drops this row from the cashflow totals. The row keeps its category. It shows in every other view.</small>
 </div>
 
+{% if txn.direction == "debit" or txn.voided %}
 <div style="margin-top: 1rem;">
     <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; font-size: 0.88rem;">
         <input id="txn-voided" type="checkbox" {% if txn.voided %}checked{% endif %}>
@@ -163,6 +164,7 @@
     <div id="voided-status" class="note-status"></div>
     <small class="text-muted" style="display: block; margin-top: 0.2rem; font-size: 0.75rem;">The bank cancelled this charge before it settled. No total counts this row.</small>
 </div>
+{% endif %}
 
 
 <script>

@@ -67,3 +67,16 @@ async def test_set_and_clear_is_observable_and_idempotent(
         f"/api/transactions/999999/{endpoint}", json={field: True}
     )
     assert missing.status_code == 404
+
+
+async def test_a_credit_cannot_be_voided(client, session):
+    """A credit can be a card bill payment. Voiding it would leave the paid
+    state stale, so the endpoint refuses it and the row stays counted."""
+    txn_id = await _seed(session)
+    txn = await session.get(Transaction, txn_id)
+    txn.direction = "credit"
+    await session.commit()
+
+    r = await client.post(f"/api/transactions/{txn_id}/void", json={"voided": True})
+    assert r.status_code == 400
+    assert await _read_flag(client, txn_id, "voided") is False
