@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 _cache: list[tuple[str, str]] = []
 # Hold across query and publish, so an older read cannot replace a newer one.
 _reload_lock = asyncio.Lock()
+# Rules match by substring. A shorter pattern matches almost every row.
+MIN_PATTERN_LENGTH = 3
 
 
 async def load_merchant_rules(_session: AsyncSession | None = None) -> None:
@@ -78,7 +80,8 @@ async def add_merchant_rule(
 
     Normalizes the pattern with normalize_text (lowercase, punctuation→space)
     so it matches the same text the matcher sees (e.g. "acme.pay@upi" →
-    "acme pay upi"). Rejects a blank pattern (it would match every row).
+    "acme pay upi"). Rejects a pattern shorter than MIN_PATTERN_LENGTH (it
+    would match almost every row).
     Validates the category slug against the active vocabulary. ON CONFLICT
     updates category/active/priority.
 
@@ -86,8 +89,10 @@ async def add_merchant_rule(
     after committing if an up-to-date cache is needed.
     """
     pattern = normalize_text(pattern)
-    if not pattern:
-        raise ValueError("Merchant rule pattern must not be blank")
+    if len(pattern) < MIN_PATTERN_LENGTH:
+        raise ValueError(
+            f"Merchant rule pattern must have at least {MIN_PATTERN_LENGTH} characters"
+        )
     if not is_valid_slug(category):
         raise ValueError(f"Invalid category slug: {category!r}")
     # Category must exist in the controlled vocabulary — catches typos like
@@ -141,7 +146,7 @@ async def save_merchant_rule(
         The stored merchant rule.
 
     Raises:
-        ValueError: The pattern is blank or the category is not valid.
+        ValueError: The pattern is too short or the category is not valid.
     """
     await add_merchant_rule(session, pattern, category, priority=priority)
     rule = await session.scalar(
