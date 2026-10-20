@@ -969,6 +969,9 @@ uv run python scripts/seed.py
 | `GET` | `/api/poll/status` | Returns current poll state, progress, last stats, last error |
 | `POST` | `/api/transactions/{id}/note` | Update the freeform note on a transaction (JSON body: `{"note": "..."}`) |
 | `POST` | `/api/sources/{id}/test` | Test connectivity for an email source; returns `{"ok": bool, "message"/"error": str}` |
+| `GET` | `/api/merchant-rules` | List merchant→category rules |
+| `POST` | `/api/merchant-rules` | Add or update a rule (`{"pattern", "category", "priority"?}`); the next categorization uses it |
+| `DELETE` | `/api/merchant-rules/{id}` | Remove a rule; the next categorization stops using it |
 | `GET` | `/api/extensions` | List registered extension manifests |
 | `GET`/`POST` | `/api/extensions/paisa/config` | Read (redacted) / save Paisa config |
 | `GET` | `/api/extensions/paisa/status` | Read-only probe of the Paisa instance |

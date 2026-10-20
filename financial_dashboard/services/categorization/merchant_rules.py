@@ -8,7 +8,7 @@ get_merchant_rules() — no DB round-trips in the hot path.
 
 import logging
 
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import async_session
@@ -75,7 +75,8 @@ async def add_merchant_rule(
     Normalizes the pattern with normalize_text (lowercase, punctuation→space)
     so it matches the same text the matcher sees (e.g. "acme.pay@upi" →
     "acme pay upi"). Rejects a blank pattern (it would match every row).
-    Validates the category slug. ON CONFLICT updates category/active/priority.
+    Validates the category slug against the active vocabulary. ON CONFLICT
+    updates category/active/priority.
 
     Does NOT refresh the module-level cache — caller calls load_merchant_rules()
     after committing if an up-to-date cache is needed.
@@ -88,11 +89,15 @@ async def add_merchant_rule(
     # Category must exist in the controlled vocabulary — catches typos like
     # 'dinng' that would otherwise auto-write an out-of-vocab rule.
     exists = (
-        await session.execute(select(Category.id).where(Category.slug == category))
+        await session.execute(
+            select(Category.id).where(
+                Category.slug == category, Category.active.is_(True)
+            )
+        )
     ).first()
     if not exists:
         raise ValueError(
-            f"Unknown category {category!r} — create it first (add to the "
+            f"Unknown or inactive category {category!r} — create it first (add to the "
             "categories table) or fix the typo"
         )
     await session.execute(
@@ -115,3 +120,49 @@ async def list_merchant_rules(session: AsyncSession) -> list[MerchantRule]:
         MerchantRule.id.asc(),
     )
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def save_merchant_rule(
+    session: AsyncSession, pattern: str, category: str, *, priority: int = 100
+) -> MerchantRule:
+    """Insert or update a merchant rule and return the stored row.
+
+    Args:
+        session: Open async session. The caller commits.
+        pattern: Raw pattern. The service normalizes it.
+        category: Category slug from the active vocabulary.
+        priority: Match priority. A lower number matches first.
+
+    Returns:
+        The stored merchant rule.
+
+    Raises:
+        ValueError: The pattern is blank or the category is not valid.
+    """
+    await add_merchant_rule(session, pattern, category, priority=priority)
+    rule = await session.scalar(
+        select(MerchantRule)
+        .where(MerchantRule.pattern == normalize_text(pattern))
+        .execution_options(populate_existing=True)
+    )
+    if rule is None:
+        raise RuntimeError("Merchant rule upsert did not store a row")
+    return rule
+
+
+async def delete_merchant_rule(session: AsyncSession, rule_id: int) -> bool:
+    """Delete one merchant rule.
+
+    Args:
+        session: Open async session. The caller commits.
+        rule_id: Primary key of the rule.
+
+    Returns:
+        True when a row was deleted, else False.
+    """
+    deleted = await session.scalar(
+        delete(MerchantRule)
+        .where(MerchantRule.id == rule_id)
+        .returning(MerchantRule.id)
+    )
+    return deleted is not None

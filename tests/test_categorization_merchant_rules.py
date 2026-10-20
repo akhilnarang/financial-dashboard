@@ -1,10 +1,14 @@
 """Tests for the DB-backed merchant-rules layer."""
 
+from decimal import Decimal
+
 import pytest
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import financial_dashboard.services.categorization.engine as eng
 import financial_dashboard.services.categorization.merchant_rules as mr_mod
-from financial_dashboard.db.models import MerchantRule
+from financial_dashboard.db.models import MerchantRule, Transaction
 from financial_dashboard.services.categorization.merchant_rules import (
     add_merchant_rule,
     get_merchant_rules,
@@ -104,6 +108,54 @@ async def test_add_merchant_rule_normalizes_upserts_and_rejects_unknown_category
     # A valid slug that is not in the vocabulary is a typo.
     with pytest.raises(ValueError):
         await add_merchant_rule(session, "somemerchant", "dinng")
+
+
+async def test_merchant_rule_api_changes_next_categorization_without_restart(
+    client: AsyncClient, session: AsyncSession
+):
+    """A rule saved over the API applies to the very next categorization. A
+    delete removes it the same way. An unknown slug is rejected."""
+    await ensure_category(session, "dining")
+    await session.commit()
+
+    async def categorize() -> str | None:
+        txn = Transaction(
+            bank="testbank",
+            email_type="x",
+            direction="debit",
+            amount=Decimal("50"),
+            counterparty="ZEPHYR NOODLE BAR",
+        )
+        session.add(txn)
+        await session.flush()
+        await eng.categorize_one(session, txn, use_llm=False)
+        return txn.category
+
+    assert await categorize() is None
+
+    bad = await client.post(
+        "/api/merchant-rules", json={"pattern": "zephyr", "category": "dinng"}
+    )
+    assert bad.status_code == 422
+    assert (await client.get("/api/merchant-rules")).json()["items"] == []
+
+    saved = await client.post(
+        "/api/merchant-rules", json={"pattern": " Zephyr Noodle ", "category": "dining"}
+    )
+    assert saved.status_code == 200
+    rule = saved.json()
+    assert (rule["pattern"], rule["category"], rule["priority"]) == (
+        "zephyr noodle",
+        "dining",
+        100,
+    )
+    assert await categorize() == "dining"
+    listed = (await client.get("/api/merchant-rules")).json()["items"]
+    assert [r["id"] for r in listed] == [rule["id"]]
+
+    assert (await client.delete(f"/api/merchant-rules/{rule['id']}")).status_code == 204
+    assert await categorize() is None
+    assert (await client.delete(f"/api/merchant-rules/{rule['id']}")).status_code == 404
 
 
 # ---------------------------------------------------------------------------
