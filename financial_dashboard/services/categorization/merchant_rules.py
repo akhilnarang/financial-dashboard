@@ -6,6 +6,7 @@ load_merchant_rules() and read on every categorization call via
 get_merchant_rules() — no DB round-trips in the hot path.
 """
 
+import asyncio
 import logging
 
 from sqlalchemy import delete, func, select, text
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 # Module-level ordered cache: list of (pattern, category) in match priority
 # order (lower priority number first, then longer pattern first for specificity).
 _cache: list[tuple[str, str]] = []
+# Hold across query and publish, so an older read cannot replace a newer one.
+_reload_lock = asyncio.Lock()
 
 
 async def load_merchant_rules(_session: AsyncSession | None = None) -> None:
@@ -55,11 +58,12 @@ async def load_merchant_rules(_session: AsyncSession | None = None) -> None:
         )
         logger.info("Loaded %d merchant rules", len(_cache))
 
-    if _session is not None:
-        await _query(_session)
-    else:
-        async with async_session() as session:
-            await _query(session)
+    async with _reload_lock:
+        if _session is not None:
+            await _query(_session)
+        else:
+            async with async_session() as session:
+                await _query(session)
 
 
 def get_merchant_rules() -> tuple[tuple[str, str], ...]:
