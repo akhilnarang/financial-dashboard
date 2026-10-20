@@ -37,6 +37,17 @@ class TransactionExcludeResponse(BaseModel):
     exclude_from_cashflow: bool = False
 
 
+class TransactionVoidUpdate(BaseModel):
+    """Set the flag to a given value, not a toggle."""
+
+    voided: bool
+
+
+class TransactionVoidResponse(BaseModel):
+    ok: bool
+    voided: bool = False
+
+
 class TransactionRelinkUpdate(BaseModel):
     """Request body for manual relink. Either field may be null to clear
     the corresponding link. If only ``card_id`` is given, the service
@@ -81,6 +92,7 @@ class TransactionRead(BaseModel):
     category: str | None
     category_method: str | None
     exclude_from_cashflow: bool = False
+    voided: bool = False
     review_status: str | None
     created_at: datetime.datetime | None
     enriched_at: datetime.datetime | None

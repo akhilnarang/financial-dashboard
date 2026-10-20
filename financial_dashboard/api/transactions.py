@@ -30,6 +30,8 @@ from financial_dashboard.schemas.transactions import (
     TransactionNoteUpdate,
     TransactionRelinkResponse,
     TransactionRelinkUpdate,
+    TransactionVoidResponse,
+    TransactionVoidUpdate,
 )
 from financial_dashboard.services.duplicate_merge import (
     BatchRefused,
@@ -47,6 +49,7 @@ from financial_dashboard.services.transactions import (
     categorize_transactions,
     relink_transaction,
     set_transaction_excluded,
+    set_transaction_voided,
     update_transaction_category,
     update_transaction_note,
 )
@@ -275,6 +278,20 @@ async def update_exclude(
     )
     if ok:
         return TransactionExcludeResponse(ok=True, exclude_from_cashflow=state)
+
+    raise NotFoundException(detail="Transaction not found")
+
+
+@router.post("/transactions/{txn_id}/void")
+async def update_void(
+    txn_id: Annotated[DatabaseId, Path()],
+    payload: TransactionVoidUpdate,
+    session: AsyncSessionDep,
+) -> TransactionVoidResponse:
+    """Set whether one transaction is voided."""
+    ok, state = await set_transaction_voided(session, txn_id, payload.voided)
+    if ok:
+        return TransactionVoidResponse(ok=True, voided=state)
 
     raise NotFoundException(detail="Transaction not found")
 

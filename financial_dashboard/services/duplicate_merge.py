@@ -325,6 +325,8 @@ async def _fold_manual_fields(
         conflicts.append("note")
     if keep.exclude_from_cashflow != data["exclude_from_cashflow"]:
         conflicts.append("exclude_from_cashflow")
+    if keep.voided != data["voided"]:
+        conflicts.append("voided")
     return conflicts
 
 

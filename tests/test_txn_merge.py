@@ -220,6 +220,7 @@ async def test_find_match_reparse_changed_reference_keeps_own_row(
 async def test_find_match_fuzzy_window_hits_within_10min(
     session: AsyncSession,
 ):
+    # A voided row still matches a re-sent alert, so a reparse does not add it again.
     existing = Transaction(
         bank="hdfc",
         email_type="hdfc_dc_transaction_alert",
@@ -228,6 +229,7 @@ async def test_find_match_fuzzy_window_hits_within_10min(
         currency="INR",
         transaction_date=date(2026, 5, 2),
         transaction_time=time(14, 23, 0),
+        voided=True,
     )
     session.add(existing)
     await session.flush()

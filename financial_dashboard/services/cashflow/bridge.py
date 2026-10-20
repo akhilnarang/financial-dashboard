@@ -34,6 +34,7 @@ from financial_dashboard.services.cashflow.report import (
     BANK_INTERNAL_SLUGS,
     EXCLUDED,
     NON_INR,
+    NOT_VOIDED,
     SIGNED_AMOUNT,
     UNCATEGORIZED,
 )
@@ -197,7 +198,7 @@ async def _bank_flows(
             Transaction.balance,
             Transaction.bank_statement_upload_id,
         )
-        .where(BANK_SCOPE, Transaction.transaction_date.is_not(None))
+        .where(BANK_SCOPE, NOT_VOIDED, Transaction.transaction_date.is_not(None))
         .order_by(Transaction.transaction_time.nulls_first(), Transaction.id)
     )
     for txn_id, account_id, day, kind, flow, balance, upload_id in rows:

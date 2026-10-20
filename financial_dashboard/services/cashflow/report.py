@@ -94,10 +94,12 @@ NON_INR = Transaction.currency.is_not(None) & (Transaction.currency != "INR")
 # figure filters to INCLUDED. Only the Excluded footnote reads EXCLUDED, so a
 # flagged row is still counted and shown. `is_not(True)` keeps a legacy NULL in,
 # because a NULL row is not flagged. `is_(True)` selects the flagged rows alone.
+# A voided row is in neither set: no money moved, so no figure counts it.
 # The Undated footnote does not filter. An excluded row with no date is in no
 # range, so the Undated line is the only place it shows.
-INCLUDED = Transaction.exclude_from_cashflow.is_not(True)
-EXCLUDED = Transaction.exclude_from_cashflow.is_(True)
+NOT_VOIDED = Transaction.voided.is_not(True)
+INCLUDED = Transaction.exclude_from_cashflow.is_not(True) & NOT_VOIDED
+EXCLUDED = Transaction.exclude_from_cashflow.is_(True) & NOT_VOIDED
 
 SIGNED_AMOUNT = case(
     (Transaction.direction == "credit", Transaction.amount),

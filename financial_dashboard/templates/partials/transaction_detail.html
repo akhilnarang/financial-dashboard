@@ -32,7 +32,7 @@
     <div>
         <dt>Amount</dt>
         <dd class="amt {% if txn.direction == 'debit' %}amt-debit{% else %}amt-credit{% endif %}" style="font-size: 1.1rem;">
-            {% if txn.direction == "debit" %}&minus;{% else %}+{% endif %}{{ txn.currency|currency_symbol }}{{ "{:,.2f}".format(txn.amount) }}
+            {% if txn.voided %}<s>{% endif %}{% if txn.direction == "debit" %}&minus;{% else %}+{% endif %}{{ txn.currency|currency_symbol }}{{ "{:,.2f}".format(txn.amount) }}{% if txn.voided %}</s> <span class="badge">Voided</span>{% endif %}
         </dd>
     </div>
     <div>
@@ -155,6 +155,15 @@
     <small class="text-muted" style="display: block; margin-top: 0.2rem; font-size: 0.75rem;">Drops this row from the cashflow totals. The row keeps its category. It shows in every other view.</small>
 </div>
 
+<div style="margin-top: 1rem;">
+    <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; font-size: 0.88rem;">
+        <input id="txn-voided" type="checkbox" {% if txn.voided %}checked{% endif %}>
+        Voided
+    </label>
+    <div id="voided-status" class="note-status"></div>
+    <small class="text-muted" style="display: block; margin-top: 0.2rem; font-size: 0.75rem;">The bank cancelled this charge before it settled. No total counts this row.</small>
+</div>
+
 
 <script>
 (() => {
@@ -199,19 +208,19 @@
     wireField('txn-note', 'note-status', 'note', 'note', 'note');
     wireField('txn-category', 'category-status', 'category', 'category', 'category');
 
-    // The exclude flag is a checkbox, not a text field. Post the state on change.
+    // A flag is a checkbox, not a text field. Post the state on change.
     // A retry lands the same value. It does not toggle.
-    (() => {
-        const box = document.getElementById('txn-exclude');
-        const status = document.getElementById('exclude-status');
+    function wireFlag(boxId, statusId, endpoint, field) {
+        const box = document.getElementById(boxId);
+        const status = document.getElementById(statusId);
         if (!box || !status) return;
         box.addEventListener('change', async () => {
             status.textContent = 'Saving...';
             try {
-                const resp = await fetch(`/api/transactions/${txnId}/exclude`, {
+                const resp = await fetch(`/api/transactions/${txnId}/${endpoint}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ exclude_from_cashflow: box.checked }),
+                    body: JSON.stringify({ [field]: box.checked }),
                 });
                 status.textContent = resp.ok ? 'Saved' : 'Error saving';
             } catch (e) {
@@ -219,7 +228,10 @@
             }
             setTimeout(() => { status.textContent = ''; }, 2000);
         });
-    })();
+    }
+
+    wireFlag('txn-exclude', 'exclude-status', 'exclude', 'exclude_from_cashflow');
+    wireFlag('txn-voided', 'voided-status', 'void', 'voided');
 
     // ----- Manual relink (only present when txn is orphaned). -----
     function wireRelink() {

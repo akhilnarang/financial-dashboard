@@ -31,6 +31,8 @@ from financial_dashboard.services.cashflow.buckets import internal_slugs_for_sco
 from financial_dashboard.services.cashflow.report import (
     BLANK_CATEGORY,
     BLANK_COUNTERPARTY,
+    EXCLUDED,
+    INCLUDED,
     INR_OR_NULL,
     NON_INR,
     UNCATEGORIZED,
@@ -424,11 +426,11 @@ async def transaction_list(
     if excluded == "1":
         # The rows the Excluded footnote counts. `is_(True)` selects the flagged
         # rows alone. A legacy NULL is an unflagged row and stays out.
-        stmt = stmt.where(Transaction.exclude_from_cashflow.is_(True))
+        stmt = stmt.where(EXCLUDED)
     elif excluded == "0":
         # The rows still in the cashflow. The report's figures sum these. Every
         # headline drill carries this value, so a tile links to the rows it counted.
-        stmt = stmt.where(Transaction.exclude_from_cashflow.is_not(True))
+        stmt = stmt.where(INCLUDED)
     account_scope = scope_predicate(scope)
     if account_scope is not None:
         # The report's own predicate, imported rather than restated: a cash-basis
@@ -442,13 +444,14 @@ async def transaction_list(
     total_count = (await session.execute(count_stmt)).scalar() or 0
 
     # Totals are INR only. A foreign-currency row is a card alert that no
-    # statement converted to rupees yet.
+    # statement converted to rupees yet. A voided row moved no money.
+    live = filtered.c.voided.is_not(True)
     is_inr = (
         func.coalesce(
             func.nullif(func.upper(func.trim(filtered.c.currency)), ""), "INR"
         )
         == "INR"
-    )
+    ) & live
     totals_row = (
         await session.execute(
             select(
@@ -463,7 +466,7 @@ async def transaction_list(
                     )
                 ).label("debits"),
                 func.count()
-                .filter(~is_inr & filtered.c.direction.in_(("credit", "debit")))
+                .filter(live & ~is_inr & filtered.c.direction.in_(("credit", "debit")))
                 .label("foreign"),
             )
         )

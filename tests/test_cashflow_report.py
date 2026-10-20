@@ -420,9 +420,10 @@ async def test_bridge_closes_on_complete_data_and_a_missing_row_is_the_gap(
 ):
     """Every bank-side row lands in exactly one bridge term.
 
-    The card-side family and excluded rows and the unlinked row are decoys. A
-    bridge that took the all-account footnotes, or the unaccounted net, would
-    miss the statement closing by their amount. An older statement that
+    The card-side family and excluded rows, the unlinked row and the voided
+    bank row are decoys. A bridge that took the all-account footnotes, the
+    unaccounted net, or a voided charge would miss the statement closing by
+    their amount. An older statement that
     overlaps the newer one and implies another opening balance loses to it,
     with a warning.
     """
@@ -490,6 +491,9 @@ async def test_bridge_closes_on_complete_data_and_a_missing_row_is_the_gap(
     )
     await _add(
         session, direction="debit", amount=D("111"), category="dining", account_id=None
+    )
+    await _add(
+        session, direction="debit", amount=D("90"), category="dining", voided=True
     )
 
     bridge = await cash_bridge(session, await cashflow_summary(session, JUN, JUN_END))

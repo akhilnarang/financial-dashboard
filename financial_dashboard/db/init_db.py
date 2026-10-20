@@ -361,6 +361,15 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                 )
             )
         try:
+            await conn.execute(text("SELECT voided FROM transactions LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE transactions ADD COLUMN "
+                    "voided BOOLEAN NOT NULL DEFAULT 0"
+                )
+            )
+        try:
             await conn.execute(text("SELECT identifies_by FROM transactions LIMIT 0"))
         except Exception:
             # Existing rows get "counterparty". A row of a shape that the bank
