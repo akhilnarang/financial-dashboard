@@ -469,6 +469,23 @@ def _contains_whole_token(haystack: str, needle: str) -> bool:
     return False
 
 
+def _word_text(text: str | None) -> str:
+    """Normalize a narration and turn each non-word run into one space.
+
+    Args:
+        text: The raw narration or counterparty.
+
+    Returns:
+        The words of ``text`` joined by single spaces, judged by
+        ``_is_word_char``. ``PURELY.MAIL`` and ``PURELY MAIL`` give the same
+        text. Empty when ``text`` has no word character.
+    """
+    normalized = _normalize_narration(text)
+    return " ".join(
+        "".join(ch if _is_word_char(ch) else " " for ch in normalized).split()
+    )
+
+
 def _same_merchant(row_narration: str | None, db_txn: Transaction) -> bool:
     """Returns whether a statement description and a stored transaction match the same
     merchant.
@@ -494,13 +511,21 @@ def _counterparty_singles_out(row_narration: str | None, db_txn) -> bool:
     normalization. Token overlap is deliberately avoided, and containment is
     word-bounded so a short counterparty cannot match inside an unrelated
     longer word (``MOB`` must not be read inside ``MOBILE`` or ``MOBILÉ``, nor
-    ``राम`` inside ``रामा``).
+    ``राम`` inside ``रामा``). Containment treats any run of punctuation or
+    spaces as one separator, so ``SAMPLE.COM`` names ``SAMPLE COM``.
+
+    Args:
+        row_narration: The statement row's narration.
+        db_txn: The stored candidate transaction.
+
+    Returns:
+        True when the row names the candidate.
     """
     narration = _normalize_narration(row_narration)
     if not narration:
         return False
-    counterparty = _normalize_narration(db_txn.counterparty)
-    if counterparty and _contains_whole_token(narration, counterparty):
+    counterparty = _word_text(db_txn.counterparty)
+    if counterparty and _contains_whole_token(_word_text(row_narration), counterparty):
         return True
     db_narration = _normalize_narration(db_txn.raw_description)
     return bool(db_narration) and db_narration == narration
