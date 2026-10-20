@@ -9,7 +9,7 @@ get_merchant_rules() — no DB round-trips in the hot path.
 import asyncio
 import logging
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import async_session
@@ -154,19 +154,23 @@ async def save_merchant_rule(
     return rule
 
 
-async def delete_merchant_rule(session: AsyncSession, rule_id: int) -> bool:
-    """Delete one merchant rule.
+async def deactivate_merchant_rule(session: AsyncSession, rule_id: int) -> bool:
+    """Deactivate one merchant rule.
+
+    The row stays as a tombstone. init_db reseeds a missing built-in rule, so a
+    hard delete would bring the rule back at the next start.
 
     Args:
         session: Open async session. The caller commits.
         rule_id: Primary key of the rule.
 
     Returns:
-        True when a row was deleted, else False.
+        True when an active rule was deactivated, else False.
     """
-    deleted = await session.scalar(
-        delete(MerchantRule)
-        .where(MerchantRule.id == rule_id)
+    deactivated = await session.scalar(
+        update(MerchantRule)
+        .where(MerchantRule.id == rule_id, MerchantRule.active.is_(True))
+        .values(active=False)
         .returning(MerchantRule.id)
     )
-    return deleted is not None
+    return deactivated is not None

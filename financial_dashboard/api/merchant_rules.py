@@ -20,7 +20,7 @@ from financial_dashboard.schemas.merchant_rules import (
     MerchantRuleSave,
 )
 from financial_dashboard.services.categorization.merchant_rules import (
-    delete_merchant_rule,
+    deactivate_merchant_rule,
     list_merchant_rules,
     load_merchant_rules,
     save_merchant_rule,
@@ -74,7 +74,7 @@ async def merchant_rule_save(
 async def merchant_rule_delete(
     rule_id: Annotated[DatabaseId, Path()], session: AsyncSessionDep
 ) -> Response:
-    """Delete one merchant rule.
+    """Deactivate one merchant rule so categorization stops using it.
 
     Args:
         rule_id: Primary key of the rule.
@@ -83,8 +83,8 @@ async def merchant_rule_delete(
     Returns:
         An empty 204 response.
     """
-    if not await delete_merchant_rule(session, rule_id):
-        raise NotFoundException(detail="Merchant rule not found")
+    if not await deactivate_merchant_rule(session, rule_id):
+        raise NotFoundException(detail="Active merchant rule not found")
     await session.commit()
     await load_merchant_rules(session)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

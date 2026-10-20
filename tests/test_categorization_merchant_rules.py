@@ -114,7 +114,7 @@ async def test_merchant_rule_api_changes_next_categorization_without_restart(
     client: AsyncClient, session: AsyncSession
 ):
     """A rule saved over the API applies to the very next categorization. A
-    delete removes it the same way. An unknown slug is rejected."""
+    delete deactivates it the same way. An unknown slug is rejected."""
     await ensure_category(session, "dining")
     await session.commit()
 
@@ -155,6 +155,9 @@ async def test_merchant_rule_api_changes_next_categorization_without_restart(
 
     assert (await client.delete(f"/api/merchant-rules/{rule['id']}")).status_code == 204
     assert await categorize() is None
+    # The row stays inactive, so init_db does not reseed a built-in rule.
+    listed = (await client.get("/api/merchant-rules")).json()["items"]
+    assert [(r["id"], r["active"]) for r in listed] == [(rule["id"], False)]
     assert (await client.delete(f"/api/merchant-rules/{rule['id']}")).status_code == 404
 
 

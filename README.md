@@ -971,7 +971,7 @@ uv run python scripts/seed.py
 | `POST` | `/api/sources/{id}/test` | Test connectivity for an email source; returns `{"ok": bool, "message"/"error": str}` |
 | `GET` | `/api/merchant-rules` | List merchant→category rules |
 | `POST` | `/api/merchant-rules` | Add or update a rule (`{"pattern", "category", "priority"?}`); the next categorization uses it |
-| `DELETE` | `/api/merchant-rules/{id}` | Remove a rule; the next categorization stops using it |
+| `DELETE` | `/api/merchant-rules/{id}` | Deactivate a rule; the next categorization stops using it, and a restart does not reseed it |
 | `GET` | `/api/extensions` | List registered extension manifests |
 | `GET`/`POST` | `/api/extensions/paisa/config` | Read (redacted) / save Paisa config |
 | `GET` | `/api/extensions/paisa/status` | Read-only probe of the Paisa instance |
