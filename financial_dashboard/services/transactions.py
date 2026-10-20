@@ -16,9 +16,13 @@ from financial_dashboard.services.cc_disambiguation import (
 logger = logging.getLogger(__name__)
 
 # Stored fields that the apply endpoint can change, directly or as a side effect.
+# The diff leaves out categorized_at. Each category write stamps it again.
 APPLY_DIFF_FIELDS = (
     "category",
     "category_method",
+    "category_confidence",
+    "category_model",
+    "category_vocab_version",
     "review_status",
     "note",
     "exclude_from_cashflow",

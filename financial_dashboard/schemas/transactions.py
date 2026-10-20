@@ -326,8 +326,8 @@ class TransactionApplyRequest(BaseModel):
 
 
 class TransactionFieldDiff(BaseModel):
-    before: str | bool | None
-    after: str | bool | None
+    before: str | bool | int | float | None
+    after: str | bool | int | float | None
 
 
 class TransactionApplyRow(BaseModel):

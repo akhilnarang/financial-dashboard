@@ -209,10 +209,20 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     for slug in ("groceries", "dining"):
         await ensure_category(session, slug)
     first = await _txn(
-        session, category="dining", category_method="llm", review_status="notified"
+        session,
+        category="dining",
+        category_method="llm",
+        category_confidence=0.5,
+        category_model="llm-x",
+        review_status="notified",
     )
     twin = await _txn(
-        session, category="dining", category_method="llm", review_status="notified"
+        session,
+        category="dining",
+        category_method="llm",
+        category_confidence=0.5,
+        category_model="llm-x",
+        review_status="notified",
     )
     second = await _txn(session, note="old note")
     credit = await _txn(session)
@@ -234,12 +244,20 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         ]
 
     untouched = await _rows()
+    preview = await client.post(
+        "/api/transactions/apply", json={"dry_run": True, "changes": changes}
+    )
+    assert preview.status_code == 200, preview.text
+    version = preview.json()["changed"][0]["changes"]["category_vocab_version"]
     expected = [
         {
             "id": first_id,
             "changes": {
                 "category": {"before": "dining", "after": "groceries"},
                 "category_method": {"before": "llm", "after": "manual"},
+                "category_confidence": {"before": 0.5, "after": 1.0},
+                "category_model": {"before": "llm-x", "after": "manual:user"},
+                "category_vocab_version": {"before": None, "after": version["after"]},
                 "review_status": {"before": "notified", "after": "resolved"},
             },
         },
@@ -252,11 +270,7 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
             },
         },
     ]
-
-    preview = await client.post(
-        "/api/transactions/apply", json={"dry_run": True, "changes": changes}
-    )
-    assert preview.status_code == 200, preview.text
+    assert version["after"] is not None
     assert preview.json()["changed"] == expected
     assert preview.json()["unchanged"] == [credit_id]
     assert await _rows() == untouched
@@ -292,6 +306,11 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         (None, None, None, True, True),
         (None, None, None, False, False),
     ]
+    again = await client.post(
+        "/api/transactions/apply", json={"dry_run": False, "changes": changes}
+    )
+    assert again.json()["changed"] == []
+    assert again.json()["unchanged"] == [first_id, second_id, credit_id]
 
     single = await client.post(
         f"/api/transactions/{twin_id}/category", json={"category": "groceries"}
