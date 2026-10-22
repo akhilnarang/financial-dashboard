@@ -35,6 +35,7 @@ from financial_dashboard.services.cc_cycle import cc_cycle_window
 from financial_dashboard.services.cc_disambiguation import (
     is_cc_payment_received_email,
 )
+from financial_dashboard.services.receivables import move_receivable_links
 from financial_dashboard.services.reminders import (
     _latest_active_cycle,
     resync_tracked_cc_payment_state,
@@ -272,6 +273,8 @@ async def move_references(
     moved = {}
     await supersede_active_decisions(session, old_id)
     await move_transaction_references(session, old_id, new_id)
+    if links := await move_receivable_links(session, old_id, new_id):
+        moved["receivable_links"] = links
     for model in _REFERRING_MODELS:
         if new_id is None and model is CategoryReviewDecision:
             continue

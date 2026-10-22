@@ -12,6 +12,7 @@ from financial_dashboard.web import (
     emails,
     extensions,
     polling,
+    receivables,
     rules,
     settings,
     sms,
@@ -31,6 +32,7 @@ def get_router(*, paisa_enabled: bool = True) -> APIRouter:
     router.include_router(emails.router)
     router.include_router(accounts.router)
     router.include_router(networth.router)
+    router.include_router(receivables.router)
     router.include_router(cas.router)
     router.include_router(sources.router)
     router.include_router(rules.router)

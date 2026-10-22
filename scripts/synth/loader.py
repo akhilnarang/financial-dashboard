@@ -241,6 +241,8 @@ _RESET_TABLES: tuple[str, ...] = (
     "snapshot_holdings",
     "balance_snapshots",
     "investment_lots",
+    "receivable_links",
+    "receivables",
     "transactions",
     "sms_messages",
     "emails",
