@@ -13,6 +13,7 @@ from financial_dashboard.core.crypto import decrypt_credentials
 from financial_dashboard.db.models import FetchRule
 from financial_dashboard.integrations.email.base import (
     INITIAL_BACKFILL_DAYS,
+    NETWORK_TIMEOUT_SECONDS,
     FetchedEmail,
     FetchSourceResult,
 )
@@ -23,9 +24,6 @@ from financial_dashboard.integrations.email.parsing import (
 from financial_dashboard.services.rules import _matches_rule_filters
 
 logger = logging.getLogger(__name__)
-
-# Without a timeout, a dropped connection blocks the poll forever.
-IMAP_TIMEOUT_SECONDS = 60
 
 
 def _imap_since_date(last_synced_at: datetime.datetime | None) -> str | None:
@@ -187,7 +185,7 @@ def _fetch_gmail_source_sync(
     # response, even if zero results).  Only these should be candidates
     # for marking backfill complete.
     backfill_searched_rule_ids: set[int] = set()
-    conn = imaplib.IMAP4_SSL("imap.gmail.com", timeout=IMAP_TIMEOUT_SECONDS)
+    conn = imaplib.IMAP4_SSL("imap.gmail.com", timeout=NETWORK_TIMEOUT_SECONDS)
     try:
         logger.info("Gmail: Connecting to imap.gmail.com for source %s", source_id)
         conn.login(user, password)
@@ -448,7 +446,7 @@ def _fetch_gmail_source_sync(
 def _fetch_gmail_single_sync(user: str, password: str, remote_id: str) -> bytes | None:
     """Fetch a single email from Gmail by X-GM-MSGID."""
     try:
-        conn = imaplib.IMAP4_SSL("imap.gmail.com", timeout=IMAP_TIMEOUT_SECONDS)
+        conn = imaplib.IMAP4_SSL("imap.gmail.com", timeout=NETWORK_TIMEOUT_SECONDS)
         conn.login(user, password)
         conn.select('"[Gmail]/All Mail"', readonly=True)
         # Search by X-GM-MSGID. stdlib runtime accepts None for the
