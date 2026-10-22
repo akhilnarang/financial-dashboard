@@ -258,29 +258,62 @@ class TransactionDeleteResponse(BaseModel):
     deletions: list[TransactionDeleteReport]
 
 
-class TransactionCategorizeItem(BaseModel):
-    """One row change. A null or absent field stays unchanged.
+class TransactionApplyChange(BaseModel):
+    """One row change. An absent field stays unchanged.
 
-    An empty ``category`` clears the category. An empty ``note`` clears the
-    note.
+    An empty ``category`` clears the category. A null or empty ``note`` clears
+    the note.
     """
 
     id: DatabaseId
-    category: Annotated[str | None, Field(max_length=128)] = None
+    category: Annotated[str, Field(max_length=128)] | None = None
     note: str | None = None
     exclude_from_cashflow: bool | None = None
+    voided: bool | None = None
+
+    @model_validator(mode="after")
+    def require_a_field(self) -> Self:
+        """Refuse a change that sets no field, or sets a non-note field to null."""
+        fields = self.model_fields_set - {"id"}
+        if not fields:
+            raise ValueError("a change must set at least one field")
+        nulls = [f for f in fields - {"note"} if getattr(self, f) is None]
+        if nulls:
+            raise ValueError(f"only note can be null: {sorted(nulls)}")
+        return self
 
 
-class TransactionCategorizeRequest(BaseModel):
-    dry_run: bool = True
-    items: Annotated[
-        list[TransactionCategorizeItem], Field(min_length=1, max_length=100)
+class TransactionApplyRequest(BaseModel):
+    """Changes to apply as one unit. Dry run is the default."""
+
+    changes: Annotated[
+        list[TransactionApplyChange], Field(min_length=1, max_length=500)
     ]
+    dry_run: bool = True
+
+    @model_validator(mode="after")
+    def require_unique_ids(self) -> Self:
+        """Refuse a request that names one row twice."""
+        ids = [change.id for change in self.changes]
+        if len(ids) != len(set(ids)):
+            raise ValueError("ids must be unique")
+        return self
 
 
-class TransactionCategorizeResponse(BaseModel):
+class TransactionFieldDiff(BaseModel):
+    before: str | bool | int | float | None
+    after: str | bool | int | float | None
+
+
+class TransactionApplyRow(BaseModel):
+    id: int
+    changes: dict[str, TransactionFieldDiff]
+
+
+class TransactionApplyResponse(BaseModel):
     dry_run: bool
-    items: list[TransactionListItem]
+    changed: list[TransactionApplyRow]
+    unchanged: list[int]
 
 
 class CategoryRead(BaseModel):
