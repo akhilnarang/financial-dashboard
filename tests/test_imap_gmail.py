@@ -135,7 +135,9 @@ def test_non_ascii_rule_searches_as_utf8_and_a_failed_rule_skips_alone(
     still fails the whole source.
     """
     monkeypatch.setattr(
-        imap_gmail.imaplib, "IMAP4_SSL", lambda host: _FakeGmail(host, refusal)
+        imap_gmail.imaplib,
+        "IMAP4_SSL",
+        lambda host, timeout=None: _FakeGmail(host, refusal),
     )
     rules = [
         FetchRule(id=1, bank="tick", sender=SENDERS[1], subject=SUBJECT_UTF8),
