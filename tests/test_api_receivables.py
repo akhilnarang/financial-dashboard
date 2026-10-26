@@ -11,14 +11,14 @@ from financial_dashboard.db import Transaction
 pytestmark = pytest.mark.anyio
 
 
-async def _row(session, direction: str, amount: str) -> int:
-    """Seed one INR transaction and return its id."""
+async def _row(session, direction: str, amount: str, currency: str = "INR") -> int:
+    """Seed one transaction and return its id."""
     txn = Transaction(
         bank="testbank",
         email_type="testbank_alert",
         direction=direction,
         amount=Decimal(amount),
-        currency="INR",
+        currency=currency,
         transaction_date=dt.date(2030, 3, 4),
     )
     session.add(txn)
@@ -93,41 +93,57 @@ async def test_payment_link_lowers_outstanding(client, session):
     ]
 
 
-# A debit cannot pay back. An id past the 64-bit SQLite range must not 500.
-@pytest.mark.parametrize("missing_id", [None, 9999, 2**63])
-async def test_link_rejects_unknown_or_wrong_direction_row(client, session, missing_id):
-    txn_id = missing_id or await _row(session, "debit", "100.00")
+# A debit cannot pay back, a credit is not a charge, and the ledger is INR
+# only. An id past the 64-bit SQLite range must not 500.
+@pytest.mark.parametrize(
+    ("row", "role"),
+    [
+        (("debit", "INR"), "payment"),
+        (("credit", "INR"), "charge"),
+        (("credit", "USD"), "payment"),
+        (9999, "payment"),
+        (2**63, "payment"),
+    ],
+)
+async def test_link_rejects_unknown_or_unfit_row(client, session, row, role):
+    txn_id = row if isinstance(row, int) else await _row(session, row[0], "100", row[1])
     rid = (
         await client.post("/api/receivables", json={"person": "A", "amount": "100"})
     ).json()["id"]
 
     response = await client.post(
         f"/api/receivables/{rid}/links",
-        json={"transaction_id": txn_id, "role": "payment"},
+        json={"transaction_id": txn_id, "role": role},
     )
     created = await client.post(
         "/api/receivables",
-        json={"person": "A", "amount": "100", "payment_transaction_ids": [txn_id]},
+        json={"person": "A", "amount": "100", f"{role}_transaction_ids": [txn_id]},
     )
 
     assert (response.status_code, created.status_code) == (422, 422)
     listed = (await client.get("/api/receivables")).json()["items"]
-    assert [item["payment_transaction_ids"] for item in listed] == [[]]
+    assert [item[f"{role}_transaction_ids"] for item in listed] == [[]]
 
 
-async def test_status_change_stamps_and_clears_closed_at(client):
+async def test_patch_changes_only_named_fields(client):
     rid = (
-        await client.post("/api/receivables", json={"person": "A", "amount": "50"})
+        await client.post(
+            "/api/receivables", json={"person": "A", "amount": "50", "note": "lunch"}
+        )
     ).json()["id"]
 
     closed = await client.patch(
         f"/api/receivables/{rid}", json={"status": "written_off"}
     )
-    reopened = await client.patch(f"/api/receivables/{rid}", json={"status": "open"})
+    reopened = await client.patch(
+        f"/api/receivables/{rid}", json={"status": "open", "note": None}
+    )
 
     assert closed.json()["status"] == "written_off"
     assert closed.json()["closed_at"] is not None
+    assert closed.json()["note"] == "lunch"
     assert reopened.json()["closed_at"] is None
+    assert reopened.json()["note"] is None
 
 
 async def test_list_and_page_filter_by_status(client):

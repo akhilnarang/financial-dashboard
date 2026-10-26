@@ -37,8 +37,9 @@ async def _seed_pair(
     statement_balance: Decimal | None = None,
     statement_date: dt.date = DAY + dt.timedelta(days=1),
     alert_on_statement: bool = False,
+    direction: str = "debit",
 ):
-    """Seed an alert row and a statement row for one synthetic debit."""
+    """Seed an alert row and a statement row for one synthetic event."""
     account = Account(bank="testbank", label="Test savings", type="bank_account")
     session.add(account)
     await session.flush()
@@ -65,7 +66,7 @@ async def _seed_pair(
         sms_message_id=sms.id,
         bank="testbank",
         email_type="testbank_account_debit_alert",
-        direction="debit",
+        direction=direction,
         amount=Decimal("1234.00"),
         currency="INR",
         transaction_date=DAY,
@@ -82,7 +83,7 @@ async def _seed_pair(
         bank_statement_upload_id=upload.id,
         bank="testbank",
         email_type="bank_statement",
-        direction="debit",
+        direction=direction,
         amount=Decimal("1234.00"),
         currency="INR",
         transaction_date=statement_date,
@@ -175,6 +176,9 @@ async def test_batch_merges_each_pair_once(client, session):
     session.add(email_copy)
     await session.commit()
     email_copy_id = email_copy.id
+    paid_alert, paid_statement, _ = await _seed_pair(
+        session, alert_ref="555666", statement_ref="UTR000555666", direction="credit"
+    )
     # A receivable links a row once, and a payment row pays one receivable.
     shared, own, paid, paid_twice = (
         Receivable(person=f"Friend {name}", amount=Decimal("100.00")) for name in "ABCD"
@@ -184,8 +188,8 @@ async def test_batch_merges_each_pair_once(client, session):
         ReceivableLink(transaction_id=statement_id, role="charge"),
     ]
     own.links = [ReceivableLink(transaction_id=statement_id, role="charge")]
-    paid.links = [ReceivableLink(transaction_id=alert_id, role="payment")]
-    paid_twice.links = [ReceivableLink(transaction_id=statement_id, role="payment")]
+    paid.links = [ReceivableLink(transaction_id=paid_alert, role="payment")]
+    paid_twice.links = [ReceivableLink(transaction_id=paid_statement, role="payment")]
     session.add_all([shared, own, paid, paid_twice])
     await session.commit()
     shared_id, own_id, paid_id = shared.id, own.id, paid.id
@@ -193,6 +197,7 @@ async def test_batch_merges_each_pair_once(client, session):
         (alert_id, statement_id),
         (other_alert, other_statement),
         (other_alert, email_copy_id),
+        (paid_alert, paid_statement),
     )
 
     response = await client.post("/api/transactions/merge-batch", json=request)
@@ -200,13 +205,17 @@ async def test_batch_merges_each_pair_once(client, session):
 
     assert response.status_code == 200
     assert repeat.status_code == 409
-    report = response.json()["merges"][0]
-    assert report["moved_references"] == {
-        "receivable_links": 3,
+    merges = response.json()["merges"]
+    seeded = {
         "sms_messages": 1,
         "audit_actions": 1,
         "bank_statement_uploads.reconciliation_data": 1,
     }
+    assert merges[0]["moved_references"] == seeded | {
+        "receivable_links": 1,
+        "receivable_links.dropped": 1,
+    }
+    assert merges[3]["moved_references"] == seeded | {"receivable_links.dropped": 1}
     session.expire_all()
     links = await session.execute(
         select(ReceivableLink.receivable_id, ReceivableLink.transaction_id)
@@ -214,7 +223,7 @@ async def test_batch_merges_each_pair_once(client, session):
     assert sorted(links) == [
         (shared_id, alert_id),
         (own_id, alert_id),
-        (paid_id, alert_id),
+        (paid_id, paid_alert),
     ]
     assert await session.get(Transaction, statement_id) is None
     assert await session.get(Transaction, other_statement) is None

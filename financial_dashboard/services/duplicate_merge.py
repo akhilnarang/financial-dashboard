@@ -273,8 +273,7 @@ async def move_references(
     moved = {}
     await supersede_active_decisions(session, old_id)
     await move_transaction_references(session, old_id, new_id)
-    if links := await move_receivable_links(session, old_id, new_id):
-        moved["receivable_links"] = links
+    moved.update(await move_receivable_links(session, old_id, new_id))
     for model in _REFERRING_MODELS:
         if new_id is None and model is CategoryReviewDecision:
             continue

@@ -5,7 +5,7 @@ computed from the linked rows on each read.
 """
 
 from decimal import Decimal
-from typing import NamedTuple, cast
+from typing import cast
 
 from sqlalchemy import CursorResult, delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -31,31 +31,6 @@ class LinkConflict(ValueError):
     """The link exists, or the payment row already pays another receivable."""
 
 
-class ReceivableTotals(NamedTuple):
-    paid: Decimal
-    outstanding: Decimal
-
-
-def receivable_totals(receivable: Receivable) -> ReceivableTotals:
-    """Compute what a person paid back and what they still owe.
-
-    Args:
-        receivable: A receivable with its links loaded.
-
-    Returns:
-        The sum of the linked payment rows, and the amount minus that sum.
-    """
-    paid = sum(
-        (
-            link.transaction.amount
-            for link in receivable.links
-            if link.role == ReceivableRole.payment
-        ),
-        Decimal("0.00"),
-    )
-    return ReceivableTotals(paid=paid, outstanding=receivable.amount - paid)
-
-
 def receivable_read(receivable: Receivable) -> ReceivableRead:
     """Build the API view of a receivable.
 
@@ -63,12 +38,15 @@ def receivable_read(receivable: Receivable) -> ReceivableRead:
         receivable: A receivable with its links loaded.
 
     Returns:
-        The receivable with its totals and linked row ids.
+        The receivable with its linked row ids, the sum of its payment
+        rows, and the amount minus that sum.
     """
-    paid, outstanding = receivable_totals(receivable)
+    paid = Decimal("0.00")
     ids = {role: [] for role in ReceivableRole}
     for link in sorted(receivable.links, key=lambda link: link.transaction_id):
         ids[ReceivableRole(link.role)].append(link.transaction_id)
+        if link.role == ReceivableRole.payment:
+            paid += link.transaction.amount
     return ReceivableRead(
         id=receivable.id,
         person=receivable.person,
@@ -78,7 +56,7 @@ def receivable_read(receivable: Receivable) -> ReceivableRead:
         created_at=receivable.created_at,
         closed_at=receivable.closed_at,
         paid=paid,
-        outstanding=outstanding,
+        outstanding=receivable.amount - paid,
         charge_transaction_ids=ids[ReceivableRole.charge],
         payment_transaction_ids=ids[ReceivableRole.payment],
     )
@@ -321,7 +299,7 @@ async def remove_link(
 
 async def move_receivable_links(
     session: AsyncSession, old_id: int, new_id: int | None
-) -> int:
+) -> dict[str, int]:
     """Point the links of a deleted transaction at its keeper, or drop them.
 
     A link is dropped when its receivable already links the keeper, or when
@@ -335,12 +313,15 @@ async def move_receivable_links(
             delete.
 
     Returns:
-        The number of links moved or dropped.
+        The nonzero counts: ``receivable_links`` for links moved, or removed
+        on a plain delete, and ``receivable_links.dropped`` for links dropped
+        on a merge.
     """
     stale = ReceivableLink.transaction_id == old_id
     if new_id is None:
         result = await session.execute(delete(ReceivableLink).where(stale))
-        return cast(CursorResult, result).rowcount
+        removed = cast(CursorResult, result).rowcount
+        return {"receivable_links": removed} if removed else {}
     keeper = ReceivableLink.transaction_id == new_id
     linked = select(ReceivableLink.receivable_id).where(keeper)
     pays = select(ReceivableLink.id).where(
@@ -358,4 +339,8 @@ async def move_receivable_links(
     moved = await session.execute(
         update(ReceivableLink).where(stale).values(transaction_id=new_id)
     )
-    return cast(CursorResult, dropped).rowcount + cast(CursorResult, moved).rowcount
+    counts = {
+        "receivable_links": cast(CursorResult, moved).rowcount,
+        "receivable_links.dropped": cast(CursorResult, dropped).rowcount,
+    }
+    return {key: n for key, n in counts.items() if n}
