@@ -161,7 +161,12 @@ if (smsFilterForm) {
 async function reparseSms(btn, smsId, forceNew = false) {
     if (forceNew && !confirm('Create a new transaction from this SMS?')) return;
     const label = btn.textContent;
-    btn.disabled = true;
+    const buttons = btn.closest('td').querySelectorAll('button');
+    const restore = () => {
+        buttons.forEach(b => { b.disabled = false; });
+        btn.textContent = label;
+    };
+    buttons.forEach(b => { b.disabled = true; });
     btn.textContent = 'Reparsing…';
     try {
         const url = forceNew ? `/sms/${smsId}/reparse?force_new=true` : `/sms/${smsId}/reparse`;
@@ -175,15 +180,15 @@ async function reparseSms(btn, smsId, forceNew = false) {
                             data.new_status === "parsed" ? "success" : "";
                 statusCell.innerHTML = `<span class="badge ${cls}">${data.new_status}</span>`;
             }
-            btn.closest('td').innerHTML = '<span class="text-muted">&mdash;</span>';
+            // A reparse that defers again keeps the row actionable.
+            if (data.new_status === "skipped") restore();
+            else btn.closest('td').innerHTML = '<span class="text-muted">&mdash;</span>';
         } else {
-            btn.disabled = false;
-            btn.textContent = label;
+            restore();
             alert('Reparse failed: ' + (data.detail || `HTTP ${resp.status}`));
         }
     } catch (e) {
-        btn.disabled = false;
-        btn.textContent = label;
+        restore();
         alert('Request failed: ' + e);
     }
 }
