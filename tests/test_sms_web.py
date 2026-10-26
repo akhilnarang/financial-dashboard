@@ -136,6 +136,10 @@ async def test_reparse_force_new_creates_row_for_deferred_sms(session, client):
     session.add(sms)
     await session.commit()
 
+    # The list and the detail view offer "Create as new" for a deferred SMS.
+    for page in ("/sms", f"/sms/{sms.id}/detail"):
+        assert "Create as new" in (await client.get(page)).text
+
     # Without force_new it defers again (no row).
     resp = await client.post(f"/sms/{sms.id}/reparse")
     assert resp.status_code == 200
@@ -148,6 +152,7 @@ async def test_reparse_force_new_creates_row_for_deferred_sms(session, client):
     data = resp.json()
     assert data["new_status"] == "parsed"
     assert data["txn_id"] is not None
+    assert "Create as new" not in (await client.get(f"/sms/{sms.id}/detail")).text
 
 
 @pytest.mark.anyio

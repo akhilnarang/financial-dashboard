@@ -34,6 +34,7 @@ from financial_dashboard.services.telegram import (
     send_enrichment_notification,
     send_transaction_notification,
 )
+from financial_dashboard.services.txn_merge import DUP_DEFER_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +373,7 @@ async def sms_list(
         {
             "active_page": "sms",
             "sms_rows": rows,
+            "dup_defer_prefix": DUP_DEFER_PREFIX,
             "banks": banks,
             "filters": filters,
             "page": page,
@@ -418,7 +420,7 @@ async def sms_detail(
     return templates.TemplateResponse(
         request,
         "partials/sms_detail.html",
-        {"sms": sms, "txn": txn},
+        {"sms": sms, "txn": txn, "dup_defer_prefix": DUP_DEFER_PREFIX},
     )
 
 
@@ -439,5 +441,6 @@ async def sms_page(
             "active_page": "sms",
             "sms": sms,
             "txn": txn,
+            "dup_defer_prefix": DUP_DEFER_PREFIX,
         },
     )
