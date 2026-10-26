@@ -426,6 +426,11 @@ async def run_turn(
         )
 
     active_categories = list(categories) or await get_active_slugs(session)
+    fitting_categories = (
+        await _fitting_slugs(session, target, active_categories)
+        if target is not None
+        else ()
+    )
     while calls_used < 4:
         if calls_used and renew_lease is not None and not await renew_lease():
             raise ProcessingLeaseLost
@@ -435,11 +440,7 @@ async def run_turn(
             transaction=serialize_tool_result(target) if target is not None else None,
             tool_results=tool_results,
             categories=active_categories,
-            fitting_categories=(
-                await _fitting_slugs(session, target, active_categories)
-                if target is not None
-                else ()
-            ),
+            fitting_categories=fitting_categories,
         )
         if context_size(prompt_context._asdict()) > MAX_CONTEXT_CHARS:
             return completed(
