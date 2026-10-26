@@ -11,15 +11,19 @@ from sqlalchemy import func, select
 from financial_dashboard.db import (
     Account,
     AuditAction,
+    AuditInteraction,
     BankStatementUpload,
     PaymentStatus,
     Receivable,
     ReceivableLink,
+    ReceivableMatchPrompt,
     SmsMessage,
     StatementUpload,
     TelegramMessageContext,
+    TelegramOutboundDelivery,
     Transaction,
 )
+from financial_dashboard.services.assistant.delivery import make_delivery
 from financial_dashboard.services.reminders import recompute_cc_payment_state
 from financial_dashboard.services.statements.bank import reconcile_bank_statement
 
@@ -190,9 +194,21 @@ async def test_batch_merges_each_pair_once(client, session):
     own.links = [ReceivableLink(transaction_id=statement_id, role="charge")]
     paid.links = [ReceivableLink(transaction_id=paid_alert, role="payment")]
     paid_twice.links = [ReceivableLink(transaction_id=paid_statement, role="payment")]
-    session.add_all([shared, own, paid, paid_twice])
+    # The match prompt of a merged-away row goes with its unsent message.
+    owner = AuditInteraction(inbound_chat_id=7, trigger="receivable_match")
+    session.add(owner)
+    await session.flush()
+    delivery = make_delivery(
+        recipient_chat_id=7, text="prompt", ordinal=0, interaction_id=owner.id
+    )
+    session.add(delivery)
+    await session.flush()
+    prompt = ReceivableMatchPrompt(
+        transaction_id=paid_statement, candidate_ids=[1], delivery_id=delivery.id
+    )
+    session.add_all([shared, own, paid, paid_twice, prompt])
     await session.commit()
-    shared_id, own_id, paid_id = shared.id, own.id, paid.id
+    shared_id, own_id, paid_id, delivery_id = shared.id, own.id, paid.id, delivery.id
     request = _batch(
         (alert_id, statement_id),
         (other_alert, other_statement),
@@ -225,6 +241,10 @@ async def test_batch_merges_each_pair_once(client, session):
         (own_id, alert_id),
         (paid_id, paid_alert),
     ]
+    assert (await session.scalars(select(ReceivableMatchPrompt))).all() == []
+    assert (await session.get(TelegramOutboundDelivery, delivery_id)).status == (
+        "cancelled"
+    )
     assert await session.get(Transaction, statement_id) is None
     assert await session.get(Transaction, other_statement) is None
     assert await session.get(Transaction, email_copy_id) is None

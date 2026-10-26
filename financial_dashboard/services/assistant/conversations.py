@@ -6,6 +6,7 @@ import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import TelegramConversation, utc_now
+from financial_dashboard.services.assistant.contracts import StoredConfirmation
 
 CONVERSATION_TTL = datetime.timedelta(hours=24)
 
@@ -43,17 +44,16 @@ async def touch_conversation(
 
 def set_pending_confirmation(
     conversation: TelegramConversation,
-    payload: dict[str, object],
+    payload: StoredConfirmation,
     *,
-    kind: str,
     source_interaction_id: int | None,
     expires_at: datetime.datetime,
     state_hash: str,
 ) -> None:
     conversation.pending_confirmation_json = json.dumps(
-        payload, separators=(",", ":"), sort_keys=True
+        payload.model_dump(mode="json"), separators=(",", ":"), sort_keys=True
     )
-    conversation.pending_confirmation_kind = kind
+    conversation.pending_confirmation_kind = payload.action.kind
     conversation.pending_confirmation_state_hash = state_hash
     conversation.pending_confirmation_source_interaction_id = source_interaction_id
     conversation.pending_confirmation_expires_at = expires_at

@@ -73,3 +73,9 @@ class ReceivableKind(StrEnum):
 class ReceivableRole(StrEnum):
     charge = "charge"
     payment = "payment"
+
+
+class PersonIdentifierKind(StrEnum):
+    counterparty = "counterparty"
+    vpa = "vpa"
+    phone = "phone"

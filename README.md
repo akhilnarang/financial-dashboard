@@ -144,6 +144,44 @@ SQLite backups do not include receipt files. Include
 `TRANSACTION_ATTACHMENT_ROOT` in durable storage and back it up separately
 from the database.
 
+The assistant can also list receivables, and, after a Yes tap, create a
+receivable, link a row to it, change its amount, status, person or note, or
+save a person identifier ("Friend A's UPI is ..."). It proposes a receivable
+write only when the message asks for one and does not negate it ("don't
+settle" asks for nothing). The confirmation hashes the receivable's amount,
+outstanding, status, person, note and links, so a change before the tap voids
+the button.
+
+#### Receivable payment prompts
+
+Each fetch cycle checks the rows created in the last 7 days against the open
+receivables. A row qualifies when it is in INR, not voided, not linked to a
+receivable, and not prompted before. Fixed rules decide a match; no LLM runs:
+
+- A receivable takes a credit; a payable takes a debit.
+- The amount equals the outstanding exactly. A partial payment is not offered.
+- A stored VPA or phone in the raw text, or a stored counterparty inside the
+  row's counterparty (alphanumerics only), is a strong match. A found VPA also
+  matches when a dash-joined narration glues a name prefix to it; the prefix
+  is dropped before a VPA is stored or compared. A person with no stored
+  identifiers matches when each name word of 4+ letters is in the counterparty.
+- A longer identifier that contains a shorter one wins. Other matches, such as
+  two names glued together by a joint account, are all offered, strong matches
+  first. More than three matches send no prompt.
+
+The prompt goes through the Telegram outbox with one `Link to <person>` button
+per match and a `Not this` button. A tap links the row as a payment and never
+changes the status; settle on the page, the API or the assistant. A tap checks
+again that the row is not voided, has the right direction, and equals the
+outstanding, and that the row still names the person. A tap acts only from the
+message that was sent for its prompt. Each payment link (API, button or assistant) stores the row's
+counterparty, and its VPA or phone when the raw text has exactly one, as
+identifiers of the person. A generic counterparty is not stored. A rename moves
+the identifiers to the new name, or copies them when another receivable still
+uses the old name. A new name that has identifiers, or that another receivable
+uses, gets none. No link takes a voided row, and a row that pays a receivable
+cannot be voided. The prompts need `telegram.assistant_enabled`.
+
 Open `/audit` for the interaction table and `/audit/{id}` for model, delivery,
 and mutation details. For offline evaluation, run
 `uv run python scripts/export_assistant_eval_data.py --output assistant-evals.jsonl`.
@@ -424,6 +462,8 @@ scripts/
 | `CategoryReviewDecision` | `category_review_decisions` | Persisted ordered category candidates and compare-and-swap selection state |
 | `Receivable` | `receivables` | Money a person owes the user (`kind = receivable`) or the user owes a person (`kind = payable`), in INR; `paid` and `outstanding` are computed from linked payment rows, not stored. A ledger only: it does not change cashflow figures |
 | `ReceivableLink` | `receivable_links` | Links a receivable to the row it was for (`charge`) or a row that pays it back (`payment`) |
+| `PersonIdentifier` | `person_identifiers` | A counterparty, VPA or phone that names a person in bank text; keyed by the normalized person name, not by receivable |
+| `ReceivableMatchPrompt` | `receivable_match_prompts` | One Telegram prompt per transaction that offers to link it to the open receivables it can pay |
 | `Setting` | `settings` | Small key/value store for app-level settings |
 | `ExtensionRun` | `extension_runs` | Audit/state row for a single extension operation (probe/generate/sync, manual or automatic); generic over `extension_id`, stores no credentials and never duplicates financial rows |
 | `ExtensionSyncState` | `extension_sync_state` | Per-extension current sync-state singleton (Paisa today): trigger-bumped `desired_revision` vs coordinator-advanced `applied_revision`, dirty window, published/remote/healthy hashes, retry backoff, diagnosis state, one-shot force-reload flag, and a single-flight lease. Exactly one row per extension; never stores credentials or duplicates financial rows |
@@ -735,6 +775,24 @@ erDiagram
         string role
     }
 
+    PERSON_IDENTIFIERS {
+        int id PK
+        string person
+        string kind
+        string value
+        datetime created_at
+    }
+
+    RECEIVABLE_MATCH_PROMPTS {
+        int id PK
+        int transaction_id FK
+        json candidate_ids
+        string status
+        int delivery_id FK
+        datetime created_at
+        datetime resolved_at
+    }
+
     TELEGRAM_CONVERSATIONS {
         int id PK
         int chat_id
@@ -891,6 +949,8 @@ erDiagram
     AUDIT_INTERACTIONS ||--o{ AUDIT_ACTIONS : records
     RECEIVABLES ||--o{ RECEIVABLE_LINKS : links
     TRANSACTIONS ||--o{ RECEIVABLE_LINKS : charges_or_pays
+    TRANSACTIONS ||--o| RECEIVABLE_MATCH_PROMPTS : prompts
+    TELEGRAM_OUTBOUND_DELIVERIES ||--o| RECEIVABLE_MATCH_PROMPTS : delivers
 ```
 
 `transactions.category` references `categories.slug` as a soft (application-enforced) link — SQLite foreign-key enforcement is intentionally off, so there is no DB-level FK constraint.
@@ -899,6 +959,7 @@ Relationship notes:
 - `transactions.account_id` and `transactions.card_id` are the canonical account/card links after the linker runs; `card_mask` and `account_mask` remain as parser-derived denormalized hints.
 - `balance_snapshots.portfolio_key` is a CAS forward-fill key for investment rows, not a foreign key. Parser/linker hints such as `card_mask` and `account_mask` remain denormalized text.
 - `settings` is intentionally standalone and has no foreign-key links.
+- `person_identifiers` is standalone: `person` matches `receivables.person` after lowercasing and collapsing spaces, not by foreign key. `receivable_match_prompts.candidate_ids` lists receivable ids as JSON, not as foreign keys.
 - `extension_runs` is intentionally standalone: `extension_id` is a free-form string matching a registered extension manifest id (today only `paisa`), not a foreign key. It records what an extension did (operation/status/outcome/counts/hashes) and never stores credentials or duplicates financial rows.
 - `extension_sync_state` is likewise a standalone singleton keyed by `extension_id` (a free-form string, today only `paisa`), not a foreign key. It records where each extension's reconciled state is *right now* (desired vs applied revision, dirty window, hashes, retry backoff, diagnosis, lease) — exactly one row per extension, never growing with operation count. `extension_runs` is the per-operation audit log; this row is the per-extension current state.
 - Several foreign keys are nullable (`fetch_rules.source_id`, `emails.source_id`, `emails.rule_id`, and the upload/transaction linkage columns), so rows can exist before the related record is known.
@@ -923,6 +984,8 @@ Relationship notes:
 - Pending confirmations and in-flight assistant writes check a hash over category, note, cashflow exclusion, date, account/card/reference identifiers, and the current categorization input state. The pending confirmation's nullable source-interaction foreign key binds an affirmative reply to the application-rendered clarification that authorized it. `audit_interactions.output_mode` records whether provider output used a strict schema or fallback JSON mode.
 - `receivables.kind` is `receivable` or `payable`. `receivables.amount` must be positive and `status` is one of `open`, `settled`, `written_off`. A move to `settled` or `written_off` stamps `closed_at`; a move back to `open` clears it.
 - `(receivable_id, transaction_id)` is unique on `receivable_links`, and `role` is `charge` or `payment`. For a receivable the charge is a debit and the payment a credit; a payable flips both. A partial unique index on `transaction_id` where `role = 'payment'` lets a payment row pay one receivable only, so its money counts once. A merge moves a deleted row's links to the keeper and drops a link the keeper already has (or a payment link when the keeper already pays a receivable); a plain delete drops them.
+- `(person, kind, value)` is unique on `person_identifiers`, and `kind` is `counterparty`, `vpa` or `phone`. A counterparty value keeps only alphanumerics (4+); a VPA is lowercase `name@handle`; a phone is a 10-digit mobile number.
+- `receivable_match_prompts.transaction_id` is unique, so a row is prompted once. `status` is `pending`, `linked` or `dismissed`; a tap acts only on a `pending` prompt. A merge or delete of the row removes its prompt and cancels its unsent message. The prompt's outbox row is owned by an `audit_interactions` row with `trigger = receivable_match`.
 - `(portfolio_key, statement_date)` is unique on `cas_uploads` so re-importing the same CAS period replaces the prior upload.
 - `investment_lots` carries a natural unique key `(cas_upload_id, source_ref, instrument_id, acquired_on, reference, source_occurrence)`. `source_occurrence` preserves genuine multiplicity inside one source statement, while idempotent normalization cannot insert the same occurrence twice. Rows repeated by overlapping CAS periods remain attached to every contributing upload; the investment service exposes a deterministic canonical multiset keyed by portfolio/source transaction identity/instrument/date/reference/quantity/cost and retains all contributing upload provenance. A lot is only created when the source states quantity, per-unit cost, cost basis, currency and acquisition date explicitly and consistently (`quantity * unit_cost == cost_basis` to the penny); value-only holdings and demat movements (CAS prints no cost) are excluded and reported as diagnostics, never fabricated into a lot. Acquisition cost facts are never derived from a current NAV/value. Current valuation facts are read separately from the latest statement per portfolio and preserve demat-account/folio identity even when the same ISIN is held in several sources. These rows are **not** consumed by the Paisa projection, which represents CAS as an aggregate valuation only; they remain available to the dashboard and to a future cost-basis feature.
 - `snapshot_holdings` has nullable investment-detail columns (`instrument_id`, `quantity`, `unit_price`, `currency`, `cost_basis`, `acquired_on`). CAS ingestion still aggregates holdings by asset class for the net-worth breakdown, so these stay NULL on those rows; they are populated only when a holding represents a single instrument the CAS explicitly priced.
@@ -1005,8 +1068,9 @@ uv run python scripts/seed.py
 | `GET` | `/api/extensions/paisa/status` | Read-only probe of the Paisa instance |
 | `GET` | `/api/receivables?status=open` | List receivables with `paid`, `outstanding`, and linked row ids |
 | `POST` | `/api/receivables` | Create a receivable (`kind` defaults to `receivable`, or `payable`; `person`, `amount`, `note`, optional `charge_transaction_ids`/`payment_transaction_ids`) |
-| `PATCH` | `/api/receivables/{id}` | Change `amount`, `note`, or `status` |
+| `PATCH` | `/api/receivables/{id}` | Change `amount`, `note`, `status`, or `person` |
 | `POST`/`DELETE` | `/api/receivables/{id}/links[/{transaction_id}]` | Link a row with a `role`, or unlink it |
+| `GET`/`POST` | `/api/receivables/identifiers` | List person identifiers, or store one (`person`, `kind` = `counterparty`/`vpa`/`phone`, `value`) |
 
 The full Paisa JSON surface (`/accounts`, `/probe`, `/preview`, `/generate`, `/sync`) is documented in [Extensions → Routes](#routes).
 

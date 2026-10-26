@@ -28,6 +28,12 @@ from financial_dashboard.services.statement_settlement import (
     answer,
     row_digest,
 )
+from financial_dashboard.services.assistant.contracts import (
+    LinkReceivable,
+    ReceivableWriteConfirmation,
+    StoredConfirmation,
+)
+from financial_dashboard.services.assistant.intent_policy import POLICY_VERSION
 from tests.conftest import new_test_engine
 
 pytestmark = pytest.mark.anyio
@@ -143,6 +149,22 @@ async def _rows(maker) -> list[Transaction]:
         )
 
 
+def _link_confirmation(transaction_id: int) -> str:
+    """Return a valid stored confirmation that links this row to receivable 1."""
+    return StoredConfirmation(
+        action=ReceivableWriteConfirmation(
+            kind="receivable_write",
+            request=LinkReceivable(
+                name="link_receivable",
+                receivable_id=1,
+                transaction_id=transaction_id,
+                role="charge",
+            ),
+        ),
+        policy_version=POLICY_VERSION,
+    ).model_dump_json()
+
+
 async def test_a_fold_states_what_the_statement_states(maker):
     """Verifies that merging overwrites stored transaction fields with statement data.
 
@@ -183,6 +205,16 @@ async def test_a_fold_states_what_the_statement_states(maker):
                 pending_confirmation_kind="merchant_rule",
             )
         )
+        # A pending link of the folded row goes. One of the survivor stays.
+        session.add_all(
+            TelegramConversation(
+                chat_id=7,
+                started_by="ask",
+                pending_confirmation_json=_link_confirmation(transaction_id),
+                pending_confirmation_kind="receivable_write",
+            )
+            for transaction_id in (2, 1)
+        )
         session.add(
             Receivable(
                 person="Friend A",
@@ -208,7 +240,7 @@ async def test_a_fold_states_what_the_statement_states(maker):
     async with maker() as session:
         context = await session.scalar(select(TelegramMessageContext))
         queued = await session.scalar(select(AuditInteraction))
-        conversation = await session.scalar(select(TelegramConversation))
+        conversations = (await session.scalars(select(TelegramConversation))).all()
         link = await session.scalar(select(ReceivableLink.transaction_id))
     assert (
         context.transaction_id,
@@ -217,7 +249,11 @@ async def test_a_fold_states_what_the_statement_states(maker):
         row.attachment_path,
     ) == (1, 1, 1, "receipt.jpg")
     # A later "yes" must not apply an action that names the deleted id.
-    assert conversation.pending_confirmation_json is None
+    assert [c.pending_confirmation_json for c in conversations] == [
+        None,
+        None,
+        _link_confirmation(1),
+    ]
 
 
 async def test_only_the_row_the_prompt_showed_is_folded_once(maker):

@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from financial_dashboard.db.enums import ReceivableStatus
 from financial_dashboard.db.models import (
     Account,
     AuditAction,
@@ -39,6 +40,7 @@ from financial_dashboard.services.assistant.contracts import (
     Answer,
     ApplyTransactionChanges,
     AssistantResponse,
+    ConfirmationAction,
     CategoryCandidate,
     CategoryProposal,
     Clarification,
@@ -46,10 +48,21 @@ from financial_dashboard.services.assistant.contracts import (
     ToolCalls,
     GetTransaction,
     ListCategories,
+    ListReceivables,
     ListTransactions,
+    AddPersonIdentifier,
+    CreateReceivable,
+    LinkReceivable,
+    UpdateReceivable,
+    MerchantRuleConfirmation,
+    ReadCall,
+    ReceivableWrite,
+    ReceivableWriteCall,
+    ReceivableWriteConfirmation,
+    StoredConfirmation,
+    TransactionChangeConfirmation,
     parse_response,
 )
-from financial_dashboard.services.assistant.contracts import MerchantRuleConfirmation
 from financial_dashboard.services.assistant.intent_policy import (
     POLICY_VERSION,
     derive_merchant_pattern,
@@ -57,6 +70,7 @@ from financial_dashboard.services.assistant.intent_policy import (
     has_global_no_change,
     has_non_mutating_intent,
     is_direct_affirmative,
+    is_receivable_write_request,
     parse_instruction,
 )
 from financial_dashboard.services.assistant.mutations import (
@@ -70,6 +84,14 @@ from financial_dashboard.services.assistant.mutations import (
     unrequested_exclusion,
 )
 from financial_dashboard.services.assistant.prompt import PromptContext
+from financial_dashboard.services.assistant.receivable_writes import (
+    apply_receivable_write,
+    describe_receivable_write,
+    receivable_state_hash,
+)
+from financial_dashboard.schemas.receivables import ReceivableRead
+from financial_dashboard.services.person_identifiers import normalize_person
+from financial_dashboard.services.receivables import list_receivables, receivable_read
 from financial_dashboard.services.assistant.provider import (
     AssistantProvider,
     ProviderFailure,
@@ -268,72 +290,112 @@ async def current_confirmation_state_hash(
     return compute_transaction_confirmation_hash(txn, account_type)
 
 
-async def _dispatch_read(session: AsyncSession, call: object) -> object:
-    if isinstance(call, GetTransaction):
-        return await get_transaction(session, call.transaction_id)
-    if isinstance(call, ListCategories):
-        return await get_active_slugs(session)
-    if isinstance(call, ListTransactions):
-        try:
-            date_from = (
-                datetime.date.fromisoformat(call.date_from) if call.date_from else None
-            )
-            date_to = (
-                datetime.date.fromisoformat(call.date_to) if call.date_to else None
-            )
-            amount = Decimal(call.amount) if call.amount else None
+async def _dispatch_read(
+    session: AsyncSession, call: ReadCall
+) -> (
+    AssistantTransaction
+    | None
+    | list[str]
+    | list[AssistantTransaction]
+    | list[ReceivableRead]
+):
+    """Run one read tool call.
+
+    Args:
+        session: The turn session.
+        call: The read call that the model asked for.
+
+    Returns:
+        The rows or values that the call reads.
+
+    Raises:
+        MutationRejected: A transaction filter is not valid, or the tool is
+            unknown.
+    """
+    match call:
+        case GetTransaction():
+            return await get_transaction(session, call.transaction_id)
+        case ListCategories():
+            return await get_active_slugs(session)
+        case ListReceivables():
+            status = ReceivableStatus(call.status) if call.status else None
+            person = normalize_person(call.person or "")
+            return [
+                read
+                for read in map(
+                    receivable_read, await list_receivables(session, status)
+                )
+                if (call.kind is None or read.kind == call.kind)
+                and person in normalize_person(read.person)
+            ]
+        case ListTransactions():
+            try:
+                date_from = (
+                    datetime.date.fromisoformat(call.date_from)
+                    if call.date_from
+                    else None
+                )
+                date_to = (
+                    datetime.date.fromisoformat(call.date_to) if call.date_to else None
+                )
+                amount = Decimal(call.amount) if call.amount else None
+            except (ValueError, InvalidOperation) as exc:
+                raise MutationRejected("invalid transaction filter") from exc
             if amount is not None and not amount.is_finite():
-                raise ValueError("amount must be finite")
-        except (ValueError, InvalidOperation) as exc:
-            raise MutationRejected("invalid transaction filter") from exc
-        return await list_transactions(
-            session,
-            limit=call.limit,
-            offset=0,
-            account_id=call.account_id,
-            date_from=date_from,
-            date_to=date_to,
-            direction=call.direction,
-            category=call.category,
-            search=call.search,
-            excluded=call.excluded,
-            transaction_ids=call.transaction_ids,
-            amount=amount,
-            bank=call.bank,
-            source=call.source,
-            review_status=call.review_status,
-            reference=call.reference,
-        )
-    raise MutationRejected("unsupported tool")
+                raise MutationRejected("invalid transaction filter")
+            return await list_transactions(
+                session,
+                limit=call.limit,
+                offset=0,
+                account_id=call.account_id,
+                date_from=date_from,
+                date_to=date_to,
+                direction=call.direction,
+                category=call.category,
+                search=call.search,
+                excluded=call.excluded,
+                transaction_ids=call.transaction_ids,
+                amount=amount,
+                bank=call.bank,
+                source=call.source,
+                review_status=call.review_status,
+                reference=call.reference,
+            )
+        case _:
+            raise MutationRejected("unsupported tool")
 
 
 async def _persist_pending(
     session: AsyncSession,
     conversation_id: int | None,
-    action: dict[str, object],
+    action: ConfirmationAction,
     *,
     source_interaction_id: int | None,
     transaction_state_hash: str,
     direction_policy: DirectionPolicy,
 ) -> None:
-    if conversation_id is None:
+    """Store the action that a Yes reply or tap applies on this conversation.
+
+    Raises:
+        MutationRejected: The turn has no conversation to hold the action.
+    """
+    if (
+        conversation_id is None
+        or (conversation := await session.get(TelegramConversation, conversation_id))
+        is None
+    ):
         raise MutationRejected("a confirmation needs a conversation")
-    conversation = await session.get(TelegramConversation, conversation_id)
-    if conversation is None:
-        raise MutationRejected("a confirmation needs a conversation")
-    payload: dict[str, object] = {
-        "action": action,
-        "policy_version": POLICY_VERSION,
-        "direction_policy": direction_policy.value,
-    }
     from financial_dashboard.services.assistant.conversations import (
         set_pending_confirmation,
     )
 
     set_pending_confirmation(
         conversation,
-        payload,
-        kind=str(action["kind"]),
+        StoredConfirmation(
+            action=action,
+            policy_version=POLICY_VERSION,
+            direction_policy=direction_policy.value,
+        ),
         source_interaction_id=source_interaction_id,
         expires_at=min(
             as_utc(conversation.expires_at) if conversation.expires_at else utc_now(),
@@ -473,7 +535,8 @@ async def run_turn(
             and response.pending_confirmation is not None
             or isinstance(response, ToolCalls)
             and any(
-                isinstance(call, ApplyTransactionChanges) for call in response.calls
+                isinstance(call, ApplyTransactionChanges | ReceivableWriteCall)
+                for call in response.calls
             )
         )
         if writes_target:
@@ -567,7 +630,7 @@ async def run_turn(
                         await _persist_pending(
                             session,
                             conversation_id,
-                            pending.model_dump(),
+                            pending,
                             source_interaction_id=interaction_id,
                             transaction_state_hash=state_hash,
                             direction_policy=_request_direction_policy(
@@ -617,7 +680,10 @@ async def run_turn(
                 for call in response.calls
                 if isinstance(call, ApplyTransactionChanges)
             ]
-            if len(mutation_calls) > 1:
+            receivable_calls = [
+                call for call in response.calls if isinstance(call, ReceivableWriteCall)
+            ]
+            if len(mutation_calls) + len(receivable_calls) > 1:
                 return completed(
                     Error(
                         outcome="error",
@@ -646,20 +712,33 @@ async def run_turn(
                 # Validate and execute every read before applying the sole mutation.
                 # A rejected later call can therefore never leave an earlier write.
                 for call in response.calls:
-                    if isinstance(call, ApplyTransactionChanges):
+                    if isinstance(call, ApplyTransactionChanges | ReceivableWriteCall):
                         continue
                     tool_result = await _dispatch_read(session, call)
-                    if hasattr(tool_result, "id"):
-                        pending_read_ids.add(cast(int, tool_result.id))
-                    elif isinstance(tool_result, Sequence):
-                        pending_read_ids.update(
-                            row.id for row in tool_result if hasattr(row, "id")
-                        )
+                    match tool_result:
+                        case AssistantTransaction():
+                            pending_read_ids.add(tool_result.id)
+                        case list():
+                            pending_read_ids.update(
+                                row.id
+                                for row in tool_result
+                                if isinstance(row, AssistantTransaction)
+                            )
                     pending_tool_results.append(
                         {
                             "tool": call.name,
                             "result": serialize_tool_result(tool_result),
                         }
+                    )
+                if receivable_calls:
+                    return completed(
+                        await _confirm_receivable_write(
+                            session,
+                            receivable_calls[0],
+                            user_message=user_message,
+                            conversation_id=conversation_id,
+                            interaction_id=interaction_id,
+                        )
                     )
                 if mutation_calls:
                     call = mutation_calls[0]
@@ -790,13 +869,35 @@ async def run_turn(
     )
 
 
+def _stored_confirmation(
+    conversation: TelegramConversation, payload: str
+) -> StoredConfirmation:
+    """Parse the stored confirmation JSON of a conversation, or clear and refuse it.
+
+    A confirmation that does not parse can never apply. Clearing it keeps it
+    from blocking every later "yes".
+
+    Raises:
+        MutationRejected: The stored JSON is not a valid confirmation.
+    """
+    from financial_dashboard.services.assistant.conversations import (
+        clear_pending_confirmation,
+    )
+
+    try:
+        return StoredConfirmation.model_validate_json(payload)
+    except ValueError as exc:
+        clear_pending_confirmation(conversation)
+        raise MutationRejected("stored confirmation is invalid") from exc
+
+
 async def claim_pending_confirmation(
     session: AsyncSession,
     conversation_id: int,
     state_hash: str,
     *,
     replied_to_interaction_id: int,
-) -> ApplyTransactionChanges | None:
+) -> ApplyTransactionChanges | ReceivableWrite | None:
     """Use compare-and-swap to claim an application-authored pending action for a direct reply."""
     conversation = await session.get(TelegramConversation, conversation_id)
     if (
@@ -812,35 +913,23 @@ async def claim_pending_confirmation(
     payload = conversation.pending_confirmation_json
     if not payload:
         return None
-    try:
-        wrapper = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise MutationRejected("stored confirmation is invalid") from exc
-    if wrapper.get("policy_version") != POLICY_VERSION:
+    stored = _stored_confirmation(conversation, payload)
+    if stored.policy_version != POLICY_VERSION:
         return None
-    pending = wrapper.get("action")
-    if not isinstance(pending, dict):
-        return None
-    try:
-        if pending.get("kind") == "merchant_rule":
-            typed = MerchantRuleConfirmation.model_validate(pending)
+    match stored.action:
+        case MerchantRuleConfirmation(transaction_id=transaction_id, category=slug):
             request = ApplyTransactionChanges(
                 name="apply_transaction_changes",
-                transaction_id=typed.transaction_id,
-                changes={"category": {"op": "set", "value": typed.category}},
-                merchant_rule={
-                    "category": typed.category,
-                    "intent_evidence": typed.category,
-                },
+                transaction_id=transaction_id,
+                changes={"category": {"op": "set", "value": slug}},
+                merchant_rule={"category": slug, "intent_evidence": slug},
             )
-        elif pending.get("kind") == "transaction_change":
-            request = ApplyTransactionChanges.model_validate(pending.get("request"))
-            if request.transaction_id != pending.get("transaction_id"):
+        case TransactionChangeConfirmation(transaction_id=transaction_id):
+            request = stored.action.request
+            if request.transaction_id != transaction_id:
                 return None
-        else:
-            return None
-    except (ValueError, TypeError) as exc:
-        raise MutationRejected("stored confirmation is invalid") from exc
+        case ReceivableWriteConfirmation():
+            request = stored.action.request
     claimed = await session.execute(
         update(TelegramConversation)
         .where(
@@ -866,8 +955,12 @@ async def run_pending_confirmation(
     replied_to_interaction_id: int,
     interaction_id: int | None = None,
     authorized_chat_id: int | None = None,
-) -> MutationResult:
-    """Consume a pending confirmation and apply it atomically."""
+) -> MutationResult | str:
+    """Consume a pending confirmation and apply it atomically.
+
+    Returns:
+        The transaction change, or the reply text of a receivable write.
+    """
     if not is_direct_affirmative(user_message):
         raise MutationRejected("confirmation must be a direct affirmative")
     # Acquire SQLite's writer lock before reading the confirmation fingerprint.
@@ -875,25 +968,23 @@ async def run_pending_confirmation(
     # and the confirmation compare-and-swap, allowing a stale action to proceed.
     await _lock_authorized_chat(session, authorized_chat_id)
     fresh_hash = None
+    pending_direction_policy = DirectionPolicy.INFERRED_STRICT
     conversation = await session.get(TelegramConversation, conversation_id)
     if conversation is not None and conversation.pending_confirmation_json:
-        try:
-            wrapper = json.loads(conversation.pending_confirmation_json)
-        except json.JSONDecodeError as exc:
-            raise MutationRejected("stored confirmation is invalid") from exc
-        action = wrapper.get("action", {})
-        if isinstance(action, dict) and isinstance(action.get("transaction_id"), int):
-            fresh_hash = await current_confirmation_state_hash(
-                session, action["transaction_id"]
-            )
-        try:
-            pending_direction_policy = DirectionPolicy(
-                wrapper.get("direction_policy", DirectionPolicy.INFERRED_STRICT)
-            )
-        except ValueError as exc:
-            raise MutationRejected("stored confirmation is invalid") from exc
-    else:
-        pending_direction_policy = DirectionPolicy.INFERRED_STRICT
+        stored = _stored_confirmation(
+            conversation, conversation.pending_confirmation_json
+        )
+        match stored.action:
+            case ReceivableWriteConfirmation(request=write):
+                fresh_hash = await receivable_state_hash(session, write)
+            case (
+                MerchantRuleConfirmation(transaction_id=transaction_id)
+                | TransactionChangeConfirmation(transaction_id=transaction_id)
+            ):
+                fresh_hash = await current_confirmation_state_hash(
+                    session, transaction_id
+                )
+        pending_direction_policy = DirectionPolicy(stored.direction_policy)
     if fresh_hash != state_hash:
         raise MutationRejected("transaction changed since confirmation was requested")
     async with session.begin_nested():
@@ -905,14 +996,23 @@ async def run_pending_confirmation(
         )
         if request is None:
             raise MutationRejected("confirmation is expired or already used")
-        result = await apply_transaction_changes(
-            session,
-            request,
-            current_user_message=user_message,
-            interaction_id=interaction_id,
-            confirmed_pending=True,
-            direction_policy=pending_direction_policy,
-        )
+        match request:
+            case ApplyTransactionChanges():
+                result = await apply_transaction_changes(
+                    session,
+                    request,
+                    current_user_message=user_message,
+                    interaction_id=interaction_id,
+                    confirmed_pending=True,
+                    direction_policy=pending_direction_policy,
+                )
+            case (
+                CreateReceivable()
+                | LinkReceivable()
+                | UpdateReceivable()
+                | AddPersonIdentifier()
+            ):
+                result = await apply_receivable_write(session, request)
         await session.execute(
             update(TelegramConversation)
             .where(TelegramConversation.id == conversation_id)
@@ -1024,10 +1124,6 @@ def _marked_transaction_ids(text: str) -> set[int]:
     }
 
 
-class _DryRun(Exception):
-    """Roll back a validation-only apply."""
-
-
 def _describe_changes(request: ApplyTransactionChanges) -> str:
     changes = request.changes
     parts = []
@@ -1072,30 +1168,29 @@ async def _confirm_change(
     if request.merchant_rule is not None:
         raise MutationRejected("a merchant rule needs a direct instruction")
     await raise_vetoes(session, request, user_message)
+    # A validation-only apply. The tap supplies the intent; every other check runs.
+    savepoint = await session.begin_nested()
     try:
-        async with session.begin_nested():
-            # The tap supplies the intent. Every other check still runs.
-            await apply_transaction_changes(
-                session,
-                request,
-                current_user_message=user_message,
-                direction_policy=direction_policy,
-                confirmed_pending=True,
-            )
-            raise _DryRun
-    except _DryRun:
-        pass
+        await apply_transaction_changes(
+            session,
+            request,
+            current_user_message=user_message,
+            direction_policy=direction_policy,
+            confirmed_pending=True,
+        )
+    finally:
+        await savepoint.rollback()
     state_hash = await current_confirmation_state_hash(session, request.transaction_id)
     if state_hash is None:
         raise MutationRejected("transaction not found")
     await _persist_pending(
         session,
         conversation_id,
-        {
-            "kind": "transaction_change",
-            "transaction_id": request.transaction_id,
-            "request": request.model_dump(mode="json"),
-        },
+        TransactionChangeConfirmation(
+            kind="transaction_change",
+            transaction_id=request.transaction_id,
+            request=request,
+        ),
         source_interaction_id=interaction_id,
         transaction_state_hash=state_hash,
         direction_policy=direction_policy,
@@ -1110,6 +1205,39 @@ async def _confirm_change(
     return Clarification(
         outcome="clarification", question=question[0].upper() + question[1:]
     )
+
+
+async def _confirm_receivable_write(
+    session: AsyncSession,
+    request: ReceivableWrite,
+    *,
+    user_message: str,
+    conversation_id: int | None,
+    interaction_id: int | None,
+) -> Clarification:
+    """Ask the user to confirm a receivable write before it is written.
+
+    A dry run checks the write first. The question comes from stored data.
+    """
+    if not is_receivable_write_request(user_message):
+        raise MutationRejected("the message does not ask for a receivable change")
+    savepoint = await session.begin_nested()
+    try:
+        await apply_receivable_write(session, request)
+    finally:
+        await savepoint.rollback()
+    if (state_hash := await receivable_state_hash(session, request)) is None:
+        raise MutationRejected("receivable not found")
+    question = await describe_receivable_write(session, request)
+    await _persist_pending(
+        session,
+        conversation_id,
+        ReceivableWriteConfirmation(kind="receivable_write", request=request),
+        source_interaction_id=interaction_id,
+        transaction_state_hash=state_hash,
+        direction_policy=DirectionPolicy.INFERRED_STRICT,
+    )
+    return Clarification(outcome="clarification", question=question)
 
 
 def _legacy_transaction_id(text: str) -> int | None:
@@ -2322,6 +2450,8 @@ async def _apply_pending(
         return OrchestrationResult(
             Error(outcome="error", message=str(exc), code="confirmation_rejected")
         )
+    if isinstance(mutation, str):
+        return OrchestrationResult(Answer(outcome="answer", text=mutation))
     return OrchestrationResult(
         Answer(outcome="answer", text="Saved."), mutation=mutation
     )

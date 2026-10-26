@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     Numeric,
     String,
     Text,
@@ -1101,5 +1102,62 @@ class ReceivableLink(Base):
             "transaction_id",
             unique=True,
             sqlite_where=text("role = 'payment'"),
+        ),
+    )
+
+
+class PersonIdentifier(Base):
+    """A value that names a person in bank text: a counterparty, a VPA or a phone.
+
+    ``person`` is the lowercase receivable name with single spaces. A
+    counterparty value keeps only alphanumerics.
+    """
+
+    __tablename__ = "person_identifiers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    person: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    value: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint("person", "kind", "value", name="uq_person_identifier"),
+        CheckConstraint(
+            "kind IN ('counterparty', 'vpa', 'phone')", name="ck_person_identifier_kind"
+        ),
+    )
+
+
+class ReceivableMatchPrompt(Base):
+    """The Telegram prompt that offers to link a row to an open receivable.
+
+    One row per transaction, so the sweep asks once.
+    """
+
+    __tablename__ = "receivable_match_prompts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    transaction_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("transactions.id"), nullable=False, unique=True
+    )
+    candidate_ids: Mapped[list[int]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="pending", server_default="pending"
+    )
+    delivery_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("telegram_outbound_deliveries.id")
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    resolved_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'linked', 'dismissed')",
+            name="ck_receivable_match_prompt_status",
         ),
     )

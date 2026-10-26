@@ -10,11 +10,18 @@ from financial_dashboard.db.models import Receivable
 from financial_dashboard.exceptions import NotFoundException
 from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.schemas.receivables import (
+    PersonIdentifierCreate,
+    PersonIdentifierListResponse,
+    PersonIdentifierRead,
     ReceivableCreate,
     ReceivableLinkCreate,
     ReceivableListResponse,
     ReceivableRead,
     ReceivableUpdate,
+)
+from financial_dashboard.services.person_identifiers import (
+    add_identifier,
+    list_identifiers,
 )
 from financial_dashboard.services.receivables import (
     add_link,
@@ -86,7 +93,7 @@ async def receivables_update(
     payload: ReceivableUpdate,
     session: AsyncSessionDep,
 ) -> ReceivableRead:
-    """Change the amount, note or status of a receivable.
+    """Change the amount, note, status or person of a receivable.
 
     Args:
         receivable_id: The receivable to change.
@@ -143,3 +150,39 @@ async def receivables_unlink(
     if receivable is None:
         raise NotFoundException(detail="Link not found")
     return receivable_read(receivable)
+
+
+@router.get("/receivables/identifiers")
+async def identifiers_list(session: AsyncSessionDep) -> PersonIdentifierListResponse:
+    """List the stored identifiers of every person.
+
+    Args:
+        session: The request session.
+
+    Returns:
+        The identifiers, by person.
+    """
+    rows = await list_identifiers(session)
+    return PersonIdentifierListResponse(
+        items=[
+            PersonIdentifierRead.model_validate(row, from_attributes=True)
+            for row in rows
+        ]
+    )
+
+
+@router.post("/receivables/identifiers", status_code=201)
+async def identifiers_create(
+    payload: PersonIdentifierCreate, session: AsyncSessionDep
+) -> PersonIdentifierRead:
+    """Store a counterparty, VPA or phone that names a person.
+
+    Args:
+        payload: The person, kind and value.
+        session: The request session.
+
+    Returns:
+        The stored identifier.
+    """
+    row = await add_identifier(session, payload)
+    return PersonIdentifierRead.model_validate(row, from_attributes=True)

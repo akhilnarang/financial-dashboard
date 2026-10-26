@@ -19,6 +19,8 @@ from financial_dashboard.db.enums import (
 from financial_dashboard.db.models import (
     Receivable,
     ReceivableLink,
+    ReceivableMatchPrompt,
+    TelegramOutboundDelivery,
     Transaction,
     utc_now,
 )
@@ -30,6 +32,10 @@ from financial_dashboard.schemas.receivables import (
     ReceivableCreate,
     ReceivableRead,
     ReceivableUpdate,
+)
+from financial_dashboard.services.person_identifiers import (
+    learn_identifiers,
+    rename_identifiers,
 )
 
 ROLE_DIRECTION = {
@@ -130,10 +136,14 @@ async def _linkable(
         raise UnprocessableEntityException(
             detail=f"Transaction {transaction_id} is not in INR"
         )
+    if txn.voided:
+        raise UnprocessableEntityException(
+            detail=f"Transaction {transaction_id} is voided"
+        )
     return txn
 
 
-async def _write_lock(session: AsyncSession) -> None:
+async def write_lock(session: AsyncSession) -> None:
     """Take the SQLite write lock. It holds until the commit or rollback.
 
     Args:
@@ -146,41 +156,7 @@ async def _write_lock(session: AsyncSession) -> None:
         await session.execute(text("BEGIN IMMEDIATE"))
 
 
-async def _new_links(
-    session: AsyncSession,
-    kind: ReceivableKind,
-    wanted: list[tuple[int, ReceivableRole]],
-) -> list[ReceivableLink]:
-    """Build links under the write lock. Roll back and raise on a bad row.
-
-    The SQLite write lock holds until the commit, so a merge or delete
-    cannot remove a linked row first.
-
-    Args:
-        session: The request session. It must not hold a write yet.
-        kind: The kind of the receivable the links belong to.
-        wanted: The row id and role of each link.
-
-    Returns:
-        The new, unsaved links.
-
-    Raises:
-        UnprocessableEntityException: A row does not fit its role.
-    """
-    await _write_lock(session)
-    try:
-        return [
-            ReceivableLink(
-                transaction=await _linkable(session, i, kind, role), role=role
-            )
-            for i, role in wanted
-        ]
-    except UnprocessableEntityException:
-        await session.rollback()
-        raise
-
-
-async def _commit_links(session: AsyncSession) -> None:
+async def commit_links(session: AsyncSession) -> None:
     """Commit, and turn a duplicate link into a conflict.
 
     Args:
@@ -218,20 +194,57 @@ async def create_receivable(
         UnprocessableEntityException: A transaction id is unknown, listed
             twice, or the wrong direction for its role.
     """
+    await write_lock(session)
+    try:
+        receivable = await build_receivable(session, payload)
+    except UnprocessableEntityException:
+        await session.rollback()
+        raise
+    await commit_links(session)
+    return receivable
+
+
+async def build_receivable(
+    session: AsyncSession, payload: ReceivableCreate
+) -> Receivable:
+    """Add a receivable and its links to the session. Do not commit.
+
+    The caller must hold the write lock. A payment link teaches the
+    identifiers of its row.
+
+    Args:
+        session: A session that holds the write lock.
+        payload: The validated request body.
+
+    Returns:
+        The new, unflushed receivable.
+
+    Raises:
+        UnprocessableEntityException: A transaction id is unknown, listed
+            twice, or the wrong direction for its role.
+    """
     wanted = [(i, ReceivableRole.charge) for i in payload.charge_transaction_ids]
     wanted += [(i, ReceivableRole.payment) for i in payload.payment_transaction_ids]
     ids = [transaction_id for transaction_id, _ in wanted]
     if len(ids) != len(set(ids)):
         raise UnprocessableEntityException(detail="A transaction is listed twice")
+    links = [
+        ReceivableLink(
+            transaction=await _linkable(session, i, payload.kind, role), role=role
+        )
+        for i, role in wanted
+    ]
+    for link in links:
+        if link.role == ReceivableRole.payment:
+            await learn_identifiers(session, payload.person, link.transaction)
     receivable = Receivable(
         kind=payload.kind,
         person=payload.person,
         amount=payload.amount,
         note=payload.note,
-        links=await _new_links(session, payload.kind, wanted),
+        links=links,
     )
     session.add(receivable)
-    await _commit_links(session)
     return receivable
 
 
@@ -251,16 +264,37 @@ async def update_receivable(
     Returns:
         The changed receivable.
     """
+    await apply_update(session, receivable, payload)
+    await session.commit()
+    return receivable
+
+
+async def apply_update(
+    session: AsyncSession, receivable: Receivable, payload: ReceivableUpdate
+) -> None:
+    """Apply a partial edit to a receivable. Do not commit.
+
+    A new person takes the identifiers of the old one.
+
+    Args:
+        session: The session to write in.
+        receivable: The receivable to change.
+        payload: The fields to change.
+
+    Returns:
+        None.
+    """
     if payload.amount is not None:
         receivable.amount = payload.amount
+    if payload.person is not None:
+        await rename_identifiers(session, receivable, payload.person)
+        receivable.person = payload.person
     if "note" in payload.model_fields_set:
         receivable.note = payload.note
     if payload.status is not None and payload.status != receivable.status:
         receivable.status = payload.status
         is_open = payload.status == ReceivableStatus.open
         receivable.closed_at = None if is_open else utc_now()
-    await session.commit()
-    return receivable
 
 
 async def add_link(
@@ -287,12 +321,46 @@ async def add_link(
         UnprocessableEntityException: The row is unknown or the wrong
             direction for the role.
     """
-    links = await _new_links(
-        session, ReceivableKind(receivable.kind), [(transaction_id, role)]
-    )
-    receivable.links.extend(links)
-    await _commit_links(session)
+    await write_lock(session)
+    try:
+        await attach_link(session, receivable, transaction_id, role)
+    except UnprocessableEntityException:
+        await session.rollback()
+        raise
+    await commit_links(session)
     return receivable
+
+
+async def attach_link(
+    session: AsyncSession,
+    receivable: Receivable,
+    transaction_id: int,
+    role: ReceivableRole,
+) -> None:
+    """Link a row to a receivable. Do not commit.
+
+    The caller must hold the write lock, so a merge or delete cannot remove
+    the row first. A payment link teaches the identifiers of its row.
+
+    Args:
+        session: A session that holds the write lock.
+        receivable: The receivable to link.
+        transaction_id: The row to link.
+        role: The role the link takes.
+
+    Returns:
+        None.
+
+    Raises:
+        UnprocessableEntityException: The row is unknown or the wrong
+            direction for the role.
+    """
+    txn = await _linkable(
+        session, transaction_id, ReceivableKind(receivable.kind), role
+    )
+    if role == ReceivableRole.payment:
+        await learn_identifiers(session, receivable.person, txn)
+    receivable.links.append(ReceivableLink(transaction=txn, role=role))
 
 
 async def remove_link(
@@ -311,7 +379,7 @@ async def remove_link(
     Returns:
         The changed receivable, or ``None`` when it does not link the row.
     """
-    await _write_lock(session)
+    await write_lock(session)
     result = await session.execute(
         delete(ReceivableLink).where(
             ReceivableLink.receivable_id == receivable_id,
@@ -336,7 +404,8 @@ async def move_receivable_links(
 
     A link is dropped when its receivable already links the keeper, or when
     it is a payment link and the keeper already pays a receivable. Both rows
-    show one event, so its money counts once.
+    show one event, so its money counts once. The match prompt of the old row
+    goes away with its unsent message, so its buttons go stale.
 
     Args:
         session: The session that deletes ``old_id``.
@@ -349,6 +418,20 @@ async def move_receivable_links(
         on a plain delete, and ``receivable_links.dropped`` for links dropped
         on a merge.
     """
+    prompt = ReceivableMatchPrompt.transaction_id == old_id
+    await session.execute(
+        update(TelegramOutboundDelivery)
+        .where(
+            TelegramOutboundDelivery.id.in_(
+                select(ReceivableMatchPrompt.delivery_id).where(prompt)
+            ),
+            TelegramOutboundDelivery.status.in_(
+                ["pending", "delivering", "delivery_unknown"]
+            ),
+        )
+        .values(status="cancelled", worker_token=None, delivery_lease_until=None)
+    )
+    await session.execute(delete(ReceivableMatchPrompt).where(prompt))
     stale = ReceivableLink.transaction_id == old_id
     if new_id is None:
         result = await session.execute(delete(ReceivableLink).where(stale))

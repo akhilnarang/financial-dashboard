@@ -676,6 +676,9 @@ async def _handle_callback(update: Update, context) -> None:
     if query.data.startswith("smsdup:v1:"):
         await _handle_sms_duplicate_callback(update, context)
         return
+    if query.data.startswith("rcv:v1:"):
+        await _handle_receivable_match_callback(query)
+        return
     if query.data.startswith("st:"):
         await _handle_settlement_callback(update, context)
         return
@@ -1049,6 +1052,46 @@ async def _handle_sms_duplicate_callback(update: Update, context) -> None:
             )
         except Exception as exc:
             logger.warning("SMS duplicate account picker failed: %s", exc)
+
+
+async def _handle_receivable_match_callback(query: CallbackQuery) -> None:
+    """Link or dismiss a receivable match prompt from an authorized tap."""
+    if not query.message or query.message.chat.id != get_telegram_chat_id():
+        await query.answer("Unauthorized")
+        return
+    match (query.data or "").split(":"):
+        case ["rcv", "v1", "l", prompt, receivable] if (
+            prompt.isdigit() and receivable.isdigit()
+        ):
+            prompt_id, receivable_id = int(prompt), int(receivable)
+        case ["rcv", "v1", "x", prompt] if prompt.isdigit():
+            prompt_id, receivable_id = int(prompt), None
+        case _:
+            await query.answer("Invalid callback")
+            return
+
+    from financial_dashboard.services.receivable_matches import resolve_match_tap
+
+    try:
+        async with async_session() as session:
+            tap = await resolve_match_tap(
+                session,
+                prompt_id,
+                receivable_id,
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id,
+            )
+    except OperationalError:
+        await query.answer("Busy, try again")
+        return
+    if not tap.resolved:
+        await query.answer(tap.text)
+        return
+    await _answer_after_commit(query)
+    try:
+        await query.edit_message_text(tap.text)
+    except Exception as exc:
+        logger.warning("Receivable match callback edit failed: %s", exc)
 
 
 def _parse_settlement_callback(data: str) -> SettlementCallback | None:

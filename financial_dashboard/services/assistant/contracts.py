@@ -111,8 +111,69 @@ class ListCategories(StrictModel):
     name: Literal["list_categories"]
 
 
+ReceivableKindName: TypeAlias = Literal["receivable", "payable"]
+ReceivableStatusName: TypeAlias = Literal["open", "settled", "written_off"]
+PersonName: TypeAlias = Annotated[StrictStr, Field(min_length=1, max_length=200)]
+MoneyText: TypeAlias = Annotated[StrictStr, Field(min_length=1, max_length=40)]
+
+
+class ListReceivables(StrictModel):
+    name: Literal["list_receivables"]
+    status: ReceivableStatusName | None = None
+    kind: ReceivableKindName | None = None
+    person: StrictStr | None = Field(default=None, max_length=200)
+
+
+class CreateReceivable(StrictModel):
+    name: Literal["create_receivable"]
+    kind: ReceivableKindName
+    person: PersonName
+    amount: MoneyText
+    note: StrictStr | None = Field(default=None, max_length=500)
+    charge_transaction_ids: list[StrictInt] = Field(default_factory=list, max_length=20)
+
+
+class LinkReceivable(StrictModel):
+    name: Literal["link_receivable"]
+    receivable_id: StrictInt = Field(gt=0)
+    transaction_id: StrictInt = Field(gt=0)
+    role: Literal["charge", "payment"]
+
+
+class UpdateReceivable(StrictModel):
+    """Omitted or null fields stay unchanged."""
+
+    name: Literal["update_receivable"]
+    receivable_id: StrictInt = Field(gt=0)
+    amount: MoneyText | None = None
+    status: ReceivableStatusName | None = None
+    person: PersonName | None = None
+    note: StrictStr | None = Field(default=None, max_length=500)
+
+
+class AddPersonIdentifier(StrictModel):
+    name: Literal["add_person_identifier"]
+    person: PersonName
+    kind: Literal["counterparty", "vpa", "phone"]
+    value: StrictStr = Field(min_length=1, max_length=200)
+
+
+ReceivableWriteCall = (
+    CreateReceivable | LinkReceivable | UpdateReceivable | AddPersonIdentifier
+)
+ReceivableWrite: TypeAlias = Annotated[ReceivableWriteCall, Field(discriminator="name")]
+ReadCall = GetTransaction | ListTransactions | ListCategories | ListReceivables
+
 ToolCall: TypeAlias = Annotated[
-    GetTransaction | ListTransactions | ListCategories | ApplyTransactionChanges,
+    GetTransaction
+    | ListTransactions
+    | ListCategories
+    | ApplyTransactionChanges
+    | ListReceivables
+    | CreateReceivable
+    | LinkReceivable
+    | UpdateReceivable
+    | AddPersonIdentifier,
     Field(discriminator="name"),
 ]
 
@@ -140,6 +201,35 @@ class MerchantRuleConfirmation(StrictModel):
 
 
 PendingConfirmation: TypeAlias = MerchantRuleConfirmation
+
+
+class TransactionChangeConfirmation(StrictModel):
+    kind: Literal["transaction_change"]
+    transaction_id: StrictInt = Field(gt=0)
+    request: ApplyTransactionChanges
+
+
+class ReceivableWriteConfirmation(StrictModel):
+    kind: Literal["receivable_write"]
+    request: ReceivableWrite
+
+
+ConfirmationAction: TypeAlias = Annotated[
+    MerchantRuleConfirmation
+    | TransactionChangeConfirmation
+    | ReceivableWriteConfirmation,
+    Field(discriminator="kind"),
+]
+
+
+class StoredConfirmation(StrictModel):
+    """The pending confirmation that a conversation stores as JSON."""
+
+    action: ConfirmationAction
+    policy_version: StrictStr
+    direction_policy: Literal["inferred_strict", "explicit_manual_override"] = (
+        "inferred_strict"
+    )
 
 
 class CategoryCandidate(StrictModel):

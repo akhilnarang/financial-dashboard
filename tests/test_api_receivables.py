@@ -4,14 +4,22 @@ import datetime as dt
 from decimal import Decimal
 
 import pytest
+from httpx import Response
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import Transaction
 
 pytestmark = pytest.mark.anyio
 
 
-async def _row(session, direction: str, amount: str, currency: str = "INR") -> int:
+async def _row(
+    session: AsyncSession,
+    direction: str,
+    amount: str,
+    currency: str = "INR",
+    **fields: str | bool,
+) -> int:
     """Seed one transaction and return its id."""
     txn = Transaction(
         bank="testbank",
@@ -20,6 +28,7 @@ async def _row(session, direction: str, amount: str, currency: str = "INR") -> i
         amount=Decimal(amount),
         currency=currency,
         transaction_date=dt.date(2030, 3, 4),
+        **fields,
     )
     session.add(txn)
     await session.commit()
@@ -27,18 +36,28 @@ async def _row(session, direction: str, amount: str, currency: str = "INR") -> i
 
 
 async def test_payment_link_lowers_outstanding(client, session):
-    charge = await _row(session, "debit", "1500.00")
-    payment = await _row(session, "credit", "600.00")
+    charge = await _row(session, "debit", "1500.00", counterparty="CAFE MERCHANT")
+    payment = await _row(
+        session,
+        "credit",
+        "600.00",
+        counterparty="FRIEND A",
+        raw_description=(
+            "UPI/CR/friend.a@okbank/other.b@okbank/9876500001/9876500003/"
+            "alerts@bank.example"
+        ),
+    )
     created = await client.post(
         "/api/receivables",
-        json={
-            "person": "Friend A",
-            "amount": "1500.00",
-            "charge_transaction_ids": [charge],
-        },
+        json={"person": "Friend A", "amount": "1500.00"},
     )
     assert created.status_code == 201
     rid = created.json()["id"]
+    charged = await client.post(
+        f"/api/receivables/{rid}/links",
+        json={"transaction_id": charge, "role": "charge"},
+    )
+    assert charged.status_code == 201
     assert (created.json()["paid"], created.json()["outstanding"]) == (
         "0.00",
         "1500.00",
@@ -67,6 +86,12 @@ async def test_payment_link_lowers_outstanding(client, session):
     )
     assert (relinked.status_code, reused.status_code) == (409, 409)
     assert unlinked.json()["outstanding"] == "1500.00"
+    # A payment link teaches the identifiers of its row. A charge does not.
+    # Two VPAs or two phones on one row are not taught: one is not the person.
+    learned = (await client.get("/api/receivables/identifiers")).json()["items"]
+    assert [(i["person"], i["kind"], i["value"]) for i in learned] == [
+        ("friend a", "counterparty", "frienda"),
+    ]
 
     # A late unlink must not delete another receivable's link that took the id.
     await client.post(
@@ -98,7 +123,7 @@ async def test_payment_link_lowers_outstanding(client, session):
 
 
 # A debit cannot pay back a receivable, a credit is not its charge, a payable
-# flips both, and the ledger is INR only.
+# flips both, the ledger is INR only, and a voided row is no money.
 @pytest.mark.parametrize(
     ("kind", "row", "role"),
     [
@@ -107,10 +132,15 @@ async def test_payment_link_lowers_outstanding(client, session):
         ("payable", ("credit", "INR"), "payment"),
         ("receivable", ("credit", "USD"), "payment"),
         ("receivable", 9999, "payment"),
+        ("receivable", ("credit", "INR", True), "payment"),
     ],
 )
 async def test_link_rejects_unknown_or_unfit_row(client, session, kind, row, role):
-    txn_id = row if isinstance(row, int) else await _row(session, row[0], "100", row[1])
+    txn_id = (
+        row
+        if isinstance(row, int)
+        else await _row(session, row[0], "100", row[1], voided=len(row) > 2)
+    )
     rid = (
         await client.post(
             "/api/receivables", json={"kind": kind, "person": "A", "amount": "100"}
@@ -137,11 +167,24 @@ async def test_link_rejects_unknown_or_unfit_row(client, session, kind, row, rol
 
 
 async def test_patch_changes_only_named_fields(client):
-    rid = (
+    rid, other = [
+        (
+            await client.post(
+                "/api/receivables",
+                json={"person": "A", "amount": "50", "note": "lunch"},
+            )
+        ).json()["id"]
+        for _ in range(2)
+    ]
+    await client.post("/api/receivables", json={"person": "F", "amount": "10"})
+    for person, value in (("A", "AAAA"), ("E", "EEEE")):
         await client.post(
-            "/api/receivables", json={"person": "A", "amount": "50", "note": "lunch"}
+            "/api/receivables/identifiers",
+            json={"person": person, "kind": "counterparty", "value": value},
         )
-    ).json()["id"]
+
+    def pairs(response: Response) -> list[tuple[str, str]]:
+        return [(i["person"], i["value"]) for i in response.json()["items"]]
 
     closed = await client.patch(
         f"/api/receivables/{rid}", json={"status": "written_off"}
@@ -151,13 +194,57 @@ async def test_patch_changes_only_named_fields(client):
     )
     nulled = await client.patch(f"/api/receivables/{rid}", json={"amount": None})
     rekinded = await client.patch(f"/api/receivables/{rid}", json={"kind": "payable"})
+    renamed = await client.patch(f"/api/receivables/{rid}", json={"person": " B  C "})
+    unnamed = await client.patch(f"/api/receivables/{rid}", json={"person": None})
+    # Another receivable still uses the old name, so the rename copies.
+    copied = pairs(await client.get("/api/receivables/identifiers"))
+    await client.patch(f"/api/receivables/{other}", json={"person": "D"})
+    moved = pairs(await client.get("/api/receivables/identifiers"))
+    # A name with identifiers, or a name another receivable uses, is another
+    # person. It gets nothing.
+    await client.patch(f"/api/receivables/{rid}", json={"person": "E"})
+    await client.patch(f"/api/receivables/{other}", json={"person": "F"})
+    kept = pairs(await client.get("/api/receivables/identifiers"))
 
     assert closed.json()["status"] == "written_off"
     assert closed.json()["closed_at"] is not None
     assert closed.json()["note"] == "lunch"
     assert reopened.json()["closed_at"] is None
     assert reopened.json()["note"] is None
-    assert (nulled.status_code, rekinded.status_code) == (422, 422)
+    assert (renamed.json()["person"], renamed.json()["amount"]) == ("B  C", "50.00")
+    assert copied == [("a", "aaaa"), ("b c", "aaaa"), ("e", "eeee")]
+    assert moved == [("b c", "aaaa"), ("d", "aaaa"), ("e", "eeee")]
+    assert kept == moved
+    assert (nulled.status_code, rekinded.status_code, unnamed.status_code) == (
+        422,
+        422,
+        422,
+    )
+
+
+async def test_identifier_is_stored_normalized_once(client):
+    bodies = [
+        {"person": "Friend  A", "kind": "counterparty", "value": "Friend A Joint"},
+        {"person": "friend a", "kind": "counterparty", "value": "FRIENDAJOINT"},
+        {"person": "Friend A", "kind": "phone", "value": "+91 98765 00001"},
+        {"person": "Friend A", "kind": "vpa", "value": "Friend.A@OKBANK"},
+        {"person": "Friend A", "kind": "vpa", "value": "friend.a@bank.example"},
+        {"person": "Friend A", "kind": "phone", "value": "12345"},
+        {"person": "Friend A", "kind": "counterparty", "value": "A B"},
+    ]
+
+    codes = [
+        (await client.post("/api/receivables/identifiers", json=body)).status_code
+        for body in bodies
+    ]
+    listed = (await client.get("/api/receivables/identifiers")).json()["items"]
+
+    assert codes == [201, 201, 201, 201, 422, 422, 422]
+    assert [(i["person"], i["kind"], i["value"]) for i in listed] == [
+        ("friend a", "counterparty", "friendajoint"),
+        ("friend a", "phone", "9876500001"),
+        ("friend a", "vpa", "friend.a@okbank"),
+    ]
 
 
 async def test_list_and_page_filter_by_status(client, session):
@@ -177,7 +264,9 @@ async def test_list_and_page_filter_by_status(client, session):
     paid = await client.post(
         f"/api/receivables/{owed.json()['id']}/links",
         json={
-            "transaction_id": await _row(session, "debit", "120.00"),
+            "transaction_id": await _row(
+                session, "debit", "120.00", counterparty="NEFT TRANSFER"
+            ),
             "role": "payment",
         },
     )
@@ -193,3 +282,5 @@ async def test_list_and_page_filter_by_status(client, session):
     assert page.index("Owed to me") < page.index("Friend A") < page.index("I owe")
     assert page.index("I owe") < page.index("Friend C")
     assert "Friend B" not in page
+    # A generic counterparty names no person, so the payment teaches nothing.
+    assert (await client.get("/api/receivables/identifiers")).json()["items"] == []

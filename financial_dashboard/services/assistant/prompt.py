@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v5"
+PROMPT_VERSION = "telegram-assistant-v6"
 
 
 class PromptContext(NamedTuple):
@@ -40,7 +40,8 @@ def build_prompt(context: PromptContext) -> str:
         '- {"outcome":"category_proposal","transaction_id":1,'
         '"explanation":"...","candidates":[{"slug":"...",'
         '"reason":"...","confidence":0.5}, ...]}',
-        '- {"outcome":"tool_calls","calls":[READ|APPLY, ...],"explanation":"..."}',
+        '- {"outcome":"tool_calls","calls":[READ|APPLY|RECEIVABLE WRITE, ...],'
+        '"explanation":"..."}',
         '- {"outcome":"error","message":"...","code":"..."}',
         "READ is get_transaction(transaction_id), list_categories(), or",
         "list_transactions with optional transaction_ids/account_id/date_from/date_to/",
@@ -52,6 +53,20 @@ def build_prompt(context: PromptContext) -> str:
         'A category patch is {"op":"set","value":"slug"} or',
         '{"op":"clear","value":null}. An exclusion patch is',
         '{"op":"set","value":true|false}. Omitted fields stay unchanged.',
+        "Receivables track money a person owes the user (kind receivable) or",
+        "money the user owes a person (kind payable). READ also includes",
+        "list_receivables with optional status/kind/person. A RECEIVABLE WRITE is",
+        '{"name":"create_receivable","kind":"receivable","person":"...",',
+        '"amount":"500.00","note":null,"charge_transaction_ids":[]},',
+        '{"name":"link_receivable","receivable_id":1,"transaction_id":1,',
+        '"role":"charge|payment"}, {"name":"update_receivable","receivable_id":1,',
+        '"amount":null,"status":null,"person":null,"note":null} (null keeps a',
+        'field), or {"name":"add_person_identifier","person":"...",',
+        '"kind":"counterparty|vpa|phone","value":"..."}.',
+        "Use a RECEIVABLE WRITE only when the user asks for that change. The",
+        "application asks the user to confirm it. A partial payment is a payment",
+        "link. Settle or write off with update_receivable status. Find ids with",
+        "list_receivables and list_transactions first. One write per response.",
         "A category proposal must contain exactly 2 or 3 existing category slugs.",
         "Categories must already exist; never propose creating a category.",
         "Act; do not ask what to do. A reply to a transaction that only gives",

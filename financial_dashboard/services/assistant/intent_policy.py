@@ -17,6 +17,12 @@ _AFFIRMATIVE = re.compile(
     re.IGNORECASE,
 )
 _REFERENCE_DIGITS = re.compile(r"\d{7,}")
+_RECEIVABLE_WRITE_CUE = re.compile(
+    r"\b(?:create|add|record|log|track|link|settle|settled|mark|write\s+off|"
+    r"rename|change|set|update|save|remember|owes?|lent|borrowed|repaid|paid)\b"
+    r"|\b(?:upi|vpa|phone|number|mobile)\s+is\b",
+    re.IGNORECASE,
+)
 _GENERIC_PATTERNS = frozenset(
     {
         "ach",
@@ -415,13 +421,44 @@ def merchant_rule_is_explicit(
     )
 
 
+def is_receivable_write_request(user_text: str) -> bool:
+    """Return whether the turn plainly asks to change a receivable or a person.
+
+    A question, a read request, or a turn that forbids changes does not ask.
+    A turn that negates the action, such as "don't settle", does not ask.
+
+    Args:
+        user_text: The current user message.
+
+    Returns:
+        True when the message names a receivable action and nothing in it
+        asks a question, reads, forbids changes, or negates that action.
+    """
+    cues = [cue.group(0) for cue in _RECEIVABLE_WRITE_CUE.finditer(user_text)]
+    return (
+        bool(cues)
+        and not any(negates_target(user_text, cue) for cue in cues)
+        and not user_text.rstrip().endswith("?")
+        and not has_non_mutating_intent(user_text)
+        and not has_global_no_change(user_text)
+    )
+
+
 def is_direct_affirmative(user_text: str) -> bool:
     """Recognize a terse reply to an application-authored confirmation."""
     return bool(_AFFIRMATIVE.fullmatch(user_text.strip()))
 
 
-def derive_merchant_pattern(counterparty: str | None) -> str:
-    """Derive and validate the V1 rule pattern from trusted transaction data."""
+def is_generic_counterparty(counterparty: str | None) -> bool:
+    """Return whether a counterparty names nobody, such as a bare "UPI TRANSFER".
+
+    Args:
+        counterparty: The stored counterparty of a row.
+
+    Returns:
+        True when it is too short, has no letters, has only generic bank
+        words, or carries a long reference number.
+    """
     pattern = normalize_text(counterparty or "").strip()
     meaningful_tokens = [
         token
@@ -429,11 +466,16 @@ def derive_merchant_pattern(counterparty: str | None) -> str:
         if token not in _GENERIC_PATTERNS
         and any(character.isalpha() for character in token)
     ]
-    if (
+    return (
         len(pattern) < 4
         or not any(character.isalpha() for character in pattern)
         or not meaningful_tokens
-        or _REFERENCE_DIGITS.search(pattern)
-    ):
+        or bool(_REFERENCE_DIGITS.search(pattern))
+    )
+
+
+def derive_merchant_pattern(counterparty: str | None) -> str:
+    """Derive and validate the V1 rule pattern from trusted transaction data."""
+    if is_generic_counterparty(counterparty):
         raise ValueError("Transaction counterparty is too generic for a merchant rule")
-    return pattern
+    return normalize_text(counterparty or "").strip()

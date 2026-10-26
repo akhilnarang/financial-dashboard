@@ -1,14 +1,17 @@
 import json
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.db.models import (
     Account,
     CategoryReviewDecision,
     AuditInteraction,
+    PersonIdentifier,
+    Receivable,
     Setting,
     TelegramConversation,
     TelegramOutboundDelivery,
@@ -34,6 +37,13 @@ from financial_dashboard.services.assistant.orchestrator import (
 )
 from financial_dashboard.services.assistant.provider import StructuredResult
 from financial_dashboard.services.categorization.vocabulary import ensure_category
+from financial_dashboard.schemas.receivables import ReceivableRead
+from financial_dashboard.services.receivables import receivable_read
+
+
+class ReceivableState(NamedTuple):
+    receivables: list[ReceivableRead]
+    identifiers: list[str]
 
 
 class FakeProvider:
@@ -326,6 +336,199 @@ async def test_typed_transaction_number_is_a_change_target(session, case, error)
     if error is not None:
         assert result.response.code == error
         assert conversation.pending_confirmation_json is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tool", "message"),
+    [
+        ("create", "Friend B owes me 250.50 for tickets"),
+        ("link", "link this payment to Friend A"),
+        ("update", "mark Friend A settled"),
+        ("identifier", "Friend A's UPI is Friend.A@okbank"),
+        # The receivable changes before the Yes, so the old button is void.
+        ("changed", "mark Friend A settled"),
+        # A reparse changes the row before the Yes, so the old button is void.
+        ("reparsed", "link this payment to Friend A"),
+        ("renamed_row", "link this payment to Friend A"),
+        # A note edit before the Yes voids the old button.
+        ("noted", "mark Friend A settled"),
+        # A stored confirmation that does not parse is cleared, not kept.
+        ("corrupt", "mark Friend A settled"),
+        # A question proposes nothing.
+        ("question", "does Friend A owe me anything?"),
+        # A negated action proposes nothing.
+        ("negated", "don't settle Friend A"),
+        # A rejected read in the same response proposes nothing.
+        ("bad_read", "link this payment to Friend A"),
+    ],
+)
+async def test_receivable_write_waits_for_a_yes(session, tool, message):
+    charge = Transaction(
+        bank="test",
+        email_type="test",
+        direction="debit",
+        amount=500,
+        counterparty="CAFE MERCHANT",
+    )
+    payment = Transaction(
+        bank="test",
+        email_type="test",
+        direction="credit",
+        amount=200,
+        counterparty="FRIEND A",
+    )
+    receivable = Receivable(person="Friend A", amount=500)
+    conversation = await start_conversation(session, chat_id=7, started_by="ask")
+    interaction = AuditInteraction(
+        inbound_chat_id=7, trigger="ask", conversation_id=conversation.id
+    )
+    session.add_all([charge, payment, receivable, interaction])
+    await session.flush()
+    rid = receivable.id
+    link = {
+        "name": "link_receivable",
+        "receivable_id": rid,
+        "transaction_id": payment.id,
+        "role": "payment",
+    }
+    call = {
+        "create": {
+            "name": "create_receivable",
+            "kind": "receivable",
+            "person": "Friend B",
+            "amount": "250.50",
+            "note": "tickets",
+            "charge_transaction_ids": [charge.id],
+        },
+        "link": link,
+        "reparsed": link,
+        "renamed_row": link,
+        "bad_read": link,
+        "identifier": {
+            "name": "add_person_identifier",
+            "person": "Friend A",
+            "kind": "vpa",
+            "value": "Friend.A@okbank",
+        },
+    }.get(
+        tool, {"name": "update_receivable", "receivable_id": rid, "status": "settled"}
+    )
+    provider = FakeProvider(
+        [
+            ToolCalls(outcome="tool_calls", calls=[{"name": "list_receivables"}]),
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[{"name": "list_transactions", "amount": "abc"}, call]
+                if tool == "bad_read"
+                else [call],
+            ),
+        ]
+    )
+
+    result = await run_turn(
+        session,
+        provider,
+        user_message=message,
+        conversation_id=conversation.id,
+        interaction_id=interaction.id,
+    )
+
+    async def state() -> ReceivableState:
+        """Read every receivable and every stored identifier value fresh."""
+        rows = (await session.scalars(select(Receivable).order_by(Receivable.id))).all()
+        identifiers = (await session.scalars(select(PersonIdentifier.value))).all()
+        return ReceivableState(
+            [
+                receivable_read(
+                    await session.get(Receivable, row.id, populate_existing=True)
+                )
+                for row in rows
+            ],
+            list(identifiers),
+        )
+
+    proposed, _ = await state()
+    listed = provider.context.tool_results[0]["result"]["items"]
+    assert [(item["id"], item["person"]) for item in listed] == [(rid, "Friend A")]
+    # A listed receivable is not a transaction the reply shows.
+    assert result.transaction_ids == ()
+    assert [(r.status, r.payment_transaction_ids) for r in proposed] == [("open", [])]
+    if tool in ("question", "bad_read", "negated"):
+        assert result.response.code == "mutation_rejected"
+        assert conversation.pending_confirmation_json is None
+        return
+    assert "Friend" in result.response.question
+    if tool == "corrupt":
+        conversation.pending_confirmation_json = (
+            '{"action":{"kind":"receivable_write"}}'
+        )
+        with pytest.raises(ValueError, match="invalid"):
+            await run_pending_confirmation(
+                session,
+                conversation_id=conversation.id,
+                state_hash=conversation.pending_confirmation_state_hash,
+                user_message="yes",
+                replied_to_interaction_id=interaction.id,
+            )
+        assert conversation.pending_confirmation_json is None
+        return
+    if tool in ("changed", "reparsed", "renamed_row", "noted"):
+        await session.execute(
+            update(Receivable)
+            .where(Receivable.id == rid)
+            .values(**({"amount": 600} if tool == "changed" else {"note": "edited"}))
+            if tool in ("changed", "noted")
+            else update(Transaction)
+            .where(Transaction.id == payment.id)
+            .values(
+                amount=150 if tool == "reparsed" else payment.amount,
+                counterparty="SOMEONE ELSE" if tool == "renamed_row" else "FRIEND A",
+            )
+        )
+        with pytest.raises(ValueError, match="changed"):
+            await run_pending_confirmation(
+                session,
+                conversation_id=conversation.id,
+                state_hash=conversation.pending_confirmation_state_hash,
+                user_message="yes",
+                replied_to_interaction_id=interaction.id,
+            )
+        saved, _ = await state()
+        assert saved[0].status == "open"
+        return
+    reply = await run_pending_confirmation(
+        session,
+        conversation_id=conversation.id,
+        state_hash=conversation.pending_confirmation_state_hash,
+        user_message="yes",
+        replied_to_interaction_id=interaction.id,
+    )
+    saved, identifiers = await state()
+    assert isinstance(reply, str)
+    expected = {
+        "create": [
+            ("Friend A", "500.00", "open", [], []),
+            ("Friend B", "250.50", "open", [charge.id], []),
+        ],
+        "link": [("Friend A", "300.00", "open", [], [payment.id])],
+        "update": [("Friend A", "500.00", "settled", [], [])],
+        "identifier": [("Friend A", "500.00", "open", [], [])],
+    }[tool]
+    assert [
+        (
+            r.person,
+            str(r.outstanding),
+            r.status,
+            r.charge_transaction_ids,
+            r.payment_transaction_ids,
+        )
+        for r in saved
+    ] == expected
+    assert identifiers == {
+        "link": ["frienda"],
+        "identifier": ["friend.a@okbank"],
+    }.get(tool, [])
 
 
 @pytest.mark.anyio
