@@ -27,4 +27,4 @@ class MerchantRuleSave(BaseModel):
 
     pattern: str = Field(min_length=1, max_length=200)
     category: str = Field(min_length=1, max_length=64)
-    priority: int = Field(default=100, ge=0, le=1_000_000)
+    priority: int = 100

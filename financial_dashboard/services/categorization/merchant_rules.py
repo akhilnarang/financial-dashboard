@@ -75,8 +75,8 @@ def get_merchant_rules() -> tuple[tuple[str, str], ...]:
 
 async def add_merchant_rule(
     session: AsyncSession, pattern: str, category: str, *, priority: int = 100
-) -> bool:
-    """Insert or update a merchant rule.
+) -> str:
+    """Insert or update a merchant rule and return its normalized pattern.
 
     Normalizes the pattern with normalize_text (lowercase, punctuation→space)
     so it matches the same text the matcher sees (e.g. "acme.pay@upi" →
@@ -118,7 +118,7 @@ async def add_merchant_rule(
         ),
         {"pattern": pattern, "category": category, "priority": priority},
     )
-    return True
+    return pattern
 
 
 async def list_merchant_rules(session: AsyncSession) -> list[MerchantRule]:
@@ -148,15 +148,13 @@ async def save_merchant_rule(
     Raises:
         ValueError: The pattern is too short or the category is not valid.
     """
-    await add_merchant_rule(session, pattern, category, priority=priority)
-    rule = await session.scalar(
+    stored = await add_merchant_rule(session, pattern, category, priority=priority)
+    rules = await session.scalars(
         select(MerchantRule)
-        .where(MerchantRule.pattern == normalize_text(pattern))
+        .where(MerchantRule.pattern == stored)
         .execution_options(populate_existing=True)
     )
-    if rule is None:
-        raise RuntimeError("Merchant rule upsert did not store a row")
-    return rule
+    return rules.one()
 
 
 async def deactivate_merchant_rule(session: AsyncSession, rule_id: int) -> bool:

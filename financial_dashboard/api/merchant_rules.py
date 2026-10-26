@@ -40,9 +40,7 @@ async def merchant_rules_list(session: AsyncSessionDep) -> MerchantRuleListRespo
         All rules, active and inactive.
     """
     rules = await list_merchant_rules(session)
-    return MerchantRuleListResponse(
-        items=[MerchantRuleRead.model_validate(rule) for rule in rules]
-    )
+    return MerchantRuleListResponse.model_validate({"items": rules})
 
 
 @router.post("/merchant-rules")

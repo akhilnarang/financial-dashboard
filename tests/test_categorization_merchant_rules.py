@@ -96,7 +96,7 @@ async def test_add_merchant_rule_normalizes_upserts_and_rejects_unknown_category
 ):
     await ensure_category(session, "expense")
     await ensure_category(session, "salary")
-    assert await add_merchant_rule(session, "  Acme Corp  ", "expense") is True
+    assert await add_merchant_rule(session, "  Acme Corp  ", "expense") == "acme corp"
     await session.flush()
     await add_merchant_rule(session, "acme corp", "salary", priority=50)
     await session.flush()
