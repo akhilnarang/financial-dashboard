@@ -992,8 +992,8 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                 await conn.execute(
                     text(
                         "INSERT OR IGNORE INTO merchant_rules "
-                        "(pattern, category, active, priority) "
-                        "VALUES (:pattern, :category, 1, 100)"
+                        "(pattern, category, active, priority, created_at) "
+                        "VALUES (:pattern, :category, 1, 100, CURRENT_TIMESTAMP)"
                     ),
                     {"pattern": _pattern, "category": _category},
                 )

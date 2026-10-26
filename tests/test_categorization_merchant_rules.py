@@ -155,6 +155,7 @@ async def test_merchant_rule_api_changes_next_categorization_without_restart(
         "dining",
         100,
     )
+    assert rule["created_at"] is not None
     assert await categorize() == "dining"
     listed = (await client.get("/api/merchant-rules")).json()["items"]
     assert [r["id"] for r in listed] == [rule["id"]]
@@ -172,7 +173,11 @@ async def test_merchant_rule_api_changes_next_categorization_without_restart(
             json={"pattern": "zephyr noodle", "category": "dining"},
         )
     ).json()
-    assert (again["id"], again["active"]) == (rule["id"], True)
+    assert (again["id"], again["active"], again["created_at"]) == (
+        rule["id"],
+        True,
+        rule["created_at"],
+    )
     assert await categorize() == "dining"
 
 

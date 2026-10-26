@@ -111,8 +111,8 @@ async def add_merchant_rule(
         )
     await session.execute(
         text(
-            "INSERT INTO merchant_rules (pattern, category, active, priority) "
-            "VALUES (:pattern, :category, 1, :priority) "
+            "INSERT INTO merchant_rules (pattern, category, active, priority, created_at) "
+            "VALUES (:pattern, :category, 1, :priority, CURRENT_TIMESTAMP) "
             "ON CONFLICT(pattern) DO UPDATE SET "
             "category = :category, active = 1, priority = :priority"
         ),
