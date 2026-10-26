@@ -263,6 +263,8 @@ async def _validate_change(
             return "A card payment row keeps its amount; apply does not recompute the statement paid sum"
         if statement_of(txn) is not None:
             return "A statement row keeps its amount; a reparse matches the line by it"
+        if change.amount is None and change.currency not in (None, txn.currency):
+            return "A currency change must set the amount in that currency too"
         if change.currency not in (None, "INR") and await session.scalar(
             select(ReceivableLink.id).where(ReceivableLink.transaction_id == txn.id)
         ):

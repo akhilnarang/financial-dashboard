@@ -255,7 +255,8 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         "/api/transactions/apply", json={"changes": [changes[0], changes[0]]}
     )
     assert duplicate.status_code == 422
-    # A card payment, a statement row and a receivable's row keep their amount.
+    # A card payment, a statement row and a receivable's row keep their amount,
+    # and a currency change needs its amount.
     statement_row = await _txn(
         session, email_type="cc_statement", statement_upload_id=1
     )
@@ -276,7 +277,8 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
             "changes": [
                 {"id": credit_id, "amount": "1"},
                 {"id": statement_id, "amount": "1"},
-                {"id": owed_id, "currency": "USD"},
+                {"id": owed_id, "currency": "USD", "amount": "1"},
+                {"id": first_id, "currency": "USD"},
             ],
         },
     )
@@ -285,6 +287,7 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         credit_id,
         statement_id,
         owed_id,
+        first_id,
     ]
 
     applied = await client.post(
