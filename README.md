@@ -992,14 +992,14 @@ uv run python scripts/seed.py
 |--------|------|-------------|
 | `GET` | `/api/poll/status` | Returns current poll state, progress, last stats, last error |
 | `POST` | `/api/transactions/{id}/note` | Update the freeform note on a transaction (JSON body: `{"note": "..."}`) |
-| `GET` | `/api/receivables?status=open` | List receivables with `paid`, `outstanding`, and linked row ids |
-| `POST` | `/api/receivables` | Create a receivable (`person`, `amount`, `note`, optional `charge_transaction_ids`/`payment_transaction_ids`) |
-| `PATCH` | `/api/receivables/{id}` | Change `amount`, `note`, or `status` |
-| `POST`/`DELETE` | `/api/receivables/{id}/links[/{transaction_id}]` | Link a row with a `role`, or unlink it |
 | `POST` | `/api/sources/{id}/test` | Test connectivity for an email source; returns `{"ok": bool, "message"/"error": str}` |
 | `GET` | `/api/extensions` | List registered extension manifests |
 | `GET`/`POST` | `/api/extensions/paisa/config` | Read (redacted) / save Paisa config |
 | `GET` | `/api/extensions/paisa/status` | Read-only probe of the Paisa instance |
+| `GET` | `/api/receivables?status=open` | List receivables with `paid`, `outstanding`, and linked row ids |
+| `POST` | `/api/receivables` | Create a receivable (`person`, `amount`, `note`, optional `charge_transaction_ids`/`payment_transaction_ids`) |
+| `PATCH` | `/api/receivables/{id}` | Change `amount`, `note`, or `status` |
+| `POST`/`DELETE` | `/api/receivables/{id}/links[/{transaction_id}]` | Link a row with a `role`, or unlink it |
 
 The full Paisa JSON surface (`/accounts`, `/probe`, `/preview`, `/generate`, `/sync`) is documented in [Extensions → Routes](#routes).
 
