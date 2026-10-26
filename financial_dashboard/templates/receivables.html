@@ -1,13 +1,14 @@
 {% extends "base.html" %}
-{% block title %}Owed to me - Ledger{% endblock %}
+{% block title %}Owed - Ledger{% endblock %}
 {% block content %}
-<div class="section-header"><h2>Owed to me</h2></div>
+{% for title, empty, rows in sections %}
+<div class="section-header"><h2>{{ title }}</h2></div>
 
 <div class="table" style="overflow-x:auto;">
 <table>
     <thead><tr><th>Person</th><th>Amount</th><th>Paid</th><th>Outstanding</th><th>For</th><th>Paid by</th><th>Note</th></tr></thead>
     <tbody>
-    {% for row in receivables %}
+    {% for row in rows %}
     <tr>
         <td>{{ row.person }}</td>
         <td class="amt">{{ row.amount|inr_exact }}</td>
@@ -18,9 +19,10 @@
         <td>{{ row.note or '' }}</td>
     </tr>
     {% else %}
-    <tr><td colspan="7">Nobody owes you money.</td></tr>
+    <tr><td colspan="7">{{ empty }}</td></tr>
     {% endfor %}
     </tbody>
 </table>
 </div>
+{% endfor %}
 {% endblock %}

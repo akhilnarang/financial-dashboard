@@ -65,6 +65,11 @@ class ReceivableStatus(StrEnum):
     written_off = "written_off"
 
 
+class ReceivableKind(StrEnum):
+    receivable = "receivable"
+    payable = "payable"
+
+
 class ReceivableRole(StrEnum):
     charge = "charge"
     payment = "payment"

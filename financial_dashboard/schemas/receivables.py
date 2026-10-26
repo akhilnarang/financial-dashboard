@@ -6,7 +6,11 @@ from typing import Annotated, Self
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
-from financial_dashboard.db.enums import ReceivableRole, ReceivableStatus
+from financial_dashboard.db.enums import (
+    ReceivableKind,
+    ReceivableRole,
+    ReceivableStatus,
+)
 from financial_dashboard.schemas.common import DatabaseId
 
 Amount = Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)]
@@ -18,6 +22,7 @@ LinkIds = Annotated[list[DatabaseId], Field(max_length=100)]
 
 
 class ReceivableCreate(BaseModel):
+    kind: ReceivableKind = ReceivableKind.receivable
     person: Person
     amount: Amount
     note: Note | None = None
@@ -31,10 +36,13 @@ class ReceivableUpdate(BaseModel):
     amount: Amount | None = None
     note: Note | None = None
     status: ReceivableStatus | None = None
+    kind: ReceivableKind | None = None
 
     @model_validator(mode="after")
     def reject_null(self) -> Self:
-        """Refuse a null amount or status."""
+        """Refuse a null amount or status, and any kind."""
+        if "kind" in self.model_fields_set:
+            raise ValueError("kind is set at create time")
         if None in self.model_dump(exclude_unset=True, exclude={"note"}).values():
             raise ValueError("only note can be null")
         return self
@@ -47,6 +55,7 @@ class ReceivableLinkCreate(BaseModel):
 
 class ReceivableRead(BaseModel):
     id: int
+    kind: ReceivableKind
     person: str
     amount: Decimal
     note: str | None

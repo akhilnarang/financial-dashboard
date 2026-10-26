@@ -318,6 +318,16 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                 text("ALTER TABLE settings ADD COLUMN updated_at DATETIME")
             )
         try:
+            await conn.execute(text("SELECT kind FROM receivables LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE receivables ADD COLUMN kind VARCHAR NOT NULL "
+                    "DEFAULT 'receivable' "
+                    "CHECK (kind IN ('receivable', 'payable'))"
+                )
+            )
+        try:
             await conn.execute(text("SELECT note FROM transactions LIMIT 0"))
         except Exception:
             await conn.execute(text("ALTER TABLE transactions ADD COLUMN note TEXT"))
