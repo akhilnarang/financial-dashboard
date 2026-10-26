@@ -16,6 +16,7 @@ from financial_dashboard.services.categorization.vocabulary import (
     get_active_slugs,
 )
 from financial_dashboard.services.transactions import update_transaction_category
+from tests.conftest import card_account
 
 pytestmark = pytest.mark.anyio
 
@@ -154,9 +155,11 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         category_model="llm-x",
         review_status="notified",
     )
-    second = await _txn(session, note="old note")
+    second = await _txn(session, note="old note", amount="12.34", currency="USD")
     credit = await _txn(session)
+    credit.email_type = "testbank_cc_payment_alert"
     credit.direction = "credit"
+    credit.account_id = await card_account(session)
     decision = CategoryReviewDecision(
         transaction_id=first.id, category_input_hash="hash", candidates_json="[]"
     )
@@ -174,7 +177,14 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     first_id, second_id, credit_id = first.id, second.id, credit.id
     changes = [
         {"id": first_id, "category": "groceries"},
-        {"id": second_id, "note": None, "exclude_from_cashflow": True, "voided": True},
+        {
+            "id": second_id,
+            "note": None,
+            "exclude_from_cashflow": True,
+            "voided": True,
+            "amount": "1172.08",
+            "currency": "INR",
+        },
         {"id": credit_id, "exclude_from_cashflow": False},
     ]
 
@@ -209,6 +219,8 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
                 "note": {"before": "old note", "after": None},
                 "exclude_from_cashflow": {"before": False, "after": True},
                 "voided": {"before": False, "after": True},
+                "amount": {"before": "12.34", "after": "1172.08"},
+                "currency": {"before": "USD", "after": "INR"},
             },
         },
     ]
@@ -237,6 +249,11 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         "/api/transactions/apply", json={"changes": [changes[0], changes[0]]}
     )
     assert duplicate.status_code == 422
+    card_payment = await client.post(
+        "/api/transactions/apply",
+        json={"dry_run": False, "changes": [{"id": credit_id, "amount": "1"}]},
+    )
+    assert card_payment.status_code == 400
 
     applied = await client.post(
         "/api/transactions/apply", json={"dry_run": False, "changes": changes}
@@ -250,6 +267,7 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         "superseded",
         "cancelled",
     ]
+    assert (second.amount, second.currency) == (Decimal("1172.08"), "INR")
     again = await client.post(
         "/api/transactions/apply", json={"dry_run": False, "changes": changes}
     )

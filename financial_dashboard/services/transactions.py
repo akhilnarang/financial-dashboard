@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import NamedTuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,6 +31,8 @@ class ApplySnapshot(NamedTuple):
     note: str | None
     exclude_from_cashflow: bool
     voided: bool
+    amount: Decimal
+    currency: str | None
 
 
 def _apply_snapshot(txn: Transaction) -> ApplySnapshot:
@@ -43,6 +46,8 @@ def _apply_snapshot(txn: Transaction) -> ApplySnapshot:
         note=txn.note,
         exclude_from_cashflow=txn.exclude_from_cashflow,
         voided=txn.voided,
+        amount=txn.amount,
+        currency=txn.currency,
     )
 
 
@@ -248,6 +253,10 @@ async def _validate_change(
             check_voidable(txn, change.voided)
         except ValueError as exc:
             return str(exc)
+    if {"amount", "currency"} & change.model_fields_set and (
+        should_auto_reconcile_statement(txn)
+    ):
+        return "A card payment row keeps its amount; the statement paid sum uses it"
     return None
 
 
@@ -277,6 +286,13 @@ async def _apply_change_no_commit(
         )
     if change.voided is not None:
         await set_transaction_voided_no_commit(session, txn_id, change.voided)
+    if change.amount is not None or change.currency is not None:
+        txn = await session.get(Transaction, txn_id)
+        assert txn is not None
+        if change.amount is not None:
+            txn.amount = change.amount
+        if change.currency is not None:
+            txn.currency = change.currency
 
 
 async def apply_transaction_changes(
@@ -285,7 +301,7 @@ async def apply_transaction_changes(
     *,
     dry_run: bool,
 ) -> ApplyResult:
-    """Apply note, category, exclusion and void changes to many rows as one unit.
+    """Apply note, category, exclusion, void, amount and currency changes as one unit.
 
     The function checks every change before it changes a row, so a rejected
     batch takes no write lock. Each change then goes through the same per-row

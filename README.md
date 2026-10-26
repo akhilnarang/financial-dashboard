@@ -993,7 +993,7 @@ uv run python scripts/seed.py
 |--------|------|-------------|
 | `GET` | `/api/poll/status` | Returns current poll state, progress, last stats, last error |
 | `POST` | `/api/transactions/{id}/note` | Update the freeform note on a transaction (JSON body: `{"note": "..."}`) |
-| `POST` | `/api/transactions/apply` | Change note, category, cashflow exclusion and void state on many transactions as one unit; `dry_run` defaults to true |
+| `POST` | `/api/transactions/apply` | Change note, category, cashflow exclusion, void state, amount and currency on many transactions as one unit; `dry_run` defaults to true. A card payment row keeps its amount and currency |
 | `POST` | `/api/sources/{id}/test` | Test connectivity for an email source; returns `{"ok": bool, "message"/"error": str}` |
 | `GET` | `/api/merchant-rules` | List merchant→category rules |
 | `POST` | `/api/merchant-rules` | Add or update a rule (`{"pattern", "category", "priority"?}`); the next categorization uses it |
