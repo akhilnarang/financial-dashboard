@@ -4,19 +4,19 @@
 {% for title, empty, rows in sections %}
 <div class="section-header"><h2>{{ title }}</h2></div>
 
-<div class="table" style="overflow-x:auto;">
+<div class="table" style="overflow-x:auto; margin-bottom:2rem;">
 <table>
-    <thead><tr><th>Person</th><th>Amount</th><th>Paid</th><th>Outstanding</th><th>For</th><th>Paid by</th><th>Note</th></tr></thead>
+    <thead><tr><th>Person</th><th>Outstanding</th><th>Amount</th><th>Paid</th><th>Note</th><th>For</th><th>Paid by</th></tr></thead>
     <tbody>
     {% for row in rows %}
     <tr>
-        <td>{{ row.person }}</td>
+        <td style="white-space:normal; min-width:8rem;">{{ row.person }}</td>
+        <td class="amt">{{ row.outstanding|inr_exact }}</td>
         <td class="amt">{{ row.amount|inr_exact }}</td>
         <td class="amt">{{ row.paid|inr_exact }}</td>
-        <td class="amt">{{ row.outstanding|inr_exact }}</td>
+        <td style="white-space:normal; min-width:12rem;">{{ row.note or '' }}</td>
         <td>{% for id in row.charge_transaction_ids %}<a href="/transactions/{{ id }}">#{{ id }}</a> {% endfor %}</td>
         <td>{% for id in row.payment_transaction_ids %}<a href="/transactions/{{ id }}">#{{ id }}</a> {% endfor %}</td>
-        <td>{{ row.note or '' }}</td>
     </tr>
     {% else %}
     <tr><td colspan="7">{{ empty }}</td></tr>
