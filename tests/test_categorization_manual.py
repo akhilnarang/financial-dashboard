@@ -160,6 +160,7 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         category_confidence=0.5,
         category_model="llm-x",
         review_status="notified",
+        currency="INR",
     )
     second = await _txn(session, note="old note", amount="10.00", currency="USD")
     credit = await _txn(session, email_type="testbank_cc_payment_alert")
@@ -181,7 +182,8 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     await session.commit()
     first_id, second_id, credit_id = first.id, second.id, credit.id
     changes = [
-        {"id": first_id, "category": "groceries"},
+        # The same currency again is no change, so the row stays bank-sourced.
+        {"id": first_id, "category": "groceries", "currency": "INR"},
         {
             "id": second_id,
             "note": None,

@@ -244,7 +244,6 @@ async def _validate_change(
     from financial_dashboard.services.categorization.manual import (
         find_manual_category,
     )
-    from financial_dashboard.services.statement_previews import statement_of
 
     txn = await session.get(Transaction, change.id)
     if txn is None:
@@ -261,7 +260,7 @@ async def _validate_change(
     if {"amount", "currency"} & change.model_fields_set:
         if should_auto_reconcile_statement(txn):
             return "A card payment row keeps its amount; apply does not recompute the statement paid sum"
-        if statement_of(txn) is not None:
+        if txn.statement_upload_id or txn.bank_statement_upload_id:
             return "A statement row keeps its amount; a reparse matches the line by it"
         if change.amount is None and change.currency not in (None, txn.currency):
             return "A currency change must set the amount in that currency too"
@@ -301,11 +300,11 @@ async def _apply_change_no_commit(
     if change.amount is not None or change.currency is not None:
         txn = await session.get(Transaction, txn_id)
         assert txn is not None
-        txn.amount_source = "manual"
-        if change.amount is not None:
-            txn.amount = change.amount
-        if change.currency is not None:
-            txn.currency = change.currency
+        amount = txn.amount if change.amount is None else change.amount
+        currency = txn.currency if change.currency is None else change.currency
+        if (amount, currency) != (txn.amount, txn.currency):
+            txn.amount, txn.currency = amount, currency
+            txn.amount_source = "manual"
 
 
 async def apply_transaction_changes(

@@ -825,10 +825,12 @@ def _pair_foreign_alerts(
         matched: The matched entries. Paired lines are added.
         missing: The missing entries. Paired lines are removed.
     """
+    taken = {entry["db_txn_id"] for entry in matched}
     foreign = [
         r
         for r in db_transactions
-        if _normalized_currency(r.currency) != "INR" or r.amount_source == "manual"
+        if (_normalized_currency(r.currency) != "INR" or r.amount_source == "manual")
+        and r.id not in taken
     ]
     if not foreign:
         return
