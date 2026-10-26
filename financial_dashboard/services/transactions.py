@@ -5,9 +5,11 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import NamedTuple
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import Account, Card, Transaction
+from financial_dashboard.db.models import ReceivableLink
 from financial_dashboard.schemas import transactions as transaction_schemas
 from financial_dashboard.services.cc_disambiguation import (
     should_auto_reconcile_statement,
@@ -33,6 +35,7 @@ class ApplySnapshot(NamedTuple):
     voided: bool
     amount: Decimal
     currency: str | None
+    amount_source: str
 
 
 def _apply_snapshot(txn: Transaction) -> ApplySnapshot:
@@ -48,6 +51,7 @@ def _apply_snapshot(txn: Transaction) -> ApplySnapshot:
         voided=txn.voided,
         amount=txn.amount,
         currency=txn.currency,
+        amount_source=txn.amount_source,
     )
 
 
@@ -240,6 +244,7 @@ async def _validate_change(
     from financial_dashboard.services.categorization.manual import (
         find_manual_category,
     )
+    from financial_dashboard.services.statement_previews import statement_of
 
     txn = await session.get(Transaction, change.id)
     if txn is None:
@@ -253,10 +258,15 @@ async def _validate_change(
             check_voidable(txn, change.voided)
         except ValueError as exc:
             return str(exc)
-    if {"amount", "currency"} & change.model_fields_set and (
-        should_auto_reconcile_statement(txn)
-    ):
-        return "A card payment row keeps its amount; the statement paid sum uses it"
+    if {"amount", "currency"} & change.model_fields_set:
+        if should_auto_reconcile_statement(txn):
+            return "A card payment row keeps its amount; apply does not recompute the statement paid sum"
+        if statement_of(txn) is not None:
+            return "A statement row keeps its amount; a reparse matches the line by it"
+        if change.currency not in (None, "INR") and await session.scalar(
+            select(ReceivableLink.id).where(ReceivableLink.transaction_id == txn.id)
+        ):
+            return "A row linked to a receivable stays in INR"
     return None
 
 
@@ -289,6 +299,7 @@ async def _apply_change_no_commit(
     if change.amount is not None or change.currency is not None:
         txn = await session.get(Transaction, txn_id)
         assert txn is not None
+        txn.amount_source = "manual"
         if change.amount is not None:
             txn.amount = change.amount
         if change.currency is not None:

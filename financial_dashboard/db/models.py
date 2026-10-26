@@ -645,6 +645,16 @@ class Transaction(Base):
     """Where ``counterparty`` came from. The parser declares this fact. One of
     ``bank`` or ``user_alias``. A user alias is a label the user chose, such as
     an HDFC payee nickname, and must not replace a name a bank stated."""
+    amount_source: Mapped[str] = mapped_column(
+        String,
+        default="bank",
+        server_default=text("'bank'"),
+        nullable=False,
+    )
+    """Where ``amount`` and ``currency`` came from. One of ``bank`` or
+    ``manual``. A manual amount is a figure the user set by hand, such as the
+    rupee amount of a foreign charge before the statement. The card statement
+    pairs the row like a foreign alert and writes the billed amount over it."""
     transaction_time_is_received_time: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("0"), nullable=False
     )

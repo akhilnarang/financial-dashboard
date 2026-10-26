@@ -1496,11 +1496,20 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
         currency="USD",
         counterparty="SAMPLEMAIL*",
     )
+    # A rupee amount set by hand pairs like a foreign alert, even when the
+    # billed amount is outside the settlement band.
+    manual_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("1172.08"),
+        counterparty="CLOUDFLARE",
+        amount_source="manual",
+    )
     parsed = _parsed(
         [
             _stmt_txn(date="07/04/2026", amount="2,529.00", narration=NARRATION),
             _stmt_txn(date="07/04/2026", amount="999.00", narration="SAMPLE CAFE"),
             _stmt_txn(date="07/04/2026", amount="1,650.00", narration="SAMPLEMAIL COM"),
+            _stmt_txn(date="07/04/2026", amount="1,190.00", narration="CLOUDFLARE US"),
         ]
     )
 
@@ -1512,6 +1521,7 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
     assert sorted(entry["db_txn_id"] for entry in recon["matched"]) == [
         alert_id,
         mail_id,
+        manual_id,
     ]
     # A line with no foreign candidate is new and imports.
     assert [entry["ambiguous"] for entry in recon["missing"]] == [False]
@@ -1521,14 +1531,17 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
             row.id: (row.amount, row.currency)
             for row in (await session.scalars(select(Transaction))).all()
         }
+        manual = await session.get(Transaction, manual_id)
     assert rows[alert_id] == (Decimal("2529.00"), "INR")
     assert rows[other_id] == (Decimal("12.00"), "USD")
     assert rows[mail_id] == (Decimal("1650.00"), "INR")
     assert rows[rival_id] == (Decimal("20.00"), "USD")
-    assert len(rows) == 5
+    assert rows[manual_id] == (Decimal("1190.00"), "INR")
+    assert manual is not None and manual.amount_source == "bank"
+    assert len(rows) == 6
     # A reprocess pairs the converted row by amount and imports nothing.
     assert sorted(entry["db_txn_id"] for entry in again["matched"]) == sorted(
-        [alert_id, mail_id, imported[0].id]
+        [alert_id, mail_id, manual_id, imported[0].id]
     )
     assert again["missing"] == []
 

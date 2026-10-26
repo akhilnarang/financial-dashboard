@@ -825,7 +825,11 @@ def _pair_foreign_alerts(
         matched: The matched entries. Paired lines are added.
         missing: The missing entries. Paired lines are removed.
     """
-    foreign = [r for r in db_transactions if _normalized_currency(r.currency) != "INR"]
+    foreign = [
+        r
+        for r in db_transactions
+        if _normalized_currency(r.currency) != "INR" or r.amount_source == "manual"
+    ]
     if not foreign:
         return
     # Every line contends for the rows it names. Only an unmatched line that
@@ -1266,7 +1270,8 @@ async def statement_card_holder(
 def _take_statement_rupees(txn: Transaction, entry: dict) -> bool:
     """Write the statement's rupee amount over a paired foreign-currency row.
 
-    The row keeps the foreign amount in its raw description.
+    The row keeps the foreign amount in its raw description. A row with a
+    manual amount takes the billed amount too, on any match.
 
     Args:
         txn: The matched row.
@@ -1275,7 +1280,9 @@ def _take_statement_rupees(txn: Transaction, entry: dict) -> bool:
     Returns:
         True when the row changed.
     """
-    if "foreign_amount" not in entry or _normalized_currency(txn.currency) == "INR":
+    if txn.amount_source == "manual":
+        txn.amount_source = "bank"
+    elif "foreign_amount" not in entry or _normalized_currency(txn.currency) == "INR":
         return False
     txn.amount = parse_cc_amount(entry["amount"])
     txn.currency = "INR"
@@ -1306,8 +1313,8 @@ async def enrich_matched_transactions(recon: dict) -> int:
 
     The counterparty takes the statement narration when it is empty, a generic
     placeholder or a user alias. A paired foreign-currency row takes the
-    statement's rupee amount. The row takes the cardholder that the statement
-    names for the line.
+    statement's rupee amount, and so does a row with a manual amount. The row
+    takes the cardholder that the statement names for the line.
 
     Args:
         recon: The reconciliation from ``reconcile_statement``. Each updated

@@ -3,7 +3,13 @@ from decimal import Decimal
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import Category, CategoryReviewDecision, Transaction
+from financial_dashboard.db.models import (
+    Category,
+    CategoryReviewDecision,
+    Receivable,
+    ReceivableLink,
+    Transaction,
+)
 from financial_dashboard.services.assistant.delivery import make_delivery
 from financial_dashboard.services.categorization.manual import (
     CategoryDirectionPolicy,
@@ -24,7 +30,7 @@ pytestmark = pytest.mark.anyio
 async def _txn(session: AsyncSession, **kw) -> Transaction:
     txn = Transaction(
         bank="testbank",
-        email_type="x",
+        email_type=kw.pop("email_type", "x"),
         direction="debit",
         amount=Decimal(kw.pop("amount", "5")),
         **kw,
@@ -156,8 +162,7 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         review_status="notified",
     )
     second = await _txn(session, note="old note", amount="12.34", currency="USD")
-    credit = await _txn(session)
-    credit.email_type = "testbank_cc_payment_alert"
+    credit = await _txn(session, email_type="testbank_cc_payment_alert")
     credit.direction = "credit"
     credit.account_id = await card_account(session)
     decision = CategoryReviewDecision(
@@ -221,6 +226,7 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
                 "voided": {"before": False, "after": True},
                 "amount": {"before": "12.34", "after": "1172.08"},
                 "currency": {"before": "USD", "after": "INR"},
+                "amount_source": {"before": "bank", "after": "manual"},
             },
         },
     ]
@@ -249,11 +255,37 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         "/api/transactions/apply", json={"changes": [changes[0], changes[0]]}
     )
     assert duplicate.status_code == 422
-    card_payment = await client.post(
-        "/api/transactions/apply",
-        json={"dry_run": False, "changes": [{"id": credit_id, "amount": "1"}]},
+    # A card payment, a statement row and a receivable's row keep their amount.
+    statement_row = await _txn(
+        session, email_type="cc_statement", statement_upload_id=1
     )
-    assert card_payment.status_code == 400
+    owed = await _txn(session)
+    session.add(
+        Receivable(
+            person="A",
+            amount=Decimal("5"),
+            links=[ReceivableLink(transaction_id=owed.id, role="charge")],
+        )
+    )
+    statement_id, owed_id = statement_row.id, owed.id
+    await session.commit()
+    kept = await client.post(
+        "/api/transactions/apply",
+        json={
+            "dry_run": False,
+            "changes": [
+                {"id": credit_id, "amount": "1"},
+                {"id": statement_id, "amount": "1"},
+                {"id": owed_id, "currency": "USD"},
+            ],
+        },
+    )
+    assert kept.status_code == 400
+    assert [e["id"] for e in kept.json()["detail"]["errors"]] == [
+        credit_id,
+        statement_id,
+        owed_id,
+    ]
 
     applied = await client.post(
         "/api/transactions/apply", json={"dry_run": False, "changes": changes}
