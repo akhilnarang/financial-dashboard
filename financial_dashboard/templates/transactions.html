@@ -223,7 +223,7 @@
                         <span class="badge success">credit</span>
                         {% endif %}
                     </td>
-                    <td class="amt {% if txn.direction == 'debit' %}amt-debit{% else %}amt-credit{% endif %}">{% if txn.direction == "debit" %}&minus;{% else %}+{% endif %}{{ txn.currency|currency_symbol }}{{ "{:,.2f}".format(txn.amount) }}</td>
+                    <td class="amt {% if txn.direction == 'debit' %}amt-debit{% else %}amt-credit{% endif %}">{% if txn.voided %}<s>{% endif %}{% if txn.direction == "debit" %}&minus;{% else %}+{% endif %}{{ txn.currency|currency_symbol }}{{ "{:,.2f}".format(txn.amount) }}{% if txn.voided %}</s> <span class="badge">Voided</span>{% endif %}</td>
                     <td class="cell-counterparty">
                         <span class="truncate" title="{{ txn.counterparty or '' }}">{{ txn.counterparty or "&mdash;"|safe }}</span>
                         {% if txn.channel %}<small>{{ txn.channel }}</small>{% endif %}

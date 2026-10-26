@@ -21,6 +21,7 @@ from financial_dashboard.services.categorization.decision_lifecycle import (
     supersede_active_decisions,
 )
 from financial_dashboard.services.categorization.engine import requeue_after_enrichment
+from financial_dashboard.services.receivables import move_receivable_links
 from financial_dashboard.services.statements.cc import (
     parse_cc_amount,
     parse_cc_date,
@@ -217,6 +218,7 @@ async def answer(
             )
         await supersede_active_decisions(session, recorded.id)
         await move_transaction_references(session, recorded.id, target.id)
+        await move_receivable_links(session, recorded.id, target.id)
         await requeue_after_enrichment(session, target)
 
         await session.delete(recorded)

@@ -71,3 +71,52 @@
         <dd class="sms-body">{{ sms.body }}</dd>
     </div>
 </dl>
+
+{% set dup_deferred = sms.status == "skipped" and (sms.parse_error or "").startswith(dup_defer_prefix) %}
+{% if sms.status in ("pending", "error") or dup_deferred %}
+<div id="sms-actions-{{ sms.id }}" style="display: flex; gap: 0.5rem; align-items: center;">
+    <button type="button" class="btn-action" data-force-new="false">Reparse</button>
+    {% if dup_deferred %}
+    <button type="button" class="btn-action" data-force-new="true">Create as new</button>
+    {% endif %}
+    <span class="text-sm text-muted" data-status></span>
+</div>
+<script>
+(() => {
+    const smsId = {{ sms.id }};
+    const box = document.getElementById(`sms-actions-${smsId}`);
+    const status = box.querySelector('[data-status]');
+    const setDisabled = (value) => box.querySelectorAll('button').forEach((b) => { b.disabled = value; });
+    box.querySelectorAll('button').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+            const forceNew = btn.dataset.forceNew === 'true';
+            if (forceNew && !confirm('Create a new transaction from this SMS?')) return;
+            setDisabled(true);
+            status.textContent = 'Reparsing...';
+            try {
+                const url = forceNew ? `/sms/${smsId}/reparse?force_new=true` : `/sms/${smsId}/reparse`;
+                const resp = await fetch(url, { method: 'POST' });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok) {
+                    status.textContent = `Error: ${data.detail || `HTTP ${resp.status}`}`;
+                    setDisabled(false);
+                    return;
+                }
+                status.textContent = `Done: ${data.new_status}`;
+                const inModal = !!box.closest('#detail-modal-content');
+                setTimeout(() => {
+                    if (inModal && typeof window.openDetailModal === 'function') {
+                        window.openDetailModal(`/sms/${smsId}/detail`);
+                    } else {
+                        window.location.reload();
+                    }
+                }, 600);
+            } catch (e) {
+                status.textContent = `Error: ${e}`;
+                setDisabled(false);
+            }
+        });
+    });
+})();
+</script>
+{% endif %}

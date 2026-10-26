@@ -9,6 +9,8 @@ INITIAL_BACKFILL_DAYS = 90
 JMAP_SESSION_URL = "https://api.fastmail.com/jmap/session"
 FAILED_SPOOL_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "failed"
 FAILED_SPOOL_MAX_AGE_DAYS = 7
+# Without a timeout, a dropped connection blocks the poll forever.
+NETWORK_TIMEOUT_SECONDS = 60
 
 
 class FetchedEmail(NamedTuple):

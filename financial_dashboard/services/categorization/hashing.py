@@ -63,6 +63,7 @@ def build_confirmation_payload(
         "category": txn.category,
         "note": txn.note,
         "exclude_from_cashflow": txn.exclude_from_cashflow,
+        "voided": txn.voided,
         "transaction_date": txn.transaction_date,
         "account_id": txn.account_id,
         "card_id": txn.card_id,

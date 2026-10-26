@@ -37,6 +37,17 @@ class TransactionExcludeResponse(BaseModel):
     exclude_from_cashflow: bool = False
 
 
+class TransactionVoidUpdate(BaseModel):
+    """Set the flag to a given value, not a toggle."""
+
+    voided: bool
+
+
+class TransactionVoidResponse(BaseModel):
+    ok: bool
+    voided: bool = False
+
+
 class TransactionRelinkUpdate(BaseModel):
     """Request body for manual relink. Either field may be null to clear
     the corresponding link. If only ``card_id`` is given, the service
@@ -81,6 +92,7 @@ class TransactionRead(BaseModel):
     category: str | None
     category_method: str | None
     exclude_from_cashflow: bool = False
+    voided: bool = False
     review_status: str | None
     created_at: datetime.datetime | None
     enriched_at: datetime.datetime | None
@@ -246,29 +258,64 @@ class TransactionDeleteResponse(BaseModel):
     deletions: list[TransactionDeleteReport]
 
 
-class TransactionCategorizeItem(BaseModel):
-    """One row change. A null or absent field stays unchanged.
+class TransactionApplyChange(BaseModel):
+    """One row change. An absent field stays unchanged.
 
-    An empty ``category`` clears the category. An empty ``note`` clears the
-    note.
+    An empty ``category`` clears the category. A null or empty ``note`` clears
+    the note.
     """
 
     id: DatabaseId
-    category: Annotated[str | None, Field(max_length=128)] = None
+    category: Annotated[str, Field(max_length=128)] | None = None
     note: str | None = None
     exclude_from_cashflow: bool | None = None
+    voided: bool | None = None
+
+    @model_validator(mode="after")
+    def require_a_field(self) -> Self:
+        """Refuse a change that sets no field, or sets a non-note field to null."""
+        fields = self.model_fields_set - {"id"}
+        if not fields:
+            raise ValueError("a change must set at least one field")
+        if None in self.model_dump(exclude_unset=True, exclude={"id", "note"}).values():
+            raise ValueError("only note can be null")
+        return self
 
 
-class TransactionCategorizeRequest(BaseModel):
-    dry_run: bool = True
-    items: Annotated[
-        list[TransactionCategorizeItem], Field(min_length=1, max_length=100)
+class TransactionApplyRequest(BaseModel):
+    """Changes to apply as one unit. Dry run is the default."""
+
+    changes: Annotated[
+        list[TransactionApplyChange], Field(min_length=1, max_length=500)
     ]
+    dry_run: bool = True
+
+    @model_validator(mode="after")
+    def require_unique_ids(self) -> Self:
+        """Refuse a request that names one row twice."""
+        ids = [change.id for change in self.changes]
+        if len(ids) != len(set(ids)):
+            raise ValueError("ids must be unique")
+        return self
 
 
-class TransactionCategorizeResponse(BaseModel):
+TransactionFieldValue = str | bool | int | float | None
+
+
+class TransactionFieldDiff(BaseModel):
+    before: TransactionFieldValue
+    after: TransactionFieldValue
+
+
+class TransactionApplyRow(BaseModel):
+    id: int
+    changes: dict[str, TransactionFieldDiff]
+
+
+class TransactionApplyResponse(BaseModel):
     dry_run: bool
-    items: list[TransactionListItem]
+    changed: list[TransactionApplyRow]
+    unchanged: list[int]
 
 
 class CategoryRead(BaseModel):

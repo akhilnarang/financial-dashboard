@@ -30,6 +30,8 @@ from financial_dashboard.schemas.transactions import (
     TransactionNoteUpdate,
     TransactionRelinkResponse,
     TransactionRelinkUpdate,
+    TransactionVoidResponse,
+    TransactionVoidUpdate,
 )
 from financial_dashboard.services.duplicate_merge import (
     BatchRefused,
@@ -44,9 +46,10 @@ from financial_dashboard.services.transaction_reads import (
 )
 from financial_dashboard.services.transactions import (
     RelinkError,
-    categorize_transactions,
+    apply_transaction_changes,
     relink_transaction,
     set_transaction_excluded,
+    set_transaction_voided,
     update_transaction_category,
     update_transaction_note,
 )
@@ -161,24 +164,26 @@ async def transactions_delete_batch(
         raise ConflictException(detail={"refused": exc.refusals}) from exc
 
 
-@router.post("/transactions/categorize")
-async def transactions_categorize(
-    payload: transaction_schemas.TransactionCategorizeRequest,
+@router.post("/transactions/apply")
+async def transactions_apply(
+    payload: transaction_schemas.TransactionApplyRequest,
     session: AsyncSessionDep,
-) -> transaction_schemas.TransactionCategorizeResponse:
-    """Change category, note and cashflow exclusion on many rows at once.
+) -> transaction_schemas.TransactionApplyResponse:
+    """Apply note, category, exclusion and void changes to many rows at once.
 
-    ``dry_run`` defaults to true. One invalid item rejects the whole request
-    with a 400 and per-item errors, and nothing is written.
+    ``dry_run`` defaults to true and writes nothing. One invalid change rejects
+    the whole request with a 400 that lists each invalid change, and nothing is
+    written. The response shows the before and after value of each field that
+    changes, and the ids where nothing changes.
     """
     try:
-        items = await categorize_transactions(
-            session, payload.items, dry_run=payload.dry_run
+        result = await apply_transaction_changes(
+            session, payload.changes, dry_run=payload.dry_run
         )
     except ValueError as exc:
         raise BadRequestException(detail={"errors": exc.args[0]}) from exc
-    return transaction_schemas.TransactionCategorizeResponse(
-        dry_run=payload.dry_run, items=items
+    return transaction_schemas.TransactionApplyResponse(
+        dry_run=payload.dry_run, changed=result.changed, unchanged=result.unchanged
     )
 
 
@@ -275,6 +280,23 @@ async def update_exclude(
     )
     if ok:
         return TransactionExcludeResponse(ok=True, exclude_from_cashflow=state)
+
+    raise NotFoundException(detail="Transaction not found")
+
+
+@router.post("/transactions/{txn_id}/void")
+async def update_void(
+    txn_id: Annotated[DatabaseId, Path()],
+    payload: TransactionVoidUpdate,
+    session: AsyncSessionDep,
+) -> TransactionVoidResponse:
+    """Void a transaction, or undo the void."""
+    try:
+        ok, state = await set_transaction_voided(session, txn_id, payload.voided)
+    except ValueError as exc:
+        raise BadRequestException(detail=str(exc)) from exc
+    if ok:
+        return TransactionVoidResponse(ok=True, voided=state)
 
     raise NotFoundException(detail="Transaction not found")
 

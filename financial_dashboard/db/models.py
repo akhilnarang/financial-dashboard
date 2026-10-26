@@ -186,8 +186,22 @@ class StatementUpload(Base):
     payment_paid_amount: Mapped[Decimal | None] = mapped_column(
         Numeric(precision=12, scale=2), default=0
     )
+    # The latest statement by due date. Only it takes payment actions. The
+    # after_flush hook in db/__init__.py keeps this current.
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
 
     account: Mapped["Account"] = relationship(lazy="joined")
+
+    __table_args__ = (
+        Index(
+            "uq_statement_uploads_one_active",
+            "account_id",
+            unique=True,
+            sqlite_where=text("is_active = 1"),
+        ),
+    )
 
 
 class BankStatementUpload(Base):
@@ -658,6 +672,12 @@ class Transaction(Base):
     The row stays in every other view. The cashflow figures skip it. The
     "Excluded" footnote counts it. Use it for a row the category must not touch,
     such as a reversal-and-redo pair, or money paid for someone and returned."""
+    voided: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
+    """True when the bank voided the charge before it settled. The user sets it.
+    A voided row never counts as money. A statement row never matches it. An
+    alert that arrives again still matches it, so a reparse does not add it again."""
     category: Mapped[str | None] = mapped_column(String)
     category_method: Mapped[str | None] = mapped_column(String)
     category_confidence: Mapped[float | None] = mapped_column(Float)
@@ -1001,3 +1021,65 @@ class AuditAction(Base):
     error_code: Mapped[str | None] = mapped_column(String)
 
     __table_args__ = (Index("ix_audit_actions_created_at", "created_at"),)
+
+
+class Receivable(Base):
+    """Money a person owes the user. Paid and outstanding are computed."""
+
+    __tablename__ = "receivables"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    person: Mapped[str] = mapped_column(String, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String, nullable=False, default="open", server_default="open", index=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    closed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+
+    links: Mapped[list["ReceivableLink"]] = relationship(
+        back_populates="receivable", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_receivable_amount_positive"),
+        CheckConstraint(
+            "status IN ('open', 'settled', 'written_off')",
+            name="ck_receivable_status",
+        ),
+    )
+
+
+class ReceivableLink(Base):
+    """A transaction a receivable is for (charge) or that pays it (payment)."""
+
+    __tablename__ = "receivable_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    receivable_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("receivables.id"), nullable=False, index=True
+    )
+    transaction_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("transactions.id"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String, nullable=False)
+
+    receivable: Mapped[Receivable] = relationship(back_populates="links")
+    transaction: Mapped[Transaction] = relationship(lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("receivable_id", "transaction_id", name="uq_receivable_link"),
+        CheckConstraint(
+            "role IN ('charge', 'payment')", name="ck_receivable_link_role"
+        ),
+        # A payment row pays one receivable, so its money counts once.
+        Index(
+            "uq_receivable_payment_link",
+            "transaction_id",
+            unique=True,
+            sqlite_where=text("role = 'payment'"),
+        ),
+    )

@@ -11,8 +11,8 @@ This is expressed as the half-open range ``[prev_due + 1 day, this_due + 1 day)`
 so one predicate can place every row. The boundary between two consecutive
 statements is a single value derived once (``boundary``), so adjacent cycles
 never overlap or leave a gap — even when a due date is unreadable or two
-statements share a due date (a duplicate re-send: the payment still lands in
-exactly one cycle, never both).
+statements share a due date (a duplicate re-send, or an email summary and its
+PDF: both share one cycle, and only the newer one is acted on).
 
 Only statements that carry a parseable due date anchor a boundary. A
 password-required or parse-error upload has no due date; it must not act as a
@@ -85,8 +85,8 @@ async def cc_cycle_window(
     Neighbours are ordered by DUE DATE, not by ``created_at``: a statement can
     be ingested out of due order (a backfilled old cycle), and its true
     neighbour is the adjacent bill, not the adjacent ingestion. Only anchors (a
-    parseable due date) take part; ``id`` breaks a due-date tie (a duplicate
-    re-send), so the payment still lands in exactly one cycle.
+    parseable due date) take part; statements that share a due date share
+    one window.
     """
     created_start = (upload.created_at or datetime.now(timezone.utc)).date()
     this_due = _due(upload.due_date)
@@ -130,12 +130,21 @@ async def cc_cycle_window(
             anchors.append((due, row.id, row.created_at))
     anchors.sort(key=lambda a: (a[0], a[1]))
 
-    idx = next((i for i, a in enumerate(anchors) if a[1] == upload.id), None)
-    prev_due = anchors[idx - 1][0] if idx not in (None, 0) else None
-    has_next = idx is not None and idx + 1 < len(anchors)
-    next_created = anchors[idx + 1][2] if has_next else None
+    # A statement that shares this due date (a re-send, or an email summary
+    # and its PDF) is the same cycle, not a neighbour.
+    earlier = [a for a in anchors if a[0] < this_due]
+    later = [a for a in anchors if a[0] > this_due]
+    prev_due = earlier[-1][0] if earlier else None
+    has_next = bool(later)
+    next_created = later[0][2] if has_next else None
 
-    start = _boundary(prev_due, upload.created_at) or created_start
+    # With no earlier bill, a tied group starts at its first ingestion, so a
+    # payment between the summary and the later PDF still counts.
+    group_created = min(
+        (a[2] for a in anchors if a[0] == this_due and a[2] is not None),
+        default=upload.created_at,
+    )
+    start = _boundary(prev_due, group_created) or created_start
     end = _boundary(this_due, next_created) if has_next else None
     return CycleWindow(start=start, end=end)
 

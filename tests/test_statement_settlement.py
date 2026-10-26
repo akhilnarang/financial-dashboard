@@ -15,6 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from financial_dashboard.db import Account, Card, StatementUpload, Transaction
 from financial_dashboard.db.models import (
     AuditInteraction,
+    Receivable,
+    ReceivableLink,
     TelegramConversation,
     TelegramMessageContext,
 )
@@ -181,6 +183,13 @@ async def test_a_fold_states_what_the_statement_states(maker):
                 pending_confirmation_kind="merchant_rule",
             )
         )
+        session.add(
+            Receivable(
+                person="Friend A",
+                amount=Decimal("2529.00"),
+                links=[ReceivableLink(transaction_id=2, role="charge")],
+            )
+        )
         await session.commit()
 
     async with maker() as session:
@@ -200,11 +209,13 @@ async def test_a_fold_states_what_the_statement_states(maker):
         context = await session.scalar(select(TelegramMessageContext))
         queued = await session.scalar(select(AuditInteraction))
         conversation = await session.scalar(select(TelegramConversation))
-    assert (context.transaction_id, queued.transaction_id, row.attachment_path) == (
-        1,
-        1,
-        "receipt.jpg",
-    )
+        link = await session.scalar(select(ReceivableLink.transaction_id))
+    assert (
+        context.transaction_id,
+        queued.transaction_id,
+        link,
+        row.attachment_path,
+    ) == (1, 1, 1, "receipt.jpg")
     # A later "yes" must not apply an action that names the deleted id.
     assert conversation.pending_confirmation_json is None
 

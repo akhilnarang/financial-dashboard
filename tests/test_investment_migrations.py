@@ -251,9 +251,11 @@ async def test_stored_reconciliations_backfill_card_holders_once(tmp_path, monke
 
         async with maker() as session:
             holders = dict(
-                (await session.execute(select(Transaction.id, Transaction.card_holder)))
-                .tuples()
-                .all()
+                (
+                    await session.execute(
+                        select(Transaction.id, Transaction.card_holder)
+                    )
+                ).all()
             )
             marker_count = (
                 await session.execute(
@@ -398,5 +400,60 @@ async def test_interim_lot_table_rebuild_preserves_rows_and_enables_occurrences(
         assert preserved.instrument_id == "INE000A01018"
         assert preserved.source_occurrence == 0
         assert count == 2
+    finally:
+        await engine.dispose()
+
+
+async def test_legacy_statement_uploads_gain_one_active_statement(
+    tmp_path, monkeypatch
+):
+    """A database from before ``is_active`` gains the column, marks the latest
+    statement per account active (by due date, not ingestion order), and
+    enforces one active statement per account."""
+    _stub_init_caches(monkeypatch)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/legacy-active.db")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        async with maker() as session:
+            session.add(Account(id=1, bank="sbi", label="Card", type="credit_card"))
+            # The newest bill is ingested first; an older bill is backfilled later.
+            for due in ("23/10/2026", "23/02/2026"):
+                session.add(
+                    StatementUpload(
+                        account_id=1,
+                        bank="sbi",
+                        filename="cc.pdf",
+                        file_path="/nonexistent/cc.pdf",
+                        due_date=due,
+                    )
+                )
+            await session.commit()
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP INDEX uq_statement_uploads_one_active"))
+            await conn.execute(
+                text("ALTER TABLE statement_uploads DROP COLUMN is_active")
+            )
+
+        await init_db(engine)
+        await init_db(engine)
+
+        async with maker() as session:
+            active = (
+                (
+                    await session.execute(
+                        select(StatementUpload.due_date).where(
+                            StatementUpload.is_active.is_(True)
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert active == ["23/10/2026"]
+        with pytest.raises(Exception, match="UNIQUE"):
+            async with engine.begin() as conn:
+                await conn.execute(text("UPDATE statement_uploads SET is_active = 1"))
     finally:
         await engine.dispose()

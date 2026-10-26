@@ -4,7 +4,7 @@ from collections import defaultdict
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import noload
+from sqlalchemy.orm import raiseload
 
 from financial_dashboard.core.masks import display_mask
 from financial_dashboard.db import (
@@ -127,7 +127,7 @@ async def list_accounts(
             (
                 await session.execute(
                     select(Account)
-                    .options(noload(Account.cards))
+                    .options(raiseload(Account.cards))
                     .where(*filters)
                     .order_by(Account.id)
                     .offset(offset)
@@ -209,7 +209,7 @@ async def get_account_detail(
     with session.no_autoflush:
         account = await session.scalar(
             select(Account)
-            .options(noload(Account.cards))
+            .options(raiseload(Account.cards))
             .where(Account.id == account_id)
             .execution_options(autoflush=False)
         )

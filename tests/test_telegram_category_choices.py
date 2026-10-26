@@ -549,7 +549,7 @@ async def test_enabled_long_review_queues_all_chunks_with_buttons_only_first(
         email_type="purchase",
         direction="debit",
         amount="960.00",
-        counterparty="MERCHANT " + ("x" * 9000),
+        counterparty="A&B <MERCHANT> " + ("x" * 9000),
         review_status="pending",
         review_reason="ambiguous merchant " + ("reason " * 1200),
         notify_attempts=0,
@@ -581,6 +581,7 @@ async def test_enabled_long_review_queues_all_chunks_with_buttons_only_first(
         return True
 
     monkeypatch.setattr(telegram, "dispatch_saved_delivery", fake_dispatch)
+    monkeypatch.setattr(sweep, "get_app_base_url", lambda: "http://host:8000")
     settings_service._cache.update(
         {
             "telegram.enabled": "true",
@@ -608,7 +609,11 @@ async def test_enabled_long_review_queues_all_chunks_with_buttons_only_first(
     assert len(deliveries) > 1
     assert dispatched == [delivery.id for delivery in deliveries]
     assert all(len(delivery.text) <= 4096 for delivery in deliveries)
-    assert all(delivery.parse_mode is None for delivery in deliveries)
+    assert all(delivery.parse_mode == "HTML" for delivery in deliveries)
+    first_line = deliveries[0].text.splitlines()[0]
+    link = f'<a href="http://host:8000/transactions/{transaction.id}">'
+    assert first_line.endswith(f"{link}#{transaction.id}</a>")
+    assert "A&amp;B &lt;MERCHANT&gt;" in deliveries[0].text
     assert deliveries[0].reply_markup_json is not None
     assert "cat:v1:" in deliveries[0].reply_markup_json
     assert all(delivery.reply_markup_json is None for delivery in deliveries[1:])

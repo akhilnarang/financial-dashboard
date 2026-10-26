@@ -46,6 +46,7 @@ class AssistantTransaction(NamedTuple):
     category_method: str | None
     note: str | None
     exclude_from_cashflow: bool
+    voided: bool
     category_confidence: float | None
     category_model: str | None
     review_status: str | None
@@ -88,6 +89,7 @@ def _projection(
         category_method=_bounded(row.category_method),
         note=_redacted(row.note, name_tokens),
         exclude_from_cashflow=bool(row.exclude_from_cashflow),
+        voided=bool(row.voided),
         category_confidence=row.category_confidence,
         category_model=_bounded(row.category_model),
         review_status=_bounded(row.review_status),
@@ -113,6 +115,7 @@ def _statement(**filters: object) -> Select:
         Transaction.category_method,
         Transaction.note,
         Transaction.exclude_from_cashflow,
+        Transaction.voided,
         Transaction.category_confidence,
         Transaction.category_model,
         Transaction.review_status,

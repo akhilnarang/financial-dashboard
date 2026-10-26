@@ -57,3 +57,14 @@ class ManualCategory(StrEnum):
     cash = "cash"
     loan = "loan"
     other = "other"
+
+
+class ReceivableStatus(StrEnum):
+    open = "open"
+    settled = "settled"
+    written_off = "written_off"
+
+
+class ReceivableRole(StrEnum):
+    charge = "charge"
+    payment = "payment"

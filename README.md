@@ -163,6 +163,7 @@ outcome, and audited actions, without attachment files or Telegram file IDs.
 - **Accounts** (`/accounts`): CRUD for bank accounts and credit cards.
 - **Email Sources** (`/sources`): CRUD for Gmail/Fastmail credentials. Test connectivity with `POST /api/sources/{id}/test`.
 - **Rules** (`/rules`): CRUD for fetch rules (sender, subject, folder, bank, source assignment). Rules can be enabled/disabled individually.
+- **Owed to me** (`/receivables`): Read-only list of open receivables with amount, paid, outstanding, and links to the charge and payment rows.
 - **Statements** (`/statements`): CC statement upload, reconciliation view, import controls, retry with password, and reprocess-failed-emails action.
 
 ## Extensions
@@ -421,6 +422,8 @@ scripts/
 | `TelegramOutboundDelivery` | `telegram_outbound_deliveries` | Durable, recipient-bound outbound message chunks owned by an interaction or category decision |
 | `AuditAction` | `audit_actions` | Audited financial mutation with before/after values and optional Undo lifecycle |
 | `CategoryReviewDecision` | `category_review_decisions` | Persisted ordered category candidates and compare-and-swap selection state |
+| `Receivable` | `receivables` | Money a person owes the user (INR); `paid` and `outstanding` are computed from linked payment rows, not stored. A ledger only: it does not change cashflow figures |
+| `ReceivableLink` | `receivable_links` | Links a receivable to a debit it was for (`charge`) or a credit that pays it back (`payment`) |
 | `Setting` | `settings` | Small key/value store for app-level settings |
 | `ExtensionRun` | `extension_runs` | Audit/state row for a single extension operation (probe/generate/sync, manual or automatic); generic over `extension_id`, stores no credentials and never duplicates financial rows |
 | `ExtensionSyncState` | `extension_sync_state` | Per-extension current sync-state singleton (Paisa today): trigger-bumped `desired_revision` vs coordinator-advanced `applied_revision`, dirty window, published/remote/healthy hashes, retry backoff, diagnosis state, one-shot force-reload flag, and a single-flight lease. Exactly one row per extension; never stores credentials or duplicates financial rows |
@@ -515,6 +518,7 @@ erDiagram
         datetime payment_last_reminded_at
         decimal payment_paid_amount
         datetime payment_paid_at
+        bool is_active
     }
 
     BANK_STATEMENT_UPLOADS {
@@ -681,6 +685,7 @@ erDiagram
         text note
         text attachment_path
         boolean exclude_from_cashflow
+        boolean voided
         string category
         string category_method
         float category_confidence
@@ -709,6 +714,23 @@ erDiagram
         bool active
         int priority
         datetime created_at
+    }
+
+    RECEIVABLES {
+        int id PK
+        string person
+        decimal amount
+        text note
+        string status
+        datetime created_at
+        datetime closed_at
+    }
+
+    RECEIVABLE_LINKS {
+        int id PK
+        int receivable_id FK
+        int transaction_id FK
+        string role
     }
 
     TELEGRAM_CONVERSATIONS {
@@ -865,6 +887,8 @@ erDiagram
     AUDIT_INTERACTIONS ||--o{ TELEGRAM_OUTBOUND_DELIVERIES : owns
     CATEGORY_REVIEW_DECISIONS ||--o{ TELEGRAM_OUTBOUND_DELIVERIES : owns
     AUDIT_INTERACTIONS ||--o{ AUDIT_ACTIONS : records
+    RECEIVABLES ||--o{ RECEIVABLE_LINKS : links
+    TRANSACTIONS ||--o{ RECEIVABLE_LINKS : charges_or_pays
 ```
 
 `transactions.category` references `categories.slug` as a soft (application-enforced) link — SQLite foreign-key enforcement is intentionally off, so there is no DB-level FK constraint.
@@ -884,14 +908,18 @@ Relationship notes:
 - `transactions` also has a partial lookup index on `reference_number` where it is non-null; ingest uses it to find an opposite-direction leg on a different linked or masked account and mark both transactions as `self_transfer`.
 - `transactions.counterparty_source` is non-null and defaults to `bank`. It says where `counterparty` came from. A parser sets `user_alias` when the bank prints a label the user chose, such as an HDFC payee nickname. A label does not replace a name a bank states, and a bank name replaces a stored label. The column follows the name: a writer that changes one changes the other.
 - `transactions.card_holder` is the cardholder that a card statement names for the row. Some banks print one card number for the primary card and each add-on, so `card_mask` alone cannot tell them apart. Statement import and enrichment set it; a one-time migration fills it from each stored statement reconciliation.
+- `transactions.voided` marks a card charge that the bank cancelled before it settled. The user sets it. Cashflow figures, list totals and the bank cash bridge skip a voided row. Card statement matching skips it too, but alert de-duplication still matches it, so a reparse does not add the row again.
 - `transactions` has a composite lookup index on `(category, transaction_date)`. Category first because a category filter with no date bounds — a drill-through from a category link, say — would otherwise scan the table, both for the rows and for the `count()` the pager needs; `transaction_date` second so a filter carrying both a category and a date range satisfies them from the one index instead of narrowing on dates and re-checking the category per row.
 - `(account_id, card_mask)` is unique on `cards`.
+- `statement_uploads` has a partial unique index on `account_id` where `is_active = 1`: each card has at most one active statement. The active statement is the latest by due date (a tie goes to the newer upload). An `after_flush` hook keeps the flag current. Only the active statement takes payment actions.
 - `balance_snapshots` has a check constraint requiring exactly one source foreign key among `account_id`, `cas_upload_id`, and `manual_item_id`.
 - `balance_snapshots` has SQLite partial unique indexes for account, investment, and manual snapshot upserts: `(account_id, category, as_of_date)`, `(portfolio_key, category, as_of_date)`, and `(manual_item_id, as_of_date)`.
 - `telegram_outbound_deliveries` requires exactly one owner (`interaction_id` or `category_review_decision_id`) and has partial unique indexes on `(interaction_id, ordinal)` and `(category_review_decision_id, ordinal)`.
 - `telegram_message_contexts` uniquely maps `(chat_id, message_id)` to the logical interaction/outbound row; `telegram_outbound_deliveries.delivery_token` is globally unique for Ref-token recovery.
 - `telegram_outbound_deliveries` rows with either `abandoned` or `cancelled` status remain visible in the audit surface; cancellation preserves the delivery history when authorization changes.
 - Pending confirmations and in-flight assistant writes check a hash over category, note, cashflow exclusion, date, account/card/reference identifiers, and the current categorization input state. The pending confirmation's nullable source-interaction foreign key binds an affirmative reply to the application-rendered clarification that authorized it. `audit_interactions.output_mode` records whether provider output used a strict schema or fallback JSON mode.
+- `receivables.amount` must be positive and `status` is one of `open`, `settled`, `written_off`. A move to `settled` or `written_off` stamps `closed_at`; a move back to `open` clears it.
+- `(receivable_id, transaction_id)` is unique on `receivable_links`, and `role` is `charge` (a debit row) or `payment` (a credit row). A partial unique index on `transaction_id` where `role = 'payment'` lets a payment row pay one receivable only, so its money counts once. A merge moves a deleted row's links to the keeper and drops a link the keeper already has (or a payment link when the keeper already pays a receivable); a plain delete drops them.
 - `(portfolio_key, statement_date)` is unique on `cas_uploads` so re-importing the same CAS period replaces the prior upload.
 - `investment_lots` carries a natural unique key `(cas_upload_id, source_ref, instrument_id, acquired_on, reference, source_occurrence)`. `source_occurrence` preserves genuine multiplicity inside one source statement, while idempotent normalization cannot insert the same occurrence twice. Rows repeated by overlapping CAS periods remain attached to every contributing upload; the investment service exposes a deterministic canonical multiset keyed by portfolio/source transaction identity/instrument/date/reference/quantity/cost and retains all contributing upload provenance. A lot is only created when the source states quantity, per-unit cost, cost basis, currency and acquisition date explicitly and consistently (`quantity * unit_cost == cost_basis` to the penny); value-only holdings and demat movements (CAS prints no cost) are excluded and reported as diagnostics, never fabricated into a lot. Acquisition cost facts are never derived from a current NAV/value. Current valuation facts are read separately from the latest statement per portfolio and preserve demat-account/folio identity even when the same ISIN is held in several sources. These rows are **not** consumed by the Paisa projection, which represents CAS as an aggregate valuation only; they remain available to the dashboard and to a future cost-basis feature.
 - `snapshot_holdings` has nullable investment-detail columns (`instrument_id`, `quantity`, `unit_price`, `currency`, `cost_basis`, `acquired_on`). CAS ingestion still aggregates holdings by asset class for the net-worth breakdown, so these stay NULL on those rows; they are populated only when a holding represents a single instrument the CAS explicitly priced.
@@ -964,10 +992,18 @@ uv run python scripts/seed.py
 |--------|------|-------------|
 | `GET` | `/api/poll/status` | Returns current poll state, progress, last stats, last error |
 | `POST` | `/api/transactions/{id}/note` | Update the freeform note on a transaction (JSON body: `{"note": "..."}`) |
+| `POST` | `/api/transactions/apply` | Change note, category, cashflow exclusion and void state on many transactions as one unit; `dry_run` defaults to true |
 | `POST` | `/api/sources/{id}/test` | Test connectivity for an email source; returns `{"ok": bool, "message"/"error": str}` |
+| `GET` | `/api/merchant-rules` | List merchant→category rules |
+| `POST` | `/api/merchant-rules` | Add or update a rule (`{"pattern", "category", "priority"?}`); the next categorization uses it |
+| `DELETE` | `/api/merchant-rules/{id}` | Deactivate a rule; the next categorization stops using it, and a restart does not reseed it |
 | `GET` | `/api/extensions` | List registered extension manifests |
 | `GET`/`POST` | `/api/extensions/paisa/config` | Read (redacted) / save Paisa config |
 | `GET` | `/api/extensions/paisa/status` | Read-only probe of the Paisa instance |
+| `GET` | `/api/receivables?status=open` | List receivables with `paid`, `outstanding`, and linked row ids |
+| `POST` | `/api/receivables` | Create a receivable (`person`, `amount`, `note`, optional `charge_transaction_ids`/`payment_transaction_ids`) |
+| `PATCH` | `/api/receivables/{id}` | Change `amount`, `note`, or `status` |
+| `POST`/`DELETE` | `/api/receivables/{id}/links[/{transaction_id}]` | Link a row with a `role`, or unlink it |
 
 The full Paisa JSON surface (`/accounts`, `/probe`, `/preview`, `/generate`, `/sync`) is documented in [Extensions → Routes](#routes).
 

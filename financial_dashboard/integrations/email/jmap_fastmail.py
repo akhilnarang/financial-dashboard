@@ -10,6 +10,7 @@ from financial_dashboard.core.crypto import decrypt_credentials
 from financial_dashboard.integrations.email.base import (
     INITIAL_BACKFILL_DAYS,
     JMAP_SESSION_URL,
+    NETWORK_TIMEOUT_SECONDS,
     FetchedEmail,
     FetchSourceResult,
 )
@@ -29,7 +30,7 @@ def _jmap_request(token: str, url: str, body: dict | None = None) -> dict:
         )
     else:
         req = Request(url, headers=headers)
-    with urlopen(req) as resp:
+    with urlopen(req, timeout=NETWORK_TIMEOUT_SECONDS) as resp:
         return json.loads(resp.read())
 
 
@@ -254,7 +255,7 @@ def _fetch_fastmail_source_sync(
                     .replace("{name}", "email.eml")
                 )
                 req = Request(blob_url, headers={"Authorization": f"Bearer {token}"})
-                with urlopen(req) as resp:
+                with urlopen(req, timeout=NETWORK_TIMEOUT_SECONDS) as resp:
                     raw = resp.read()
                 results_by_rule[rule.id].append(
                     FetchedEmail(
@@ -314,7 +315,7 @@ def _fetch_fastmail_single_sync(token: str, remote_id: str) -> bytes | None:
             .replace("{name}", "email.eml")
         )
         req = Request(blob_url, headers={"Authorization": f"Bearer {token}"})
-        with urlopen(req) as resp:
+        with urlopen(req, timeout=NETWORK_TIMEOUT_SECONDS) as resp:
             return resp.read()
     except Exception as e:
         logger.error("Failed to fetch Fastmail message %s: %s", remote_id, e)
