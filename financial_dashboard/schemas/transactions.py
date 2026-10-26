@@ -277,9 +277,8 @@ class TransactionApplyChange(BaseModel):
         fields = self.model_fields_set - {"id"}
         if not fields:
             raise ValueError("a change must set at least one field")
-        set_values = self.model_dump(include=fields - {"note"})
-        if nulls := sorted(f for f, value in set_values.items() if value is None):
-            raise ValueError(f"only note can be null: {nulls}")
+        if None in self.model_dump(exclude_unset=True, exclude={"id", "note"}).values():
+            raise ValueError("only note can be null")
         return self
 
 
