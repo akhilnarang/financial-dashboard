@@ -1,4 +1,4 @@
-"""Receivables ledger: money other people owe the user.
+"""Receivables ledger: money other people owe the user, and money the user owes.
 
 The ledger does not change cashflow figures. Paid and outstanding are
 computed from the linked rows on each read.
@@ -11,7 +11,11 @@ from sqlalchemy import CursorResult, delete, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.enums import ReceivableRole, ReceivableStatus
+from financial_dashboard.db.enums import (
+    ReceivableKind,
+    ReceivableRole,
+    ReceivableStatus,
+)
 from financial_dashboard.db.models import (
     Receivable,
     ReceivableLink,
@@ -28,7 +32,16 @@ from financial_dashboard.schemas.receivables import (
     ReceivableUpdate,
 )
 
-ROLE_DIRECTION = {ReceivableRole.charge: "debit", ReceivableRole.payment: "credit"}
+ROLE_DIRECTION = {
+    ReceivableKind.receivable: {
+        ReceivableRole.charge: "debit",
+        ReceivableRole.payment: "credit",
+    },
+    ReceivableKind.payable: {
+        ReceivableRole.charge: "credit",
+        ReceivableRole.payment: "debit",
+    },
+}
 
 
 def receivable_read(receivable: Receivable) -> ReceivableRead:
@@ -50,6 +63,7 @@ def receivable_read(receivable: Receivable) -> ReceivableRead:
             paid += link.transaction.amount
     return ReceivableRead(
         id=receivable.id,
+        kind=ReceivableKind(receivable.kind),
         person=receivable.person,
         amount=receivable.amount,
         note=receivable.note,
@@ -82,13 +96,17 @@ async def list_receivables(
 
 
 async def _linkable(
-    session: AsyncSession, transaction_id: int, role: ReceivableRole
+    session: AsyncSession,
+    transaction_id: int,
+    kind: ReceivableKind,
+    role: ReceivableRole,
 ) -> Transaction:
     """Load the row a link names and check that it fits the role.
 
     Args:
         session: The request session.
         transaction_id: The row to link.
+        kind: The kind of the receivable the link belongs to.
         role: The role the link takes.
 
     Returns:
@@ -103,9 +121,9 @@ async def _linkable(
         raise UnprocessableEntityException(
             detail=f"Transaction {transaction_id} not found"
         )
-    if txn.direction != ROLE_DIRECTION[role]:
+    if txn.direction != (direction := ROLE_DIRECTION[kind][role]):
         raise UnprocessableEntityException(
-            detail=f"A {role} link needs a {ROLE_DIRECTION[role]} row; "
+            detail=f"A {kind} {role} link needs a {direction} row; "
             f"transaction {transaction_id} is a {txn.direction}"
         )
     if (txn.currency or "INR") != "INR":
@@ -129,7 +147,9 @@ async def _write_lock(session: AsyncSession) -> None:
 
 
 async def _new_links(
-    session: AsyncSession, wanted: list[tuple[int, ReceivableRole]]
+    session: AsyncSession,
+    kind: ReceivableKind,
+    wanted: list[tuple[int, ReceivableRole]],
 ) -> list[ReceivableLink]:
     """Build links under the write lock. Roll back and raise on a bad row.
 
@@ -138,6 +158,7 @@ async def _new_links(
 
     Args:
         session: The request session. It must not hold a write yet.
+        kind: The kind of the receivable the links belong to.
         wanted: The row id and role of each link.
 
     Returns:
@@ -149,7 +170,9 @@ async def _new_links(
     await _write_lock(session)
     try:
         return [
-            ReceivableLink(transaction=await _linkable(session, i, role), role=role)
+            ReceivableLink(
+                transaction=await _linkable(session, i, kind, role), role=role
+            )
             for i, role in wanted
         ]
     except UnprocessableEntityException:
@@ -201,10 +224,11 @@ async def create_receivable(
     if len(ids) != len(set(ids)):
         raise UnprocessableEntityException(detail="A transaction is listed twice")
     receivable = Receivable(
+        kind=payload.kind,
         person=payload.person,
         amount=payload.amount,
         note=payload.note,
-        links=await _new_links(session, wanted),
+        links=await _new_links(session, payload.kind, wanted),
     )
     session.add(receivable)
     await _commit_links(session)
@@ -251,8 +275,8 @@ async def add_link(
         session: The request session.
         receivable: The receivable to link.
         transaction_id: The row to link.
-        role: ``charge`` for a debit the money was for, ``payment`` for a
-            credit that pays it back.
+        role: ``charge`` for the row the money was for, ``payment`` for a
+            row that pays it back.
 
     Returns:
         The changed receivable.
@@ -263,7 +287,10 @@ async def add_link(
         UnprocessableEntityException: The row is unknown or the wrong
             direction for the role.
     """
-    receivable.links.extend(await _new_links(session, [(transaction_id, role)]))
+    links = await _new_links(
+        session, ReceivableKind(receivable.kind), [(transaction_id, role)]
+    )
+    receivable.links.extend(links)
     await _commit_links(session)
     return receivable
 

@@ -97,21 +97,24 @@ async def test_payment_link_lowers_outstanding(client, session):
     ]
 
 
-# A debit cannot pay back, a credit is not a charge, and the ledger is INR
-# only.
+# A debit cannot pay back a receivable, a credit is not its charge, a payable
+# flips both, and the ledger is INR only.
 @pytest.mark.parametrize(
-    ("row", "role"),
+    ("kind", "row", "role"),
     [
-        (("debit", "INR"), "payment"),
-        (("credit", "INR"), "charge"),
-        (("credit", "USD"), "payment"),
-        (9999, "payment"),
+        ("receivable", ("debit", "INR"), "payment"),
+        ("receivable", ("credit", "INR"), "charge"),
+        ("payable", ("credit", "INR"), "payment"),
+        ("receivable", ("credit", "USD"), "payment"),
+        ("receivable", 9999, "payment"),
     ],
 )
-async def test_link_rejects_unknown_or_unfit_row(client, session, row, role):
+async def test_link_rejects_unknown_or_unfit_row(client, session, kind, row, role):
     txn_id = row if isinstance(row, int) else await _row(session, row[0], "100", row[1])
     rid = (
-        await client.post("/api/receivables", json={"person": "A", "amount": "100"})
+        await client.post(
+            "/api/receivables", json={"kind": kind, "person": "A", "amount": "100"}
+        )
     ).json()["id"]
 
     response = await client.post(
@@ -120,7 +123,12 @@ async def test_link_rejects_unknown_or_unfit_row(client, session, row, role):
     )
     created = await client.post(
         "/api/receivables",
-        json={"person": "A", "amount": "100", f"{role}_transaction_ids": [txn_id]},
+        json={
+            "kind": kind,
+            "person": "A",
+            "amount": "100",
+            f"{role}_transaction_ids": [txn_id],
+        },
     )
 
     assert (response.status_code, created.status_code) == (422, 422)
@@ -151,15 +159,30 @@ async def test_patch_changes_only_named_fields(client):
     assert nulled.status_code == 422
 
 
-async def test_list_and_page_filter_by_status(client):
+async def test_list_and_page_filter_by_status(client, session):
     for person in ("Friend A", "Friend B"):
         await client.post("/api/receivables", json={"person": person, "amount": "75"})
     settled = (await client.get("/api/receivables")).json()["items"][1]["id"]
     await client.patch(f"/api/receivables/{settled}", json={"status": "settled"})
+    owed = await client.post(
+        "/api/receivables",
+        json={
+            "kind": "payable",
+            "person": "Friend C",
+            "amount": "300",
+            "charge_transaction_ids": [await _row(session, "credit", "300.00")],
+            "payment_transaction_ids": [await _row(session, "debit", "120.00")],
+        },
+    )
 
     open_rows = (await client.get("/api/receivables?status=open")).json()["items"]
-    page = await client.get("/receivables")
+    page = (await client.get("/receivables")).text
 
-    assert [row["person"] for row in open_rows] == ["Friend A"]
-    assert "Friend A" in page.text
-    assert "Friend B" not in page.text
+    assert owed.status_code == 201
+    assert [(row["person"], row["kind"], row["outstanding"]) for row in open_rows] == [
+        ("Friend A", "receivable", "75.00"),
+        ("Friend C", "payable", "180.00"),
+    ]
+    assert page.index("Owed to me") < page.index("Friend A") < page.index("I owe")
+    assert page.index("I owe") < page.index("Friend C")
+    assert "Friend B" not in page

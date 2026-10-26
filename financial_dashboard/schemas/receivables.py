@@ -6,7 +6,11 @@ from typing import Annotated, Self
 
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
-from financial_dashboard.db.enums import ReceivableRole, ReceivableStatus
+from financial_dashboard.db.enums import (
+    ReceivableKind,
+    ReceivableRole,
+    ReceivableStatus,
+)
 from financial_dashboard.schemas.common import DatabaseId
 
 Amount = Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)]
@@ -18,6 +22,7 @@ LinkIds = Annotated[list[DatabaseId], Field(max_length=100)]
 
 
 class ReceivableCreate(BaseModel):
+    kind: ReceivableKind = ReceivableKind.receivable
     person: Person
     amount: Amount
     note: Note | None = None
@@ -47,6 +52,7 @@ class ReceivableLinkCreate(BaseModel):
 
 class ReceivableRead(BaseModel):
     id: int
+    kind: ReceivableKind
     person: str
     amount: Decimal
     note: str | None

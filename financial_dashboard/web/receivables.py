@@ -1,4 +1,4 @@
-"""Read-only HTML view of open receivables."""
+"""Read-only HTML view of open receivables and payables."""
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, Response
@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.deps import get_session
 from financial_dashboard.core.templating import get_templates
-from financial_dashboard.db.enums import ReceivableStatus
+from financial_dashboard.db.enums import ReceivableKind, ReceivableStatus
 from financial_dashboard.services.receivables import list_receivables, receivable_read
 
 router = APIRouter()
@@ -17,7 +17,7 @@ templates = get_templates()
 async def receivables_page(
     request: Request, session: AsyncSession = Depends(get_session)
 ) -> Response:
-    """Show who still owes money, with paid and outstanding sums.
+    """Show who owes the user and whom the user owes, with paid and outstanding sums.
 
     Args:
         request: The page request.
@@ -26,12 +26,21 @@ async def receivables_page(
     Returns:
         The rendered page.
     """
-    rows = await list_receivables(session, ReceivableStatus.open)
+    rows = [
+        receivable_read(row)
+        for row in await list_receivables(session, ReceivableStatus.open)
+    ]
     return templates.TemplateResponse(
         request,
         "receivables.html",
         {
             "active_page": "receivables",
-            "receivables": [receivable_read(row) for row in rows],
+            "sections": [
+                (title, empty, [row for row in rows if row.kind == kind])
+                for kind, title, empty in (
+                    (ReceivableKind.receivable, "Owed to me", "Nobody owes you money."),
+                    (ReceivableKind.payable, "I owe", "You owe nobody money."),
+                )
+            ],
         },
     )

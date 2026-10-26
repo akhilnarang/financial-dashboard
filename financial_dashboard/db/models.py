@@ -1024,11 +1024,17 @@ class AuditAction(Base):
 
 
 class Receivable(Base):
-    """Money a person owes the user. Paid and outstanding are computed."""
+    """Money a person owes the user, or the user owes a person.
+
+    Paid and outstanding are computed.
+    """
 
     __tablename__ = "receivables"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(
+        String, nullable=False, default="receivable", server_default="receivable"
+    )
     person: Mapped[str] = mapped_column(String, nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     note: Mapped[str | None] = mapped_column(Text)
@@ -1050,11 +1056,15 @@ class Receivable(Base):
             "status IN ('open', 'settled', 'written_off')",
             name="ck_receivable_status",
         ),
+        CheckConstraint("kind IN ('receivable', 'payable')", name="ck_receivable_kind"),
     )
 
 
 class ReceivableLink(Base):
-    """A transaction a receivable is for (charge) or that pays it (payment)."""
+    """A transaction a receivable is for (charge) or that pays it (payment).
+
+    A receivable charge is a debit and its payment a credit. A payable flips both.
+    """
 
     __tablename__ = "receivable_links"
 
