@@ -1258,7 +1258,7 @@ async def statement_card_holder(
             .where(Card.account_id == account_id)
             .order_by(Card.id)
         )
-        if label := addon_card_label(person, cards.tuples()):
+        if label := addon_card_label(person, cards):
             return label
     return card_holder_name(person)
 

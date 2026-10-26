@@ -251,9 +251,11 @@ async def test_stored_reconciliations_backfill_card_holders_once(tmp_path, monke
 
         async with maker() as session:
             holders = dict(
-                (await session.execute(select(Transaction.id, Transaction.card_holder)))
-                .tuples()
-                .all()
+                (
+                    await session.execute(
+                        select(Transaction.id, Transaction.card_holder)
+                    )
+                ).all()
             )
             marker_count = (
                 await session.execute(

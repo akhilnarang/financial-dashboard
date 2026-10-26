@@ -5,7 +5,7 @@ from decimal import Decimal
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import defer, joinedload, noload
+from sqlalchemy.orm import defer, joinedload, raiseload
 
 from financial_dashboard.core.masks import display_mask
 from financial_dashboard.db import (
@@ -290,8 +290,8 @@ async def list_transactions(
                 await session.execute(
                     select(Transaction)
                     .options(
-                        noload(Transaction.account),
-                        noload(Transaction.card),
+                        raiseload(Transaction.account),
+                        raiseload(Transaction.card),
                         defer(Transaction.review_reason),
                     )
                     .where(*clauses)
@@ -405,7 +405,7 @@ async def get_transaction_detail(
         row = await session.scalar(
             select(Transaction)
             .options(
-                joinedload(Transaction.account).noload(Account.cards),
+                joinedload(Transaction.account).raiseload(Account.cards),
                 joinedload(Transaction.card),
             )
             .where(Transaction.id == transaction_id)
@@ -469,8 +469,8 @@ async def get_transactions_by_ids(
                 await session.execute(
                     select(Transaction)
                     .options(
-                        noload(Transaction.account),
-                        noload(Transaction.card),
+                        raiseload(Transaction.account),
+                        raiseload(Transaction.card),
                         defer(Transaction.raw_description),
                         defer(Transaction.note),
                         defer(Transaction.review_reason),

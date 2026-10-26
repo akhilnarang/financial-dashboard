@@ -202,6 +202,7 @@ async def _bank_flows(
         .order_by(Transaction.transaction_time.nulls_first(), Transaction.id)
     )
     for txn_id, account_id, day, kind, flow, balance, upload_id in rows:
+        assert account_id is not None and day is not None  # the WHERE excludes NULLs
         flows.daily[account_id][day] += flow
         flows.row_flow[txn_id] = (day, flow)
         flows.upload_rows[upload_id].append(txn_id)
@@ -302,6 +303,7 @@ async def _known(
         )
     )
     for account_id, as_of, value in snapshots:
+        assert account_id is not None  # in_(account_ids) excludes NULL
         anchors[account_id].append(Anchor(as_of, value, "snapshot"))
     for (account_id, day), balance in flows.day_end.items():
         anchors[account_id].append(Anchor(day, balance, "transaction"))
