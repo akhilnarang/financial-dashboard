@@ -296,6 +296,14 @@ async def _review_decision(
     return decision
 
 
+def _id_label(txn_id: int, base_url: str) -> str:
+    """Return the HTML id of a row, linked to its page when a base URL is set."""
+    if not base_url:
+        return f"#{txn_id}"
+    href = html.escape(f"{base_url}/transactions/{txn_id}", quote=True)
+    return f'<a href="{href}">#{txn_id}</a>'
+
+
 async def _notify_assistant(
     session: AsyncSession,
     txn: Transaction,
@@ -316,11 +324,8 @@ async def _notify_assistant(
     proposed = decision.proposed_slug or (
         str(candidates[0].get("category", "")) if candidates else ""
     )
-    plain_id = f"#{txn.id}"
-    if base_url:
-        plain_id += f" ({base_url}/transactions/{txn.id})"
     assistant_text = (
-        f"\U0001f50d Needs a category: {plain_id}\n"
+        f"\U0001f50d Needs a category: #{txn.id}\n"
         f"{txn.direction or ''} {txn.amount} {txn.currency or 'INR'}\n"
         f"{txn.counterparty or txn.raw_description or ''}\n"
         f"Likely category: {proposed or 'uncertain'}\n"
@@ -328,8 +333,11 @@ async def _notify_assistant(
         f"Reasoning: {txn.review_reason or 'low confidence'}\n"
         f"{next_step}"
     )
+    # Split before escaping, so a split never cuts an HTML entity in two.
+    chunks = [html.escape(c) for c in split_plain_text(assistant_text, limit=4000)]
+    chunks[0] = chunks[0].replace(f"#{txn.id}", _id_label(txn.id, base_url), 1)
     deliveries = []
-    for ordinal, chunk in enumerate(split_plain_text(assistant_text, limit=4000)):
+    for ordinal, chunk in enumerate(chunks):
         delivery = await ensure_decision_delivery(
             session,
             decision,
@@ -338,7 +346,7 @@ async def _notify_assistant(
             text=chunk,
             reply_markup_json=None,
             ordinal=ordinal,
-            parse_mode=None,
+            parse_mode="HTML",
         )
         if "\nRef: " not in delivery.text:
             delivery.text = f"{delivery.text}\n\nRef: {delivery.delivery_token}"
@@ -378,11 +386,7 @@ async def _notify_plain(txn: Transaction, chat_id: int, base_url: str) -> bool:
     # output) that could otherwise contain & or " or < and break Telegram's
     # HTML parser, stranding the row — as is the literal <note>/<category>
     # hint. txn.amount is a Decimal, so it's safe as-is.
-    if base_url:
-        href = html.escape(f"{base_url}/transactions/{txn.id}", quote=True)
-        id_label = f'<a href="{href}">#{txn.id}</a>'
-    else:
-        id_label = f"#{txn.id}"
+    id_label = _id_label(txn.id, base_url)
     detail = html.escape(txn.counterparty or txn.raw_description or "")
     reason = html.escape(txn.review_reason or "low confidence")
     direction = html.escape(txn.direction or "")
