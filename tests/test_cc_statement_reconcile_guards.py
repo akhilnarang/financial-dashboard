@@ -1496,11 +1496,30 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
         currency="USD",
         counterparty="SAMPLEMAIL*",
     )
+    # A rupee amount set by hand pairs like a foreign alert, even when the
+    # billed amount is outside the settlement band.
+    manual_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("900.00"),
+        counterparty="SAMPLEHOST",
+        amount_source="manual",
+    )
+    # A manual row that a line matched by amount cannot pair with a second
+    # line too. The second line is a new charge and imports.
+    matched_manual_id = await _seed_txn(
+        session_factory,
+        amount=Decimal("700.00"),
+        counterparty="SAMPLESHOP",
+        amount_source="manual",
+    )
     parsed = _parsed(
         [
             _stmt_txn(date="07/04/2026", amount="2,529.00", narration=NARRATION),
             _stmt_txn(date="07/04/2026", amount="999.00", narration="SAMPLE CAFE"),
             _stmt_txn(date="07/04/2026", amount="1,650.00", narration="SAMPLEMAIL COM"),
+            _stmt_txn(date="07/04/2026", amount="914.00", narration="SAMPLEHOST US"),
+            _stmt_txn(date="07/04/2026", amount="700.00", narration="SHOP 42"),
+            _stmt_txn(date="07/04/2026", amount="350.00", narration="SAMPLESHOP PAY"),
         ]
     )
 
@@ -1512,23 +1531,32 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
     assert sorted(entry["db_txn_id"] for entry in recon["matched"]) == [
         alert_id,
         mail_id,
+        manual_id,
+        matched_manual_id,
     ]
     # A line with no foreign candidate is new and imports.
-    assert [entry["ambiguous"] for entry in recon["missing"]] == [False]
-    assert [txn.amount for txn in imported] == [Decimal("999.00")]
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [False, False]
+    assert [txn.amount for txn in imported] == [Decimal("999.00"), Decimal("350.00")]
     async with session_factory() as session:
         rows = {
             row.id: (row.amount, row.currency)
+            for row in (await session.scalars(select(Transaction))).all()
+        }
+        sources = {
+            row.id: row.amount_source
             for row in (await session.scalars(select(Transaction))).all()
         }
     assert rows[alert_id] == (Decimal("2529.00"), "INR")
     assert rows[other_id] == (Decimal("12.00"), "USD")
     assert rows[mail_id] == (Decimal("1650.00"), "INR")
     assert rows[rival_id] == (Decimal("20.00"), "USD")
-    assert len(rows) == 5
+    assert rows[manual_id] == (Decimal("914.00"), "INR")
+    assert rows[matched_manual_id] == (Decimal("700.00"), "INR")
+    assert sources[manual_id] == sources[matched_manual_id] == "bank"
+    assert len(rows) == 8
     # A reprocess pairs the converted row by amount and imports nothing.
     assert sorted(entry["db_txn_id"] for entry in again["matched"]) == sorted(
-        [alert_id, mail_id, imported[0].id]
+        [alert_id, mail_id, manual_id, matched_manual_id] + [txn.id for txn in imported]
     )
     assert again["missing"] == []
 

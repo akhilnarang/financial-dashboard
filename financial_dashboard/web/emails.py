@@ -531,6 +531,10 @@ async def _apply_reparsed_transaction(
                     elif previous_value != value:
                         refresh_diff.overwritten[key] = (previous_value, value)
                     setattr(existing, key, value)
+            if {"amount", "currency"} & (
+                refresh_diff.filled.keys() | refresh_diff.overwritten.keys()
+            ):
+                existing.amount_source = "bank"
             if existing.transaction_time != previous_transaction_time:
                 # This column describes the stored time. If a refresh changes
                 # the time, it must also change the time source. If it does

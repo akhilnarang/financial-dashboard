@@ -675,6 +675,7 @@ erDiagram
         bool transaction_time_is_received_time
         string counterparty
         string counterparty_source
+        string amount_source
         string card_mask
         string card_holder
         string account_mask
@@ -908,6 +909,7 @@ Relationship notes:
 - `transactions` has a partial unique index on `(bank, reference_number, direction)` where `reference_number IS NOT NULL` (deduplicates transactions with known UTR/UPI reference numbers; direction is included so a debit and credit sharing a ref don't collide).
 - `transactions` also has a partial lookup index on `reference_number` where it is non-null; ingest uses it to find an opposite-direction leg on a different linked or masked account and mark both transactions as `self_transfer`.
 - `transactions.counterparty_source` is non-null and defaults to `bank`. It says where `counterparty` came from. A parser sets `user_alias` when the bank prints a label the user chose, such as an HDFC payee nickname. A label does not replace a name a bank states, and a bank name replaces a stored label. The column follows the name: a writer that changes one changes the other.
+- `transactions.amount_source` is non-null and defaults to `bank`. `/api/transactions/apply` sets `manual` when it changes `amount` or `currency`. The card statement then pairs a manual row like a foreign-currency alert (card, date, merchant, not amount), writes the billed rupee amount over it, and sets it back to `bank`.
 - `transactions.card_holder` is the cardholder that a card statement names for the row. Some banks print one card number for the primary card and each add-on, so `card_mask` alone cannot tell them apart. Statement import and enrichment set it; a one-time migration fills it from each stored statement reconciliation.
 - `transactions.voided` marks a card charge that the bank cancelled before it settled. The user sets it. Cashflow figures, list totals and the bank cash bridge skip a voided row. Card statement matching skips it too, but alert de-duplication still matches it, so a reparse does not add the row again.
 - `transactions` has a composite lookup index on `(category, transaction_date)`. Category first because a category filter with no date bounds — a drill-through from a category link, say — would otherwise scan the table, both for the rows and for the `count()` the pager needs; `transaction_date` second so a filter carrying both a category and a date range satisfies them from the one index instead of narrowing on dates and re-checking the category per row.
@@ -993,7 +995,7 @@ uv run python scripts/seed.py
 |--------|------|-------------|
 | `GET` | `/api/poll/status` | Returns current poll state, progress, last stats, last error |
 | `POST` | `/api/transactions/{id}/note` | Update the freeform note on a transaction (JSON body: `{"note": "..."}`) |
-| `POST` | `/api/transactions/apply` | Change note, category, cashflow exclusion and void state on many transactions as one unit; `dry_run` defaults to true |
+| `POST` | `/api/transactions/apply` | Change note, category, cashflow exclusion, void state, amount and currency on many transactions as one unit; `dry_run` defaults to true. A card payment row, a statement row, and a row linked to a receivable (for a non-INR currency) refuse an amount or currency change |
 | `POST` | `/api/sources/{id}/test` | Test connectivity for an email source; returns `{"ok": bool, "message"/"error": str}` |
 | `GET` | `/api/merchant-rules` | List merchant→category rules |
 | `POST` | `/api/merchant-rules` | Add or update a rule (`{"pattern", "category", "priority"?}`); the next categorization uses it |

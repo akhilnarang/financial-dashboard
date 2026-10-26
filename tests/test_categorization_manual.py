@@ -3,7 +3,13 @@ from decimal import Decimal
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import Category, CategoryReviewDecision, Transaction
+from financial_dashboard.db.models import (
+    Category,
+    CategoryReviewDecision,
+    Receivable,
+    ReceivableLink,
+    Transaction,
+)
 from financial_dashboard.services.assistant.delivery import make_delivery
 from financial_dashboard.services.categorization.manual import (
     CategoryDirectionPolicy,
@@ -16,6 +22,7 @@ from financial_dashboard.services.categorization.vocabulary import (
     get_active_slugs,
 )
 from financial_dashboard.services.transactions import update_transaction_category
+from tests.conftest import card_account
 
 pytestmark = pytest.mark.anyio
 
@@ -23,7 +30,7 @@ pytestmark = pytest.mark.anyio
 async def _txn(session: AsyncSession, **kw) -> Transaction:
     txn = Transaction(
         bank="testbank",
-        email_type="x",
+        email_type=kw.pop("email_type", "x"),
         direction="debit",
         amount=Decimal(kw.pop("amount", "5")),
         **kw,
@@ -153,10 +160,12 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         category_confidence=0.5,
         category_model="llm-x",
         review_status="notified",
+        currency="INR",
     )
-    second = await _txn(session, note="old note")
-    credit = await _txn(session)
+    second = await _txn(session, note="old note", amount="10.00", currency="USD")
+    credit = await _txn(session, email_type="testbank_cc_payment_alert")
     credit.direction = "credit"
+    credit.account_id = await card_account(session)
     decision = CategoryReviewDecision(
         transaction_id=first.id, category_input_hash="hash", candidates_json="[]"
     )
@@ -173,8 +182,16 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     await session.commit()
     first_id, second_id, credit_id = first.id, second.id, credit.id
     changes = [
-        {"id": first_id, "category": "groceries"},
-        {"id": second_id, "note": None, "exclude_from_cashflow": True, "voided": True},
+        # The same currency again is no change, so the row stays bank-sourced.
+        {"id": first_id, "category": "groceries", "currency": "INR"},
+        {
+            "id": second_id,
+            "note": None,
+            "exclude_from_cashflow": True,
+            "voided": True,
+            "amount": "900.00",
+            "currency": "INR",
+        },
         {"id": credit_id, "exclude_from_cashflow": False},
     ]
 
@@ -209,6 +226,9 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
                 "note": {"before": "old note", "after": None},
                 "exclude_from_cashflow": {"before": False, "after": True},
                 "voided": {"before": False, "after": True},
+                "amount": {"before": "10.00", "after": "900.00"},
+                "currency": {"before": "USD", "after": "INR"},
+                "amount_source": {"before": "bank", "after": "manual"},
             },
         },
     ]
@@ -237,6 +257,40 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         "/api/transactions/apply", json={"changes": [changes[0], changes[0]]}
     )
     assert duplicate.status_code == 422
+    # A card payment, a statement row and a receivable's row keep their amount,
+    # and a currency change needs its amount.
+    statement_row = await _txn(
+        session, email_type="cc_statement", statement_upload_id=1
+    )
+    owed = await _txn(session)
+    session.add(
+        Receivable(
+            person="A",
+            amount=Decimal("5"),
+            links=[ReceivableLink(transaction_id=owed.id, role="charge")],
+        )
+    )
+    statement_id, owed_id = statement_row.id, owed.id
+    await session.commit()
+    kept = await client.post(
+        "/api/transactions/apply",
+        json={
+            "dry_run": False,
+            "changes": [
+                {"id": credit_id, "amount": "1"},
+                {"id": statement_id, "amount": "1"},
+                {"id": owed_id, "currency": "USD", "amount": "1"},
+                {"id": first_id, "currency": "USD"},
+            ],
+        },
+    )
+    assert kept.status_code == 400
+    assert [e["id"] for e in kept.json()["detail"]["errors"]] == [
+        credit_id,
+        statement_id,
+        owed_id,
+        first_id,
+    ]
 
     applied = await client.post(
         "/api/transactions/apply", json={"dry_run": False, "changes": changes}
@@ -250,6 +304,7 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         "superseded",
         "cancelled",
     ]
+    assert (second.amount, second.currency) == (Decimal("900.00"), "INR")
     again = await client.post(
         "/api/transactions/apply", json={"dry_run": False, "changes": changes}
     )

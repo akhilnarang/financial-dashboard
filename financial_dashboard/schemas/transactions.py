@@ -262,7 +262,9 @@ class TransactionApplyChange(BaseModel):
     """One row change. An absent field stays unchanged.
 
     An empty ``category`` clears the category. A null or empty ``note`` clears
-    the note.
+    the note. ``amount`` and ``currency`` fix a row by hand, for example a
+    foreign-currency charge whose rupee amount the bank shows before the
+    statement.
     """
 
     id: DatabaseId
@@ -270,6 +272,10 @@ class TransactionApplyChange(BaseModel):
     note: str | None = None
     exclude_from_cashflow: bool | None = None
     voided: bool | None = None
+    amount: Annotated[Decimal, Field(gt=0, max_digits=12, decimal_places=2)] | None = (
+        None
+    )
+    currency: Annotated[str, StringConstraints(pattern=r"^[A-Z]{3}$")] | None = None
 
     @model_validator(mode="after")
     def require_a_field(self) -> Self:
@@ -299,7 +305,7 @@ class TransactionApplyRequest(BaseModel):
         return self
 
 
-TransactionFieldValue = str | bool | int | float | None
+TransactionFieldValue = str | bool | int | float | Decimal | None
 
 
 class TransactionFieldDiff(BaseModel):

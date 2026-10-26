@@ -328,6 +328,15 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                 )
             )
         try:
+            await conn.execute(text("SELECT amount_source FROM transactions LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE transactions ADD COLUMN amount_source VARCHAR "
+                    "NOT NULL DEFAULT 'bank'"
+                )
+            )
+        try:
             await conn.execute(text("SELECT note FROM transactions LIMIT 0"))
         except Exception:
             await conn.execute(text("ALTER TABLE transactions ADD COLUMN note TEXT"))

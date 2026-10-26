@@ -2,11 +2,14 @@
 
 import logging
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import NamedTuple
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db import Account, Card, Transaction
+from financial_dashboard.db.models import ReceivableLink
 from financial_dashboard.schemas import transactions as transaction_schemas
 from financial_dashboard.services.cc_disambiguation import (
     should_auto_reconcile_statement,
@@ -30,6 +33,9 @@ class ApplySnapshot(NamedTuple):
     note: str | None
     exclude_from_cashflow: bool
     voided: bool
+    amount: Decimal
+    currency: str | None
+    amount_source: str
 
 
 def _apply_snapshot(txn: Transaction) -> ApplySnapshot:
@@ -43,6 +49,9 @@ def _apply_snapshot(txn: Transaction) -> ApplySnapshot:
         note=txn.note,
         exclude_from_cashflow=txn.exclude_from_cashflow,
         voided=txn.voided,
+        amount=txn.amount,
+        currency=txn.currency,
+        amount_source=txn.amount_source,
     )
 
 
@@ -248,6 +257,17 @@ async def _validate_change(
             check_voidable(txn, change.voided)
         except ValueError as exc:
             return str(exc)
+    if {"amount", "currency"} & change.model_fields_set:
+        if should_auto_reconcile_statement(txn):
+            return "A card payment row keeps its amount; apply does not recompute the statement paid sum"
+        if txn.statement_upload_id or txn.bank_statement_upload_id:
+            return "A statement row keeps its amount; a reparse matches the line by it"
+        if change.amount is None and change.currency not in (None, txn.currency):
+            return "A currency change must set the amount in that currency too"
+        if change.currency not in (None, "INR") and await session.scalar(
+            select(ReceivableLink.id).where(ReceivableLink.transaction_id == txn.id)
+        ):
+            return "A row linked to a receivable stays in INR"
     return None
 
 
@@ -277,6 +297,14 @@ async def _apply_change_no_commit(
         )
     if change.voided is not None:
         await set_transaction_voided_no_commit(session, txn_id, change.voided)
+    if change.amount is not None or change.currency is not None:
+        txn = await session.get(Transaction, txn_id)
+        assert txn is not None
+        amount = txn.amount if change.amount is None else change.amount
+        currency = txn.currency if change.currency is None else change.currency
+        if (amount, currency) != (txn.amount, txn.currency):
+            txn.amount, txn.currency = amount, currency
+            txn.amount_source = "manual"
 
 
 async def apply_transaction_changes(
@@ -285,7 +313,7 @@ async def apply_transaction_changes(
     *,
     dry_run: bool,
 ) -> ApplyResult:
-    """Apply note, category, exclusion and void changes to many rows as one unit.
+    """Apply note, category, exclusion, void, amount and currency changes as one unit.
 
     The function checks every change before it changes a row, so a rejected
     batch takes no write lock. Each change then goes through the same per-row

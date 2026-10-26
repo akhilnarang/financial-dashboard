@@ -158,6 +158,7 @@ def _merge(
     """
     try:
         target.amount = parse_cc_amount(entry["amount"])
+        target.amount_source = "bank"
         target.transaction_date = parse_cc_date(entry["date"])
     except ValueError, InvalidOperation:
         raise SettlementError("The statement row is unreadable") from None
