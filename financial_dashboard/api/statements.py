@@ -47,7 +47,6 @@ async def bank_statement_upload(
     account_id: Annotated[DatabaseId, Form()],
     file: Annotated[UploadFile, File()],
     password: Annotated[str, Form(max_length=128)] = "",
-    # A str, not a bool: FastAPI reads a missing bool form field as false.
     dry_run_form: Annotated[Literal["true", "false"], Form(alias="dry_run")] = "true",
 ) -> statement_schemas.BankStatementUploadResponse:
     """Parse and reconcile one bank statement PDF against the account's rows.
