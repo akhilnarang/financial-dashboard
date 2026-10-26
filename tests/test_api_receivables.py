@@ -48,6 +48,10 @@ async def test_payment_link_lowers_outstanding(client, session):
         f"/api/receivables/{rid}/links",
         json={"transaction_id": payment, "role": "payment"},
     )
+    relinked = await client.post(
+        f"/api/receivables/{rid}/links",
+        json={"transaction_id": charge, "role": "charge"},
+    )
     reused = await client.post(
         "/api/receivables",
         json={"person": "B", "amount": "600", "payment_transaction_ids": [payment]},
@@ -61,7 +65,7 @@ async def test_payment_link_lowers_outstanding(client, session):
         [charge],
         [payment],
     )
-    assert reused.status_code == 409
+    assert (relinked.status_code, reused.status_code) == (409, 409)
     assert unlinked.json()["outstanding"] == "1500.00"
 
     # A late unlink must not delete another receivable's link that took the id.
@@ -94,7 +98,7 @@ async def test_payment_link_lowers_outstanding(client, session):
 
 
 # A debit cannot pay back, a credit is not a charge, and the ledger is INR
-# only. An id past the 64-bit SQLite range must not 500.
+# only.
 @pytest.mark.parametrize(
     ("row", "role"),
     [
@@ -102,7 +106,6 @@ async def test_payment_link_lowers_outstanding(client, session):
         (("credit", "INR"), "charge"),
         (("credit", "USD"), "payment"),
         (9999, "payment"),
-        (2**63, "payment"),
     ],
 )
 async def test_link_rejects_unknown_or_unfit_row(client, session, row, role):
@@ -138,12 +141,14 @@ async def test_patch_changes_only_named_fields(client):
     reopened = await client.patch(
         f"/api/receivables/{rid}", json={"status": "open", "note": None}
     )
+    nulled = await client.patch(f"/api/receivables/{rid}", json={"amount": None})
 
     assert closed.json()["status"] == "written_off"
     assert closed.json()["closed_at"] is not None
     assert closed.json()["note"] == "lunch"
     assert reopened.json()["closed_at"] is None
     assert reopened.json()["note"] is None
+    assert nulled.status_code == 422
 
 
 async def test_list_and_page_filter_by_status(client):

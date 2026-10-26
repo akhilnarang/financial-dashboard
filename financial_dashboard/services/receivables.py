@@ -18,6 +18,10 @@ from financial_dashboard.db.models import (
     Transaction,
     utc_now,
 )
+from financial_dashboard.exceptions import (
+    ConflictException,
+    UnprocessableEntityException,
+)
 from financial_dashboard.schemas.receivables import (
     ReceivableCreate,
     ReceivableRead,
@@ -25,10 +29,6 @@ from financial_dashboard.schemas.receivables import (
 )
 
 ROLE_DIRECTION = {ReceivableRole.charge: "debit", ReceivableRole.payment: "credit"}
-
-
-class LinkConflict(ValueError):
-    """The link exists, or the payment row already pays another receivable."""
 
 
 def receivable_read(receivable: Receivable) -> ReceivableRead:
@@ -43,7 +43,8 @@ def receivable_read(receivable: Receivable) -> ReceivableRead:
     """
     paid = Decimal("0.00")
     ids = {role: [] for role in ReceivableRole}
-    for link in sorted(receivable.links, key=lambda link: link.transaction_id):
+    links = [link for link in receivable.links if link.transaction is not None]
+    for link in sorted(links, key=lambda link: link.transaction_id):
         ids[ReceivableRole(link.role)].append(link.transaction_id)
         if link.role == ReceivableRole.payment:
             paid += link.transaction.amount
@@ -94,18 +95,23 @@ async def _linkable(
         The transaction.
 
     Raises:
-        ValueError: The row is unknown, the wrong direction, or not in INR.
+        UnprocessableEntityException: The row is unknown, the wrong
+            direction, or not in INR.
     """
     txn = await session.get(Transaction, transaction_id)
     if txn is None:
-        raise ValueError(f"Transaction {transaction_id} not found")
+        raise UnprocessableEntityException(
+            detail=f"Transaction {transaction_id} not found"
+        )
     if txn.direction != ROLE_DIRECTION[role]:
-        raise ValueError(
-            f"A {role} link needs a {ROLE_DIRECTION[role]} row; "
+        raise UnprocessableEntityException(
+            detail=f"A {role} link needs a {ROLE_DIRECTION[role]} row; "
             f"transaction {transaction_id} is a {txn.direction}"
         )
     if (txn.currency or "INR") != "INR":
-        raise ValueError(f"Transaction {transaction_id} is not in INR")
+        raise UnprocessableEntityException(
+            detail=f"Transaction {transaction_id} is not in INR"
+        )
     return txn
 
 
@@ -138,7 +144,7 @@ async def _new_links(
         The new, unsaved links.
 
     Raises:
-        ValueError: A row does not fit its role.
+        UnprocessableEntityException: A row does not fit its role.
     """
     await _write_lock(session)
     try:
@@ -146,7 +152,7 @@ async def _new_links(
             ReceivableLink(transaction=await _linkable(session, i, role), role=role)
             for i, role in wanted
         ]
-    except ValueError:
+    except UnprocessableEntityException:
         await session.rollback()
         raise
 
@@ -161,14 +167,14 @@ async def _commit_links(session: AsyncSession) -> None:
         None.
 
     Raises:
-        LinkConflict: A unique index refused a link.
+        ConflictException: A unique index refused a link.
     """
     try:
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise LinkConflict(
-            "A payment row pays one receivable, and a receivable links a row once"
+        raise ConflictException(
+            detail="A payment row pays one receivable, and a receivable links a row once"
         ) from exc
 
 
@@ -185,15 +191,15 @@ async def create_receivable(
         The new receivable.
 
     Raises:
-        LinkConflict: A payment row already pays another receivable.
-        ValueError: A transaction id is unknown, listed twice, or the wrong
-            direction for its role.
+        ConflictException: A payment row already pays another receivable.
+        UnprocessableEntityException: A transaction id is unknown, listed
+            twice, or the wrong direction for its role.
     """
     wanted = [(i, ReceivableRole.charge) for i in payload.charge_transaction_ids]
     wanted += [(i, ReceivableRole.payment) for i in payload.payment_transaction_ids]
     ids = [transaction_id for transaction_id, _ in wanted]
     if len(ids) != len(set(ids)):
-        raise ValueError("A transaction is listed twice")
+        raise UnprocessableEntityException(detail="A transaction is listed twice")
     receivable = Receivable(
         person=payload.person,
         amount=payload.amount,
@@ -252,12 +258,11 @@ async def add_link(
         The changed receivable.
 
     Raises:
-        LinkConflict: The receivable already links the row, or the payment
-            row already pays another receivable.
-        ValueError: The row is unknown or the wrong direction for the role.
+        ConflictException: The receivable already links the row, or the
+            payment row already pays another receivable.
+        UnprocessableEntityException: The row is unknown or the wrong
+            direction for the role.
     """
-    if any(link.transaction_id == transaction_id for link in receivable.links):
-        raise LinkConflict(f"Transaction {transaction_id} is already linked")
     receivable.links.extend(await _new_links(session, [(transaction_id, role)]))
     await _commit_links(session)
     return receivable

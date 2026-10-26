@@ -2,9 +2,9 @@
 
 import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Self
 
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from financial_dashboard.db.enums import ReceivableRole, ReceivableStatus
 from financial_dashboard.schemas.common import DatabaseId
@@ -31,6 +31,13 @@ class ReceivableUpdate(BaseModel):
     amount: Amount | None = None
     note: Note | None = None
     status: ReceivableStatus | None = None
+
+    @model_validator(mode="after")
+    def reject_null(self) -> Self:
+        """Refuse a null amount or status."""
+        if None in self.model_dump(exclude_unset=True, exclude={"note"}).values():
+            raise ValueError("only note can be null")
+        return self
 
 
 class ReceivableLinkCreate(BaseModel):

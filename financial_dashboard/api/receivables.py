@@ -7,11 +7,7 @@ from fastapi import APIRouter, Path
 from financial_dashboard.core.deps import AsyncSessionDep
 from financial_dashboard.db.enums import ReceivableStatus
 from financial_dashboard.db.models import Receivable
-from financial_dashboard.exceptions import (
-    ConflictException,
-    NotFoundException,
-    UnprocessableEntityException,
-)
+from financial_dashboard.exceptions import NotFoundException
 from financial_dashboard.schemas.common import DatabaseId
 from financial_dashboard.schemas.receivables import (
     ReceivableCreate,
@@ -21,7 +17,6 @@ from financial_dashboard.schemas.receivables import (
     ReceivableUpdate,
 )
 from financial_dashboard.services.receivables import (
-    LinkConflict,
     add_link,
     create_receivable,
     list_receivables,
@@ -82,13 +77,7 @@ async def receivables_create(
     Returns:
         The new receivable.
     """
-    try:
-        receivable = await create_receivable(session, payload)
-    except LinkConflict as exc:
-        raise ConflictException(detail=str(exc)) from exc
-    except ValueError as exc:
-        raise UnprocessableEntityException(detail=str(exc)) from exc
-    return receivable_read(receivable)
+    return receivable_read(await create_receivable(session, payload))
 
 
 @router.patch("/receivables/{receivable_id}")
@@ -128,14 +117,9 @@ async def receivables_link(
         The changed receivable.
     """
     receivable = await _get(session, receivable_id)
-    try:
-        receivable = await add_link(
-            session, receivable, payload.transaction_id, payload.role
-        )
-    except LinkConflict as exc:
-        raise ConflictException(detail=str(exc)) from exc
-    except ValueError as exc:
-        raise UnprocessableEntityException(detail=str(exc)) from exc
+    receivable = await add_link(
+        session, receivable, payload.transaction_id, payload.role
+    )
     return receivable_read(receivable)
 
 
