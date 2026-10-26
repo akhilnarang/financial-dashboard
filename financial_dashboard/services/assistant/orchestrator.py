@@ -601,7 +601,10 @@ async def run_turn(
                     return completed(
                         Error(
                             outcome="error",
-                            message=str(exc),
+                            message=(
+                                f"I couldn't safely propose that: {exc}. Say the "
+                                "category plainly, e.g. 'category groceries'."
+                            ),
                             code="proposal_rejected",
                         )
                     )
@@ -967,7 +970,11 @@ async def _save_proposal(
     candidates = [c for c in response.candidates if c.slug in fitting]
     if not candidates:
         raise MutationRejected("no proposed category fits this transaction")
-    response = response.model_copy(update={"candidates": candidates})
+    update: dict[str, object] = {"candidates": candidates}
+    if len(candidates) < len(response.candidates):
+        # The model text can name a dropped category.
+        update["explanation"] = f"Is '{candidates[0].slug}' the right category?"
+    response = response.model_copy(update=update)
     await supersede_active_decisions(session, target.id)
     state_hash = await current_transaction_state_hash(session, target.id)
     if state_hash is None:

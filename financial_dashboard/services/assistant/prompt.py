@@ -61,7 +61,7 @@ def build_prompt(context: PromptContext) -> str:
         "A reply that is only a category name sets the category and not the note.",
         "A category_proposal never saves a note. To save a note, use APPLY.",
         "When you infer a category, choose it from CATEGORIES THAT FIT THIS",
-        "TRANSACTION. Use another active slug only when the user names it.",
+        "TRANSACTION. When the user names another active slug, use APPLY.",
         "Change exclude_from_cashflow only when the user asks for it.",
         "The TRUSTED TRANSACTION TARGET is the transaction to change. A number",
         "inside context, such as 'Cashback received for 8864', is part of the",
