@@ -968,6 +968,7 @@ uv run python scripts/seed.py
 |--------|------|-------------|
 | `GET` | `/api/poll/status` | Returns current poll state, progress, last stats, last error |
 | `POST` | `/api/transactions/{id}/note` | Update the freeform note on a transaction (JSON body: `{"note": "..."}`) |
+| `POST` | `/api/transactions/apply` | Change note, category, cashflow exclusion and void state on many transactions as one unit; `dry_run` defaults to true |
 | `POST` | `/api/sources/{id}/test` | Test connectivity for an email source; returns `{"ok": bool, "message"/"error": str}` |
 | `GET` | `/api/extensions` | List registered extension manifests |
 | `GET`/`POST` | `/api/extensions/paisa/config` | Read (redacted) / save Paisa config |

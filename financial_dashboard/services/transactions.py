@@ -255,16 +255,13 @@ async def _apply_change_no_commit(
     session: AsyncSession,
     txn_id: int,
     change: transaction_schemas.TransactionApplyChange,
-) -> str | None:
+) -> None:
     """Apply one change through the single-field functions.
 
     Args:
         session: Request session. This function does not commit.
         txn_id: The row to change. It must exist.
-        change: The fields to set.
-
-    Returns:
-        The reason the change is invalid, or None when it applied.
+        change: The fields to set. ``_validate_change`` must accept it.
     """
     from financial_dashboard.services.categorization.manual import (
         assign_category_no_commit,
@@ -273,19 +270,13 @@ async def _apply_change_no_commit(
     if "note" in change.model_fields_set:
         await update_transaction_note_no_commit(session, txn_id, change.note or "")
     if change.category is not None:
-        ok, _ = await assign_category_no_commit(session, txn_id, change.category)
-        if not ok:
-            return f"Invalid category: {change.category!r}"
+        await assign_category_no_commit(session, txn_id, change.category)
     if change.exclude_from_cashflow is not None:
         await set_transaction_excluded_no_commit(
             session, txn_id, change.exclude_from_cashflow
         )
     if change.voided is not None:
-        try:
-            await set_transaction_voided_no_commit(session, txn_id, change.voided)
-        except ValueError as exc:
-            return str(exc)
-    return None
+        await set_transaction_voided_no_commit(session, txn_id, change.voided)
 
 
 async def apply_transaction_changes(
@@ -329,14 +320,9 @@ async def apply_transaction_changes(
     unchanged: list[int] = []
     for change in changes:
         txn = await session.get(Transaction, change.id)
-        if txn is None:
-            errors.append({"id": change.id, "error": "Transaction not found"})
-            continue
+        assert txn is not None
         before = _apply_snapshot(txn)
-        error = await _apply_change_no_commit(session, txn.id, change)
-        if error is not None:
-            errors.append({"id": change.id, "error": error})
-            continue
+        await _apply_change_no_commit(session, txn.id, change)
         after = _apply_snapshot(txn)
         diff = {
             field: transaction_schemas.TransactionFieldDiff(before=old, after=new)
@@ -350,12 +336,10 @@ async def apply_transaction_changes(
         else:
             unchanged.append(txn.id)
 
-    if errors or dry_run:
+    if dry_run:
         await session.rollback()
     else:
         await session.commit()
-    if errors:
-        raise ValueError(errors)
     return ApplyResult(changed=changed, unchanged=unchanged)
 
 
