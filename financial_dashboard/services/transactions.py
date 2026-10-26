@@ -283,7 +283,8 @@ async def apply_transaction_changes(
     batch takes no write lock. Each change then goes through the same per-row
     function as the single endpoints, so the side effects are the same. The
     function commits only when every change is valid and ``dry_run`` is False.
-    Otherwise it rolls back, so nothing is written.
+    Otherwise it rolls back, so nothing is written. A dry run writes and then
+    rolls back, so it holds the write lock for the whole batch.
 
     Args:
         session: Request session. This function commits or rolls it back.
