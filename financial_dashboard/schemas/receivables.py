@@ -36,10 +36,13 @@ class ReceivableUpdate(BaseModel):
     amount: Amount | None = None
     note: Note | None = None
     status: ReceivableStatus | None = None
+    kind: ReceivableKind | None = None
 
     @model_validator(mode="after")
     def reject_null(self) -> Self:
-        """Refuse a null amount or status."""
+        """Refuse a null amount or status, and any kind."""
+        if "kind" in self.model_fields_set:
+            raise ValueError("kind is set at create time")
         if None in self.model_dump(exclude_unset=True, exclude={"note"}).values():
             raise ValueError("only note can be null")
         return self

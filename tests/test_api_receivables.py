@@ -150,13 +150,14 @@ async def test_patch_changes_only_named_fields(client):
         f"/api/receivables/{rid}", json={"status": "open", "note": None}
     )
     nulled = await client.patch(f"/api/receivables/{rid}", json={"amount": None})
+    rekinded = await client.patch(f"/api/receivables/{rid}", json={"kind": "payable"})
 
     assert closed.json()["status"] == "written_off"
     assert closed.json()["closed_at"] is not None
     assert closed.json()["note"] == "lunch"
     assert reopened.json()["closed_at"] is None
     assert reopened.json()["note"] is None
-    assert nulled.status_code == 422
+    assert (nulled.status_code, rekinded.status_code) == (422, 422)
 
 
 async def test_list_and_page_filter_by_status(client, session):
@@ -171,14 +172,20 @@ async def test_list_and_page_filter_by_status(client, session):
             "person": "Friend C",
             "amount": "300",
             "charge_transaction_ids": [await _row(session, "credit", "300.00")],
-            "payment_transaction_ids": [await _row(session, "debit", "120.00")],
+        },
+    )
+    paid = await client.post(
+        f"/api/receivables/{owed.json()['id']}/links",
+        json={
+            "transaction_id": await _row(session, "debit", "120.00"),
+            "role": "payment",
         },
     )
 
     open_rows = (await client.get("/api/receivables?status=open")).json()["items"]
     page = (await client.get("/receivables")).text
 
-    assert owed.status_code == 201
+    assert (owed.status_code, paid.status_code) == (201, 201)
     assert [(row["person"], row["kind"], row["outstanding"]) for row in open_rows] == [
         ("Friend A", "receivable", "75.00"),
         ("Friend C", "payable", "180.00"),
