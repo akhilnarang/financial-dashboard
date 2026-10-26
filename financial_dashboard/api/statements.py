@@ -1,7 +1,7 @@
 """JSON endpoints for credit-card and bank statements."""
 
 import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, File, Form, Path, Query, Response, UploadFile
 
@@ -47,13 +47,15 @@ async def bank_statement_upload(
     account_id: Annotated[DatabaseId, Form()],
     file: Annotated[UploadFile, File()],
     password: Annotated[str, Form(max_length=128)] = "",
-    dry_run: Annotated[bool, Form()] = True,
+    # A str, not a bool: FastAPI reads a missing bool form field as false.
+    dry_run_form: Annotated[Literal["true", "false"], Form(alias="dry_run")] = "true",
 ) -> statement_schemas.BankStatementUploadResponse:
     """Parse and reconcile one bank statement PDF against the account's rows.
 
     ``dry_run`` defaults to true. A dry run writes nothing. A real run saves the
     PDF, records the upload, enriches matched rows and imports missing rows.
     """
+    dry_run = dry_run_form == "true"
     response.headers["Cache-Control"] = "no-store"
     account = await session.get(Account, account_id)
     if account is None or account.type != "bank_account":

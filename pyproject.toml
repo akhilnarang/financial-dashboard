@@ -42,6 +42,10 @@ select = ["E4", "E7", "E9", "F"]
 # published malicious version has had no time to be found and yanked, and
 # this repo handles the user's bank data.
 exclude-newer = "3 days"
+# CA bundle updates revoke bad roots, so take them at once.
+exclude-newer-package = { certifi = false }
+# PyMuPDF 2.0 makes onnxruntime and numpy hard dependencies.
+constraint-dependencies = ["pymupdf<2"]
 
 [tool.uv.sources]
 bank-email-parser = { git = "https://github.com/akhilnarang/bank-email-parser" }
