@@ -1500,8 +1500,8 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
     # billed amount is outside the settlement band.
     manual_id = await _seed_txn(
         session_factory,
-        amount=Decimal("1172.08"),
-        counterparty="CLOUDFLARE",
+        amount=Decimal("900.00"),
+        counterparty="SAMPLEHOST",
         amount_source="manual",
     )
     parsed = _parsed(
@@ -1509,7 +1509,7 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
             _stmt_txn(date="07/04/2026", amount="2,529.00", narration=NARRATION),
             _stmt_txn(date="07/04/2026", amount="999.00", narration="SAMPLE CAFE"),
             _stmt_txn(date="07/04/2026", amount="1,650.00", narration="SAMPLEMAIL COM"),
-            _stmt_txn(date="07/04/2026", amount="1,190.00", narration="CLOUDFLARE US"),
+            _stmt_txn(date="07/04/2026", amount="914.00", narration="SAMPLEHOST US"),
         ]
     )
 
@@ -1536,7 +1536,7 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
     assert rows[other_id] == (Decimal("12.00"), "USD")
     assert rows[mail_id] == (Decimal("1650.00"), "INR")
     assert rows[rival_id] == (Decimal("20.00"), "USD")
-    assert rows[manual_id] == (Decimal("1190.00"), "INR")
+    assert rows[manual_id] == (Decimal("914.00"), "INR")
     assert manual is not None and manual.amount_source == "bank"
     assert len(rows) == 6
     # A reprocess pairs the converted row by amount and imports nothing.
