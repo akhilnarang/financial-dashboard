@@ -277,9 +277,9 @@ class TransactionApplyChange(BaseModel):
         fields = self.model_fields_set - {"id"}
         if not fields:
             raise ValueError("a change must set at least one field")
-        nulls = [f for f in fields - {"note"} if getattr(self, f) is None]
-        if nulls:
-            raise ValueError(f"only note can be null: {sorted(nulls)}")
+        set_values = self.model_dump(include=fields - {"note"})
+        if nulls := sorted(f for f, value in set_values.items() if value is None):
+            raise ValueError(f"only note can be null: {nulls}")
         return self
 
 
@@ -300,9 +300,12 @@ class TransactionApplyRequest(BaseModel):
         return self
 
 
+TransactionFieldValue = str | bool | int | float | None
+
+
 class TransactionFieldDiff(BaseModel):
-    before: str | bool | int | float | None
-    after: str | bool | int | float | None
+    before: TransactionFieldValue
+    after: TransactionFieldValue
 
 
 class TransactionApplyRow(BaseModel):

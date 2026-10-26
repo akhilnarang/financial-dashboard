@@ -14,19 +14,36 @@ from financial_dashboard.services.cc_disambiguation import (
 
 logger = logging.getLogger(__name__)
 
-# Stored fields that the apply endpoint can change, directly or as a side effect.
-# The diff leaves out categorized_at. Each category write stamps it again.
-APPLY_DIFF_FIELDS = (
-    "category",
-    "category_method",
-    "category_confidence",
-    "category_model",
-    "category_vocab_version",
-    "review_status",
-    "note",
-    "exclude_from_cashflow",
-    "voided",
-)
+
+class ApplySnapshot(NamedTuple):
+    """Stored fields that the apply endpoint can change, directly or as a side effect.
+
+    It leaves out categorized_at. Each category write stamps it again.
+    """
+
+    category: str | None
+    category_method: str | None
+    category_confidence: float | None
+    category_model: str | None
+    category_vocab_version: int | None
+    review_status: str | None
+    note: str | None
+    exclude_from_cashflow: bool
+    voided: bool
+
+
+def _apply_snapshot(txn: Transaction) -> ApplySnapshot:
+    return ApplySnapshot(
+        category=txn.category,
+        category_method=txn.category_method,
+        category_confidence=txn.category_confidence,
+        category_model=txn.category_model,
+        category_vocab_version=txn.category_vocab_version,
+        review_status=txn.review_status,
+        note=txn.note,
+        exclude_from_cashflow=txn.exclude_from_cashflow,
+        voided=txn.voided,
+    )
 
 
 class NoteResult(NamedTuple):
@@ -315,17 +332,16 @@ async def apply_transaction_changes(
         if txn is None:
             errors.append({"id": change.id, "error": "Transaction not found"})
             continue
-        before = {field: getattr(txn, field) for field in APPLY_DIFF_FIELDS}
+        before = _apply_snapshot(txn)
         error = await _apply_change_no_commit(session, txn.id, change)
         if error is not None:
             errors.append({"id": change.id, "error": error})
             continue
+        after = _apply_snapshot(txn)
         diff = {
-            field: transaction_schemas.TransactionFieldDiff(
-                before=before[field], after=getattr(txn, field)
-            )
-            for field in APPLY_DIFF_FIELDS
-            if getattr(txn, field) != before[field]
+            field: transaction_schemas.TransactionFieldDiff(before=old, after=new)
+            for field, old, new in zip(ApplySnapshot._fields, before, after)
+            if old != new
         }
         if diff:
             changed.append(
