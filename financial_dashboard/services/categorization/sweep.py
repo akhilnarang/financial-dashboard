@@ -333,7 +333,6 @@ async def _notify_assistant(
         f"Reasoning: {txn.review_reason or 'low confidence'}\n"
         f"{next_step}"
     )
-    # Split before escaping, so a split never cuts an HTML entity in two.
     chunks = [html.escape(c) for c in split_plain_text(assistant_text, limit=4000)]
     chunks[0] = chunks[0].replace(f"#{txn.id}", _id_label(txn.id, base_url), 1)
     deliveries = []
