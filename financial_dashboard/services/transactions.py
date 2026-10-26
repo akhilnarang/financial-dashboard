@@ -140,19 +140,28 @@ class VoidResult(NamedTuple):
     voided: bool
 
 
-def check_voidable(txn: Transaction, voided: bool) -> None:
-    """Refuse to void a credit.
+async def check_voidable(session: AsyncSession, txn: Transaction, voided: bool) -> None:
+    """Refuse to void a credit, or a row that pays a receivable.
 
     Args:
+        session: The session that reads the row.
         txn: The row to change.
         voided: The new state.
 
     Raises:
-        ValueError: The row is a credit. Only a charge can be voided.
+        ValueError: The row is a credit, or it pays a receivable.
     """
     # A credit can be a card bill payment, and its paid state would go stale.
     if voided and txn.direction != "debit":
         raise ValueError("Only a debit can be voided")
+    if voided and await session.scalar(
+        select(ReceivableLink.id).where(
+            ReceivableLink.transaction_id == txn.id, ReceivableLink.role == "payment"
+        )
+    ):
+        raise ValueError(
+            "A row that pays a receivable cannot be voided; unlink it first"
+        )
 
 
 async def set_transaction_voided(
@@ -172,7 +181,7 @@ async def set_transaction_voided(
         The stored state. ``ok`` is False when no such row exists.
 
     Raises:
-        ValueError: The row is a credit. Only a charge can be voided.
+        ValueError: The row is a credit, or it pays a receivable.
     """
     result = await set_transaction_voided_no_commit(session, txn_id, voided)
     if result.ok:
@@ -194,12 +203,12 @@ async def set_transaction_voided_no_commit(
         The stored state. ``ok`` is False when no such row exists.
 
     Raises:
-        ValueError: The row is a credit. Only a charge can be voided.
+        ValueError: The row is a credit, or it pays a receivable.
     """
     txn = await session.get(Transaction, txn_id)
     if txn is None:
         return VoidResult(ok=False, voided=False)
-    check_voidable(txn, voided)
+    await check_voidable(session, txn, voided)
     txn.voided = voided
     return VoidResult(ok=True, voided=voided)
 
@@ -254,7 +263,7 @@ async def _validate_change(
             return f"Invalid category: {category!r}"
     if change.voided is not None:
         try:
-            check_voidable(txn, change.voided)
+            await check_voidable(session, txn, change.voided)
         except ValueError as exc:
             return str(exc)
     if {"amount", "currency"} & change.model_fields_set:

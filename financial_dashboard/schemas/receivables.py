@@ -7,6 +7,7 @@ from typing import Annotated, Self
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from financial_dashboard.db.enums import (
+    PersonIdentifierKind,
     ReceivableKind,
     ReceivableRole,
     ReceivableStatus,
@@ -36,11 +37,12 @@ class ReceivableUpdate(BaseModel):
     amount: Amount | None = None
     note: Note | None = None
     status: ReceivableStatus | None = None
+    person: Person | None = None
     kind: ReceivableKind | None = None
 
     @model_validator(mode="after")
     def reject_null(self) -> Self:
-        """Refuse a null amount or status, and any kind."""
+        """Refuse a null amount, status or person, and any kind."""
         if "kind" in self.model_fields_set:
             raise ValueError("kind is set at create time")
         if None in self.model_dump(exclude_unset=True, exclude={"note"}).values():
@@ -70,3 +72,21 @@ class ReceivableRead(BaseModel):
 
 class ReceivableListResponse(BaseModel):
     items: list[ReceivableRead]
+
+
+class PersonIdentifierCreate(BaseModel):
+    person: Person
+    kind: PersonIdentifierKind
+    value: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)
+    ]
+
+
+class PersonIdentifierRead(BaseModel):
+    person: str
+    kind: PersonIdentifierKind
+    value: str
+
+
+class PersonIdentifierListResponse(BaseModel):
+    items: list[PersonIdentifierRead]

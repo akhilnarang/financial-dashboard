@@ -11,7 +11,7 @@ from decimal import Decimal
 
 import pytest
 
-from financial_dashboard.db import Transaction
+from financial_dashboard.db import Receivable, ReceivableLink, Transaction
 
 pytestmark = pytest.mark.anyio
 
@@ -69,12 +69,24 @@ async def test_set_and_clear_is_observable_and_idempotent(
     assert missing.status_code == 404
 
 
-async def test_a_credit_cannot_be_voided(client, session):
-    """A credit can be a card bill payment. Voiding it would leave the paid
-    state stale, so the endpoint refuses it and the row stays counted."""
+@pytest.mark.parametrize("case", ["credit", "pays_receivable"])
+async def test_a_credit_or_a_receivable_payment_cannot_be_voided(client, session, case):
+    """A credit can be a card bill payment, and a payment row counts toward a
+    receivable. Voiding either would leave that state stale, so the endpoint
+    refuses it and the row stays counted."""
     txn_id = await _seed(session)
-    txn = await session.get(Transaction, txn_id)
-    txn.direction = "credit"
+    if case == "credit":
+        txn = await session.get(Transaction, txn_id)
+        txn.direction = "credit"
+    else:
+        session.add(
+            Receivable(
+                kind="payable",
+                person="Friend A",
+                amount=Decimal("24995"),
+                links=[ReceivableLink(transaction_id=txn_id, role="payment")],
+            )
+        )
     await session.commit()
 
     r = await client.post(f"/api/transactions/{txn_id}/void", json={"voided": True})

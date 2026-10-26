@@ -280,6 +280,27 @@ uv run python scripts/paisa_contract.py --skip-if-unavailable   # needs Docker
   A field that a pinned sibling parser does not carry yet is NOT a
   reason: bump the pin in `uv.lock` instead. A test stub that omits the
   field is not a reason either: give the stub the field.
+- **Typed models, not raw dicts, for fixed-shape data.** Persisted JSON
+  (for example a stored pending confirmation) is one Pydantic model, with
+  a discriminated union where the shape varies by `kind`. Write it from
+  the model, and parse it with the model at every read site.
+- **No exceptions as control flow.** For a dry run, open a savepoint and
+  roll it back in `finally`. Do not raise a private exception to undo it.
+- **Precise types.** Do not write `object` or `Any` when the type is
+  known; name the union. Reuse the existing formatters, such as
+  `core.templating.format_inr_exact` for rupee text.
+- **Inline a helper that has one caller.** A helper that several modules
+  use goes in its own shared module, not in the middle of a service file.
+- **Module layout:** imports, then constants, type aliases and classes
+  (NamedTuples, models), then functions. Do not define a class between
+  functions.
+- **Use `match` over a closed set of types or kinds**, not an
+  `isinstance` if/elif chain. A single `isinstance` takes `A | B`, not a
+  tuple.
+- **Use a walrus when it removes a line and stays readable**, as in
+  `if (row := await session.get(...)) is not None: return row`.
+- **Docstrings on helpers too.** A private helper whose name and signature
+  do not say everything gets a real summary of what it does and why.
 
 ## Compatibility rules
 

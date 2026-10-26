@@ -1,6 +1,5 @@
 """Telegram message to application-record lookup and recovery helpers."""
 
-import json
 import re
 
 from sqlalchemy import select, update
@@ -12,6 +11,14 @@ from financial_dashboard.db.models import (
     TelegramConversation,
     TelegramMessageContext,
     TelegramOutboundDelivery,
+)
+from financial_dashboard.services.assistant.contracts import (
+    CreateReceivable,
+    LinkReceivable,
+    MerchantRuleConfirmation,
+    ReceivableWriteConfirmation,
+    StoredConfirmation,
+    TransactionChangeConfirmation,
 )
 
 # Only the application-appended footer is authoritative.  Anchoring the end
@@ -161,8 +168,30 @@ async def move_transaction_references(
         )
     )
     for conversation in pending:
-        action = json.loads(conversation.pending_confirmation_json or "{}")
-        if action.get("action", {}).get("transaction_id") == old_id:
+        try:
+            stored = StoredConfirmation.model_validate_json(
+                conversation.pending_confirmation_json or ""
+            )
+        except ValueError:
+            # A confirmation that does not parse can never apply.
+            clear_pending_confirmation(conversation)
+            continue
+        match stored.action:
+            case (
+                MerchantRuleConfirmation(transaction_id=transaction_id)
+                | TransactionChangeConfirmation(transaction_id=transaction_id)
+                | ReceivableWriteConfirmation(
+                    request=LinkReceivable(transaction_id=transaction_id)
+                )
+            ):
+                named = {transaction_id}
+            case ReceivableWriteConfirmation(
+                request=CreateReceivable(charge_transaction_ids=charges)
+            ):
+                named = set(charges)
+            case _:
+                named = set()
+        if old_id in named:
             clear_pending_confirmation(conversation)
     for model in (
         TelegramConversation,

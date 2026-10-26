@@ -3,6 +3,8 @@
 import json
 from collections.abc import Mapping, Sequence
 
+from pydantic import BaseModel
+
 from financial_dashboard.services.categorization.normalize import (
     redact_names,
     redact_pii,
@@ -39,6 +41,8 @@ def serialize_tool_result(value: object) -> dict[str, object]:
             "items": [
                 dict(item._asdict())
                 if hasattr(item, "_asdict")
+                else item.model_dump(mode="json")
+                if isinstance(item, BaseModel)
                 else dict(item)
                 if isinstance(item, Mapping)
                 else str(item)[:1000]

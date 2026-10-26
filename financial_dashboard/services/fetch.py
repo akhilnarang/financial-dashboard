@@ -15,6 +15,7 @@ from financial_dashboard.services.categorization.sweep import (
     run_rule_sweep,
 )
 from financial_dashboard.services.categorization.vocabulary import refresh_vocab_cache
+from financial_dashboard.services.receivable_matches import run_receivable_match_sweep
 from financial_dashboard.services.reminders import check_and_send_reminders
 from financial_dashboard.services.settings import get_setting_int
 from financial_dashboard.services.assistant.delivery import recover_assistant_work
@@ -41,6 +42,10 @@ async def run_categorization_cycle() -> None:
     await run_rule_sweep()
     await run_llm_sweep()
     await run_review_notify()
+    try:
+        await run_receivable_match_sweep()
+    except Exception:
+        logger.exception("Receivable match sweep failed")
     # Category creation can happen through web/API/manual paths in another
     # worker. Refresh only after those services have committed their writes so
     # a rolled-back transaction never leaks a vocabulary version into cache.
