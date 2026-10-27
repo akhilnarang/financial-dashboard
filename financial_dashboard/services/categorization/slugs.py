@@ -10,6 +10,8 @@ Deliberately import-free: every layer (categorization, reporting, the web
 routes) can depend on it without pulling a session, a setting or a model in.
 """
 
+from typing import Literal, TypeAlias, get_args
+
 # The category a credit falls back to when nothing better fits, and the one the
 # cashflow report breaks out on its own line rather than counting as income:
 # somebody handing money back is not money earned.
@@ -33,3 +35,6 @@ UNKNOWN_SLUG = "unknown"
 # a card can only ever be credited by a refund or a bill payment, so the
 # categorizer has to branch on it.
 CREDIT_CARD_ACCOUNT_TYPE = "credit_card"
+
+UserCategoryBucket: TypeAlias = Literal["expense", "income"]
+USER_CATEGORY_BUCKETS: tuple[UserCategoryBucket, ...] = get_args(UserCategoryBucket)

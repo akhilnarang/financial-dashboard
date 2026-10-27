@@ -50,7 +50,7 @@ from financial_dashboard.core.dates import (
     month_key as month_key_of,
     trailing_month_starts,
 )
-from financial_dashboard.db.models import Transaction
+from financial_dashboard.db.models import Category, Transaction
 from financial_dashboard.schemas.cashflow import (
     BucketSummary,
     CashflowSummary,
@@ -74,7 +74,11 @@ from financial_dashboard.services.cashflow.scope import (
     UNACCOUNTED_SCOPE,
     Scope,
 )
-from financial_dashboard.services.categorization.slugs import UNKNOWN_SLUG
+from financial_dashboard.services.categorization.slugs import (
+    UNKNOWN_SLUG,
+    USER_CATEGORY_BUCKETS,
+)
+from financial_dashboard.services.categorization.vocabulary import load_user_buckets
 
 MAX_TREND_MONTHS = 60
 NO_COUNTERPARTY_LABEL = "(no counterparty)"
@@ -152,13 +156,19 @@ NORMALIZED_CATEGORY = case(
 )
 
 # The uncategorized population: no category at all, the 'unknown' sentinel, or a
-# runtime slug the bucket map has never heard of. Defined once and used by both
-# the report's uncategorized line and the `?uncategorized=1` drill-through, so the
-# count on the tile and the rows on the list cannot drift apart.
+# runtime slug that neither the bucket map nor a stored bucket places. Defined
+# once and used by both the report's uncategorized line and the
+# `?uncategorized=1` drill-through, so the count on the tile and the rows on the
+# list cannot drift apart.
 UNCATEGORIZED = (
     BLANK_CATEGORY
     | (Transaction.category == UNKNOWN_SLUG)
-    | Transaction.category.not_in(list(BUCKET_BY_SLUG))
+    | (
+        Transaction.category.not_in(list(BUCKET_BY_SLUG))
+        & Transaction.category.not_in(
+            select(Category.slug).where(Category.bucket.in_(USER_CATEGORY_BUCKETS))
+        )
+    )
 )
 
 
@@ -217,6 +227,7 @@ async def cashflow_summary(
     unaccounted/undated footnotes, which exist precisely to count what the bank
     scope leaves out.
     """
+    await load_user_buckets(session)
     in_range = Transaction.transaction_date.between(date_from, date_to)
 
     # The headline buckets share one scan of the in-range, bank-side INR-or-null
@@ -580,6 +591,7 @@ async def cashflow_trend(
     keeps the chart from telling a different story month by month than the tiles
     above it tell for the selected range.
     """
+    await load_user_buckets(session)
     today = today or datetime.date.today()
     months = max(1, min(months, MAX_TREND_MONTHS))
     window = trailing_month_starts(today, months)

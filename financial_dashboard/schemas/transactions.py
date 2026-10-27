@@ -5,6 +5,7 @@ from typing import Annotated, Literal, Self
 from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from financial_dashboard.schemas.common import DatabaseId, DatabaseIdBatch
+from financial_dashboard.services.categorization.slugs import UserCategoryBucket
 
 
 class TransactionNoteUpdate(BaseModel):
@@ -331,6 +332,13 @@ class CategoryRead(BaseModel):
     label: str
     active: bool
     bucket: str
+
+
+class CategoryCreate(BaseModel):
+    """A user category. The slug is normalized as a manual category is."""
+
+    slug: str = Field(min_length=1, max_length=100)
+    bucket: UserCategoryBucket = "expense"
 
 
 class CategoryListResponse(BaseModel):

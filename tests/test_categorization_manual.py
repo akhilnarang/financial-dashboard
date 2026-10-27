@@ -18,8 +18,10 @@ from financial_dashboard.services.categorization.manual import (
 )
 from financial_dashboard.services.categorization.review_io import apply_reviewed_rows
 from financial_dashboard.services.categorization.vocabulary import (
+    create_category,
     ensure_category,
     get_active_slugs,
+    load_user_buckets,
 )
 from financial_dashboard.services.transactions import update_transaction_category
 from tests.conftest import card_account
@@ -80,6 +82,31 @@ async def test_manual_assign_rejects_unknown_slug(session: AsyncSession):
     assert txn.category is None
     assert "grocieis" not in await get_active_slugs(session)
     assert await assign_category_manual(session, 9999, "groceries") == (False, None)
+
+
+async def test_inferred_category_must_fit_its_bucket_direction(session: AsyncSession):
+    """Laundry and a user expense category fit a debit. A user income category
+    fits a credit, not a debit."""
+    await ensure_category(session, "laundry")
+    await create_category(session, "dry_cleaning", "expense")
+    await create_category(session, "side_gig", "income")
+    await load_user_buckets(session)
+    debit = await _txn(session)
+    credit = await _txn(session)
+    credit.direction = "credit"
+    for txn, slug, ok in [
+        (debit, "laundry", True),
+        (credit, "laundry", False),
+        (credit, "dry_cleaning", False),
+        (debit, "side_gig", False),
+        (credit, "side_gig", True),
+    ]:
+        assert await assign_category_no_commit(
+            session,
+            txn.id,
+            slug,
+            direction_policy=CategoryDirectionPolicy.INFERRED_STRICT,
+        ) == ((True, slug) if ok else (False, None)), (txn.direction, slug)
 
 
 async def test_inactive_category_is_manual_only(session: AsyncSession):

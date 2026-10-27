@@ -1,4 +1,4 @@
-"""Receivable reads and confirmed receivable writes for the assistant.
+"""Receivable reads and confirmed receivable and category writes for the assistant.
 
 A write runs only after the user taps Yes. The caller holds the SQLite write
 lock and commits.
@@ -29,12 +29,17 @@ from financial_dashboard.schemas.receivables import (
 )
 from financial_dashboard.services.assistant.contracts import (
     AddPersonIdentifier,
+    CreateCategory,
     CreateReceivable,
     LinkReceivable,
-    ReceivableWrite,
+    AssistantWrite,
     UpdateReceivable,
 )
 from financial_dashboard.services.assistant.mutations import MutationRejected
+from financial_dashboard.services.categorization.vocabulary import (
+    canonicalize_slug,
+    create_category,
+)
 from financial_dashboard.services.person_identifiers import (
     identifier_value,
     store_identifier,
@@ -67,10 +72,8 @@ def _update_payload(request: UpdateReceivable) -> ReceivableUpdate:
     raise MutationRejected("name a field to change")
 
 
-async def apply_receivable_write(
-    session: AsyncSession, request: ReceivableWrite
-) -> str:
-    """Apply one receivable write. Do not commit.
+async def apply_assistant_write(session: AsyncSession, request: AssistantWrite) -> str:
+    """Apply one receivable or category write. Do not commit.
 
     Args:
         session: A session that holds the write lock.
@@ -101,6 +104,9 @@ async def apply_receivable_write(
                     ),
                 )
                 return f"Saved {row.kind} {row.value} for {row.person}."
+            case CreateCategory():
+                category = await create_category(session, request.slug, request.bucket)
+                return f"Created {request.bucket} category {category.slug}."
             case LinkReceivable():
                 receivable = await _receivable(session, request.receivable_id)
                 await attach_link(
@@ -136,8 +142,8 @@ def _describe(read: ReceivableRead) -> str:
     )
 
 
-async def describe_receivable_write(
-    session: AsyncSession, request: ReceivableWrite
+async def describe_assistant_write(
+    session: AsyncSession, request: AssistantWrite
 ) -> str:
     """Render the confirmation question from stored data and the request.
 
@@ -169,6 +175,11 @@ async def describe_receivable_write(
         case AddPersonIdentifier():
             value = identifier_value(PersonIdentifierKind(request.kind), request.value)
             return f"Save {request.kind} {value} for {request.person}?"
+        case CreateCategory():
+            return (
+                f"Create the {request.bucket} category "
+                f"{canonicalize_slug(request.slug)}?"
+            )
         case LinkReceivable():
             read = receivable_read(await _receivable(session, request.receivable_id))
             if (txn := await session.get(Transaction, request.transaction_id)) is None:
@@ -199,8 +210,8 @@ async def describe_receivable_write(
             return f"Change {_describe(read)}: set {', '.join(changes)}?"
 
 
-async def receivable_state_hash(
-    session: AsyncSession, request: ReceivableWrite
+async def assistant_write_state_hash(
+    session: AsyncSession, request: AssistantWrite
 ) -> str | None:
     """Fingerprint the state that a confirmation of this write relies on.
 
@@ -232,7 +243,7 @@ async def receivable_state_hash(
             )
         case UpdateReceivable():
             receivable_id = request.receivable_id
-        case CreateReceivable() | AddPersonIdentifier():
+        case CreateReceivable() | AddPersonIdentifier() | CreateCategory():
             pass
     if receivable_id is not None:
         receivable = await session.get(

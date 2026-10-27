@@ -14,8 +14,8 @@ from financial_dashboard.services.categorization.merchant_rules import (
     get_merchant_rules,
 )
 from financial_dashboard.services.categorization.polarity import (
-    EXPENSE_SLUGS,
-    INCOME_SLUGS,
+    is_expense_slug,
+    is_income_slug,
 )
 from financial_dashboard.services.categorization.slugs import (
     CREDIT_CARD_ACCOUNT_TYPE,
@@ -232,9 +232,9 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
         # fall through to the LLM/fallback (e.g. a credit at a dining merchant →
         # refund, not dining). Neutral categories (credit_card_payment,
         # investment) are unaffected and apply either direction.
-        if direction == "credit" and category in EXPENSE_SLUGS:
+        if direction == "credit" and is_expense_slug(category):
             continue
-        if direction == "debit" and category in INCOME_SLUGS:
+        if direction == "debit" and is_income_slug(category):
             continue
         if pattern in text_norm:
             # Investing is an outflow (debit). A CREDIT at an investment

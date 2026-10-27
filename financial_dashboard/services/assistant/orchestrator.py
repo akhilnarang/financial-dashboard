@@ -51,14 +51,15 @@ from financial_dashboard.services.assistant.contracts import (
     ListReceivables,
     ListTransactions,
     AddPersonIdentifier,
+    CreateCategory,
     CreateReceivable,
     LinkReceivable,
     UpdateReceivable,
     MerchantRuleConfirmation,
     ReadCall,
-    ReceivableWrite,
-    ReceivableWriteCall,
-    ReceivableWriteConfirmation,
+    AssistantWrite,
+    AssistantWriteCall,
+    AssistantWriteConfirmation,
     StoredConfirmation,
     TransactionChangeConfirmation,
     parse_response,
@@ -70,7 +71,7 @@ from financial_dashboard.services.assistant.intent_policy import (
     has_global_no_change,
     has_non_mutating_intent,
     is_direct_affirmative,
-    is_receivable_write_request,
+    is_assistant_write_request,
     parse_instruction,
 )
 from financial_dashboard.services.assistant.mutations import (
@@ -84,10 +85,10 @@ from financial_dashboard.services.assistant.mutations import (
     unrequested_exclusion,
 )
 from financial_dashboard.services.assistant.prompt import PromptContext
-from financial_dashboard.services.assistant.receivable_writes import (
-    apply_receivable_write,
-    describe_receivable_write,
-    receivable_state_hash,
+from financial_dashboard.services.assistant.assistant_writes import (
+    apply_assistant_write,
+    describe_assistant_write,
+    assistant_write_state_hash,
 )
 from financial_dashboard.schemas.receivables import ReceivableRead
 from financial_dashboard.services.person_identifiers import normalize_person
@@ -108,7 +109,10 @@ from financial_dashboard.services.categorization.hashing import (
     compute_input_hash,
 )
 
-from financial_dashboard.services.categorization.vocabulary import get_active_slugs
+from financial_dashboard.services.categorization.vocabulary import (
+    get_active_slugs,
+    load_user_buckets,
+)
 from financial_dashboard.services.categorization.decision_lifecycle import (
     supersede_active_decisions,
 )
@@ -148,6 +152,7 @@ class OrchestrationResult(NamedTuple):
     output_tokens: int | None = None
     latency_ms: int | None = None
     transaction_ids: tuple[int, ...] = ()
+    confirmed_write: bool = False
 
 
 class AuthorizationChanged(MutationRejected):
@@ -431,6 +436,7 @@ async def run_turn(
                 code="unsupported_aggregate",
             )
         )
+    await load_user_buckets(session)
     expected_state_hash = (
         await current_confirmation_state_hash(session, transaction_id)
         if transaction_id is not None
@@ -535,7 +541,7 @@ async def run_turn(
             and response.pending_confirmation is not None
             or isinstance(response, ToolCalls)
             and any(
-                isinstance(call, ApplyTransactionChanges | ReceivableWriteCall)
+                isinstance(call, ApplyTransactionChanges | AssistantWriteCall)
                 for call in response.calls
             )
         )
@@ -681,7 +687,7 @@ async def run_turn(
                 if isinstance(call, ApplyTransactionChanges)
             ]
             receivable_calls = [
-                call for call in response.calls if isinstance(call, ReceivableWriteCall)
+                call for call in response.calls if isinstance(call, AssistantWriteCall)
             ]
             if len(mutation_calls) + len(receivable_calls) > 1:
                 return completed(
@@ -712,7 +718,7 @@ async def run_turn(
                 # Validate and execute every read before applying the sole mutation.
                 # A rejected later call can therefore never leave an earlier write.
                 for call in response.calls:
-                    if isinstance(call, ApplyTransactionChanges | ReceivableWriteCall):
+                    if isinstance(call, ApplyTransactionChanges | AssistantWriteCall):
                         continue
                     tool_result = await _dispatch_read(session, call)
                     match tool_result:
@@ -732,7 +738,7 @@ async def run_turn(
                     )
                 if receivable_calls:
                     return completed(
-                        await _confirm_receivable_write(
+                        await _confirm_assistant_write(
                             session,
                             receivable_calls[0],
                             user_message=user_message,
@@ -897,7 +903,7 @@ async def claim_pending_confirmation(
     state_hash: str,
     *,
     replied_to_interaction_id: int,
-) -> ApplyTransactionChanges | ReceivableWrite | None:
+) -> ApplyTransactionChanges | AssistantWrite | None:
     """Use compare-and-swap to claim an application-authored pending action for a direct reply."""
     conversation = await session.get(TelegramConversation, conversation_id)
     if (
@@ -928,7 +934,7 @@ async def claim_pending_confirmation(
             request = stored.action.request
             if request.transaction_id != transaction_id:
                 return None
-        case ReceivableWriteConfirmation():
+        case AssistantWriteConfirmation():
             request = stored.action.request
     claimed = await session.execute(
         update(TelegramConversation)
@@ -967,6 +973,7 @@ async def run_pending_confirmation(
     # Otherwise a concurrent manual edit could land between the freshness read
     # and the confirmation compare-and-swap, allowing a stale action to proceed.
     await _lock_authorized_chat(session, authorized_chat_id)
+    await load_user_buckets(session)
     fresh_hash = None
     pending_direction_policy = DirectionPolicy.INFERRED_STRICT
     conversation = await session.get(TelegramConversation, conversation_id)
@@ -975,8 +982,8 @@ async def run_pending_confirmation(
             conversation, conversation.pending_confirmation_json
         )
         match stored.action:
-            case ReceivableWriteConfirmation(request=write):
-                fresh_hash = await receivable_state_hash(session, write)
+            case AssistantWriteConfirmation(request=write):
+                fresh_hash = await assistant_write_state_hash(session, write)
             case (
                 MerchantRuleConfirmation(transaction_id=transaction_id)
                 | TransactionChangeConfirmation(transaction_id=transaction_id)
@@ -1011,8 +1018,9 @@ async def run_pending_confirmation(
                 | LinkReceivable()
                 | UpdateReceivable()
                 | AddPersonIdentifier()
+                | CreateCategory()
             ):
-                result = await apply_receivable_write(session, request)
+                result = await apply_assistant_write(session, request)
         await session.execute(
             update(TelegramConversation)
             .where(TelegramConversation.id == conversation_id)
@@ -1207,32 +1215,34 @@ async def _confirm_change(
     )
 
 
-async def _confirm_receivable_write(
+async def _confirm_assistant_write(
     session: AsyncSession,
-    request: ReceivableWrite,
+    request: AssistantWrite,
     *,
     user_message: str,
     conversation_id: int | None,
     interaction_id: int | None,
 ) -> Clarification:
-    """Ask the user to confirm a receivable write before it is written.
+    """Ask the user to confirm a receivable or category write before it is written.
 
     A dry run checks the write first. The question comes from stored data.
     """
-    if not is_receivable_write_request(user_message):
-        raise MutationRejected("the message does not ask for a receivable change")
+    if not is_assistant_write_request(user_message):
+        raise MutationRejected(
+            "the message does not ask for a receivable or category change"
+        )
     savepoint = await session.begin_nested()
     try:
-        await apply_receivable_write(session, request)
+        await apply_assistant_write(session, request)
     finally:
         await savepoint.rollback()
-    if (state_hash := await receivable_state_hash(session, request)) is None:
+    if (state_hash := await assistant_write_state_hash(session, request)) is None:
         raise MutationRejected("receivable not found")
-    question = await describe_receivable_write(session, request)
+    question = await describe_assistant_write(session, request)
     await _persist_pending(
         session,
         conversation_id,
-        ReceivableWriteConfirmation(kind="receivable_write", request=request),
+        AssistantWriteConfirmation(kind="receivable_write", request=request),
         source_interaction_id=interaction_id,
         transaction_state_hash=state_hash,
         direction_policy=DirectionPolicy.INFERRED_STRICT,
@@ -1727,7 +1737,7 @@ async def _process_text_interaction(
         return
     except ProcessingLeaseLost:
         return
-    if result.mutation is not None:
+    if result.mutation is not None or result.confirmed_write:
         try:
             async with async_session() as session:
                 from financial_dashboard.services.assistant.mutations import (
@@ -2404,8 +2414,10 @@ async def _process_callback_interaction(
             await mark_authorization_changed(session, interaction_id)
             await session.commit()
             return
-    if (trigger == "undo" and result.response.outcome != "error") or (
-        result.mutation is not None
+    if (
+        (trigger == "undo" and result.response.outcome != "error")
+        or result.mutation is not None
+        or result.confirmed_write
     ):
         try:
             async with async_session() as session:
@@ -2451,7 +2463,9 @@ async def _apply_pending(
             Error(outcome="error", message=str(exc), code="confirmation_rejected")
         )
     if isinstance(mutation, str):
-        return OrchestrationResult(Answer(outcome="answer", text=mutation))
+        return OrchestrationResult(
+            Answer(outcome="answer", text=mutation), confirmed_write=True
+        )
     return OrchestrationResult(
         Answer(outcome="answer", text="Saved."), mutation=mutation
     )

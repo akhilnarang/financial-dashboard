@@ -21,6 +21,7 @@ from financial_dashboard.services.categorization.review_decisions import (
     ensure_legacy_decision,
 )
 from financial_dashboard.services.assistant.rendering import split_plain_text
+from financial_dashboard.services.categorization.vocabulary import load_user_buckets
 from financial_dashboard.services.settings import (
     get_active_llm_key,
     get_app_base_url,
@@ -60,6 +61,7 @@ async def run_rule_sweep(*, batch_limit: int = 500) -> int:
     PROCESSED (each becomes 'rule' or 'pending_llm'), so a backfill loop can
     terminate when the never-touched set is empty (0 processed)."""
     async with async_session() as session:
+        await load_user_buckets(session)
         stmt = select_needs_work_stmt(llm=False, limit=batch_limit)
         rows = (await session.execute(stmt)).scalars().all()
         for txn in rows:
@@ -83,6 +85,7 @@ async def run_llm_sweep(*, batch_limit: int = 100) -> int:
     # must not expire/contaminate the others (a rollback expires preloaded ORM
     # objects even with expire_on_commit=False), so we isolate per row.
     async with async_session() as session:
+        await load_user_buckets(session)
         stmt = select_needs_work_stmt(llm=True, limit=batch_limit)
         txn_ids = [t.id for t in (await session.execute(stmt)).scalars().all()]
     count = 0

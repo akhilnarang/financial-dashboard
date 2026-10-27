@@ -16,7 +16,7 @@ from financial_dashboard.services.assistant.contracts import (
     CreateReceivable,
     LinkReceivable,
     MerchantRuleConfirmation,
-    ReceivableWriteConfirmation,
+    AssistantWriteConfirmation,
     StoredConfirmation,
     TransactionChangeConfirmation,
 )
@@ -180,12 +180,12 @@ async def move_transaction_references(
             case (
                 MerchantRuleConfirmation(transaction_id=transaction_id)
                 | TransactionChangeConfirmation(transaction_id=transaction_id)
-                | ReceivableWriteConfirmation(
+                | AssistantWriteConfirmation(
                     request=LinkReceivable(transaction_id=transaction_id)
                 )
             ):
                 named = {transaction_id}
-            case ReceivableWriteConfirmation(
+            case AssistantWriteConfirmation(
                 request=CreateReceivable(charge_transaction_ids=charges)
             ):
                 named = set(charges)
