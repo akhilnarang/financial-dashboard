@@ -819,6 +819,16 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                 text("ALTER TABLE transactions ADD COLUMN enriched_at DATETIME")
             )
         try:
+            await conn.execute(
+                text("SELECT screenshot_flagged_at FROM transactions LIMIT 0")
+            )
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE transactions ADD COLUMN screenshot_flagged_at DATETIME"
+                )
+            )
+        try:
             await conn.execute(text("SELECT status FROM sms_messages LIMIT 0"))
         except Exception:
             await conn.execute(

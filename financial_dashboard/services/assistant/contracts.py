@@ -5,6 +5,9 @@ tools below.  Pydantic validation is deliberately strict: provider output is
 untrusted input and is never interpreted as prose or partially recovered.
 """
 
+import datetime
+import re
+from decimal import Decimal
 from typing import Annotated, Literal, TypeAlias, cast
 
 from pydantic import (
@@ -12,11 +15,13 @@ from pydantic import (
     ConfigDict,
     Field,
     TypeAdapter,
+    WithJsonSchema,
     field_validator,
     model_validator,
 )
 from pydantic.types import StrictBool, StrictFloat, StrictInt, StrictStr
 
+from financial_dashboard.core.dates import IST
 from financial_dashboard.services.categorization.slugs import UserCategoryBucket
 
 
@@ -166,12 +171,25 @@ class CreateCategory(StrictModel):
     bucket: UserCategoryBucket = "expense"
 
 
+class VoidTransaction(StrictModel):
+    name: Literal["void_transaction"]
+    transaction_id: StrictInt = Field(gt=0)
+
+
+class MergeTransactions(StrictModel):
+    name: Literal["merge_transactions"]
+    keep_id: StrictInt = Field(gt=0)
+    duplicate_id: StrictInt = Field(gt=0)
+
+
 AssistantWriteCall = (
     CreateReceivable
     | LinkReceivable
     | UpdateReceivable
     | AddPersonIdentifier
     | CreateCategory
+    | VoidTransaction
+    | MergeTransactions
 )
 AssistantWrite: TypeAlias = Annotated[AssistantWriteCall, Field(discriminator="name")]
 ReadCall = GetTransaction | ListTransactions | ListCategories | ListReceivables
@@ -186,7 +204,9 @@ ToolCall: TypeAlias = Annotated[
     | LinkReceivable
     | UpdateReceivable
     | AddPersonIdentifier
-    | CreateCategory,
+    | CreateCategory
+    | VoidTransaction
+    | MergeTransactions,
     Field(discriminator="name"),
 ]
 
@@ -227,10 +247,90 @@ class AssistantWriteConfirmation(StrictModel):
     request: AssistantWrite
 
 
+class ScreenshotTransaction(StrictModel):
+    """What the vision model reads off one UPI app screenshot.
+
+    The model output is untrusted. Code checks every field before a row is
+    proposed.
+    """
+
+    status: Literal["success", "pending", "failed", "unknown"]
+    direction: Literal["debit", "credit"]
+    amount: (
+        Annotated[
+            Decimal,
+            WithJsonSchema({"type": "string", "description": "Rupees, e.g. 950.00"}),
+        ]
+        | None
+    )
+    counterparty: StrictStr | None = Field(max_length=200)
+    vpa: StrictStr | None = Field(max_length=200)
+    utr: StrictStr | None = Field(max_length=40)
+    occurred_at: (
+        Annotated[
+            datetime.datetime,
+            WithJsonSchema(
+                {"type": "string", "description": "IST as shown, YYYY-MM-DDTHH:MM:SS"}
+            ),
+        ]
+        | None
+    )
+    app: Literal["gpay", "phonepe", "paytm", "bhim", "other"]
+    account_hint: StrictStr | None = Field(max_length=100)
+
+    @field_validator("amount")
+    @classmethod
+    def storable_amount(cls, value: Decimal | None) -> Decimal | None:
+        """Drop an amount the amount column cannot hold, so the checks ask for it.
+
+        The column holds 10 integer digits and 2 decimals. The bound comes
+        first, because quantize fails on a huge value.
+        """
+        if (
+            value is None
+            or not Decimal(0) < value < Decimal("1e10")
+            or value != value.quantize(Decimal("0.01"))
+        ):
+            return None
+        return value
+
+    @field_validator("utr")
+    @classmethod
+    def strip_utr_spaces(cls, value: str | None) -> str | None:
+        return re.sub(r"\s", "", value) if value is not None else None
+
+    @field_validator("occurred_at")
+    @classmethod
+    def as_ist(cls, value: datetime.datetime | None) -> datetime.datetime | None:
+        if value is None or value.tzinfo is None:
+            return value
+        return value.astimezone(IST).replace(tzinfo=None)
+
+
+class ScreenshotTransactionConfirmation(StrictModel):
+    """A screenshot read that a Yes tap saves, or attaches to ``duplicate_of``.
+
+    ``missing`` names the mandatory fields that failed the checks. A Yes
+    never saves while it is not empty. ``not_duplicates`` holds the rows the
+    owner called another payment. ``duplicate_voided`` is the void state of
+    ``duplicate_of`` that the question showed.
+    """
+
+    kind: Literal["screenshot_transaction"]
+    read: ScreenshotTransaction
+    attachment_path: StrictStr = Field(min_length=1, max_length=200)
+    media_type: StrictStr = Field(min_length=1, max_length=50)
+    missing: list[StrictStr]
+    duplicate_of: StrictInt | None = None
+    duplicate_voided: StrictBool = False
+    not_duplicates: list[StrictInt] = Field(default_factory=list, max_length=20)
+
+
 ConfirmationAction: TypeAlias = Annotated[
     MerchantRuleConfirmation
     | TransactionChangeConfirmation
-    | AssistantWriteConfirmation,
+    | AssistantWriteConfirmation
+    | ScreenshotTransactionConfirmation,
     Field(discriminator="kind"),
 ]
 
@@ -320,6 +420,14 @@ def response_json_schema() -> dict[str, object]:
     return cast(
         dict[str, object],
         _openai_strict_schema(AssistantResponseEnvelope.model_json_schema()),
+    )
+
+
+def screenshot_json_schema() -> dict[str, object]:
+    """Return the strict provider schema of a screenshot read."""
+    return cast(
+        dict[str, object],
+        _openai_strict_schema(ScreenshotTransaction.model_json_schema()),
     )
 
 

@@ -706,6 +706,9 @@ class Transaction(Base):
     source: Mapped[str | None] = mapped_column(String)
     notified_channel: Mapped[str | None] = mapped_column(String)
     enriched_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    screenshot_flagged_at: Mapped[datetime.datetime | None] = mapped_column(DateTime)
+    """When Telegram asked about this screenshot row because no bank source
+    matched it in 60 days. The sweep asks once."""
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime, default=utc_now
     )

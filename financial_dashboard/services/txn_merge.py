@@ -8,6 +8,7 @@ does NOT commit and does NOT fire Telegram.
 """
 
 import datetime as _dt
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -182,6 +183,7 @@ _ENRICHMENT_FIELDS = (
 
 
 _MASK_FIELDS = ("card_mask", "account_mask")
+_UTR = re.compile(r"\d{12}")
 
 
 def _as_str(val: object) -> str | None:
@@ -622,6 +624,21 @@ def _decide(
     if not candidates:
         return MatchDecision("insert")
 
+    # A screenshot row holds the 12-digit UPI UTR. Another 12-digit reference
+    # on any channel, with or without a balance, is another payment.
+    incoming_ref = (txn_data.get("reference_number") or "").strip()
+    candidates = [
+        c
+        for c in candidates
+        if _is_source_row(c, channel, source_id)
+        or not (c.source or "").startswith("screenshot")
+        or not _UTR.fullmatch(incoming_ref)
+        or not _UTR.fullmatch(c.reference_number or "")
+        or c.reference_number == incoming_ref
+    ]
+    if not candidates:
+        return MatchDecision("insert")
+
     incoming_balance = _quantize_balance(txn_data.get("balance"))
 
     # Step 1 — authoritative split: drop candidates with a DIFFERENT *known*
@@ -662,7 +679,6 @@ def _decide(
     # same-amount card-bill payments on one day with different bank references
     # are two payments. They are not a duplicate to merge. Do not defer them to
     # a manual prompt. If the split empties the set, the incoming row is new.
-    incoming_ref = (txn_data.get("reference_number") or "").strip()
     if incoming_ref:
         # Keep the row the incoming message already owns. A reparse can change a
         # message's reference. Without this guard, the split would drop that own
@@ -1267,7 +1283,10 @@ async def apply_transaction_enrichment(
     # name changes no field, and still settles the source.
     sync_counterparty_source(match, txn_data)
 
-    if match.source != channel and match.source is not None:
+    if match.source and match.source.startswith("screenshot"):
+        if channel not in match.source.split("+"):
+            match.source += f"+{channel}"
+    elif match.source != channel and match.source is not None:
         match.source = "sms+email"
     # Gate the timestamp churn on a real change: a no-op duplicate (equal
     # balance, slot already filled) must not rewrite the row.

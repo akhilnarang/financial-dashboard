@@ -516,15 +516,21 @@ async def _merge_pair(
     for name in _LINK_FIELDS:
         if getattr(keep, name) is None:
             setattr(keep, name, data[name])
-    sources = {
+    parts = [
         part
         for value in (keep.source, data["source"])
         if value
         for part in value.split("+")
-    }
-    source = (
-        "sms+email" if sources == {"sms", "email"} else keep.source or data["source"]
-    )
+    ]
+    sources = set(parts)
+    if "screenshot" in sources:
+        source = "+".join(dict.fromkeys(["screenshot", *parts]))
+    else:
+        source = (
+            "sms+email"
+            if sources == {"sms", "email"}
+            else keep.source or data["source"]
+        )
     conflicts = cc_conflicts + await _fold_manual_fields(session, keep, data)
     # The enrichment runs the self-transfer rule. Thus it must see the final
     # reference and category.
@@ -574,6 +580,35 @@ async def _merge_pair(
         cc_payment_state=cc_state,
         overrides=applied,
     )
+
+
+async def merge_pair_no_commit(
+    session: AsyncSession, keep_id: int, duplicate_id: int
+) -> TransactionMergeReport:
+    """Merge one duplicate into its keeper with no override. Do not commit.
+
+    Args:
+        session: A session inside the caller's transaction.
+        keep_id: The row that stays.
+        duplicate_id: The row that is folded in and deleted.
+
+    Returns:
+        The report of the merge.
+
+    Raises:
+        PairRefused: A check fails.
+    """
+    keep = await session.get(Transaction, keep_id)
+    dup = await session.get(Transaction, duplicate_id)
+    pair = TransactionMergePair(keep_id=keep_id, duplicate_id=duplicate_id)
+    if reasons := _pair_checks(pair, keep, dup, [duplicate_id], {keep_id}).reasons:
+        raise PairRefused("; ".join(reasons))
+    assert keep is not None and dup is not None
+    if keep.voided or dup.voided:
+        raise PairRefused("a voided row cannot merge")
+    if keep.attachment_path and dup.attachment_path:
+        raise PairRefused("both rows have an attachment")
+    return await _merge_pair(session, keep, dup, [], "")
 
 
 async def merge_duplicates(

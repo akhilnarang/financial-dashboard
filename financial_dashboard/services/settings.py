@@ -172,6 +172,13 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
         category="Categorization",
         label="OpenAI Model",
     ),
+    "openai.vision_model": SettingDef(
+        default="gpt-6.1-luna",
+        data_type="str",
+        category="Categorization",
+        label="OpenAI Vision Model",
+        description="Reads UPI screenshots sent to the Telegram bot",
+    ),
     "openai.base_url": SettingDef(
         default="",
         data_type="str",

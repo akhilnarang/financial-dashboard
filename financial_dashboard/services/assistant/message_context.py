@@ -15,10 +15,13 @@ from financial_dashboard.db.models import (
 from financial_dashboard.services.assistant.contracts import (
     CreateReceivable,
     LinkReceivable,
+    MergeTransactions,
     MerchantRuleConfirmation,
+    ScreenshotTransactionConfirmation,
     AssistantWriteConfirmation,
     StoredConfirmation,
     TransactionChangeConfirmation,
+    VoidTransaction,
 )
 
 # Only the application-appended footer is authoritative.  Anchoring the end
@@ -182,9 +185,18 @@ async def move_transaction_references(
                 | TransactionChangeConfirmation(transaction_id=transaction_id)
                 | AssistantWriteConfirmation(
                     request=LinkReceivable(transaction_id=transaction_id)
+                    | VoidTransaction(transaction_id=transaction_id)
                 )
             ):
                 named = {transaction_id}
+            case AssistantWriteConfirmation(
+                request=MergeTransactions(keep_id=keep_id, duplicate_id=duplicate_id)
+            ):
+                named = {keep_id, duplicate_id}
+            case ScreenshotTransactionConfirmation(
+                duplicate_of=duplicate_of, not_duplicates=not_duplicates
+            ):
+                named = {duplicate_of, *not_duplicates}
             case AssistantWriteConfirmation(
                 request=CreateReceivable(charge_transaction_ids=charges)
             ):

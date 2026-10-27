@@ -38,6 +38,7 @@ class StubDbTxn:
     channel: str | None = None
     balance: Decimal | None = None
     voided: bool = False
+    source: str | None = None
     bank_statement_upload_id: int | None = None
 
 

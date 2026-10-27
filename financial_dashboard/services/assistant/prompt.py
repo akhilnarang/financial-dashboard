@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v7"
+PROMPT_VERSION = "telegram-assistant-v8"
 
 
 class PromptContext(NamedTuple):
@@ -71,6 +71,13 @@ def build_prompt(context: PromptContext) -> str:
         '"bucket":"expense"}. Use it only when the user asks for a new',
         'category. Set "bucket":"income" only when the user calls it income. The',
         "application asks the user to confirm it.",
+        'A WRITE can also be {"name":"void_transaction","transaction_id":1}',
+        'or {"name":"merge_transactions","keep_id":1,"duplicate_id":2}.',
+        "Void a debit when the user says the payment failed, was reversed, or",
+        "never happened. Merge when the user says a row is the same payment as",
+        "another row: keep the bank row and give the other as duplicate_id.",
+        "Find the bank row with list_transactions first. The application asks",
+        "the user to confirm a void or a merge.",
         "A category proposal must contain exactly 2 or 3 existing category slugs.",
         "A category proposal or APPLY uses only an existing category slug.",
         "Act; do not ask what to do. A reply to a transaction that only gives",

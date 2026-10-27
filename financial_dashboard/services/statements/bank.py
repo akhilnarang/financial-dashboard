@@ -29,7 +29,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -78,6 +78,7 @@ from financial_dashboard.services.telegram import (
 logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z]{4,}")
+_UTR = re.compile(r"\d{12}")
 _MIN_REF_SUBSTRING_LEN = 6
 _OVERLAP_STOPWORDS: frozenset[str] = frozenset(
     {
@@ -378,7 +379,8 @@ def _is_statement_candidate_compatible(
       collide easily on the holder's name and lack distinctive merchant
       tokens, so we prefer false-split there over false-merge. The
       word-boundary check on (a)/(b) prevents short refs from matching
-      accidentally as embedded substrings of unrelated long ids.
+      accidentally as embedded substrings of unrelated long ids. (c) never
+      applies to a screenshot row when both refs are 12-digit UTRs.
 
     - Otherwise → incompatible.
     """
@@ -403,6 +405,14 @@ def _is_statement_candidate_compatible(
         return True
     if _ref_appears_in(statement_reference, candidate_narration):
         return True
+
+    # A screenshot row holds the UPI UTR. A line with another 12-digit
+    # reference is another payment, even to the same payee.
+    if (candidate_transaction.source or "").startswith("screenshot") and all(
+        _UTR.fullmatch((ref or "").strip())
+        for ref in (candidate_reference, statement_reference)
+    ):
+        return False
 
     if (
         statement_channel == "upi"
@@ -963,9 +973,27 @@ async def enrich_matched_transactions(recon: dict) -> int:
     have no narration: an SMS alert carries no description at all, and the
     statement is the only source that does. Returns the number of rows that
     gained either field.
+
+    A matched screenshot row gets a bank source, so it is no longer
+    provisional and the 60-day sweep skips it.
     """
     enriched = 0
     async with async_session() as session:
+        await session.execute(
+            update(Transaction)
+            .where(
+                Transaction.id.in_(
+                    [
+                        entry["db_txn_id"]
+                        for entry in recon.get("matched", [])
+                        if entry.get("db_txn_id")
+                    ]
+                ),
+                Transaction.source.startswith("screenshot"),
+                Transaction.source.not_like("%bank_statement%"),
+            )
+            .values(source=Transaction.source + "+bank_statement")
+        )
         for entry in recon.get("matched", []):
             counterparty = (entry.get("counterparty") or "").strip()
             narration = (entry.get("narration") or "").strip()
@@ -1026,8 +1054,7 @@ async def enrich_matched_transactions(recon: dict) -> int:
                 enriched += 1
                 entry["enriched"] = True
 
-        if enriched:
-            await session.commit()
+        await session.commit()
 
     return enriched
 
