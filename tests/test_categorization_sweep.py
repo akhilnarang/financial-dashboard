@@ -1,3 +1,4 @@
+import datetime
 import json
 from decimal import Decimal
 
@@ -6,7 +7,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.services.telegram as tg
-from financial_dashboard.db.models import Transaction
+from financial_dashboard.db.models import Transaction, as_utc, utc_now
 from financial_dashboard.services.categorization import merchant_rules as mr_mod
 from financial_dashboard.services.categorization import sweep
 from tests.conftest import new_test_engine
@@ -45,16 +46,28 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
     monkeypatch.setitem(settings._cache, "category_vocab_version", "1")
     monkeypatch.setitem(settings._cache, "categorization.enabled", "true")
     monkeypatch.setattr(sweep, "get_active_llm_key", lambda: "test-key")
-    # Each run returns the same categories with a slightly different confidence.
-    runs = iter([0.40, 0.41])
+    # The third run offers a new runner-up. The fourth run changes the likely
+    # category. The fifth run is confident.
+    runs = iter(
+        [
+            ("groceries", 0.40, "food"),
+            ("groceries", 0.41, "food"),
+            ("groceries", 0.42, "travel"),
+            ("travel", 0.43, "travel"),
+            ("groceries", 0.95, "food"),
+        ]
+    )
 
     async def classify(**kwargs):
-        confidence = next(runs)
+        slug, confidence, runner_up = next(runs)
         return llm.LlmResult(
-            "groceries",
+            slug,
             confidence,
             "ambiguous",
-            (llm.LlmCandidate("groceries", confidence), llm.LlmCandidate("food", 0.2)),
+            (
+                llm.LlmCandidate("groceries", confidence),
+                llm.LlmCandidate(runner_up, 0.2),
+            ),
         )
 
     monkeypatch.setattr(engine, "_llm_classify", classify)
@@ -99,6 +112,7 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         s.add(Category(slug="groceries", active=True))
         decision = await s.scalar(select(CategoryReviewDecision))
         assert decision.proposed_slug == "groceries"
+        decision.expires_at = utc_now() - datetime.timedelta(days=1)
         # Another transaction's prompt failed. It must not look like this
         # row's prompt.
         other = CategoryReviewDecision(
@@ -151,8 +165,8 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
     async with memdb() as s:
         row = (await s.scalars(select(Transaction))).one()
         assert row.category == "expense"
-        # The same candidates reuse a sent prompt. A prompt that was never
-        # sent must be sent again.
+        # The same outcome keeps a sent prompt and renews its buttons. A
+        # prompt that was never sent must be sent again.
         assert row.review_status == ("pending" if prompt_failed else "notified")
         assert row.category_vocab_version == 2
         decisions = (
@@ -165,6 +179,31 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         assert [decision.status for decision in decisions] == (
             ["superseded", "active"] if prompt_failed else ["active"]
         )
+        assert as_utc(decisions[-1].expires_at) > utc_now()
+        row.review_status = "notified"
+        await s.commit()
+    for version, proposed in (("3", "groceries"), ("4", "travel")):
+        monkeypatch.setitem(settings._cache, "category_vocab_version", version)
+        assert await sweep.run_llm_sweep() == 1
+        async with memdb() as s:
+            row = (await s.scalars(select(Transaction))).one()
+            assert row.review_status == "pending"
+            active = await s.scalar(
+                select(CategoryReviewDecision).where(
+                    CategoryReviewDecision.transaction_id == row.id,
+                    CategoryReviewDecision.status == "active",
+                )
+            )
+            assert "travel" in active.candidates_json
+            assert active.proposed_slug == proposed
+            row.review_status = "notified"
+            await s.commit()
+    monkeypatch.setitem(settings._cache, "category_vocab_version", "5")
+    assert await sweep.run_llm_sweep() == 1
+    async with memdb() as s:
+        row = (await s.scalars(select(Transaction))).one()
+        assert row.category == "groceries"
+        assert row.review_status is None
         row.category_method = "manual"
         row.category_vocab_version = 1
         row.review_status = "notified"

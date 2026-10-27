@@ -100,6 +100,35 @@ def _candidate_slugs(candidates_json: str) -> set[str]:
     }
 
 
+def shows_same_prompt(
+    decision: CategoryReviewDecision,
+    txn: Transaction,
+    candidates_json: str,
+    proposed_slug: str | None,
+) -> bool:
+    """Return True when a decision prompts for this row data and these categories.
+
+    Confidence shifts a little on every model run. The prompt only shows
+    the categories, so compare those.
+
+    Args:
+        decision: The stored decision.
+        txn: The row, with its current category input hash.
+        candidates_json: The new candidates as JSON.
+        proposed_slug: The new likely category.
+
+    Returns:
+        True when the input hash, the candidate slugs and the likely
+        category are the same.
+    """
+    return (
+        decision.category_input_hash == txn.category_input_hash
+        and decision.proposed_slug == proposed_slug
+        and _candidate_slugs(decision.candidates_json)
+        == _candidate_slugs(candidates_json)
+    )
+
+
 async def create_or_reuse_decision(
     session: AsyncSession,
     txn: Transaction,
@@ -127,12 +156,9 @@ async def create_or_reuse_decision(
         .order_by(CategoryReviewDecision.id.desc())
         .limit(1)
     )
-    # Confidence shifts a little on every model run. The prompt only shows
-    # the categories, so compare those.
     if (
         existing is not None
-        and existing.category_input_hash == txn.category_input_hash
-        and _candidate_slugs(existing.candidates_json) == _candidate_slugs(encoded)
+        and shows_same_prompt(existing, txn, encoded, proposed_slug)
         and (existing.expires_at is None or as_utc(existing.expires_at) > now)
     ):
         return existing
