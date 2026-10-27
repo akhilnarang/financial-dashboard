@@ -17,8 +17,8 @@ _AFFIRMATIVE = re.compile(
     re.IGNORECASE,
 )
 _REFERENCE_DIGITS = re.compile(r"\d{7,}")
-_RECEIVABLE_WRITE_CUE = re.compile(
-    r"\b(?:create|add|record|log|track|link|settle|settled|mark|write\s+off|"
+_ASSISTANT_WRITE_CUE = re.compile(
+    r"\b(?:create|make|add|record|log|track|link|settle|settled|mark|write\s+off|"
     r"rename|change|set|update|save|remember|owes?|lent|borrowed|repaid|paid)\b"
     r"|\b(?:upi|vpa|phone|number|mobile)\s+is\b",
     re.IGNORECASE,
@@ -421,8 +421,9 @@ def merchant_rule_is_explicit(
     )
 
 
-def is_receivable_write_request(user_text: str) -> bool:
-    """Return whether the turn plainly asks to change a receivable or a person.
+def is_assistant_write_request(user_text: str) -> bool:
+    """Return whether the turn plainly asks to change a receivable or a person,
+    or to create a category, such as "create a laundry category".
 
     A question, a read request, or a turn that forbids changes does not ask.
     A turn that negates the action, such as "don't settle", does not ask.
@@ -434,7 +435,7 @@ def is_receivable_write_request(user_text: str) -> bool:
         True when the message names a receivable action and nothing in it
         asks a question, reads, forbids changes, or negates that action.
     """
-    cues = [cue.group(0) for cue in _RECEIVABLE_WRITE_CUE.finditer(user_text)]
+    cues = [cue.group(0) for cue in _ASSISTANT_WRITE_CUE.finditer(user_text)]
     return (
         bool(cues)
         and not any(negates_target(user_text, cue) for cue in cues)

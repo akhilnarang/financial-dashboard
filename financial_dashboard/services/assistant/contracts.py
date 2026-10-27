@@ -17,6 +17,8 @@ from pydantic import (
 )
 from pydantic.types import StrictBool, StrictFloat, StrictInt, StrictStr
 
+from financial_dashboard.services.categorization.slugs import UserCategoryBucket
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -158,10 +160,20 @@ class AddPersonIdentifier(StrictModel):
     value: StrictStr = Field(min_length=1, max_length=200)
 
 
-ReceivableWriteCall = (
-    CreateReceivable | LinkReceivable | UpdateReceivable | AddPersonIdentifier
+class CreateCategory(StrictModel):
+    name: Literal["create_category"]
+    slug: StrictStr = Field(min_length=1, max_length=100)
+    bucket: UserCategoryBucket = "expense"
+
+
+AssistantWriteCall = (
+    CreateReceivable
+    | LinkReceivable
+    | UpdateReceivable
+    | AddPersonIdentifier
+    | CreateCategory
 )
-ReceivableWrite: TypeAlias = Annotated[ReceivableWriteCall, Field(discriminator="name")]
+AssistantWrite: TypeAlias = Annotated[AssistantWriteCall, Field(discriminator="name")]
 ReadCall = GetTransaction | ListTransactions | ListCategories | ListReceivables
 
 ToolCall: TypeAlias = Annotated[
@@ -173,7 +185,8 @@ ToolCall: TypeAlias = Annotated[
     | CreateReceivable
     | LinkReceivable
     | UpdateReceivable
-    | AddPersonIdentifier,
+    | AddPersonIdentifier
+    | CreateCategory,
     Field(discriminator="name"),
 ]
 
@@ -209,15 +222,15 @@ class TransactionChangeConfirmation(StrictModel):
     request: ApplyTransactionChanges
 
 
-class ReceivableWriteConfirmation(StrictModel):
+class AssistantWriteConfirmation(StrictModel):
     kind: Literal["receivable_write"]
-    request: ReceivableWrite
+    request: AssistantWrite
 
 
 ConfirmationAction: TypeAlias = Annotated[
     MerchantRuleConfirmation
     | TransactionChangeConfirmation
-    | ReceivableWriteConfirmation,
+    | AssistantWriteConfirmation,
     Field(discriminator="kind"),
 ]
 

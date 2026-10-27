@@ -22,6 +22,8 @@ from financial_dashboard.services.cashflow.scope import Scope
 from financial_dashboard.services.categorization.polarity import (
     EXPENSE_SLUGS,
     INCOME_SLUGS,
+    USER_EXPENSE_SLUGS,
+    USER_INCOME_SLUGS,
 )
 from financial_dashboard.services.categorization.slugs import (
     CREDIT_CARD_PAYMENT_SLUG,
@@ -111,9 +113,11 @@ def bucket_for_slug(
     * ``None``, the empty string and the ``unknown`` sentinel are the *expected*
       absence of a category, so they short-circuit to ``uncategorized`` before
       the map is consulted and never look like drift.
-    * A slug the map has never heard of (a manual override can mint one at
-      runtime) also lands in ``uncategorized``, but is logged as a warning first:
-      money must never vanish from the report just because a slug is new.
+    * A user-created category is not in the map. It takes its stored bucket,
+      ``expense`` or ``income``. The map always wins for a built-in slug.
+    * A slug the map has never heard of and that stores no bucket also lands
+      in ``uncategorized``, but is logged as a warning first: money must never
+      vanish from the report just because a slug is new.
 
     ``scope="bank"`` moves ``credit_card_payment`` — and nothing else — out of
     ``internal`` and into ``expense``: over the bank, paying the card bill is
@@ -128,11 +132,14 @@ def bucket_for_slug(
         return "expense"
     if slug == GIFT_SLUG and direction == "credit":
         return "income"
-    bucket = BUCKET_BY_SLUG.get(slug)
-    if bucket is None:
-        logger.warning("cashflow: unmapped category slug %r -> uncategorized", slug)
-        return "uncategorized"
-    return bucket
+    if (bucket := BUCKET_BY_SLUG.get(slug)) is not None:
+        return bucket
+    if slug in USER_EXPENSE_SLUGS:
+        return "expense"
+    if slug in USER_INCOME_SLUGS:
+        return "income"
+    logger.warning("cashflow: unmapped category slug %r -> uncategorized", slug)
+    return "uncategorized"
 
 
 def internal_slugs_for_scope(scope: Scope | None = None) -> frozenset[str]:
@@ -158,6 +165,11 @@ def label_for_slug(slug: str | None) -> str:
         return "(uncategorized)"
     if slug in LABEL_OVERRIDES:
         return LABEL_OVERRIDES[slug]
-    if slug not in BUCKET_BY_SLUG and slug != UNKNOWN_SLUG:
+    if (
+        slug not in BUCKET_BY_SLUG
+        and slug not in USER_EXPENSE_SLUGS
+        and slug not in USER_INCOME_SLUGS
+        and slug != UNKNOWN_SLUG
+    ):
         return f"unmapped: {slug}"
     return slug.replace("_", " ").title()

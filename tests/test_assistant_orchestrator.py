@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from financial_dashboard.db.models import (
     Account,
+    Category,
     CategoryReviewDecision,
     AuditInteraction,
     PersonIdentifier,
@@ -529,6 +530,60 @@ async def test_receivable_write_waits_for_a_yes(session, tool, message):
         "link": ["frienda"],
         "identifier": ["friend.a@okbank"],
     }.get(tool, [])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "message",
+    ["create a dry cleaning category", "don't create a dry cleaning category"],
+)
+async def test_create_category_waits_for_a_yes(session, message):
+    conversation = await start_conversation(session, chat_id=7, started_by="ask")
+    interaction = AuditInteraction(
+        inbound_chat_id=7, trigger="ask", conversation_id=conversation.id
+    )
+    session.add(interaction)
+    await session.flush()
+    call = {"name": "create_category", "slug": "Dry Cleaning", "bucket": "expense"}
+    provider = FakeProvider(
+        [
+            ToolCalls(outcome="tool_calls", calls=[call]),
+            Answer(outcome="answer", text="Listed."),
+        ]
+    )
+    bucket = select(Category.bucket).where(Category.slug == "dry_cleaning")
+
+    result = await run_turn(
+        session,
+        provider,
+        user_message=message,
+        conversation_id=conversation.id,
+        interaction_id=interaction.id,
+    )
+
+    assert await session.scalar(bucket) is None
+    if message.startswith("don't"):
+        assert result.response.code == "mutation_rejected"
+        assert conversation.pending_confirmation_json is None
+        return
+    assert result.response.question == "Create the expense category dry_cleaning?"
+    reply = await run_pending_confirmation(
+        session,
+        conversation_id=conversation.id,
+        state_hash=conversation.pending_confirmation_state_hash,
+        user_message="yes",
+        replied_to_interaction_id=interaction.id,
+    )
+    assert reply == "Created expense category dry_cleaning."
+    assert await session.scalar(bucket) == "expense"
+    await run_turn(
+        session,
+        provider,
+        user_message="list my categories",
+        conversation_id=conversation.id,
+        interaction_id=interaction.id,
+    )
+    assert "dry_cleaning" in provider.context.categories
 
 
 @pytest.mark.anyio

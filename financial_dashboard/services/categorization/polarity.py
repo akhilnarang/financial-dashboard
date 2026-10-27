@@ -31,6 +31,7 @@ EXPENSE_SLUGS: frozenset = frozenset(
         "education",
         "personal_care",
         "fees_charges",
+        "laundry",
         "professional_services",
         "tax",
         "cash_withdrawal",
@@ -52,6 +53,9 @@ INCOME_SLUGS: frozenset = frozenset(
     }
 )
 
+USER_EXPENSE_SLUGS: set[str] = set()
+USER_INCOME_SLUGS: set[str] = set()
+
 # neutral (valid either direction, passed through unchanged): self_transfer,
 # credit_card_payment, investment, misc. NOTE: 'unknown' is NOT neutral — it is
 # always replaced by the direction default below.
@@ -72,6 +76,30 @@ class DirectionResult(NamedTuple):
     changed: bool
 
 
+def is_expense_slug(slug: str) -> bool:
+    """Return whether a slug is a built-in or a user-created expense category.
+
+    Args:
+        slug: The category slug.
+
+    Returns:
+        True when the slug is in ``EXPENSE_SLUGS`` or ``USER_EXPENSE_SLUGS``.
+    """
+    return slug in EXPENSE_SLUGS or slug in USER_EXPENSE_SLUGS
+
+
+def is_income_slug(slug: str) -> bool:
+    """Return whether a slug is a built-in or a user-created income category.
+
+    Args:
+        slug: The category slug.
+
+    Returns:
+        True when the slug is in ``INCOME_SLUGS`` or ``USER_INCOME_SLUGS``.
+    """
+    return slug in INCOME_SLUGS or slug in USER_INCOME_SLUGS
+
+
 def resolve_direction(
     slug: str, direction: str, account_type: str | None = None
 ) -> DirectionResult:
@@ -84,17 +112,18 @@ def resolve_direction(
       otherwise unchanged.
     """
     if direction == "debit":
-        if slug in INCOME_SLUGS or slug == UNKNOWN_SLUG:
+        if is_income_slug(slug) or slug == UNKNOWN_SLUG:
             return DirectionResult(DEBIT_DEFAULT, True)
     elif direction == "credit":
         if account_type == CREDIT_CARD_ACCOUNT_TYPE:
             if (
-                slug in EXPENSE_SLUGS
+                is_expense_slug(slug)
                 or slug in CC_IMPOSSIBLE_CREDIT_SLUGS
+                or slug in USER_INCOME_SLUGS
                 or slug == UNKNOWN_SLUG
             ):
                 return DirectionResult(CC_CREDIT_DEFAULT, True)
             return DirectionResult(slug, False)
-        if slug in EXPENSE_SLUGS or slug == UNKNOWN_SLUG:
+        if is_expense_slug(slug) or slug == UNKNOWN_SLUG:
             return DirectionResult(CREDIT_DEFAULT, True)
     return DirectionResult(slug, False)

@@ -4,7 +4,7 @@ import datetime
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Path, Query
+from fastapi import APIRouter, Path, Query, status
 from fastapi.responses import FileResponse
 from pydantic import Field
 
@@ -37,7 +37,12 @@ from financial_dashboard.services.duplicate_merge import (
     BatchRefused,
     merge_duplicates,
 )
-from financial_dashboard.services.categorization.vocabulary import list_categories
+from financial_dashboard.services.categorization.vocabulary import (
+    create_category,
+    list_categories,
+    refresh_vocab_cache,
+)
+from financial_dashboard.services.cashflow.buckets import label_for_slug
 from financial_dashboard.services.phantom_delete import delete_phantoms
 from financial_dashboard.services.transaction_reads import (
     get_transaction_detail,
@@ -193,6 +198,34 @@ async def categories_list(
 ) -> transaction_schemas.CategoryListResponse:
     """List every category slug with its bank-scope cashflow bucket."""
     return await list_categories(session)
+
+
+@router.post("/categories", status_code=status.HTTP_201_CREATED)
+async def category_create(
+    payload: transaction_schemas.CategoryCreate, session: AsyncSessionDep
+) -> transaction_schemas.CategoryRead:
+    """Create a user category that counts in its stored cashflow bucket.
+
+    Args:
+        payload: The category name and its bucket, ``expense`` or ``income``.
+        session: Request session.
+
+    Returns:
+        The new category.
+
+    Raises:
+        UnprocessableEntityException: The name does not make a valid slug.
+        ConflictException: The slug is a built-in or already has a bucket.
+    """
+    category = await create_category(session, payload.slug, payload.bucket)
+    await session.commit()
+    await refresh_vocab_cache(session)
+    return transaction_schemas.CategoryRead(
+        slug=category.slug,
+        label=label_for_slug(category.slug),
+        active=category.active,
+        bucket=payload.bucket,
+    )
 
 
 @router.get("/transactions/{txn_id}")

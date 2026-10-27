@@ -95,7 +95,7 @@ Set `telegram.assistant_enabled` to `true` in Settings to enable the assistant.
 `/ask` starts a fresh conversation; otherwise only a reply to a bot message is
 accepted. Conversations retain their reply context for 24 hours, then expire.
 The assistant can answer questions about transactions, set or clear a note,
-set an existing category, exclude a transaction from cashflow, or create an
+set an existing category, create a category after a Yes tap, exclude a transaction from cashflow, or create an
 explicitly requested merchant rule. Aggregate financial questions are rejected
 until the assistant has a report-backed totals tool. Clear
 requests are applied directly; ambiguity produces a question or category
@@ -146,9 +146,11 @@ from the database.
 
 The assistant can also list receivables, and, after a Yes tap, create a
 receivable, link a row to it, change its amount, status, person or note, or
-save a person identifier ("Friend A's UPI is ..."). It proposes a receivable
-write only when the message asks for one and does not negate it ("don't
-settle" asks for nothing). The confirmation hashes the receivable's amount,
+save a person identifier ("Friend A's UPI is ..."). After a Yes tap, it can
+also create a category with a bucket, `expense` or `income` ("create a dry
+cleaning category"). The next turn can use the new category. It proposes a
+receivable or category write only when the message asks for one and does not
+negate it ("don't settle" asks for nothing). The confirmation hashes the receivable's amount,
 outstanding, status, person, note and links, so a change before the tap voids
 the button.
 
@@ -452,7 +454,7 @@ scripts/
 | `SnapshotHolding` | `snapshot_holdings` | Asset-class breakdown rows for investment snapshots; optional nullable instrument detail (ISIN/quantity/unit price/currency/cost basis/acquired on) a CAS payload states for a priced instrument |
 | `InvestmentLot` | `investment_lots` | Complete, capital-gains-eligible investment lot normalized from an explicit CAS acquisition fact (MF purchase with units+nav+amount+date+isin); source occurrences and overlapping-upload provenance are retained, and current valuation stays separate from acquisition cost |
 | `ManualItem` | `manual_items` | User-maintained asset/liability sources such as property, cash, or loans |
-| `Category` | `categories` | Controlled vocabulary of transaction category slugs (editable; seeded at init) |
+| `Category` | `categories` | Controlled vocabulary of transaction category slugs (editable; seeded at init). `bucket` is the cashflow bucket of a user-created category |
 | `MerchantRule` | `merchant_rules` | Editable substring→category rules; the deterministic layer that skips the LLM for known merchants |
 | `TelegramConversation` | `telegram_conversations` | Expiring `/ask` or transaction reply thread, including a pending typed confirmation |
 | `TelegramMessageContext` | `telegram_message_contexts` | Authoritative mapping from Telegram messages to conversations, transactions, interactions, and outbound rows |
@@ -745,6 +747,7 @@ erDiagram
         int id PK
         string slug UK
         bool active
+        string bucket
         datetime created_at
     }
 
@@ -982,6 +985,7 @@ Relationship notes:
 - `telegram_message_contexts` uniquely maps `(chat_id, message_id)` to the logical interaction/outbound row; `telegram_outbound_deliveries.delivery_token` is globally unique for Ref-token recovery.
 - `telegram_outbound_deliveries` rows with either `abandoned` or `cancelled` status remain visible in the audit surface; cancellation preserves the delivery history when authorization changes.
 - Pending confirmations and in-flight assistant writes check a hash over category, note, cashflow exclusion, date, account/card/reference identifiers, and the current categorization input state. The pending confirmation's nullable source-interaction foreign key binds an affirmative reply to the application-rendered clarification that authorized it. `audit_interactions.output_mode` records whether provider output used a strict schema or fallback JSON mode.
+- `categories.bucket` is NULL on a built-in slug, whose bucket comes from the code map. A user-created category stores `expense` or `income`. An expense category counts in Spent, and an income category counts in income. The categorizer and the assistant put an expense category only on a debit and an income category only on a credit. A slug with neither stays uncategorized.
 - `receivables.kind` is `receivable` or `payable`. `receivables.amount` must be positive and `status` is one of `open`, `settled`, `written_off`. A move to `settled` or `written_off` stamps `closed_at`; a move back to `open` clears it.
 - `(receivable_id, transaction_id)` is unique on `receivable_links`, and `role` is `charge` or `payment`. For a receivable the charge is a debit and the payment a credit; a payable flips both. A partial unique index on `transaction_id` where `role = 'payment'` lets a payment row pay one receivable only, so its money counts once. A merge moves a deleted row's links to the keeper and drops a link the keeper already has (or a payment link when the keeper already pays a receivable); a plain delete drops them.
 - `(person, kind, value)` is unique on `person_identifiers`, and `kind` is `counterparty`, `vpa` or `phone`. A counterparty value keeps only alphanumerics (4+); a VPA is lowercase `name@handle`; a phone is a 10-digit mobile number.
@@ -1060,6 +1064,8 @@ uv run python scripts/seed.py
 | `POST` | `/api/transactions/{id}/note` | Update the freeform note on a transaction (JSON body: `{"note": "..."}`) |
 | `POST` | `/api/transactions/apply` | Change note, category, cashflow exclusion, void state, amount and currency on many transactions as one unit; `dry_run` defaults to true. A card payment row, a statement row, and a row linked to a receivable (for a non-INR currency) refuse an amount or currency change |
 | `POST` | `/api/sources/{id}/test` | Test connectivity for an email source; returns `{"ok": bool, "message"/"error": str}` |
+| `GET` | `/api/categories` | List every category slug with its label, active flag and bank-scope cashflow bucket |
+| `POST` | `/api/categories` | Create a user category (`{"slug", "bucket"?}`). The slug is normalized; `bucket` is `expense` (default) or `income`. A built-in slug, or an existing slug that already has a bucket, returns 409; an existing slug with no bucket gets the bucket; another bucket returns 422 |
 | `GET` | `/api/merchant-rules` | List merchant→category rules |
 | `POST` | `/api/merchant-rules` | Add or update a rule (`{"pattern", "category", "priority"?}`); the next categorization uses it |
 | `DELETE` | `/api/merchant-rules/{id}` | Deactivate a rule; the next categorization stops using it, and a restart does not reseed it |

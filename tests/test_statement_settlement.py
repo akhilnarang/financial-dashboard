@@ -30,7 +30,7 @@ from financial_dashboard.services.statement_settlement import (
 )
 from financial_dashboard.services.assistant.contracts import (
     LinkReceivable,
-    ReceivableWriteConfirmation,
+    AssistantWriteConfirmation,
     StoredConfirmation,
 )
 from financial_dashboard.services.assistant.intent_policy import POLICY_VERSION
@@ -152,7 +152,7 @@ async def _rows(maker) -> list[Transaction]:
 def _link_confirmation(transaction_id: int) -> str:
     """Return a valid stored confirmation that links this row to receivable 1."""
     return StoredConfirmation(
-        action=ReceivableWriteConfirmation(
+        action=AssistantWriteConfirmation(
             kind="receivable_write",
             request=LinkReceivable(
                 name="link_receivable",

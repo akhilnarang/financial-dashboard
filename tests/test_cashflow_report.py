@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.db.models import (
     BalanceSnapshot,
     BankStatementUpload,
+    Category,
     Transaction,
 )
 from financial_dashboard.services.cashflow.bridge import cash_bridge
@@ -377,9 +378,40 @@ def test_every_seed_slug_has_one_bucket_consistent_with_its_polarity():
         assert BUCKET_BY_SLUG[slug] == "expense", slug
     for slug in INCOME_SLUGS:
         assert BUCKET_BY_SLUG[slug] == rehomed.get(slug, "income"), slug
+    assert BUCKET_BY_SLUG["laundry"] == "expense"
 
 
 async def test_summary_api_returns_the_range_it_used(client, session: AsyncSession):
+    created = await client.post("/api/categories", json={"slug": "Dry Cleaning"})
+    assert created.status_code == 201, created.text
+    assert created.json() == {
+        "slug": "dry_cleaning",
+        "label": "Dry Cleaning",
+        "active": True,
+        "bucket": "expense",
+    }
+    session.add(Category(slug="side_gig", active=False))
+    await session.commit()
+    income = await client.post(
+        "/api/categories", json={"slug": "side_gig", "bucket": "income"}
+    )
+    assert income.status_code == 201, income.text
+    assert (income.json()["bucket"], income.json()["active"]) == ("income", True)
+    for body, code in [
+        ({"slug": "dry cleaning"}, 409),
+        ({"slug": "side_gig", "bucket": "expense"}, 409),
+        ({"slug": "groceries"}, 409),
+        ({"slug": "pocket_money", "bucket": "internal"}, 422),
+    ]:
+        assert (await client.post("/api/categories", json=body)).status_code == code
+    buckets = {
+        item["slug"]: item["bucket"]
+        for item in (await client.get("/api/categories")).json()["items"]
+    }
+    assert (buckets["dry_cleaning"], buckets["side_gig"]) == ("expense", "income")
+    await _add(session, direction="debit", amount=D("40"), category="dry_cleaning")
+    await _add(session, direction="credit", amount=D("60"), category="side_gig")
+
     await _add(session, direction="credit", amount=D("1000"), category="salary")
     await _add(session, direction="debit", amount=D("250"), category="groceries")
     await _add(
@@ -397,12 +429,17 @@ async def test_summary_api_returns_the_range_it_used(client, session: AsyncSessi
     body = r.json()
     assert body["date_from"] == "2026-06-01"
     assert body["date_to"] == "2026-06-30"
-    assert D(str(body["income"]["total"])) == D("1000")
-    assert body["income"]["lines"][0]["slug"] == "salary"
-    assert D(str(body["expense"]["total"])) == D("250")
+    assert D(str(body["income"]["total"])) == D("1060")
+    assert [line["slug"] for line in body["income"]["lines"]] == ["salary", "side_gig"]
+    assert D(str(body["expense"]["total"])) == D("290")
+    assert {line["slug"] for line in body["expense"]["lines"]} == {
+        "groceries",
+        "dry_cleaning",
+    }
+    assert body["uncategorized"]["count"] == 0
     assert D(str(body["transfers_in"]["total"])) == D("500")
     assert body["transfers_in"]["lines"][0]["counterparty"] == "MOM"
-    assert D(str(body["net_cash_retained"])) == D("1250")
+    assert D(str(body["net_cash_retained"])) == D("1270")
 
 
 async def test_trend_api_clamps_months(client):

@@ -40,16 +40,25 @@ def anyio_backend():
 
 @pytest.fixture(autouse=True)
 def _restore_settings_cache():
-    """Snapshot/restore the global settings._cache around each test so tests
-    that mutate it (e.g. CAS feature tests) can't leak into unrelated ones."""
+    """Snapshot/restore the global settings._cache and the user-category slug
+    caches around each test so tests that mutate them (e.g. CAS feature tests)
+    can't leak into unrelated ones."""
     from financial_dashboard.services import settings as settings_mod
+    from financial_dashboard.services.categorization.polarity import (
+        USER_EXPENSE_SLUGS,
+        USER_INCOME_SLUGS,
+    )
 
     snapshot = dict(settings_mod._cache)
+    user_slugs = (set(USER_EXPENSE_SLUGS), set(USER_INCOME_SLUGS))
     try:
         yield
     finally:
         settings_mod._cache.clear()
         settings_mod._cache.update(snapshot)
+        for cached, saved in zip((USER_EXPENSE_SLUGS, USER_INCOME_SLUGS), user_slugs):
+            cached.clear()
+            cached.update(saved)
 
 
 # The cashflow report is scoped to the accounts a row is linked to, so an

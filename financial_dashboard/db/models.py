@@ -769,6 +769,7 @@ class Category(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     slug: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    bucket: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime, default=utc_now
     )

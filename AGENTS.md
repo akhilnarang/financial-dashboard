@@ -301,6 +301,9 @@ uv run python scripts/paisa_contract.py --skip-if-unavailable   # needs Docker
   `if (row := await session.get(...)) is not None: return row`.
 - **Docstrings on helpers too.** A private helper whose name and signature
   do not say everything gets a real summary of what it does and why.
+- **Comment only a rare why.** Do not write comments that narrate
+  history, compatibility or what the code does. Put that reason in the
+  commit or PR text.
 
 ## Compatibility rules
 

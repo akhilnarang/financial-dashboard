@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import financial_dashboard.services.telegram as tg
 from financial_dashboard.db.models import Transaction
+from financial_dashboard.services.categorization import merchant_rules as mr_mod
 from financial_dashboard.services.categorization import sweep
 from tests.conftest import new_test_engine
 
@@ -57,6 +58,10 @@ async def test_sweeps_retry_review_once_after_vocabulary_changes(
         )
 
     monkeypatch.setattr(engine, "_llm_classify", classify)
+    monkeypatch.setattr(mr_mod, "_cache", [("acme store", "side_gig")])
+    async with memdb() as s:
+        s.add(Category(slug="side_gig", active=True, bucket="income"))
+        await s.commit()
     # An unmatched row becomes 'pending_llm' after the rule sweep, and a second
     # sweep finds zero never-touched rows (returns 0) — this is what lets the
     # backfill loop terminate with full coverage instead of re-evaluating forever.

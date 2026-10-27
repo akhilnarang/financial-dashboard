@@ -337,6 +337,10 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                 )
             )
         try:
+            await conn.execute(text("SELECT bucket FROM categories LIMIT 0"))
+        except Exception:
+            await conn.execute(text("ALTER TABLE categories ADD COLUMN bucket VARCHAR"))
+        try:
             await conn.execute(text("SELECT note FROM transactions LIMIT 0"))
         except Exception:
             await conn.execute(text("ALTER TABLE transactions ADD COLUMN note TEXT"))
@@ -1028,3 +1032,11 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
     )
 
     await load_merchant_rules()
+
+    # function-local: breaks cycle with categorization (vocabulary imports db at top)
+    from financial_dashboard.services.categorization.vocabulary import (
+        load_user_buckets,
+    )
+
+    async with AsyncSession(engine) as session:
+        await load_user_buckets(session)

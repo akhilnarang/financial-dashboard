@@ -389,12 +389,7 @@ async def transaction_list(
     if card_holder:
         stmt = stmt.where(Transaction.card_holder == card_holder)
     if uncategorized == "1":
-        # Uncategorized means "has no category the bucket map can place": blank,
-        # the 'unknown' sentinel, or a runtime slug the map does not know. The
-        # clause is the one the report's uncategorized line aggregates on, imported
-        # rather than restated, so the count on the tile and the rows listed here
-        # cannot drift apart. No currency clause — a non-INR row with no category
-        # is still uncategorized.
+        # No currency clause: a non-INR row with no category is still uncategorized.
         stmt = stmt.where(UNCATEGORIZED)
     if category_null == "1":
         # Strictly the rows carrying no category at all — NULL or blank, which are

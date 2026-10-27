@@ -214,6 +214,7 @@ SEED_CATEGORY_SLUGS: tuple[str, ...] = (
     "education",
     "personal_care",
     "fees_charges",
+    "laundry",
     "professional_services",
     "tax",
     "tax_refund",

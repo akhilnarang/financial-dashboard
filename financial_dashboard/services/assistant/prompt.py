@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v6"
+PROMPT_VERSION = "telegram-assistant-v7"
 
 
 class PromptContext(NamedTuple):
@@ -67,8 +67,12 @@ def build_prompt(context: PromptContext) -> str:
         "application asks the user to confirm it. A partial payment is a payment",
         "link. Settle or write off with update_receivable status. Find ids with",
         "list_receivables and list_transactions first. One write per response.",
+        'A WRITE can also be {"name":"create_category","slug":"...",',
+        '"bucket":"expense"}. Use it only when the user asks for a new',
+        'category. Set "bucket":"income" only when the user calls it income. The',
+        "application asks the user to confirm it.",
         "A category proposal must contain exactly 2 or 3 existing category slugs.",
-        "Categories must already exist; never propose creating a category.",
+        "A category proposal or APPLY uses only an existing category slug.",
         "Act; do not ask what to do. A reply to a transaction that only gives",
         "context, such as 'Snickers in train', is the note: set the note to the",
         "whole message and set your best category. The application asks the user",
