@@ -14,6 +14,7 @@ from financial_dashboard.db.models import (
     TelegramOutboundDelivery,
     Transaction,
     Setting,
+    as_utc,
     utc_now,
 )
 from financial_dashboard.services.categorization import gemini, openai_provider
@@ -32,8 +33,10 @@ from financial_dashboard.services.categorization.rules import (
 from financial_dashboard.services.categorization.polarity import resolve_direction
 from financial_dashboard.services.categorization.slugs import MANUAL_ONLY_SLUGS
 from financial_dashboard.services.categorization.review_decisions import (
+    DECISION_TTL,
     candidates_from_result,
     create_or_reuse_decision,
+    shows_same_prompt,
 )
 from financial_dashboard.services.categorization.decision_lifecycle import (
     supersede_active_decisions,
@@ -313,16 +316,12 @@ async def categorize_one(
         )
         return "skip"
     was_notified = txn.review_status == "notified"
-    active_decision = (
-        await session.execute(
-            select(
-                CategoryReviewDecision.id, CategoryReviewDecision.source_interaction_id
-            ).where(
-                CategoryReviewDecision.transaction_id == txn.id,
-                CategoryReviewDecision.status == "active",
-            )
+    active_decision = await session.scalar(
+        select(CategoryReviewDecision).where(
+            CategoryReviewDecision.transaction_id == txn.id,
+            CategoryReviewDecision.status == "active",
         )
-    ).first()
+    )
     active_decision_id = active_decision.id if active_decision else None
     # A background prompt owns its delivery. An assistant proposal is sent
     # by the interaction that made it.
@@ -400,6 +399,21 @@ async def categorize_one(
             ).slug
             == candidate["category"]
         ]
+        if (
+            was_notified
+            and active_decision is not None
+            and shows_same_prompt(
+                active_decision, txn, json.dumps(compatible_candidates), proposed_slug
+            )
+        ):
+            now = utc_now()
+            if (
+                active_decision.expires_at is not None
+                and as_utc(active_decision.expires_at) <= now
+            ):
+                active_decision.expires_at = now + DECISION_TTL
+            txn.review_status = "notified"
+            return "llm"
         decision = await create_or_reuse_decision(
             session,
             txn,
