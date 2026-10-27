@@ -1,7 +1,8 @@
 """Offer to link a new row to the open receivable it pays.
 
 The rules are fixed. The amount must equal the outstanding exactly. Nothing
-links without a Telegram tap, and a tap never changes the status.
+links without a Telegram tap. A link that pays the outstanding in full
+settles the receivable.
 """
 
 import datetime
@@ -318,7 +319,7 @@ async def resolve_match_tap(
     the outstanding, and the same person. So a stale prompt cannot pay a
     receivable twice. The tapped message must be the one sent for this
     prompt, because SQLite can give a deleted prompt id to a new prompt.
-    The status of the receivable does not change.
+    The link pays the outstanding in full, so the receivable is settled.
 
     Args:
         session: A session that holds no write yet.
@@ -376,7 +377,7 @@ async def resolve_match_tap(
         await session.rollback()
         return MatchTap(str(exc.detail), False)
     return MatchTap(
-        f"Linked #{txn.id} to {receivable.person} #{receivable.id}. It is fully "
-        "paid. Settle it on the page or ask the assistant.",
+        f"Linked #{txn.id} to {receivable.person} #{receivable.id}. It is paid "
+        "in full and settled.",
         True,
     )

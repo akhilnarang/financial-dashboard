@@ -60,13 +60,11 @@ def receivable_read(receivable: Receivable) -> ReceivableRead:
         The receivable with its linked row ids, the sum of its payment
         rows, and the amount minus that sum.
     """
-    paid = Decimal("0.00")
+    paid = _paid(receivable)
     ids = {role: [] for role in ReceivableRole}
     links = [link for link in receivable.links if link.transaction is not None]
     for link in sorted(links, key=lambda link: link.transaction_id):
         ids[ReceivableRole(link.role)].append(link.transaction_id)
-        if link.role == ReceivableRole.payment:
-            paid += link.transaction.amount
     return ReceivableRead(
         id=receivable.id,
         kind=ReceivableKind(receivable.kind),
@@ -81,6 +79,28 @@ def receivable_read(receivable: Receivable) -> ReceivableRead:
         charge_transaction_ids=ids[ReceivableRole.charge],
         payment_transaction_ids=ids[ReceivableRole.payment],
     )
+
+
+def _paid(receivable: Receivable) -> Decimal:
+    """Sum the payment rows of a receivable. A link whose row is gone adds nothing."""
+    return sum(
+        (
+            link.transaction.amount
+            for link in receivable.links
+            if link.role == ReceivableRole.payment and link.transaction is not None
+        ),
+        Decimal("0.00"),
+    )
+
+
+def _settle_if_paid(receivable: Receivable) -> None:
+    """Settle an open receivable that its payment links pay in full."""
+    if (
+        receivable.status == ReceivableStatus.open
+        and _paid(receivable) >= receivable.amount
+    ):
+        receivable.status = ReceivableStatus.settled
+        receivable.closed_at = utc_now()
 
 
 async def list_receivables(
@@ -242,8 +262,10 @@ async def build_receivable(
         person=payload.person,
         amount=payload.amount,
         note=payload.note,
+        status=ReceivableStatus.open,
         links=links,
     )
+    _settle_if_paid(receivable)
     session.add(receivable)
     return receivable
 
@@ -284,6 +306,7 @@ async def apply_update(
     Returns:
         None.
     """
+    amount_changed = payload.amount not in (None, receivable.amount)
     if payload.amount is not None:
         receivable.amount = payload.amount
     if payload.person is not None:
@@ -295,6 +318,8 @@ async def apply_update(
         receivable.status = payload.status
         is_open = payload.status == ReceivableStatus.open
         receivable.closed_at = None if is_open else utc_now()
+    elif amount_changed and "status" not in payload.model_fields_set:
+        _settle_if_paid(receivable)
 
 
 async def add_link(
@@ -361,6 +386,8 @@ async def attach_link(
     if role == ReceivableRole.payment:
         await learn_identifiers(session, receivable.person, txn)
     receivable.links.append(ReceivableLink(transaction=txn, role=role))
+    if role == ReceivableRole.payment:
+        _settle_if_paid(receivable)
 
 
 async def remove_link(
@@ -454,6 +481,17 @@ async def move_receivable_links(
     moved = await session.execute(
         update(ReceivableLink).where(stale).values(transaction_id=new_id)
     )
+    for receivable in await session.scalars(
+        select(Receivable)
+        .join(ReceivableLink)
+        .where(
+            ReceivableLink.transaction_id == new_id,
+            ReceivableLink.role == ReceivableRole.payment,
+            Receivable.status == ReceivableStatus.open,
+        )
+        .execution_options(populate_existing=True)
+    ):
+        _settle_if_paid(receivable)
     counts = {
         "receivable_links": cast(CursorResult, moved).rowcount,
         "receivable_links.dropped": cast(CursorResult, dropped).rowcount,
