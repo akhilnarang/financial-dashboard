@@ -217,9 +217,10 @@ async def test_a_fold_states_what_the_statement_states(maker):
         )
         session.add(
             Receivable(
+                kind="payable",
                 person="Friend A",
                 amount=Decimal("2529.00"),
-                links=[ReceivableLink(transaction_id=2, role="charge")],
+                links=[ReceivableLink(transaction_id=2, role="payment")],
             )
         )
         await session.commit()
@@ -242,12 +243,15 @@ async def test_a_fold_states_what_the_statement_states(maker):
         queued = await session.scalar(select(AuditInteraction))
         conversations = (await session.scalars(select(TelegramConversation))).all()
         link = await session.scalar(select(ReceivableLink.transaction_id))
+        payable = await session.scalar(select(Receivable))
     assert (
         context.transaction_id,
         queued.transaction_id,
         link,
         row.attachment_path,
     ) == (1, 1, 1, "receipt.jpg")
+    # The folded amount pays the payable in full, so the merge settles it.
+    assert payable.status == "settled"
     # A later "yes" must not apply an action that names the deleted id.
     assert [c.pending_confirmation_json for c in conversations] == [
         None,

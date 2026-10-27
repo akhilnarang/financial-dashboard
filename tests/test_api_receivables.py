@@ -284,3 +284,32 @@ async def test_list_and_page_filter_by_status(client, session):
     assert "Friend B" not in page
     # A generic counterparty names no person, so the payment teaches nothing.
     assert (await client.get("/api/receivables/identifiers")).json()["items"] == []
+
+    # Paid in full: a lower amount settles it, and it leaves the open list.
+    lowered = await client.patch(
+        f"/api/receivables/{owed.json()['id']}", json={"amount": "120"}
+    )
+    assert (lowered.json()["status"], lowered.json()["outstanding"]) == (
+        "settled",
+        "0.00",
+    )
+    assert lowered.json()["closed_at"] is not None
+    still_open = (await client.get("/api/receivables?status=open")).json()["items"]
+    assert [row["person"] for row in still_open] == ["Friend A"]
+    # A named status wins, and an edit that does not change the amount keeps it.
+    for body in (
+        {"status": "open"},
+        {"note": "keep open"},
+        {"amount": "120", "status": "open"},
+        {"amount": "120"},
+    ):
+        kept = await client.patch(f"/api/receivables/{owed.json()['id']}", json=body)
+        assert kept.json()["status"] == "open", body
+    charged = await client.post(
+        f"/api/receivables/{owed.json()['id']}/links",
+        json={
+            "transaction_id": await _row(session, "credit", "10.00"),
+            "role": "charge",
+        },
+    )
+    assert (charged.status_code, charged.json()["status"]) == (201, "open")

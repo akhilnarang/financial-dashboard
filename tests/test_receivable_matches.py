@@ -285,7 +285,7 @@ def _tap(data: str, chat_id: int = 7, message_id: int = 101) -> Tap:
 @pytest.mark.parametrize(
     "action", ["link", "dismiss", "stale", "voided", "renamed_row", "old_message"]
 )
-async def test_tap_links_only_once_and_never_settles(rcv, action):
+async def test_tap_links_once_and_settles(rcv, action):
     maker, sent = rcv
     txn_id = await _seed(
         maker,
@@ -344,10 +344,10 @@ async def test_tap_links_only_once_and_never_settles(rcv, action):
             )
         ).all()
     stranger.answer.assert_awaited_once_with("Unauthorized")
-    assert read.status == "open"
+    assert read.status == ("settled" if action == "link" else "open")
     if action == "link":
         first.edit_message_text.assert_awaited_once()
-        assert "fully paid" in first.edit_message_text.await_args.args[0]
+        assert "settled" in first.edit_message_text.await_args.args[0]
         second.answer.assert_awaited_once_with("Already handled")
         assert (read.payment_transaction_ids, read.outstanding) == (
             [txn_id],
