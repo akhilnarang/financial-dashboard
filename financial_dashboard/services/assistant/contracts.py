@@ -387,7 +387,11 @@ class CategoryProposal(StrictModel):
 
 
 class ToolCalls(StrictModel):
-    """Application-owned reads or one complete atomic mutation request."""
+    """Application-owned reads and up to 4 writes.
+
+    The first write applies or asks now. The others form a chain that asks for
+    one Yes per write, so the writes are not atomic.
+    """
 
     outcome: Literal["tool_calls"]
     calls: list[ToolCall] = Field(min_length=1, max_length=4)

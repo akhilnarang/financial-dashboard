@@ -331,6 +331,7 @@ async def test_missing_fields_ask_and_a_reply_fills_them_before_yes_saves(
         "maybe_new",
         "maybe_moved",
         "maybe_no_utr",
+        "corrupt",
     ],
 )
 async def test_duplicate_utr_offers_to_attach_instead(
@@ -398,6 +399,23 @@ async def test_duplicate_utr_offers_to_attach_instead(
         assert f"may already be recorded as #{maybe.id}" in asked.text
         assert asked.buttons == [f"Attach to #{maybe.id}", "Skip"]
     if case == "maybe_no_utr":
+        return
+    if case == "corrupt":
+        # A reply to a question whose stored action no longer parses still
+        # gets an answer, and the action is gone.
+        async with shot.maker() as s:
+            conversation = await s.get(TelegramConversation, asked.conversation_id)
+            assert conversation is not None
+            conversation.pending_confirmation_json = (
+                '{"action":{"kind":"screenshot_transaction"}}'
+            )
+            await s.commit()
+        answered = await _reply(shot, asked.conversation_id, "new")
+        assert "no longer valid" in answered.text
+        async with shot.maker() as s:
+            conversation = await s.get(TelegramConversation, asked.conversation_id)
+            assert conversation is not None
+            assert conversation.pending_confirmation_json is None
         return
     if case == "maybe_moved":
         # The row changes before the Yes, so it no longer matches.
