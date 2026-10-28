@@ -68,6 +68,7 @@ from financial_dashboard.services.assistant.contracts import (
     AssistantWrite,
     AssistantWriteCall,
     AssistantWriteConfirmation,
+    PendingChain,
     StoredConfirmation,
     TransactionChangeConfirmation,
     parse_response,
@@ -423,8 +424,11 @@ async def _persist_pending(
     source_interaction_id: int | None,
     transaction_state_hash: str,
     direction_policy: DirectionPolicy,
+    chain: PendingChain | None = None,
 ) -> None:
     """Store the action that a Yes reply or tap applies on this conversation.
+
+    ``chain`` holds the writes that follow it from the same message.
 
     Raises:
         MutationRejected: The turn has no conversation to hold the action.
@@ -443,6 +447,7 @@ async def _persist_pending(
         conversation,
         StoredConfirmation(
             action=action,
+            chain=chain,
             policy_version=POLICY_VERSION,
             direction_policy=direction_policy.value,
         ),
@@ -726,22 +731,27 @@ async def run_turn(
                 return completed(saved.proposal, None, saved.decision_id)
             return completed(response, mutation)
         if isinstance(response, ToolCalls):
-            mutation_calls = [
+            writes = [
                 call
                 for call in response.calls
-                if isinstance(call, ApplyTransactionChanges)
+                if isinstance(call, ApplyTransactionChanges | AssistantWriteCall)
+            ]
+            first = writes[:1]
+            mutation_calls = [
+                call for call in first if isinstance(call, ApplyTransactionChanges)
             ]
             receivable_calls = [
-                call for call in response.calls if isinstance(call, AssistantWriteCall)
+                call for call in first if isinstance(call, AssistantWriteCall)
             ]
-            if len(mutation_calls) + len(receivable_calls) > 1:
-                return completed(
-                    Error(
-                        outcome="error",
-                        message="I change one transaction per message. Send one message for each.",
-                        code="ambiguous_target",
-                    )
+            chain = (
+                PendingChain(
+                    calls=writes[1:],
+                    message=user_message,
+                    transaction_id=transaction_id,
                 )
+                if len(writes) > 1
+                else None
+            )
             if (
                 mutation_calls
                 and mutation_calls[0].transaction_id != transaction_id
@@ -789,6 +799,7 @@ async def run_turn(
                             user_message=user_message,
                             conversation_id=conversation_id,
                             interaction_id=interaction_id,
+                            chain=chain,
                         )
                     )
                 if mutation_calls:
@@ -816,6 +827,7 @@ async def run_turn(
                                 direction_policy=_request_direction_policy(
                                     call, user_message, direction_policy
                                 ),
+                                chain=chain,
                             )
                         )
                     note = call.changes.note
@@ -867,13 +879,19 @@ async def run_turn(
                                     direction_policy=_request_direction_policy(
                                         call, user_message, direction_policy
                                     ),
+                                    chain=chain,
                                 )
                             )
                     if guessed is not None:
                         proposal = CategoryProposal(
                             outcome="category_proposal",
                             transaction_id=call.transaction_id,
-                            explanation=f"Is '{guessed}' the right category?",
+                            explanation=f"Is '{guessed}' the right category?"
+                            + (
+                                " Send the other changes again after you choose."
+                                if chain is not None
+                                else ""
+                            ),
                             candidates=[
                                 CategoryCandidate(
                                     slug=guessed,
@@ -906,6 +924,31 @@ async def run_turn(
                 )
             read_transaction_ids.update(pending_read_ids)
             tool_results.extend(pending_tool_results)
+            if mutation is not None and chain is not None:
+                try:
+                    question = await _confirm_next(
+                        session,
+                        chain,
+                        conversation_id=conversation_id,
+                        interaction_id=interaction_id,
+                    )
+                except MutationRejected as exc:
+                    return completed(
+                        Error(
+                            outcome="error",
+                            message=(
+                                f"I stopped and did not do the other changes: {exc}."
+                            ),
+                            code="chain_stopped",
+                        ),
+                        mutation,
+                    )
+                return completed(
+                    question.model_copy(
+                        update={"question": f"Next: {question.question}"}
+                    ),
+                    mutation,
+                )
             if mutation is not None:
                 return completed(response, mutation)
             continue
@@ -1222,6 +1265,7 @@ async def _confirm_change(
     conversation_id: int | None,
     interaction_id: int | None,
     direction_policy: DirectionPolicy,
+    chain: PendingChain | None = None,
 ) -> Clarification:
     """Ask the user to confirm a change before it is written.
 
@@ -1259,6 +1303,7 @@ async def _confirm_change(
         source_interaction_id=interaction_id,
         transaction_state_hash=state_hash,
         direction_policy=direction_policy,
+        chain=chain,
     )
     row = (
         f"#{target.id} ({target.direction} {target.amount} {target.currency or 'INR'}"
@@ -1279,6 +1324,7 @@ async def _confirm_assistant_write(
     user_message: str,
     conversation_id: int | None,
     interaction_id: int | None,
+    chain: PendingChain | None = None,
 ) -> Clarification:
     """Ask the user to confirm an assistant write before it is written.
 
@@ -1307,8 +1353,68 @@ async def _confirm_assistant_write(
         source_interaction_id=interaction_id,
         transaction_state_hash=state_hash,
         direction_policy=DirectionPolicy.INFERRED_STRICT,
+        chain=chain,
     )
     return Clarification(outcome="clarification", question=question)
+
+
+async def _confirm_next(
+    session: AsyncSession,
+    chain: PendingChain,
+    *,
+    conversation_id: int | None,
+    interaction_id: int | None,
+) -> Clarification:
+    """Ask the user to confirm the next write of a chain.
+
+    The write gets the dry run, vetoes and fresh state hash of a confirmed
+    write. It skips the checks that only decide whether to apply at once or
+    ask, because it always asks; the question shows the exact change. An
+    APPLY must change the trusted target of that message, or a transaction
+    the message names. Each later write asks for its own Yes. The conversation
+    then targets no row. Each question binds its own row instead, so a free
+    reply to any question of the chain cannot reach another row.
+
+    Raises:
+        MutationRejected: The next write is not valid now.
+    """
+    call, *rest = chain.calls
+    following = chain.model_copy(update={"calls": rest}) if rest else None
+    if not isinstance(call, ApplyTransactionChanges):
+        question = await _confirm_assistant_write(
+            session,
+            call,
+            user_message=chain.message,
+            conversation_id=conversation_id,
+            interaction_id=interaction_id,
+            chain=following,
+        )
+    else:
+        if call.transaction_id != chain.transaction_id and (
+            call.transaction_id not in _named_transaction_ids(chain.message)
+        ):
+            raise MutationRejected("the next change names another transaction")
+        if (target := await get_transaction(session, call.transaction_id)) is None:
+            raise MutationRejected("transaction not found")
+        if unrequested_exclusion(call, chain.message):
+            call = _without(call, "exclude_from_cashflow")
+        question = await _confirm_change(
+            session,
+            call,
+            target,
+            user_message=chain.message,
+            conversation_id=conversation_id,
+            interaction_id=interaction_id,
+            direction_policy=_request_direction_policy(
+                call, chain.message, DirectionPolicy.INFERRED_STRICT
+            ),
+            chain=following,
+        )
+    if conversation_id is not None and (
+        conversation := await session.get(TelegramConversation, conversation_id)
+    ):
+        conversation.transaction_id = None
+    return question
 
 
 def _legacy_transaction_id(text: str) -> int | None:
@@ -1391,8 +1497,13 @@ def _response_text(result: OrchestrationResult, transaction_id: int | None) -> s
         ]
         label = ", ".join(changed) or "transaction"
         text = f"Saved {label} for #{result.mutation.transaction_id}."
-        if isinstance(response, CategoryProposal):
-            text += f" {response.explanation}"
+        match response:
+            case CategoryProposal():
+                text += f" {response.explanation}"
+            case Clarification():
+                text += f"\n{response.question}"
+            case Error() if response.code == "chain_stopped":
+                text += f"\n{response.message}"
         if result.mutation.merchant_rule_pattern:
             text += (
                 f" Merchant rule '{result.mutation.merchant_rule_pattern}' uses "
@@ -1490,7 +1601,24 @@ async def _queue_result(
             # A settlement fold moved this turn while it ran. SQLite can give
             # the old id to a new row, so the reply gets no target.
             transaction_id = None
-    if result.mutation is not None:
+    if isinstance(result.response, Clarification) and (
+        result.mutation is not None or result.confirmed_write
+    ):
+        # The next write of a chain asks here. The question binds the row of
+        # its own change, or no row, never the row of the message before it.
+        pending = await _pending_conversation(session, interaction_id)
+        match (
+            _stored_confirmation(
+                pending, pending.pending_confirmation_json or ""
+            ).action
+            if pending is not None
+            else None
+        ):
+            case TransactionChangeConfirmation(transaction_id=pending_id):
+                transaction_id = pending_id
+            case _:
+                transaction_id = None
+    elif result.mutation is not None:
         transaction_id = result.mutation.transaction_id
     elif isinstance(result.response, CategoryProposal):
         transaction_id = result.response.transaction_id
@@ -1572,12 +1700,13 @@ async def _queue_result(
             if merchant_action is not None:
                 delivery.reply_markup_json = json.dumps(
                     [
+                        *json.loads(delivery.reply_markup_json or "[]"),
                         [
                             {
                                 "text": "Undo merchant rule",
                                 "callback_data": f"undo:v1:{merchant_action.id}",
                             }
-                        ]
+                        ],
                     ],
                     separators=(",", ":"),
                 )
@@ -2667,8 +2796,16 @@ async def _apply_pending(
     interaction_id: int,
     recipient_chat_id: int,
 ) -> OrchestrationResult:
-    """Apply the conversation's pending confirmation, or explain why not."""
+    """Apply the conversation's pending confirmation, or explain why not.
+
+    When the confirmation has a chain, ask for the next write after it.
+    """
     try:
+        chain = (
+            _stored_confirmation(conversation, payload).chain
+            if (payload := conversation.pending_confirmation_json)
+            else None
+        )
         mutation = await run_pending_confirmation(
             session,
             conversation_id=conversation.id,
@@ -2684,12 +2821,35 @@ async def _apply_pending(
         return OrchestrationResult(
             Error(outcome="error", message=str(exc), code="confirmation_rejected")
         )
-    if isinstance(mutation, str):
-        return OrchestrationResult(
-            Answer(outcome="answer", text=mutation), confirmed_write=True
+    done = mutation if isinstance(mutation, str) else "Saved."
+    result = (
+        OrchestrationResult(Answer(outcome="answer", text=done), confirmed_write=True)
+        if isinstance(mutation, str)
+        else OrchestrationResult(Answer(outcome="answer", text=done), mutation=mutation)
+    )
+    if chain is None:
+        return result
+    # A saved transaction change renders its own line before this text.
+    lead = "" if result.mutation is not None else f"{done}\n"
+    try:
+        question = await _confirm_next(
+            session,
+            chain,
+            conversation_id=conversation.id,
+            interaction_id=interaction_id,
         )
-    return OrchestrationResult(
-        Answer(outcome="answer", text="Saved."), mutation=mutation
+    except MutationRejected as exc:
+        return result._replace(
+            response=Error(
+                outcome="error",
+                message=f"{lead}I stopped and did not do the other changes: {exc}.",
+                code="chain_stopped",
+            )
+        )
+    return result._replace(
+        response=question.model_copy(
+            update={"question": f"{lead}Next: {question.question}"}
+        )
     )
 
 
@@ -2760,9 +2920,21 @@ async def _confirm_from_button(
                     )
 
                     remove_attachment(path)
+        try:
+            chained = bool(
+                (payload := conversation.pending_confirmation_json)
+                and _stored_confirmation(conversation, payload).chain is not None
+            )
+        except MutationRejected:
+            # A No still clears and answers when the stored payload is invalid.
+            chained = False
         clear_pending_confirmation(conversation)
         return OrchestrationResult(
-            Answer(outcome="answer", text="Okay. Nothing changed.")
+            Answer(
+                outcome="answer",
+                text="Okay. I did not make this change"
+                + (" or the ones after it." if chained else "."),
+            )
         )
     result = await _apply_pending(
         session,

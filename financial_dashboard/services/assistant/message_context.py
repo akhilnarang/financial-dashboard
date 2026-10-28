@@ -13,6 +13,8 @@ from financial_dashboard.db.models import (
     TelegramOutboundDelivery,
 )
 from financial_dashboard.services.assistant.contracts import (
+    ApplyTransactionChanges,
+    ChainedWrite,
     CreateReceivable,
     LinkReceivable,
     MergeTransactions,
@@ -146,6 +148,23 @@ async def record_physical_message(
     return row
 
 
+def _named_rows(request: ChainedWrite) -> set[int]:
+    """Return the transaction ids that one write names."""
+    match request:
+        case (
+            ApplyTransactionChanges(transaction_id=transaction_id)
+            | LinkReceivable(transaction_id=transaction_id)
+            | VoidTransaction(transaction_id=transaction_id)
+        ):
+            return {transaction_id}
+        case MergeTransactions(keep_id=keep_id, duplicate_id=duplicate_id):
+            return {keep_id, duplicate_id}
+        case CreateReceivable(charge_transaction_ids=charges):
+            return set(charges)
+        case _:
+            return set()
+
+
 async def move_transaction_references(
     session: AsyncSession, old_id: int, new_id: int | None
 ) -> None:
@@ -183,26 +202,20 @@ async def move_transaction_references(
             case (
                 MerchantRuleConfirmation(transaction_id=transaction_id)
                 | TransactionChangeConfirmation(transaction_id=transaction_id)
-                | AssistantWriteConfirmation(
-                    request=LinkReceivable(transaction_id=transaction_id)
-                    | VoidTransaction(transaction_id=transaction_id)
-                )
             ):
                 named = {transaction_id}
-            case AssistantWriteConfirmation(
-                request=MergeTransactions(keep_id=keep_id, duplicate_id=duplicate_id)
-            ):
-                named = {keep_id, duplicate_id}
+            case AssistantWriteConfirmation(request=request):
+                named = _named_rows(request)
             case ScreenshotTransactionConfirmation(
                 duplicate_of=duplicate_of, not_duplicates=not_duplicates
             ):
                 named = {duplicate_of, *not_duplicates}
-            case AssistantWriteConfirmation(
-                request=CreateReceivable(charge_transaction_ids=charges)
-            ):
-                named = set(charges)
             case _:
                 named = set()
+        if (chain := stored.chain) is not None:
+            if chain.transaction_id is not None:
+                named.add(chain.transaction_id)
+            named |= {row for call in chain.calls for row in _named_rows(call)}
         if old_id in named:
             clear_pending_confirmation(conversation)
     for model in (

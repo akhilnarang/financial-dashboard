@@ -31,7 +31,9 @@ from financial_dashboard.services.assistant.message_context import (
 )
 from financial_dashboard.services.assistant.orchestrator import (
     OrchestrationResult,
+    _apply_pending,
     _conversation_for_message,
+    _response_text,
     _process_callback_interaction,
     _queue_result,
     run_pending_confirmation,
@@ -531,6 +533,192 @@ async def test_receivable_write_waits_for_a_yes(session, tool, message):
         "link": ["frienda"],
         "identifier": ["friend.a@okbank"],
     }.get(tool, [])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "plan",
+    ["apply_first", "write_first", "apply_next", "next_rejected", "next_other_row"],
+)
+async def test_several_writes_ask_one_by_one(session, plan):
+    await ensure_category(session, "passthrough")
+    charge = Transaction(
+        bank="test",
+        email_type="test",
+        direction="debit",
+        amount=500,
+        counterparty="CAFE MERCHANT",
+    )
+    session.add(charge)
+    await session.flush()
+    conversation = await start_conversation(
+        session, chat_id=7, started_by="reply", transaction_id=charge.id
+    )
+    first_turn = AuditInteraction(
+        inbound_chat_id=7, trigger="reply", conversation_id=conversation.id
+    )
+    yes_turns = [
+        AuditInteraction(
+            inbound_chat_id=7,
+            trigger="reply",
+            conversation_id=conversation.id,
+            status="processing",
+            worker_token="worker",
+        )
+        for _ in range(2)
+    ]
+    session.add_all(
+        [Setting(key="telegram.chat_id", value="7"), first_turn, *yes_turns]
+    )
+    await session.flush()
+    create = {
+        "name": "create_receivable",
+        "kind": "receivable",
+        "person": "Friend A",
+        "amount": "500.00",
+        "note": None,
+        "charge_transaction_ids": [charge.id],
+    }
+    calls = {
+        "apply_first": [
+            {
+                "name": "apply_transaction_changes",
+                "transaction_id": charge.id,
+                "changes": {"category": {"op": "set", "value": "passthrough"}},
+            },
+            create,
+        ],
+        "write_first": [
+            create,
+            {
+                "name": "add_person_identifier",
+                "person": "Friend A",
+                "kind": "vpa",
+                "value": "friend.a@okbank",
+            },
+        ],
+        "apply_next": [
+            create,
+            {
+                "name": "apply_transaction_changes",
+                "transaction_id": charge.id,
+                "changes": {"category": {"op": "set", "value": "passthrough"}},
+            },
+        ],
+        "next_rejected": [
+            create,
+            {
+                "name": "link_receivable",
+                "receivable_id": 999,
+                "transaction_id": charge.id,
+                "role": "payment",
+            },
+        ],
+        "next_other_row": [
+            create,
+            {
+                "name": "apply_transaction_changes",
+                "transaction_id": charge.id + 1,
+                "changes": {"category": {"op": "set", "value": "passthrough"}},
+            },
+        ],
+    }[plan]
+    provider = FakeProvider([ToolCalls(outcome="tool_calls", calls=calls)])
+
+    last: list[OrchestrationResult] = []
+
+    async def yes(source: AuditInteraction, turn: AuditInteraction) -> str:
+        """Tap Yes on the question that ``source`` asked; return the sent text."""
+        result = await _apply_pending(
+            session,
+            conversation,
+            user_message="yes",
+            source_interaction_id=source.id,
+            interaction_id=turn.id,
+            recipient_chat_id=7,
+        )
+        last[:] = [result]
+        return _response_text(result, None)
+
+    result = await run_turn(
+        session,
+        provider,
+        user_message=(
+            "mark as passthrough, and create a receivable from Friend A for this "
+            "amount, and save Friend A's UPI friend.a@okbank"
+        ),
+        transaction_id=charge.id,
+        conversation_id=conversation.id,
+        interaction_id=first_turn.id,
+    )
+    receivables = select(Receivable.person, Receivable.amount)
+
+    if plan == "apply_first":
+        # The named category applies now; the receivable waits for its Yes.
+        assert charge.category == "passthrough"
+        assert _response_text(result, charge.id).startswith(
+            f"Saved category for #{charge.id}.\n"
+            "Next: Record that Friend A owes you ₹500.00"
+        )
+        assert (await session.execute(receivables)).all() == []
+        # A free reply to the receivable question must not target the charge.
+        assert conversation.transaction_id is None
+        reply = await yes(first_turn, yes_turns[0])
+        assert reply.startswith("Created Friend A #")
+        assert len((await session.execute(receivables)).all()) == 1
+        return
+    assert _response_text(result, charge.id).startswith("Record that Friend A owes you")
+    reply = await yes(first_turn, yes_turns[0])
+    assert len((await session.execute(receivables)).all()) == 1
+    if plan in ("next_rejected", "next_other_row"):
+        assert reply.endswith(
+            "I stopped and did not do the other changes: "
+            + (
+                "receivable #999 not found."
+                if plan == "next_rejected"
+                else "the next change names another transaction."
+            )
+        )
+        assert conversation.pending_confirmation_json is None
+        return
+    assert reply.startswith("Created Friend A #")
+    assert conversation.transaction_id is None
+    if plan == "write_first":
+        assert reply.endswith("Next: Save vpa friend.a@okbank for Friend A?")
+    else:
+        assert "\nNext: " in reply and f"for #{charge.id} (" in reply
+    # Each question binds its own row, or no row, and keeps Yes/No.
+    await _queue_result(
+        session,
+        interaction_id=yes_turns[0].id,
+        worker_token="worker",
+        result=last[0],
+        transaction_id=charge.id,
+        recipient_chat_id=7,
+    )
+    delivery = await session.scalar(
+        select(TelegramOutboundDelivery).where(
+            TelegramOutboundDelivery.interaction_id == yes_turns[0].id
+        )
+    )
+    assert delivery.transaction_id == (charge.id if plan == "apply_next" else None)
+    assert [b["text"] for b in json.loads(delivery.reply_markup_json)[0]] == [
+        "Yes",
+        "No",
+    ]
+    if plan == "apply_next":
+        # The chained APPLY applies on its own Yes, after the receivable write.
+        assert await yes(yes_turns[0], yes_turns[1]) == (
+            f"Saved category for #{charge.id}."
+        )
+        assert charge.category == "passthrough"
+        return
+    assert (
+        await yes(yes_turns[0], yes_turns[1])
+        == "Saved vpa friend.a@okbank for friend a."
+    )
+    identifiers = (await session.scalars(select(PersonIdentifier.value))).all()
+    assert identifiers == ["friend.a@okbank"]
 
 
 @pytest.mark.anyio

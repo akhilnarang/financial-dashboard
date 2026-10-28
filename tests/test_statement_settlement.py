@@ -29,7 +29,9 @@ from financial_dashboard.services.statement_settlement import (
     row_digest,
 )
 from financial_dashboard.services.assistant.contracts import (
+    ApplyTransactionChanges,
     LinkReceivable,
+    PendingChain,
     ScreenshotTransaction,
     ScreenshotTransactionConfirmation,
     VoidTransaction,
@@ -152,10 +154,13 @@ async def _rows(maker) -> list[Transaction]:
         )
 
 
-def _link_confirmation(transaction_id: int, *, void: bool = False) -> str:
+def _link_confirmation(
+    transaction_id: int, *, void: bool = False, chained: int | None = None
+) -> str:
     """Return a valid stored confirmation that links this row to receivable 1.
 
-    With ``void``, the confirmation voids the row instead.
+    With ``void``, the confirmation voids the row instead. With ``chained``, a
+    chained change of that row follows it.
     """
     return StoredConfirmation(
         action=AssistantWriteConfirmation(
@@ -171,6 +176,18 @@ def _link_confirmation(transaction_id: int, *, void: bool = False) -> str:
                 role="charge",
             ),
         ),
+        chain=PendingChain(
+            calls=[
+                ApplyTransactionChanges(
+                    name="apply_transaction_changes",
+                    transaction_id=chained,
+                    changes={"note": {"op": "set", "value": "lunch"}},
+                )
+            ],
+            message="link it, and note lunch",
+        )
+        if chained is not None
+        else None,
         policy_version=POLICY_VERSION,
     ).model_dump_json()
 
@@ -264,6 +281,15 @@ async def test_a_fold_states_what_the_statement_states(maker):
                 pending_confirmation_kind="screenshot_transaction",
             )
         )
+        # A chained change of the folded row goes too.
+        session.add(
+            TelegramConversation(
+                chat_id=7,
+                started_by="reply",
+                pending_confirmation_json=_link_confirmation(1, chained=2),
+                pending_confirmation_kind="receivable_write",
+            )
+        )
         session.add(
             Receivable(
                 kind="payable",
@@ -306,6 +332,7 @@ async def test_a_fold_states_what_the_statement_states(maker):
         None,
         None,
         _link_confirmation(1),
+        None,
         None,
         None,
     ]

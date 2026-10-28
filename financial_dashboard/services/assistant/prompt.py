@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v8"
+PROMPT_VERSION = "telegram-assistant-v9"
 
 
 class PromptContext(NamedTuple):
@@ -66,7 +66,9 @@ def build_prompt(context: PromptContext) -> str:
         "Use a RECEIVABLE WRITE only when the user asks for that change. The",
         "application asks the user to confirm it. A partial payment is a payment",
         "link. Settle or write off with update_receivable status. Find ids with",
-        "list_receivables and list_transactions first. One write per response.",
+        "list_receivables and list_transactions first. When the message asks",
+        "for several changes, put each write in calls in the order to apply,",
+        "at most 4. The application asks the user to confirm them one by one.",
         'A WRITE can also be {"name":"create_category","slug":"...",',
         '"bucket":"expense"}. Use it only when the user asks for a new',
         'category. Set "bucket":"income" only when the user calls it income. The',
@@ -93,7 +95,7 @@ def build_prompt(context: PromptContext) -> str:
         "inside context, such as 'Cashback received for 8864', is part of the",
         "note, not a new target. A transaction number, such as 8788 or #8788, is a",
         "target only when there is no trusted target, or when the user tells you",
-        "to change that transaction. Change one transaction per response.",
+        "to change that transaction. Each APPLY changes one transaction.",
         "For a durable merchant rule, include an exact substring",
         "from the current user message as intent_evidence.",
         "Merchant-rule pattern and priority are server-derived; never provide them.",
