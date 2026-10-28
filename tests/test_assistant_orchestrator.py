@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from financial_dashboard.db.models import as_utc, utc_now
 from financial_dashboard.db.models import (
     Account,
     Category,
@@ -668,6 +669,8 @@ async def test_several_writes_ask_one_by_one(session, plan):
         assert len((await session.execute(receivables)).all()) == 1
         return
     assert _response_text(result, charge.id).startswith("Record that Friend A owes you")
+    # A conversation near its end still gives the next question a full window.
+    conversation.expires_at = utc_now() + datetime.timedelta(minutes=5)
     reply = await yes(first_turn, yes_turns[0])
     assert len((await session.execute(receivables)).all()) == 1
     if plan in ("next_rejected", "next_other_row"):
@@ -683,6 +686,9 @@ async def test_several_writes_ask_one_by_one(session, plan):
         return
     assert reply.startswith("Created Friend A #")
     assert conversation.transaction_id is None
+    assert as_utc(conversation.pending_confirmation_expires_at) > (
+        utc_now() + datetime.timedelta(hours=1)
+    )
     if plan == "write_first":
         assert reply.endswith("Next: Save vpa friend.a@okbank for Friend A?")
     else:

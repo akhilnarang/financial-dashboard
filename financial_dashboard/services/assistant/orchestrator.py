@@ -770,8 +770,8 @@ async def run_turn(
             pending_tool_results: list[dict[str, object]] = []
             pending_read_ids: set[int] = set()
             try:
-                # Validate and execute every read before applying the sole mutation.
-                # A rejected later call can therefore never leave an earlier write.
+                # Validate and execute every read before the first write applies.
+                # A rejected read can therefore never leave an earlier write.
                 for call in response.calls:
                     if isinstance(call, ApplyTransactionChanges | AssistantWriteCall):
                         continue
@@ -961,6 +961,21 @@ async def run_turn(
         ),
         mutation,
     )
+
+
+def _confirmation_or_none(
+    conversation: TelegramConversation,
+) -> StoredConfirmation | None:
+    """Parse the stored confirmation, or return None when it is invalid.
+
+    An invalid confirmation is cleared, so a No or a reply still answers.
+    """
+    try:
+        return _stored_confirmation(
+            conversation, conversation.pending_confirmation_json or ""
+        )
+    except MutationRejected:
+        return None
 
 
 def _stored_confirmation(
@@ -1895,9 +1910,22 @@ async def _process_text_interaction(
                 and replied_to_interaction_id
                 == conversation.pending_confirmation_source_interaction_id
             ):
-                match _stored_confirmation(
-                    conversation, conversation.pending_confirmation_json
-                ).action:
+                match (
+                    stored.action
+                    if (stored := _confirmation_or_none(conversation))
+                    else None
+                ):
+                    case None:
+                        result = OrchestrationResult(
+                            Error(
+                                outcome="error",
+                                message=(
+                                    "That screenshot question is no longer valid. "
+                                    "Send the screenshot again."
+                                ),
+                                code="confirmation_rejected",
+                            )
+                        )
                     case ScreenshotTransactionConfirmation() as draft:
                         result = await _screenshot_result(
                             session,
@@ -2829,6 +2857,13 @@ async def _apply_pending(
     )
     if chain is None:
         return result
+    from financial_dashboard.services.assistant.conversations import (
+        touch_conversation,
+    )
+
+    # A button Yes does not refresh the conversation, and the next question
+    # expires with it.
+    await touch_conversation(session, conversation)
     # A saved transaction change renders its own line before this text.
     lead = "" if result.mutation is not None else f"{done}\n"
     try:
@@ -2910,24 +2945,16 @@ async def _confirm_from_button(
         return stale
     interaction.conversation_id = conversation.id
     if choice == "n":
-        if conversation.pending_confirmation_kind == "screenshot_transaction":
-            match _stored_confirmation(
-                conversation, conversation.pending_confirmation_json or ""
-            ).action:
-                case ScreenshotTransactionConfirmation(attachment_path=path):
-                    from financial_dashboard.services.transaction_attachments import (
-                        remove_attachment,
-                    )
-
-                    remove_attachment(path)
-        try:
-            chained = bool(
-                (payload := conversation.pending_confirmation_json)
-                and _stored_confirmation(conversation, payload).chain is not None
+        stored = _confirmation_or_none(conversation)
+        if stored is not None and isinstance(
+            stored.action, ScreenshotTransactionConfirmation
+        ):
+            from financial_dashboard.services.transaction_attachments import (
+                remove_attachment,
             )
-        except MutationRejected:
-            # A No still clears and answers when the stored payload is invalid.
-            chained = False
+
+            remove_attachment(stored.action.attachment_path)
+        chained = stored is not None and stored.chain is not None
         clear_pending_confirmation(conversation)
         return OrchestrationResult(
             Answer(
