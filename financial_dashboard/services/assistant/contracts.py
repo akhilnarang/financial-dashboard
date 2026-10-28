@@ -335,10 +335,28 @@ ConfirmationAction: TypeAlias = Annotated[
 ]
 
 
+ChainedWrite: TypeAlias = Annotated[
+    ApplyTransactionChanges | AssistantWriteCall, Field(discriminator="name")
+]
+
+
+class PendingChain(StrictModel):
+    """The writes that follow the pending one, from the same user message.
+
+    After a Yes applies the pending write, the next write is checked and asked
+    for in turn. ``transaction_id`` is the trusted target of that message.
+    """
+
+    calls: list[ChainedWrite] = Field(min_length=1, max_length=3)
+    message: StrictStr = Field(min_length=1)
+    transaction_id: StrictInt | None = None
+
+
 class StoredConfirmation(StrictModel):
     """The pending confirmation that a conversation stores as JSON."""
 
     action: ConfirmationAction
+    chain: PendingChain | None = None
     policy_version: StrictStr
     direction_policy: Literal["inferred_strict", "explicit_manual_override"] = (
         "inferred_strict"
