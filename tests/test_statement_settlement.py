@@ -30,6 +30,9 @@ from financial_dashboard.services.statement_settlement import (
 )
 from financial_dashboard.services.assistant.contracts import (
     LinkReceivable,
+    ScreenshotTransaction,
+    ScreenshotTransactionConfirmation,
+    VoidTransaction,
     AssistantWriteConfirmation,
     StoredConfirmation,
 )
@@ -149,12 +152,19 @@ async def _rows(maker) -> list[Transaction]:
         )
 
 
-def _link_confirmation(transaction_id: int) -> str:
-    """Return a valid stored confirmation that links this row to receivable 1."""
+def _link_confirmation(transaction_id: int, *, void: bool = False) -> str:
+    """Return a valid stored confirmation that links this row to receivable 1.
+
+    With ``void``, the confirmation voids the row instead.
+    """
     return StoredConfirmation(
         action=AssistantWriteConfirmation(
             kind="receivable_write",
-            request=LinkReceivable(
+            request=VoidTransaction(
+                name="void_transaction", transaction_id=transaction_id
+            )
+            if void
+            else LinkReceivable(
                 name="link_receivable",
                 receivable_id=1,
                 transaction_id=transaction_id,
@@ -216,6 +226,45 @@ async def test_a_fold_states_what_the_statement_states(maker):
             for transaction_id in (2, 1)
         )
         session.add(
+            TelegramConversation(
+                chat_id=7,
+                started_by="reply",
+                pending_confirmation_json=_link_confirmation(2, void=True),
+                pending_confirmation_kind="receivable_write",
+            )
+        )
+        # So does a screenshot attach offer for the folded row.
+        session.add(
+            TelegramConversation(
+                chat_id=7,
+                started_by="screenshot",
+                pending_confirmation_json=StoredConfirmation(
+                    action=ScreenshotTransactionConfirmation(
+                        kind="screenshot_transaction",
+                        read=ScreenshotTransaction.model_validate(
+                            {
+                                "status": "success",
+                                "direction": "debit",
+                                "amount": "2529.00",
+                                "counterparty": "Friend A",
+                                "vpa": None,
+                                "utr": "123456789012",
+                                "occurred_at": "2026-04-07T10:00:00",
+                                "app": "gpay",
+                                "account_hint": None,
+                            }
+                        ),
+                        attachment_path="shot.png",
+                        media_type="image/png",
+                        missing=[],
+                        duplicate_of=2,
+                    ),
+                    policy_version=POLICY_VERSION,
+                ).model_dump_json(),
+                pending_confirmation_kind="screenshot_transaction",
+            )
+        )
+        session.add(
             Receivable(
                 kind="payable",
                 person="Friend A",
@@ -257,6 +306,8 @@ async def test_a_fold_states_what_the_statement_states(maker):
         None,
         None,
         _link_confirmation(1),
+        None,
+        None,
     ]
 
 

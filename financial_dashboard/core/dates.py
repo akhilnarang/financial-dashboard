@@ -64,14 +64,17 @@ def trailing_month_starts(day: date, months: int) -> list[date]:
 
 
 def parse_datetime(
-    value: str | datetime | None, *, dayfirst: bool = False
+    value: str | datetime | None,
+    *,
+    dayfirst: bool = False,
+    default: datetime | None = None,
 ) -> datetime | None:
     if value is None or isinstance(value, datetime):
         return value
     text = str(value).strip()
     if not text:
         return None
-    return parser.parse(text, dayfirst=dayfirst)
+    return parser.parse(text, dayfirst=dayfirst, default=default)
 
 
 def parse_date(

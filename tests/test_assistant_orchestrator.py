@@ -1,3 +1,4 @@
+import datetime
 import json
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -584,6 +585,136 @@ async def test_create_category_waits_for_a_yes(session, message):
         interaction_id=interaction.id,
     )
     assert "dry_cleaning" in provider.context.categories
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "void",
+        "corroborated",
+        "merge",
+        "renoted",
+        "screenshot_keeper",
+        "refused_merge",
+        "voided_keeper",
+        "two_attachments",
+    ],
+)
+async def test_void_and_merge_wait_for_a_yes(session, tool):
+    shot = Transaction(
+        bank="sbi",
+        account_id=1,
+        email_type="upi_screenshot",
+        source="screenshot",
+        direction="debit",
+        amount=250,
+        counterparty="TEST MERCHANT",
+        transaction_date=datetime.date(2026, 8, 1),
+        attachment_path="shot.png",
+        note="lunch" if tool == "screenshot_keeper" else None,
+    )
+    bank_row = Transaction(
+        bank="sbi",
+        account_id=1,
+        voided=tool == "voided_keeper",
+        attachment_path="bank.pdf" if tool == "two_attachments" else None,
+        email_type="test",
+        source="bank_statement",
+        direction="debit",
+        amount=251 if tool == "refused_merge" else 250,
+        counterparty="UPI TEST MERCHANT",
+        transaction_date=datetime.date(2026, 8, 1),
+        note="dinner" if tool == "screenshot_keeper" else None,
+    )
+    conversation = await start_conversation(session, chat_id=7, started_by="reply")
+    interaction = AuditInteraction(
+        inbound_chat_id=7, trigger="reply", conversation_id=conversation.id
+    )
+    session.add_all(
+        [Account(id=1, bank="sbi", label="SBI", type="bank_account"), shot, bank_row]
+    )
+    session.add(interaction)
+    await session.flush()
+    call = (
+        {"name": "void_transaction", "transaction_id": shot.id}
+        if tool in ("void", "corroborated")
+        else {
+            "name": "merge_transactions",
+            "keep_id": shot.id,
+            "duplicate_id": bank_row.id,
+        }
+        if tool == "screenshot_keeper"
+        else {
+            "name": "merge_transactions",
+            "keep_id": bank_row.id,
+            "duplicate_id": shot.id,
+        }
+    )
+    provider = FakeProvider([ToolCalls(outcome="tool_calls", calls=[call])])
+
+    result = await run_turn(
+        session,
+        provider,
+        user_message="that payment failed"
+        if tool in ("void", "corroborated")
+        else "it is the bank row",
+        conversation_id=conversation.id,
+        interaction_id=interaction.id,
+    )
+
+    rows = select(
+        Transaction.id,
+        Transaction.voided,
+        Transaction.attachment_path,
+        Transaction.source,
+    )
+    assert len((await session.execute(rows)).all()) == 2
+    if tool in ("refused_merge", "voided_keeper", "two_attachments"):
+        assert result.response.code == "mutation_rejected"
+        assert conversation.pending_confirmation_json is None
+        return
+    assert f"#{shot.id}" in result.response.question
+    if tool in ("corroborated", "renoted"):
+        # A bank alert confirms the row, or a new note lands on the duplicate,
+        # before the Yes, so the old button is void.
+        if tool == "corroborated":
+            shot.source = "screenshot+sms"
+        else:
+            shot.note = "keep this"
+        await session.flush()
+        with pytest.raises(ValueError, match="changed"):
+            await run_pending_confirmation(
+                session,
+                conversation_id=conversation.id,
+                state_hash=conversation.pending_confirmation_state_hash,
+                user_message="yes",
+                replied_to_interaction_id=interaction.id,
+            )
+        assert len((await session.execute(rows)).all()) == 2
+        assert not shot.voided
+        return
+    reply = await run_pending_confirmation(
+        session,
+        conversation_id=conversation.id,
+        state_hash=conversation.pending_confirmation_state_hash,
+        user_message="yes",
+        replied_to_interaction_id=interaction.id,
+    )
+    stored = [tuple(row) for row in (await session.execute(rows)).all()]
+    if tool == "void":
+        assert reply == f"Voided #{shot.id}."
+        assert stored == [
+            (shot.id, True, "shot.png", "screenshot"),
+            (bank_row.id, False, None, "bank_statement"),
+        ]
+    elif tool == "screenshot_keeper":
+        # The keeper keeps its screenshot source and gains the bank source.
+        assert reply == f"Merged #{bank_row.id} into #{shot.id}. Not merged: note."
+        assert stored == [(shot.id, False, "shot.png", "screenshot+bank_statement")]
+    else:
+        assert reply == f"Merged #{shot.id} into #{bank_row.id}."
+        assert stored == [(bank_row.id, False, "shot.png", "screenshot+bank_statement")]
 
 
 @pytest.mark.anyio

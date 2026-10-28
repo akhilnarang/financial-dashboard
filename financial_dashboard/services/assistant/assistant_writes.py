@@ -1,4 +1,4 @@
-"""Receivable reads and confirmed receivable and category writes for the assistant.
+"""Confirmed receivable, category and transaction writes for the assistant.
 
 A write runs only after the user taps Yes. The caller holds the SQLite write
 lock and commits.
@@ -33,12 +33,18 @@ from financial_dashboard.services.assistant.contracts import (
     CreateReceivable,
     LinkReceivable,
     AssistantWrite,
+    MergeTransactions,
     UpdateReceivable,
+    VoidTransaction,
 )
 from financial_dashboard.services.assistant.mutations import MutationRejected
 from financial_dashboard.services.categorization.vocabulary import (
     canonicalize_slug,
     create_category,
+)
+from financial_dashboard.services.duplicate_merge import (
+    PairRefused,
+    merge_pair_no_commit,
 )
 from financial_dashboard.services.person_identifiers import (
     identifier_value,
@@ -49,6 +55,9 @@ from financial_dashboard.services.receivables import (
     attach_link,
     build_receivable,
     receivable_read,
+)
+from financial_dashboard.services.transactions import (
+    set_transaction_voided_no_commit,
 )
 
 
@@ -72,8 +81,24 @@ def _update_payload(request: UpdateReceivable) -> ReceivableUpdate:
     raise MutationRejected("name a field to change")
 
 
+async def _describe_row(session: AsyncSession, transaction_id: int) -> str:
+    """Name a row with its direction, amount, counterparty and date, or refuse."""
+    if (txn := await session.get(Transaction, transaction_id)) is None:
+        raise MutationRejected(f"transaction #{transaction_id} not found")
+    currency = txn.currency or "INR"
+    amount = (
+        format_inr_exact(txn.amount)
+        if currency == "INR"
+        else f"{txn.amount} {currency}"
+    )
+    return (
+        f"#{txn.id} ({txn.direction} {amount}, "
+        f"{(txn.counterparty or 'unknown')[:200]}, {txn.transaction_date})"
+    )
+
+
 async def apply_assistant_write(session: AsyncSession, request: AssistantWrite) -> str:
-    """Apply one receivable or category write. Do not commit.
+    """Apply one receivable, category or transaction write. Do not commit.
 
     Args:
         session: A session that holds the write lock.
@@ -107,6 +132,24 @@ async def apply_assistant_write(session: AsyncSession, request: AssistantWrite) 
             case CreateCategory():
                 category = await create_category(session, request.slug, request.bucket)
                 return f"Created {request.bucket} category {category.slug}."
+            case VoidTransaction():
+                if not (
+                    await set_transaction_voided_no_commit(
+                        session, request.transaction_id, True
+                    )
+                ).ok:
+                    raise MutationRejected(
+                        f"transaction #{request.transaction_id} not found"
+                    )
+                return f"Voided #{request.transaction_id}."
+            case MergeTransactions():
+                report = await merge_pair_no_commit(
+                    session, request.keep_id, request.duplicate_id
+                )
+                text = f"Merged #{request.duplicate_id} into #{request.keep_id}."
+                if report.conflicts:
+                    text += f" Not merged: {'; '.join(report.conflicts)}."
+                return text
             case LinkReceivable():
                 receivable = await _receivable(session, request.receivable_id)
                 await attach_link(
@@ -121,6 +164,8 @@ async def apply_assistant_write(session: AsyncSession, request: AssistantWrite) 
         await session.flush()
     except ValidationError as exc:
         raise MutationRejected(exc.errors()[0]["msg"]) from exc
+    except (ValueError, PairRefused) as exc:
+        raise MutationRejected(str(exc)) from exc
     except (UnprocessableEntityException, ConflictException) as exc:
         raise MutationRejected(str(exc.detail)) from exc
     except IntegrityError as exc:
@@ -182,20 +227,7 @@ async def describe_assistant_write(
             )
         case LinkReceivable():
             read = receivable_read(await _receivable(session, request.receivable_id))
-            if (txn := await session.get(Transaction, request.transaction_id)) is None:
-                raise MutationRejected(
-                    f"transaction #{request.transaction_id} not found"
-                )
-            currency = txn.currency or "INR"
-            amount = (
-                format_inr_exact(txn.amount)
-                if currency == "INR"
-                else f"{txn.amount} {currency}"
-            )
-            row = (
-                f"#{txn.id} ({txn.direction} {amount}, "
-                f"{(txn.counterparty or 'unknown')[:200]}, {txn.transaction_date})"
-            )
+            row = await _describe_row(session, request.transaction_id)
             return f"Link {row} to {_describe(read)} as a {request.role}?"
         case UpdateReceivable():
             read = receivable_read(await _receivable(session, request.receivable_id))
@@ -208,6 +240,13 @@ async def describe_assistant_write(
                 .items()
             ]
             return f"Change {_describe(read)}: set {', '.join(changes)}?"
+        case VoidTransaction():
+            row = await _describe_row(session, request.transaction_id)
+            return f"Void {row}? It then counts as no money."
+        case MergeTransactions():
+            keep = await _describe_row(session, request.keep_id)
+            dup = await _describe_row(session, request.duplicate_id)
+            return f"Merge {dup} into {keep}? #{request.duplicate_id} is deleted."
 
 
 async def assistant_write_state_hash(
@@ -216,9 +255,11 @@ async def assistant_write_state_hash(
     """Fingerprint the state that a confirmation of this write relies on.
 
     For a link or an update, the hash covers the amount, outstanding,
-    status, person, note and links of the receivable. For a link, it also
-    covers the amount, direction, currency, void state and counterparty of
-    the row. A change in between voids the old button.
+    status, person, note and links of the receivable. For a link, a void or
+    a merge, it also covers the amount, direction, currency, void state,
+    counterparty, source, reference, date, account, note, category,
+    exclusion and attachment of each row. A change in between, such as a
+    bank alert that confirms the row, voids the old button.
 
     Args:
         session: The turn session.
@@ -229,22 +270,41 @@ async def assistant_write_state_hash(
     """
     state = [request.model_dump_json()]
     receivable_id = None
-    row_fields: tuple[Decimal | str | bool | None, ...] = ()
+    transaction_ids: tuple[int, ...] = ()
     match request:
         case LinkReceivable():
             receivable_id = request.receivable_id
-            txn = await session.get(
-                Transaction, request.transaction_id, populate_existing=True
-            )
-            row_fields = (
-                (txn.amount, txn.direction, txn.currency, txn.voided, txn.counterparty)
-                if txn is not None
-                else (None,)
-            )
+            transaction_ids = (request.transaction_id,)
         case UpdateReceivable():
             receivable_id = request.receivable_id
+        case VoidTransaction():
+            transaction_ids = (request.transaction_id,)
+        case MergeTransactions():
+            transaction_ids = (request.keep_id, request.duplicate_id)
         case CreateReceivable() | AddPersonIdentifier() | CreateCategory():
             pass
+    for transaction_id in transaction_ids:
+        txn = await session.get(Transaction, transaction_id, populate_existing=True)
+        state += map(
+            str,
+            (
+                txn.amount,
+                txn.direction,
+                txn.currency,
+                txn.voided,
+                txn.counterparty,
+                txn.source,
+                txn.reference_number,
+                txn.transaction_date,
+                txn.account_id,
+                txn.note,
+                txn.category,
+                txn.exclude_from_cashflow,
+                txn.attachment_path,
+            )
+            if txn is not None
+            else (None,),
+        )
     if receivable_id is not None:
         receivable = await session.get(
             Receivable, receivable_id, populate_existing=True
@@ -262,7 +322,6 @@ async def assistant_write_state_hash(
                 read.note,
                 read.charge_transaction_ids,
                 read.payment_transaction_ids,
-                *row_fields,
             ),
         )
     return hashlib.sha256("\x1f".join(state).encode()).hexdigest()

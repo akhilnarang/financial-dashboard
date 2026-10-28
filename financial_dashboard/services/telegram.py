@@ -123,6 +123,12 @@ async def init_telegram(token: str, base_url: str | None = None):
             _handle_attachment_reply,
         )
     )
+    app.add_handler(
+        MessageHandler(
+            (filters.PHOTO | filters.Document.IMAGE) & ~filters.REPLY,
+            _handle_screenshot,
+        )
+    )
     app.add_handler(CallbackQueryHandler(_handle_callback))
     try:
         await app.initialize()
@@ -725,6 +731,17 @@ async def _handle_attachment_reply(update: Update, context) -> None:
         await msg.reply_text("Assistant is disabled")
         return
     await _call_assistant(update, context, trigger="attachment")
+
+
+async def _handle_screenshot(update: Update, context) -> None:
+    """Read a UPI screenshot that the authorized chat sends on its own."""
+    msg = update.message
+    if not msg or msg.chat_id != get_telegram_chat_id():
+        return
+    if not is_telegram_assistant_enabled():
+        await msg.reply_text("Assistant is disabled")
+        return
+    await _call_assistant(update, context, trigger="screenshot")
 
 
 async def _handle_reply(update: Update, context) -> None:

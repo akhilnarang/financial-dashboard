@@ -154,6 +154,46 @@ negate it ("don't settle" asks for nothing). The confirmation hashes the receiva
 outstanding, status, person, note and links, so a change before the tap voids
 the button.
 
+#### UPI screenshots
+
+Send a UPI app success screenshot (a photo or an image document) to the bot
+on its own, not as a reply. The vision model in `openai.vision_model`
+(default `gpt-6.1-luna`, through the OpenAI key and base URL of
+categorization) reads it. Every such image goes to that provider, with its names, VPAs and
+amounts, before any check. Code then checks the read; it never trusts the model:
+
+- The status must be a success. Any other screenshot is refused.
+- The amount is above zero, a name or a VPA is shown, the UTR has 12 digits,
+  and the date and time are not in the future.
+- The account text resolves by exact last 4 digits to exactly one active
+  bank account.
+
+A missing or bad field is named in the reply, and only `Skip` is offered.
+Reply with the values ("utr 123456789012, account 1234", "it was ₹950",
+"date 20/10/2026 14:05") or tap `Skip`. A reply runs the checks again. A row
+with the same UTR and direction gets "already recorded as #id" and an
+`Attach to #id` button instead. When that row is voided, the question says so
+and asks to attach the screenshot and un-void the row, because the screenshot
+shows a success. A tap is refused when the row's void state changed since
+the question. A row with the same account, direction and
+amount within one day, and no other UTR, gets "may already be recorded as
+#id" with the same button; reply "new" if it is another payment.
+Nothing is saved without a Yes tap. Yes saves one row with
+`source = screenshot`, `email_type = upi_screenshot`, `channel = upi` and
+the UTR as `reference_number`, keeps the name as `counterparty` and the VPA
+as `raw_description`, and attaches the screenshot. It is
+categorized and counted in cashflow like any new row.
+
+The row is provisional while `source` is `screenshot`. An SMS or email alert
+with the same UTR enriches it, and a matched bank statement line does too.
+Each adds its channel to the source, such as `screenshot+sms` or
+`screenshot+sms+bank_statement`. Each
+fetch cycle asks once about each screenshot-only row dated more than 60 days
+ago. The question has no buttons. The owner replies with what happened, and
+the assistant can propose `void_transaction` or `merge_transactions` behind a
+Yes tap. Void uses the normal void path, so a credit cannot be voided. This
+needs `telegram.assistant_enabled`.
+
 #### Receivable payment prompts
 
 Each fetch cycle checks the rows created in the last 7 days against the open
@@ -740,6 +780,7 @@ erDiagram
         text review_reason
         datetime last_notified_at
         int notify_attempts
+        datetime screenshot_flagged_at
         datetime created_at
     }
 
@@ -975,6 +1016,7 @@ Relationship notes:
 - `transactions.counterparty_source` is non-null and defaults to `bank`. It says where `counterparty` came from. A parser sets `user_alias` when the bank prints a label the user chose, such as an HDFC payee nickname. A label does not replace a name a bank states, and a bank name replaces a stored label. The column follows the name: a writer that changes one changes the other.
 - `transactions.amount_source` is non-null and defaults to `bank`. `/api/transactions/apply` sets `manual` when it changes `amount` or `currency`. The card statement then pairs a manual row like a foreign-currency alert (card, date, merchant, not amount), writes the billed rupee amount over it, and sets it back to `bank`.
 - `transactions.card_holder` is the cardholder that a card statement names for the row. Some banks print one card number for the primary card and each add-on, so `card_mask` alone cannot tell them apart. Statement import and enrichment set it; a one-time migration fills it from each stored statement reconciliation.
+- `transactions.screenshot_flagged_at` is set when the 60-day screenshot sweep asks about a row with `source = screenshot`, so it asks once. The prompt's outbox row is owned by an `audit_interactions` row with `trigger = screenshot_flag`.
 - `transactions.voided` marks a card charge that the bank cancelled before it settled. The user sets it. Cashflow figures, list totals and the bank cash bridge skip a voided row. Card statement matching skips it too, but alert de-duplication still matches it, so a reparse does not add the row again.
 - `transactions` has a composite lookup index on `(category, transaction_date)`. Category first because a category filter with no date bounds — a drill-through from a category link, say — would otherwise scan the table, both for the rows and for the `count()` the pager needs; `transaction_date` second so a filter carrying both a category and a date range satisfies them from the one index instead of narrowing on dates and re-checking the category per row.
 - `(account_id, card_mask)` is unique on `cards`.

@@ -5,6 +5,7 @@ transport resolves the trusted reply target and passes it here.
 """
 
 import asyncio
+import hashlib
 import json
 import datetime
 import logging
@@ -16,6 +17,10 @@ from typing import NamedTuple, cast
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from telegram import Bot
+
+from telegram import Document
 
 from financial_dashboard.db.enums import ReceivableStatus
 from financial_dashboard.db.models import (
@@ -54,9 +59,12 @@ from financial_dashboard.services.assistant.contracts import (
     CreateCategory,
     CreateReceivable,
     LinkReceivable,
+    MergeTransactions,
     UpdateReceivable,
+    VoidTransaction,
     MerchantRuleConfirmation,
     ReadCall,
+    ScreenshotTransactionConfirmation,
     AssistantWrite,
     AssistantWriteCall,
     AssistantWriteConfirmation,
@@ -117,6 +125,12 @@ from financial_dashboard.services.categorization.decision_lifecycle import (
     supersede_active_decisions,
 )
 from financial_dashboard.services.categorization.normalize import normalize_text
+from financial_dashboard.services.screenshot_transactions import (
+    ScreenshotReview,
+    apply_corrections,
+    review_screenshot,
+    save_screenshot_transaction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +242,37 @@ async def _lock_authorized_chat(
             await session.flush()
             return
     raise AuthorizationChanged("Telegram authorization changed")
+
+
+def _screenshot_state_hash(action: ScreenshotTransactionConfirmation) -> str:
+    """Fingerprint a screenshot action, so a Yes applies only the question it answers."""
+    return hashlib.sha256(action.model_dump_json().encode()).hexdigest()
+
+
+async def _screenshot_result(
+    session: AsyncSession,
+    review: ScreenshotReview,
+    *,
+    conversation_id: int,
+    interaction_id: int,
+) -> OrchestrationResult:
+    """Store the screenshot action of a review as the pending confirmation.
+
+    A refused screenshot has no action, so the reply is a plain answer.
+    """
+    if review.action is None:
+        return OrchestrationResult(Answer(outcome="answer", text=review.text))
+    await _persist_pending(
+        session,
+        conversation_id,
+        review.action,
+        source_interaction_id=interaction_id,
+        transaction_state_hash=_screenshot_state_hash(review.action),
+        direction_policy=DirectionPolicy.INFERRED_STRICT,
+    )
+    return OrchestrationResult(
+        Clarification(outcome="clarification", question=review.text)
+    )
 
 
 def _confirmation_question(
@@ -903,7 +948,9 @@ async def claim_pending_confirmation(
     state_hash: str,
     *,
     replied_to_interaction_id: int,
-) -> ApplyTransactionChanges | AssistantWrite | None:
+) -> (
+    ApplyTransactionChanges | AssistantWrite | ScreenshotTransactionConfirmation | None
+):
     """Use compare-and-swap to claim an application-authored pending action for a direct reply."""
     conversation = await session.get(TelegramConversation, conversation_id)
     if (
@@ -936,6 +983,8 @@ async def claim_pending_confirmation(
                 return None
         case AssistantWriteConfirmation():
             request = stored.action.request
+        case ScreenshotTransactionConfirmation():
+            request = stored.action
     claimed = await session.execute(
         update(TelegramConversation)
         .where(
@@ -984,6 +1033,8 @@ async def run_pending_confirmation(
         match stored.action:
             case AssistantWriteConfirmation(request=write):
                 fresh_hash = await assistant_write_state_hash(session, write)
+            case ScreenshotTransactionConfirmation():
+                fresh_hash = _screenshot_state_hash(stored.action)
             case (
                 MerchantRuleConfirmation(transaction_id=transaction_id)
                 | TransactionChangeConfirmation(transaction_id=transaction_id)
@@ -1019,8 +1070,14 @@ async def run_pending_confirmation(
                 | UpdateReceivable()
                 | AddPersonIdentifier()
                 | CreateCategory()
+                | VoidTransaction()
+                | MergeTransactions()
             ):
                 result = await apply_assistant_write(session, request)
+            case ScreenshotTransactionConfirmation():
+                result = await save_screenshot_transaction(
+                    session, request, interaction_id=interaction_id
+                )
         await session.execute(
             update(TelegramConversation)
             .where(TelegramConversation.id == conversation_id)
@@ -1223,11 +1280,15 @@ async def _confirm_assistant_write(
     conversation_id: int | None,
     interaction_id: int | None,
 ) -> Clarification:
-    """Ask the user to confirm a receivable or category write before it is written.
+    """Ask the user to confirm an assistant write before it is written.
 
     A dry run checks the write first. The question comes from stored data.
+    A void or a merge needs no write cue: the user explains what happened, as
+    in "that payment failed", and the tap confirms it.
     """
-    if not is_assistant_write_request(user_message):
+    if not isinstance(
+        request, VoidTransaction | MergeTransactions
+    ) and not is_assistant_write_request(user_message):
         raise MutationRejected(
             "the message does not ask for a receivable or category change"
         )
@@ -1470,12 +1531,28 @@ async def _queue_result(
                 separators=(",", ":"),
             )
         if ordinal == 0 and isinstance(result.response, Clarification):
-            if await _pending_conversation(session, interaction_id) is not None:
+            if (
+                pending := await _pending_conversation(session, interaction_id)
+            ) is not None:
+                match _stored_confirmation(
+                    pending, pending.pending_confirmation_json or ""
+                ).action:
+                    case ScreenshotTransactionConfirmation(duplicate_of=int() as dup):
+                        buttons = [(f"Attach to #{dup}", "y"), ("Skip", "n")]
+                    case ScreenshotTransactionConfirmation(missing=[_, *_]):
+                        buttons = [("Skip", "n")]
+                    case ScreenshotTransactionConfirmation():
+                        buttons = [("Yes", "y"), ("Skip", "n")]
+                    case _:
+                        buttons = [("Yes", "y"), ("No", "n")]
                 delivery.reply_markup_json = json.dumps(
                     [
                         [
-                            {"text": "Yes", "callback_data": f"pc:v1:{delivery.id}:y"},
-                            {"text": "No", "callback_data": f"pc:v1:{delivery.id}:n"},
+                            {
+                                "text": label,
+                                "callback_data": f"pc:v1:{delivery.id}:{choice}",
+                            }
+                            for label, choice in buttons
                         ]
                     ],
                     separators=(",", ":"),
@@ -1576,8 +1653,8 @@ async def _conversation_for_message(
         touch_conversation,
     )
 
-    if trigger == "ask":
-        return await start_conversation(session, chat_id=chat_id, started_by="ask")
+    if trigger in {"ask", "screenshot"}:
+        return await start_conversation(session, chat_id=chat_id, started_by=trigger)
     if mapped.conversation_id is not None:
         conversation = await session.get(TelegramConversation, mapped.conversation_id)
         if (
@@ -1682,6 +1759,37 @@ async def _process_text_interaction(
                     interaction_id=interaction_id,
                     recipient_chat_id=recipient_chat_id,
                 )
+            elif (
+                result is None
+                and conversation.pending_confirmation_json
+                and conversation.pending_confirmation_kind == "screenshot_transaction"
+                and replied_to_interaction_id
+                == conversation.pending_confirmation_source_interaction_id
+            ):
+                match _stored_confirmation(
+                    conversation, conversation.pending_confirmation_json
+                ).action:
+                    case ScreenshotTransactionConfirmation() as draft:
+                        result = await _screenshot_result(
+                            session,
+                            await review_screenshot(
+                                session,
+                                apply_corrections(draft.read, user_text),
+                                attachment_path=draft.attachment_path,
+                                media_type=draft.media_type,
+                                not_duplicates=[
+                                    *draft.not_duplicates,
+                                    *(
+                                        [draft.duplicate_of]
+                                        if draft.duplicate_of is not None
+                                        and user_text.strip().lower() == "new"
+                                        else []
+                                    ),
+                                ],
+                            ),
+                            conversation_id=conversation.id,
+                            interaction_id=interaction_id,
+                        )
             elif result is None and conversation.pending_confirmation_json:
                 from financial_dashboard.services.assistant.conversations import (
                     clear_pending_confirmation,
@@ -1902,7 +2010,7 @@ async def handle_telegram_update(update, context, *, trigger: str) -> None:
 
     mapped = None
     async with async_session() as session:
-        if trigger != "ask":
+        if trigger not in {"ask", "screenshot"}:
             mapped = await _resolve_text_context(session, message)
             if mapped is None:
                 return
@@ -1925,13 +2033,13 @@ async def handle_telegram_update(update, context, *, trigger: str) -> None:
         )
         if trigger == "ask" and context.args:
             user_text = " ".join(context.args).strip()
-        elif trigger == "attachment":
+        elif trigger in {"attachment", "screenshot"}:
             # A receipt caption is transaction data; preserve it verbatim.
             user_text = message.caption
         else:
             user_text = (message.text or "").strip()
         inbound_payload = None
-        if trigger == "attachment":
+        if trigger in {"attachment", "screenshot"}:
             media = message.document or (message.photo[-1] if message.photo else None)
             if media is None:
                 raise MutationRejected("attachment has no media")
@@ -1940,7 +2048,9 @@ async def handle_telegram_update(update, context, *, trigger: str) -> None:
                     "file_id": media.file_id,
                     "file_unique_id": media.file_unique_id,
                     "declared_size": media.file_size,
-                    "mime_type": getattr(media, "mime_type", "image/jpeg"),
+                    "mime_type": media.mime_type
+                    if isinstance(media, Document) and media.mime_type
+                    else "image/jpeg",
                 },
                 sort_keys=True,
             )
@@ -2009,6 +2119,17 @@ async def handle_telegram_update(update, context, *, trigger: str) -> None:
                 file_id=media.file_id,
                 declared_size=media.file_size,
                 caption=message.caption,
+            )
+            return
+        if trigger == "screenshot":
+            await _process_screenshot_interaction(
+                bot=context.bot,
+                interaction_id=interaction.id,
+                worker_token=worker_token,
+                conversation_id=conversation.id,
+                recipient_chat_id=message.chat.id,
+                file_id=media.file_id,
+                declared_size=media.file_size,
             )
             return
 
@@ -2214,6 +2335,107 @@ async def _process_attachment_interaction(
             await mark_authorization_changed(session, interaction_id)
             await session.commit()
             return
+    for delivery_id in delivery_ids:
+        await dispatch_saved_delivery(delivery_id)
+
+
+async def _process_screenshot_interaction(
+    *,
+    bot: Bot,
+    interaction_id: int,
+    worker_token: str,
+    conversation_id: int,
+    recipient_chat_id: int,
+    file_id: str,
+    declared_size: int | None,
+) -> None:
+    """Read one UPI screenshot and ask the owner about the row it shows.
+
+    Nothing is saved here. The reply holds a pending confirmation that a Yes
+    tap applies. The file stays on disk only while a confirmation holds it.
+    """
+    import httpx
+    from openai import OpenAIError
+    from telegram.error import TelegramError
+    from financial_dashboard.db import async_session
+    from financial_dashboard.services.categorization import openai_provider
+    from financial_dashboard.services.settings import (
+        get_openai_api_key,
+        get_openai_base_url,
+        get_setting,
+    )
+    from financial_dashboard.services.transaction_attachments import (
+        AttachmentError,
+        download_attachment,
+        remove_attachment,
+    )
+    from financial_dashboard.services.telegram import dispatch_saved_delivery
+
+    stored = None
+    read = None
+    try:
+        telegram_file = await bot.get_file(file_id)
+        if not telegram_file.file_path:
+            raise AttachmentError("Telegram did not provide a download URL")
+        stored = await download_attachment(
+            str(telegram_file.file_path), transaction_id=0, declared_size=declared_size
+        )
+        read = await openai_provider.read_screenshot(
+            image=stored.absolute_path.read_bytes(),
+            media_type=stored.media_type,
+            api_key=get_openai_api_key(),
+            model=get_setting("openai.vision_model") or "gpt-6.1-luna",
+            base_url=get_openai_base_url(),
+        )
+    except OSError, ValueError, httpx.HTTPError, TelegramError, OpenAIError:
+        logger.exception("Screenshot %s could not be read", interaction_id)
+    async with async_session() as session:
+        try:
+            await _lock_authorized_chat(session, recipient_chat_id)
+            if stored is None or read is None:
+                result = OrchestrationResult(
+                    Error(
+                        outcome="error",
+                        message="I couldn't read that screenshot.",
+                        code="screenshot_unreadable",
+                    )
+                )
+            else:
+                result = await _screenshot_result(
+                    session,
+                    await review_screenshot(
+                        session,
+                        read,
+                        attachment_path=stored.relative_path,
+                        media_type=stored.media_type,
+                        not_duplicates=[],
+                    ),
+                    conversation_id=conversation_id,
+                    interaction_id=interaction_id,
+                )
+            delivery_ids = await _queue_result(
+                session,
+                interaction_id=interaction_id,
+                worker_token=worker_token,
+                result=result,
+                transaction_id=None,
+                recipient_chat_id=recipient_chat_id,
+                outcome_override="screenshot",
+            )
+            await session.commit()
+        except AuthorizationChanged:
+            await session.rollback()
+            if stored is not None:
+                remove_attachment(stored.relative_path)
+            from financial_dashboard.services.assistant.audit import (
+                mark_authorization_changed,
+            )
+
+            await mark_authorization_changed(session, interaction_id)
+            await session.commit()
+            return
+    if stored is not None and not isinstance(result.response, Clarification):
+        remove_attachment(stored.relative_path)
     for delivery_id in delivery_ids:
         await dispatch_saved_delivery(delivery_id)
 
@@ -2528,6 +2750,16 @@ async def _confirm_from_button(
         return stale
     interaction.conversation_id = conversation.id
     if choice == "n":
+        if conversation.pending_confirmation_kind == "screenshot_transaction":
+            match _stored_confirmation(
+                conversation, conversation.pending_confirmation_json or ""
+            ).action:
+                case ScreenshotTransactionConfirmation(attachment_path=path):
+                    from financial_dashboard.services.transaction_attachments import (
+                        remove_attachment,
+                    )
+
+                    remove_attachment(path)
         clear_pending_confirmation(conversation)
         return OrchestrationResult(
             Answer(outcome="answer", text="Okay. Nothing changed.")

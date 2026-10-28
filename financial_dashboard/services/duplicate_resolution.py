@@ -109,7 +109,10 @@ def _projected_state(
     values.update(diff.filled)
     values.update({field: new for field, (_old, new) in diff.overwritten.items()})
     source = row.source
-    if source != "email" and source is not None:
+    if source and source.startswith("screenshot"):
+        if "email" not in source.split("+"):
+            source += "+email"
+    elif source != "email" and source is not None:
         source = "sms+email"
     return TransactionEnrichmentState(
         **values,

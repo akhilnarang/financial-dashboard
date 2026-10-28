@@ -1,6 +1,7 @@
 """OpenAI-compatible classifier, with isolated official Luna merchant lookup."""
 
 import asyncio
+import base64
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -8,7 +9,12 @@ from urllib.parse import urlsplit
 
 from openai import AsyncOpenAI, omit
 from openai.types.shared import ReasoningEffort
+from openai.types.shared_params import ResponseFormatJSONSchema
 
+from financial_dashboard.services.assistant.contracts import (
+    ScreenshotTransaction,
+    screenshot_json_schema,
+)
 from financial_dashboard.services.categorization.fewshot import FewShotExample
 from financial_dashboard.services.categorization.llm import (
     LLM_TIMEOUT_MS,
@@ -29,6 +35,15 @@ REASONING_EFFORTS: dict[str, ReasoningEffort] = {
     "medium": "medium",
     "high": "high",
 }
+
+SCREENSHOT_PROMPT = (
+    "Read this UPI payment app screenshot. Return only what the screen shows. "
+    "direction is debit when the owner paid and credit when the owner received. "
+    "amount is in rupees with digits and an optional dot. utr is the UPI "
+    "transaction ID, UTR or RRN. occurred_at is the date and time shown, in IST. "
+    "account_hint is the bank account text shown, such as 'SBI 1234'. Use null "
+    "for a field the screen does not show. Never guess."
+)
 
 
 async def classify(
@@ -224,3 +239,50 @@ async def classify(
         # from an upstream error body entering the audit or Telegram message.
         evidence["error_code"] = type(exc).__name__
     return result._replace(merchant_search=evidence)
+
+
+async def read_screenshot(
+    *, image: bytes, media_type: str, api_key: str, model: str, base_url: str
+) -> ScreenshotTransaction:
+    """Read one UPI screenshot with a vision model and a strict output schema.
+
+    The call stores nothing on the provider side.
+
+    Args:
+        image: The screenshot file.
+        media_type: Its MIME type, such as ``image/png``.
+        api_key: The OpenAI-compatible API key.
+        model: The vision model id.
+        base_url: The endpoint, or "" for the official API.
+
+    Returns:
+        The validated read. A malformed answer raises ``ValueError``.
+    """
+    client = AsyncOpenAI(
+        api_key=api_key, base_url=base_url or None, timeout=LLM_TIMEOUT_MS / 1000
+    )
+    data_url = f"data:{media_type};base64,{base64.b64encode(image).decode()}"
+    response = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": SCREENSHOT_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        response_format=ResponseFormatJSONSchema(
+            type="json_schema",
+            json_schema={
+                "name": "screenshot_transaction",
+                "strict": True,
+                "schema": screenshot_json_schema(),
+            },
+        ),
+        store=False,
+    )
+    return ScreenshotTransaction.model_validate_json(
+        response.choices[0].message.content or "{}"
+    )
