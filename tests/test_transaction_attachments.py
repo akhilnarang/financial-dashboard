@@ -1,3 +1,4 @@
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -89,7 +90,7 @@ async def test_attachment_route_serves_only_saved_path(
         bank="hdfc",
         email_type="purchase",
         direction="debit",
-        amount="12.00",
+        amount=Decimal("12.00"),
         attachment_path="receipt.pdf",
     )
     session.add(transaction)
@@ -101,6 +102,23 @@ async def test_attachment_route_serves_only_saved_path(
     assert response.content.startswith(b"%PDF-")
     assert response.headers["content-type"] == "application/pdf"
     assert response.headers["content-disposition"].startswith("attachment;")
+
+    detail = await client.get(f"/transactions/{transaction.id}/detail")
+    assert detail.status_code == 200
+    assert "View / download receipt" in detail.text
+    assert f"/api/transactions/{transaction.id}/attachment" in detail.text
+    # PDFs are served as downloads, so they must not open a blank new tab.
+    assert 'target="_blank"' not in detail.text
+
+    listing = await client.get("/transactions")
+    assert listing.status_code == 200
+    assert 'title="Receipt attached"' in listing.text
+
+    transaction.attachment_path = "receipt.png"
+    await session.commit()
+    detail = await client.get(f"/transactions/{transaction.id}/detail")
+    assert detail.status_code == 200
+    assert 'target="_blank" rel="noopener"' in detail.text
 
 
 @pytest.mark.anyio
