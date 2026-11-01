@@ -58,7 +58,7 @@
     {% if txn.attachment_path %}
     <div>
         <dt>Receipt</dt>
-        <dd><a href="/api/transactions/{{ txn.id }}/attachment">Open attachment</a></dd>
+        <dd><a href="/api/transactions/{{ txn.id }}/attachment"{% if txn.attachment_path.lower().endswith((".png", ".jpg", ".jpeg", ".webp")) %} target="_blank" rel="noopener"{% endif %}>View / download receipt</a></dd>
     </div>
     {% endif %}
     <div>

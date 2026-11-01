@@ -220,19 +220,42 @@ async def test_unrequested_cashflow_exclusion_is_dropped(session, message, exclu
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("message", "note"),
+    ("message", "note_patch", "category", "note"),
     [
-        ("food", "lunch"),
-        ("food for lunch with a friend", "food for lunch with a friend"),
+        # Category-only reply keeps the note, append op too.
+        ("food", {"op": "append", "value": "food"}, "food", "lunch"),
+        # An owner who asks to replace the note gets a replacement. The bounded
+        # payload stops at the comma, so the trailing "food" names the category.
+        (
+            "Change the note to dinner with a friend, food",
+            {"op": "set", "value": "dinner with a friend"},
+            "food",
+            "dinner with a friend",
+        ),
+        # Follow-up context appends to the stored note.
+        (
+            "Snickers in train, food",
+            {"op": "append", "value": "Snickers in train"},
+            "food",
+            "lunch · Snickers in train",
+        ),
+        # A manual-only slug the owner names is still applied.
+        ("mark as passthrough", None, "passthrough", "lunch"),
     ],
 )
-async def test_category_only_reply_keeps_the_existing_note(session, message, note):
+async def test_follow_up_reply_keeps_the_existing_note(
+    session, message, note_patch, category, note
+):
     await ensure_category(session, "food")
+    await ensure_category(session, "passthrough")
     txn = Transaction(
         bank="test", email_type="test", direction="debit", amount=10, note="lunch"
     )
     session.add(txn)
     await session.flush()
+    changes = {"category": {"op": "set", "value": category}}
+    if note_patch is not None:
+        changes["note"] = note_patch
     provider = FakeProvider(
         [
             ToolCalls(
@@ -241,10 +264,7 @@ async def test_category_only_reply_keeps_the_existing_note(session, message, not
                     {
                         "name": "apply_transaction_changes",
                         "transaction_id": txn.id,
-                        "changes": {
-                            "note": {"op": "set", "value": message},
-                            "category": {"op": "set", "value": "food"},
-                        },
+                        "changes": changes,
                     }
                 ],
             )
@@ -253,7 +273,7 @@ async def test_category_only_reply_keeps_the_existing_note(session, message, not
 
     await run_turn(session, provider, user_message=message, transaction_id=txn.id)
 
-    assert txn.category == "food"
+    assert txn.category == category
     assert txn.note == note
 
 
@@ -539,7 +559,14 @@ async def test_receivable_write_waits_for_a_yes(session, tool, message):
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     "plan",
-    ["apply_first", "write_first", "apply_next", "next_rejected", "next_other_row"],
+    [
+        "apply_first",
+        "write_first",
+        "apply_next",
+        "next_rejected",
+        "next_other_row",
+        "next_manual_guess",
+    ],
 )
 async def test_several_writes_ask_one_by_one(session, plan):
     await ensure_category(session, "passthrough")
@@ -623,7 +650,23 @@ async def test_several_writes_ask_one_by_one(session, plan):
                 "changes": {"category": {"op": "set", "value": "passthrough"}},
             },
         ],
+        # The message never names the manual-only category the model guessed.
+        "next_manual_guess": [
+            create,
+            {
+                "name": "apply_transaction_changes",
+                "transaction_id": charge.id,
+                "changes": {"category": {"op": "set", "value": "passthrough"}},
+            },
+        ],
     }[plan]
+    # Only the guessed-category plan gets a message that does not name it.
+    user_message = (
+        "create a receivable from Friend A for this amount"
+        if plan == "next_manual_guess"
+        else "mark as passthrough, and create a receivable from Friend A for this "
+        "amount, and save Friend A's UPI friend.a@okbank"
+    )
     provider = FakeProvider([ToolCalls(outcome="tool_calls", calls=calls)])
 
     last: list[OrchestrationResult] = []
@@ -644,10 +687,7 @@ async def test_several_writes_ask_one_by_one(session, plan):
     result = await run_turn(
         session,
         provider,
-        user_message=(
-            "mark as passthrough, and create a receivable from Friend A for this "
-            "amount, and save Friend A's UPI friend.a@okbank"
-        ),
+        user_message=user_message,
         transaction_id=charge.id,
         conversation_id=conversation.id,
         interaction_id=first_turn.id,
@@ -673,16 +713,20 @@ async def test_several_writes_ask_one_by_one(session, plan):
     conversation.expires_at = utc_now() + datetime.timedelta(minutes=5)
     reply = await yes(first_turn, yes_turns[0])
     assert len((await session.execute(receivables)).all()) == 1
-    if plan in ("next_rejected", "next_other_row"):
+    if plan in ("next_rejected", "next_other_row", "next_manual_guess"):
         assert reply.endswith(
             "I stopped and did not do the other changes: "
             + (
                 "receivable #999 not found."
                 if plan == "next_rejected"
                 else "the next change names another transaction."
+                if plan == "next_other_row"
+                else "only you can set the category to passthrough."
             )
         )
         assert conversation.pending_confirmation_json is None
+        if plan == "next_manual_guess":
+            assert charge.category is None
         return
     assert reply.startswith("Created Friend A #")
     assert conversation.transaction_id is None
@@ -1312,7 +1356,7 @@ async def test_forbidden_change_is_refused_not_offered(session, message):
 @pytest.mark.anyio
 @pytest.mark.parametrize("fits", [True, False], ids=["some_fit", "none_fit"])
 async def test_proposal_keeps_only_categories_that_fit(session, fits):
-    for slug in ("tax_refund", "refund"):
+    for slug in ("tax_refund", "refund", "passthrough"):
         await ensure_category(session, slug)
     card = Account(bank="test", label="Card", type="credit_card")
     session.add(card)
@@ -1327,7 +1371,11 @@ async def test_proposal_keeps_only_categories_that_fit(session, fits):
     session.add(txn)
     await session.flush()
     # A tax refund cannot be a credit on a card.
-    candidates = [{"slug": "tax_refund", "reason": "VAT", "confidence": 0.8}]
+    candidates = [
+        {"slug": "tax_refund", "reason": "VAT", "confidence": 0.8},
+        # Direction-valid on a card credit, so only the manual-only rule drops it.
+        {"slug": "passthrough", "reason": "held for a friend", "confidence": 0.9},
+    ]
     if fits:
         candidates.append({"slug": "refund", "reason": "refund", "confidence": 0.2})
     provider = FakeProvider(
@@ -1351,8 +1399,10 @@ async def test_proposal_keeps_only_categories_that_fit(session, fits):
         return
     # The model sees which categories fit, and can still use any active one.
     assert "tax_refund" not in provider.context.fitting_categories
+    assert "passthrough" not in provider.context.fitting_categories
     assert "refund" in provider.context.fitting_categories
     assert "tax_refund" in provider.context.categories
+    assert "passthrough" in provider.context.categories
     assert isinstance(result.response, CategoryProposal)
     assert [c.slug for c in result.response.candidates] == ["refund"]
     assert "tax_refund" not in result.response.explanation

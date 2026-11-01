@@ -43,8 +43,10 @@ from financial_dashboard.services.assistant.context import (
 )
 from financial_dashboard.services.assistant.contracts import (
     Answer,
+    AppendTextValue,
     ApplyTransactionChanges,
     AssistantResponse,
+    ClearValue,
     ConfirmationAction,
     CategoryCandidate,
     CategoryProposal,
@@ -65,6 +67,7 @@ from financial_dashboard.services.assistant.contracts import (
     MerchantRuleConfirmation,
     ReadCall,
     ScreenshotTransactionConfirmation,
+    SetTextValue,
     AssistantWrite,
     AssistantWriteCall,
     AssistantWriteConfirmation,
@@ -126,6 +129,7 @@ from financial_dashboard.services.categorization.decision_lifecycle import (
     supersede_active_decisions,
 )
 from financial_dashboard.services.categorization.normalize import normalize_text
+from financial_dashboard.services.categorization.slugs import MANUAL_ONLY_SLUGS
 from financial_dashboard.services.screenshot_transactions import (
     ScreenshotReview,
     apply_corrections,
@@ -833,8 +837,7 @@ async def run_turn(
                     note = call.changes.note
                     category = call.changes.category
                     if (
-                        note is not None
-                        and note.op == "set"
+                        isinstance(note, SetTextValue | AppendTextValue)
                         and category is not None
                         and category.op == "set"
                         and normalize_text(note.value).strip()
@@ -1155,7 +1158,10 @@ async def _fitting_slugs(
     target: AssistantTransaction,
     slugs: Sequence[str],
 ) -> list[str]:
-    """Return the slugs that the target transaction can take, in order."""
+    """Return the slugs that the target transaction can take, in order.
+
+    A manual-only slug never fits a guess; the owner sets it by naming it.
+    """
     account_type = None
     if target.account_id is not None:
         account = await session.get(Account, target.account_id)
@@ -1163,7 +1169,8 @@ async def _fitting_slugs(
     return [
         slug
         for slug in slugs
-        if resolve_direction(slug, target.direction, account_type).slug == slug
+        if slug not in MANUAL_ONLY_SLUGS
+        and resolve_direction(slug, target.direction, account_type).slug == slug
     ]
 
 
@@ -1251,11 +1258,13 @@ def _describe_changes(request: ApplyTransactionChanges) -> str:
     changes = request.changes
     parts = []
     if changes.note is not None:
-        parts.append(
-            f"set the note to '{changes.note.value}'"
-            if changes.note.op == "set"
-            else "clear the note"
-        )
+        match changes.note:
+            case SetTextValue(value=value):
+                parts.append(f"set the note to '{value}'")
+            case AppendTextValue(value=value):
+                parts.append(f"add '{value}' to the note")
+            case ClearValue():
+                parts.append("clear the note")
     if changes.category is not None:
         parts.append(
             f"set the category to {changes.category.value}"
@@ -1287,11 +1296,19 @@ async def _confirm_change(
     The bot asks when a bare number names the row, which can be an amount, or
     when the message does not clearly ask for the change. The user sees the
     row and the change, and a Yes tap authorizes it. A change that the message
-    forbids, or that is not valid, raises instead.
+    forbids, or that is not valid, raises instead. A category the message never
+    names that only the owner may set raises too, so the question never offers
+    it.
     """
     if request.merchant_rule is not None:
         raise MutationRejected("a merchant rule needs a direct instruction")
     await raise_vetoes(session, request, user_message)
+    if (
+        (category := request.changes.category) is not None
+        and category.value in MANUAL_ONLY_SLUGS
+        and await unnamed_category(session, request, user_message) is not None
+    ):
+        raise MutationRejected(f"only you can set the category to {category.value}")
     # A validation-only apply. The tap supplies the intent; every other check runs.
     savepoint = await session.begin_nested()
     try:

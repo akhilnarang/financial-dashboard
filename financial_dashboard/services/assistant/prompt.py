@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v9"
+PROMPT_VERSION = "telegram-assistant-v10"
 
 
 class PromptContext(NamedTuple):
@@ -49,7 +49,8 @@ def build_prompt(context: PromptContext) -> str:
         'APPLY is {"name":"apply_transaction_changes","transaction_id":1,',
         '"changes":{optional note/category/exclude_from_cashflow patches},',
         'optional "merchant_rule":{"category":"...","intent_evidence":"..."}}.',
-        'A note patch is {"op":"set","value":"..."} or {"op":"clear"}.',
+        'A note patch is {"op":"set","value":"..."},'
+        ' {"op":"append","value":"..."} or {"op":"clear"}.',
         'A category patch is {"op":"set","value":"slug"} or',
         '{"op":"clear","value":null}. An exclusion patch is',
         '{"op":"set","value":true|false}. Omitted fields stay unchanged.',
@@ -86,6 +87,11 @@ def build_prompt(context: PromptContext) -> str:
         "context, such as 'Snickers in train', is the note: set the note to the",
         "whole message and set your best category. The application asks the user",
         "to confirm a category that the message does not name.",
+        "When the TRUSTED TRANSACTION TARGET already has a note, a reply that adds",
+        'context appends: use {"op":"append","value":...} with only the new text.',
+        "The application keeps the old note and adds the new text after it,",
+        'separated by " · ". Use {"op":"set"} on an existing note only when the',
+        "user asks to replace or change the note.",
         "A reply that is only a category name sets the category and not the note.",
         "A category_proposal never saves a note. To save a note, use APPLY.",
         "When you infer a category, choose it from CATEGORIES THAT FIT THIS",

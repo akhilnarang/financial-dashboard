@@ -17,7 +17,12 @@ from financial_dashboard.db.models import (
     Transaction,
     utc_now,
 )
-from financial_dashboard.services.assistant.contracts import ApplyTransactionChanges
+from financial_dashboard.services.assistant.contracts import (
+    AppendTextValue,
+    ApplyTransactionChanges,
+    ClearValue,
+    SetTextValue,
+)
 from financial_dashboard.services.assistant.intent_policy import (
     derive_merchant_pattern,
     has_ambiguous_intent,
@@ -227,11 +232,11 @@ async def raise_vetoes(
         raise ExplicitlyDenied("the current message forbids transaction changes")
     # A note can contain these words, so skip the note that the patch saves.
     # Text after that note is an instruction.
-    note = (
-        changes.note.value
-        if changes.note is not None and changes.note.op == "set"
-        else None
-    )
+    match changes.note:
+        case SetTextValue(value=value) | AppendTextValue(value=value):
+            note = value
+        case _:
+            note = None
     kept_text = (
         raw
         if instruction.note_payload is None
@@ -283,7 +288,7 @@ async def _validate_ordinary_intent(
     evidence = await raise_vetoes(session, request, current_user_message)
     if instruction.note_requires_category and not (
         changes.note is not None
-        and changes.note.op == "set"
+        and changes.note.op in {"set", "append"}
         and changes.category is not None
         and changes.category.op == "set"
     ):
@@ -301,18 +306,19 @@ async def _validate_ordinary_intent(
     if "?" in instruction_text or has_non_mutating_intent(instruction_text):
         raise MutationRejected("questions cannot change transaction data")
     if changes.note is not None:
-        raw_note_value = changes.note.value if changes.note.op == "set" else ""
-        note_value = (
-            normalize_text(raw_note_value).strip() if changes.note.op == "set" else ""
-        )
-        if changes.note.op == "set":
-            bounded_note = normalize_text(instruction.note_payload or "").strip()
-            if not bounded_note or note_value != bounded_note:
+        match changes.note:
+            case SetTextValue(value=value) | AppendTextValue(value=value):
+                bounded_note = normalize_text(instruction.note_payload or "").strip()
+                if not bounded_note or normalize_text(value).strip() != bounded_note:
+                    raise MutationRejected(
+                        "note value must match the application-bounded note payload"
+                    )
+            case ClearValue() if not re.search(
+                r"\b(?:clear|remove|delete)\b.*\bnote\b", normalized
+            ):
                 raise MutationRejected(
-                    "note value must match the application-bounded note payload"
+                    "clearing a note requires current-message intent"
                 )
-        elif not re.search(r"\b(?:clear|remove|delete)\b.*\bnote\b", normalized):
-            raise MutationRejected("clearing a note requires current-message intent")
     if changes.category is not None:
         if changes.category.op == "set":
             value = normalize_text(evidence).replace("_", " ")
@@ -423,7 +429,7 @@ async def _apply_transaction_changes(
     # Resolve and validate the complete request before changing any ORM field.
     if (
         changes.note is not None
-        and changes.note.op == "set"
+        and changes.note.op != "clear"
         and not isinstance(changes.note.value, str)
     ):
         raise MutationRejected("note must be text")
@@ -506,10 +512,17 @@ async def _apply_transaction_changes(
             )
 
     if changes.note is not None:
-        if changes.note.op == "clear":
-            await update_transaction_note_no_commit(session, txn.id, "")
-        else:
-            await update_transaction_note_no_commit(session, txn.id, changes.note.value)
+        match changes.note:
+            case ClearValue():
+                note_text = ""
+            case SetTextValue(value=value):
+                note_text = value
+            case AppendTextValue(value=value):
+                added = value.strip()
+                # The model sees only the redacted note, so the stored note is
+                # the one that survives a follow-up reply.
+                note_text = f"{txn.note} · {added}" if txn.note else added
+        await update_transaction_note_no_commit(session, txn.id, note_text)
 
     if changes.category is not None:
         ok, _ = await assign_category_no_commit(
