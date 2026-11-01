@@ -39,11 +39,18 @@ class SetBoolValue(StrictModel):
     value: StrictBool
 
 
+class AppendTextValue(StrictModel):
+    op: Literal["append"]
+    value: StrictStr = Field(max_length=500)
+
+
 class ClearValue(StrictModel):
     op: Literal["clear"]
 
 
-TextPatch: TypeAlias = Annotated[SetTextValue | ClearValue, Field(discriminator="op")]
+TextPatch: TypeAlias = Annotated[
+    SetTextValue | AppendTextValue | ClearValue, Field(discriminator="op")
+]
 
 
 class CategoryPatch(StrictModel):
