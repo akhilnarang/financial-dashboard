@@ -775,10 +775,11 @@ async def test_several_writes_ask_one_by_one(session, plan):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("first", ["with_exclusion", "guess_only"])
+@pytest.mark.parametrize("first", ["with_exclusion", "guess_only", "unfit_guess"])
 async def test_guessed_category_keeps_the_other_writes(session, first):
     """A guessed category used to end the turn and drop the writes after it."""
     await ensure_category(session, "reimbursement")
+    await ensure_category(session, "dining")
     credit = Transaction(
         bank="test",
         email_type="test",
@@ -819,7 +820,9 @@ async def test_guessed_category_keeps_the_other_writes(session, first):
         [Setting(key="telegram.chat_id", value="7"), first_turn, *yes_turns]
     )
     await session.flush()
-    first_changes = {"category": {"op": "set", "value": "reimbursement"}}
+    # A dining guess does not fit a credit, so the reply says it is not set.
+    guess = "dining" if first == "unfit_guess" else "reimbursement"
+    first_changes = {"category": {"op": "set", "value": guess}}
     if first == "with_exclusion":
         first_changes["exclude_from_cashflow"] = {"op": "set", "value": True}
     provider = FakeProvider(
@@ -877,6 +880,11 @@ async def test_guessed_category_keeps_the_other_writes(session, first):
             f"Saved exclude_from_cashflow for #{credit.id}.\n"
             f"Next: Exclude it from cashflow for #{debit.id} ("
         )
+    elif first == "unfit_guess":
+        assert text.startswith(
+            f"I did not set the category to dining for #{credit.id}. It does not "
+            f"fit this transaction.\nExclude it from cashflow for #{debit.id} ("
+        )
     else:
         assert text.startswith(f"Exclude it from cashflow for #{debit.id} (")
     # The question shows the debit, so a free reply must target the debit.
@@ -900,6 +908,10 @@ async def test_guessed_category_keeps_the_other_writes(session, first):
     ]
     reply = await yes(first_turn, yes_turns[0])
     assert debit.exclude_from_cashflow is True
+    if first == "unfit_guess":
+        assert "Next:" not in reply
+        assert credit.category is None
+        return
     assert f"Next: Set the category to reimbursement for #{credit.id} (" in reply
     assert await yes(yes_turns[0], yes_turns[1]) == f"Saved category for #{credit.id}."
     assert credit.category == "reimbursement"

@@ -775,6 +775,7 @@ async def run_turn(
                 )
             pending_tool_results: list[dict[str, object]] = []
             pending_read_ids: set[int] = set()
+            unfit_guess: str | None = None
             try:
                 # Validate and execute every read before the first write applies.
                 # A rejected read can therefore never leave an earlier write.
@@ -876,6 +877,12 @@ async def run_turn(
                                     ]
                                 }
                             )
+                        else:
+                            unfit_guess = (
+                                f"I did not set the category to {guessed} for "
+                                f"#{call.transaction_id}. It does not fit this "
+                                "transaction.\n"
+                            )
                     if (
                         guessed is None
                         or call.changes.note is not None
@@ -959,7 +966,8 @@ async def run_turn(
                         Error(
                             outcome="error",
                             message=(
-                                f"I stopped and did not do the other changes: {exc}."
+                                f"{unfit_guess or ''}I stopped and did not do the "
+                                f"other changes: {exc}."
                             ),
                             code="chain_stopped",
                         ),
@@ -967,10 +975,12 @@ async def run_turn(
                     )
                 return completed(
                     question.model_copy(
-                        update={"question": f"Next: {question.question}"}
-                    )
-                    if mutation is not None
-                    else question,
+                        update={
+                            "question": f"{unfit_guess or ''}"
+                            + ("Next: " if mutation is not None else "")
+                            + question.question
+                        }
+                    ),
                     mutation,
                 )
             if mutation is not None:
