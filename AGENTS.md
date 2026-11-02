@@ -253,7 +253,7 @@ uv run python scripts/paisa_contract.py --skip-if-unavailable   # needs Docker
 
 ## Style conventions
 
-- **No `from __future__ import annotations`.** Python 3.14 + PEP 649
+- **No `from __future__ import annotations`.** Python 3.15 + PEP 649
   makes lazy annotation evaluation the default, so the future import is
   a no-op. Don't add it to new files; existing files have it stripped.
 - **Multi-value returns use `typing.NamedTuple`**, not anonymous
