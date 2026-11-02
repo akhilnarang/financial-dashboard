@@ -354,7 +354,7 @@ class PendingChain(StrictModel):
     for in turn. ``transaction_id`` is the trusted target of that message.
     """
 
-    calls: list[ChainedWrite] = Field(min_length=1, max_length=3)
+    calls: list[ChainedWrite] = Field(min_length=1, max_length=4)
     message: StrictStr = Field(min_length=1)
     transaction_id: StrictInt | None = None
 

@@ -79,6 +79,14 @@ _NEGATION = (
     r"could not|couldn t|may not|might not)"
 )
 
+# A terse reply such as "even 8788 exclude" or "exclude both". A transaction
+# can only be excluded from cashflow, so the bare verb names that change.
+_TERSE_EXCLUDE = re.compile(
+    r"(?:(?:please|also|even|just|and|so|then|txn|transaction|this|that|it|both|them|\d+)\s+)*"
+    r"exclude"
+    r"(?:\s+(?:please|also|too|this|that|it|both|them|txn|transaction|\d+|as\s+well|to\s+match))*"
+)
+
 
 def _category_assignment_is_negated(text: str) -> bool:
     """Detect a denied assignment without confusing it with denied creation."""
@@ -114,6 +122,7 @@ def _cashflow_polarity_is_explicit(text: str, excluded: bool) -> bool:
                 rf"\b{_NEGATION}\b(?:\s+\w+){{0,5}}\s+include(?:d)?\b{flow}", text
             )
             or re.search(r"\bcash ?flow exclusion\b.{0,16}\b(?:on|true|yes)\b", text)
+            or _TERSE_EXCLUDE.fullmatch(text)
         )
     if negative_include:
         return False

@@ -284,6 +284,8 @@ async def test_follow_up_reply_keeps_the_existing_note(
         ("marked", None),
         # A bare number can be an amount, so the user confirms the row first.
         ("bare", None),
+        # A terse reply, such as "even 8788 exclude", still asks for the exclusion.
+        ("terse", None),
         ("unnamed", "ambiguous_target"),
         # A bare number must not turn an explicit "no" into a Yes/No prompt.
         ("bare_denied", "mutation_rejected"),
@@ -336,6 +338,7 @@ async def test_typed_transaction_number_is_a_change_target(session, case, error)
     message = {
         "unnamed": "exclude it from cashflow",
         "bare": f"exclude {txn.id} from cashflow",
+        "terse": f"even {txn.id} exclude",
         "bare_denied": f"exclude {txn.id} from cashflow; don't make changes",
     }.get(case, f"exclude #{txn.id} from cashflow")
 
@@ -347,7 +350,7 @@ async def test_typed_transaction_number_is_a_change_target(session, case, error)
         interaction_id=interaction.id,
     )
 
-    if case == "bare":
+    if case in ("bare", "terse"):
         assert txn.exclude_from_cashflow is False
         assert "ZERODHA BROKING" in result.response.question
         await run_pending_confirmation(
@@ -769,6 +772,137 @@ async def test_several_writes_ask_one_by_one(session, plan):
     )
     identifiers = (await session.scalars(select(PersonIdentifier.value))).all()
     assert identifiers == ["friend.a@okbank"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("first", ["with_exclusion", "guess_only"])
+async def test_guessed_category_keeps_the_other_writes(session, first):
+    """A guessed category used to end the turn and drop the writes after it."""
+    await ensure_category(session, "reimbursement")
+    credit = Transaction(
+        bank="test",
+        email_type="test",
+        direction="credit",
+        amount=2000,
+        counterparty="FRIEND A",
+    )
+    debit = Transaction(
+        bank="test",
+        email_type="test",
+        direction="debit",
+        amount=2000,
+        counterparty="CAFE MERCHANT",
+    )
+    session.add_all([credit, debit])
+    await session.flush()
+    conversation = await start_conversation(
+        session, chat_id=7, started_by="reply", transaction_id=credit.id
+    )
+    first_turn = AuditInteraction(
+        inbound_chat_id=7,
+        trigger="reply",
+        conversation_id=conversation.id,
+        status="processing",
+        worker_token="worker",
+    )
+    yes_turns = [
+        AuditInteraction(
+            inbound_chat_id=7,
+            trigger="reply",
+            conversation_id=conversation.id,
+            status="processing",
+            worker_token="worker",
+        )
+        for _ in range(2)
+    ]
+    session.add_all(
+        [Setting(key="telegram.chat_id", value="7"), first_turn, *yes_turns]
+    )
+    await session.flush()
+    first_changes = {"category": {"op": "set", "value": "reimbursement"}}
+    if first == "with_exclusion":
+        first_changes["exclude_from_cashflow"] = {"op": "set", "value": True}
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": credit.id,
+                        "changes": first_changes,
+                    },
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": debit.id,
+                        "changes": {
+                            "exclude_from_cashflow": {"op": "set", "value": True}
+                        },
+                    },
+                ],
+            )
+        ]
+    )
+    user_message = (
+        f"She paid me and then used the money in {debit.id}. Exclude both from cashflow"
+    )
+
+    async def yes(source: AuditInteraction, turn: AuditInteraction) -> str:
+        """Tap Yes on the question that ``source`` asked; return the sent text."""
+        result = await _apply_pending(
+            session,
+            conversation,
+            user_message="yes",
+            source_interaction_id=source.id,
+            interaction_id=turn.id,
+            recipient_chat_id=7,
+        )
+        return _response_text(result, credit.id)
+
+    result = await run_turn(
+        session,
+        provider,
+        user_message=user_message,
+        transaction_id=credit.id,
+        conversation_id=conversation.id,
+        interaction_id=first_turn.id,
+    )
+
+    assert credit.category is None
+    assert credit.exclude_from_cashflow is (first == "with_exclusion")
+    assert debit.exclude_from_cashflow is False
+    text = _response_text(result, credit.id)
+    if first == "with_exclusion":
+        assert text.startswith(
+            f"Saved exclude_from_cashflow for #{credit.id}.\n"
+            f"Next: Exclude it from cashflow for #{debit.id} ("
+        )
+    else:
+        assert text.startswith(f"Exclude it from cashflow for #{debit.id} (")
+    # The question shows the debit, so a free reply must target the debit.
+    await _queue_result(
+        session,
+        interaction_id=first_turn.id,
+        worker_token="worker",
+        result=result,
+        transaction_id=credit.id,
+        recipient_chat_id=7,
+    )
+    delivery = await session.scalar(
+        select(TelegramOutboundDelivery).where(
+            TelegramOutboundDelivery.interaction_id == first_turn.id
+        )
+    )
+    assert delivery.transaction_id == debit.id
+    assert [b["text"] for b in json.loads(delivery.reply_markup_json)[0]] == [
+        "Yes",
+        "No",
+    ]
+    reply = await yes(first_turn, yes_turns[0])
+    assert debit.exclude_from_cashflow is True
+    assert f"Next: Set the category to reimbursement for #{credit.id} (" in reply
+    assert await yes(yes_turns[0], yes_turns[1]) == f"Saved category for #{credit.id}."
+    assert credit.category == "reimbursement"
 
 
 @pytest.mark.anyio
