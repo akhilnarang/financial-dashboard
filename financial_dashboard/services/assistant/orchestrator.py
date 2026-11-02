@@ -49,6 +49,7 @@ from financial_dashboard.services.assistant.contracts import (
     ClearValue,
     ConfirmationAction,
     CategoryCandidate,
+    CategoryPatch,
     CategoryProposal,
     Clarification,
     Error,
@@ -74,6 +75,7 @@ from financial_dashboard.services.assistant.contracts import (
     PendingChain,
     StoredConfirmation,
     TransactionChangeConfirmation,
+    TransactionChanges,
     parse_response,
 )
 from financial_dashboard.services.assistant.intent_policy import (
@@ -852,6 +854,28 @@ async def run_turn(
                     guessed = await unnamed_category(session, call, user_message)
                     if guessed is not None:
                         call = _without(call, "category")
+                    if guessed is not None and chain is not None:
+                        # A proposal ends the turn, so the guess asks for its
+                        # own Yes after the other writes instead.
+                        if guessed in await _fitting_slugs(
+                            session, call_target, active_categories
+                        ):
+                            chain = chain.model_copy(
+                                update={
+                                    "calls": [
+                                        *chain.calls,
+                                        ApplyTransactionChanges(
+                                            name="apply_transaction_changes",
+                                            transaction_id=call.transaction_id,
+                                            changes=TransactionChanges(
+                                                category=CategoryPatch(
+                                                    op="set", value=guessed
+                                                )
+                                            ),
+                                        ),
+                                    ]
+                                }
+                            )
                     if (
                         guessed is None
                         or call.changes.note is not None
@@ -885,16 +909,11 @@ async def run_turn(
                                     chain=chain,
                                 )
                             )
-                    if guessed is not None:
+                    if guessed is not None and chain is None:
                         proposal = CategoryProposal(
                             outcome="category_proposal",
                             transaction_id=call.transaction_id,
-                            explanation=f"Is '{guessed}' the right category?"
-                            + (
-                                " Send the other changes again after you choose."
-                                if chain is not None
-                                else ""
-                            ),
+                            explanation=f"Is '{guessed}' the right category?",
                             candidates=[
                                 CategoryCandidate(
                                     slug=guessed,
@@ -927,7 +946,7 @@ async def run_turn(
                 )
             read_transaction_ids.update(pending_read_ids)
             tool_results.extend(pending_tool_results)
-            if mutation is not None and chain is not None:
+            if chain is not None:
                 try:
                     question = await _confirm_next(
                         session,
@@ -949,7 +968,9 @@ async def run_turn(
                 return completed(
                     question.model_copy(
                         update={"question": f"Next: {question.question}"}
-                    ),
+                    )
+                    if mutation is not None
+                    else question,
                     mutation,
                 )
             if mutation is not None:
@@ -1633,19 +1654,23 @@ async def _queue_result(
             # A settlement fold moved this turn while it ran. SQLite can give
             # the old id to a new row, so the reply gets no target.
             transaction_id = None
-    if isinstance(result.response, Clarification) and (
-        result.mutation is not None or result.confirmed_write
+    pending_action = None
+    if (
+        isinstance(result.response, Clarification)
+        and (pending := await _pending_conversation(session, interaction_id))
+        is not None
     ):
-        # The next write of a chain asks here. The question binds the row of
-        # its own change, or no row, never the row of the message before it.
-        pending = await _pending_conversation(session, interaction_id)
-        match (
-            _stored_confirmation(
-                pending, pending.pending_confirmation_json or ""
-            ).action
-            if pending is not None
-            else None
-        ):
+        pending_action = _stored_confirmation(
+            pending, pending.pending_confirmation_json or ""
+        ).action
+    if isinstance(result.response, Clarification) and (
+        result.mutation is not None
+        or result.confirmed_write
+        or isinstance(pending_action, TransactionChangeConfirmation)
+    ):
+        # A transaction-change question binds the row it shows. Any other
+        # question after a write binds no row, never the row before it.
+        match pending_action:
             case TransactionChangeConfirmation(transaction_id=pending_id):
                 transaction_id = pending_id
             case _:
