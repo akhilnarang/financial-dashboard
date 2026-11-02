@@ -48,7 +48,7 @@ wheels = [
 [[package]]
 name = "bank-email-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-email-parser#2ac30b5836f8c0af311c6bd483ef9174dd636dc6" }
+source = { git = "https://github.com/akhilnarang/bank-email-parser#81b2d8e78c0e0b7b724bc21d59f156402a506b83" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "pydantic" },
@@ -59,7 +59,7 @@ dependencies = [
 [[package]]
 name = "bank-sms-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-sms-parser#7921fe2a051584afef3f0a8526c4be2920b1f456" }
+source = { git = "https://github.com/akhilnarang/bank-sms-parser#79e354187058ce138951e733520c84ceb0883394" }
 dependencies = [
     { name = "pydantic" },
     { name = "python-dateutil" },
@@ -69,7 +69,7 @@ dependencies = [
 [[package]]
 name = "bank-statement-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-statement-parser#56c4479f6ac221cdea31c39a3446761ed2fc3f4b" }
+source = { git = "https://github.com/akhilnarang/bank-statement-parser#40fd618cebf6688d8316a5a7a5d116d781c97b1e" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },
@@ -107,7 +107,7 @@ wheels = [
 [[package]]
 name = "cas-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/cas-parser#4688365b0dd32f47060f5482c62207d1bfaa8a7f" }
+source = { git = "https://github.com/akhilnarang/cas-parser#de578913e9b0e447fea5ce40ce21ded7c7b2f77f" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },
@@ -121,7 +121,7 @@ dependencies = [
 [[package]]
 name = "cc-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/cc-parser#f1023f952c9ab7cfad6427b33034d764292b4d3f" }
+source = { git = "https://github.com/akhilnarang/cc-parser#8944e9228041bd66fd6c04f1278ac0fdbbbeb0db" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },
