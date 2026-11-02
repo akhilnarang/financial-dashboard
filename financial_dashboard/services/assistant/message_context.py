@@ -215,7 +215,7 @@ async def move_transaction_references(
         if (chain := stored.chain) is not None:
             if chain.transaction_id is not None:
                 named.add(chain.transaction_id)
-            named |= {row for call in chain.calls for row in _named_rows(call)}
+            named |= {*_named_rows(call) for call in chain.calls}
         if old_id in named:
             clear_pending_confirmation(conversation)
     for model in (
