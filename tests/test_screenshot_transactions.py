@@ -249,7 +249,7 @@ async def test_failed_screenshot_is_refused(
 ) -> None:
     asked = await _send(shot, monkeypatch, _read(status="failed"))
 
-    assert shot.vision_calls == [{"image": PNG, "model": "gpt-6.1-luna"}]
+    assert shot.vision_calls == [{"image": PNG, "model": "gpt-6-luna"}]
     assert "failed payment" in asked.text
     assert asked.buttons == []
     assert not (shot.root / "shot.png").exists()

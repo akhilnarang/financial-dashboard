@@ -158,7 +158,7 @@ the button.
 
 Send a UPI app success screenshot (a photo or an image document) to the bot
 on its own, not as a reply. The vision model in `openai.vision_model`
-(default `gpt-6.1-luna`, through the OpenAI key and base URL of
+(default `gpt-6-luna`, through the OpenAI key and base URL of
 categorization) reads it. Every such image goes to that provider, with its names, VPAs and
 amounts, before any check. Code then checks the read; it never trusts the model:
 

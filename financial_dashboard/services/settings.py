@@ -173,7 +173,7 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
         label="OpenAI Model",
     ),
     "openai.vision_model": SettingDef(
-        default="gpt-6.1-luna",
+        default="gpt-6-luna",
         data_type="str",
         category="Categorization",
         label="OpenAI Vision Model",

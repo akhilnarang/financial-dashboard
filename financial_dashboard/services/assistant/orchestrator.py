@@ -2593,7 +2593,7 @@ async def _process_screenshot_interaction(
             image=stored.absolute_path.read_bytes(),
             media_type=stored.media_type,
             api_key=get_openai_api_key(),
-            model=get_setting("openai.vision_model") or "gpt-6.1-luna",
+            model=get_setting("openai.vision_model") or "gpt-6-luna",
             base_url=get_openai_base_url(),
         )
     except OSError, ValueError, httpx.HTTPError, TelegramError, OpenAIError:
