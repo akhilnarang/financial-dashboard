@@ -94,6 +94,7 @@ class TransactionRead(BaseModel):
     category_method: str | None
     exclude_from_cashflow: bool = False
     voided: bool = False
+    gain: Decimal | None = None
     review_status: str | None
     created_at: datetime.datetime | None
     enriched_at: datetime.datetime | None
@@ -265,7 +266,8 @@ class TransactionApplyChange(BaseModel):
     An empty ``category`` clears the category. A null or empty ``note`` clears
     the note. ``amount`` and ``currency`` fix a row by hand, for example a
     foreign-currency charge whose rupee amount the bank shows before the
-    statement.
+    statement. ``gain`` sets the profit part of a credit.
+    A null ``gain`` clears it.
     """
 
     id: DatabaseId
@@ -277,15 +279,21 @@ class TransactionApplyChange(BaseModel):
         None
     )
     currency: Annotated[str, StringConstraints(pattern=r"^[A-Z]{3}$")] | None = None
+    gain: Annotated[Decimal, Field(max_digits=12, decimal_places=2)] | None = None
 
     @model_validator(mode="after")
     def require_a_field(self) -> Self:
-        """Refuse a change that sets no field, or sets a non-note field to null."""
+        """Refuse a change that sets no field, or sets a non-nullable field to null."""
         fields = self.model_fields_set - {"id"}
         if not fields:
             raise ValueError("a change must set at least one field")
-        if None in self.model_dump(exclude_unset=True, exclude={"id", "note"}).values():
-            raise ValueError("only note can be null")
+        if (
+            None
+            in self.model_dump(
+                exclude_unset=True, exclude={"id", "note", "gain"}
+            ).values()
+        ):
+            raise ValueError("only note and gain can be null")
         return self
 
 

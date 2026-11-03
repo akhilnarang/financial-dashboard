@@ -46,6 +46,8 @@ PERSONAL_LOAN_SLUG = "personal_loan"
 FAMILY_SLUG = "family"
 # A gift the owner gives is spend. A gift the owner receives is income.
 GIFT_SLUG = "gift"
+# The income line that the gain of a credit joins.
+OTHER_INCOME_SLUG = "other_income"
 # Credits that reduce spend rather than count as income.
 CONTRA_EXPENSE_SLUGS = frozenset({"refund", "cashback_rewards", "reimbursement"})
 INTERNAL_SLUGS = frozenset(

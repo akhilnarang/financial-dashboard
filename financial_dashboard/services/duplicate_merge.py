@@ -312,7 +312,7 @@ async def move_references(
 async def _fold_manual_fields(
     session: AsyncSession, keep: Transaction, data: dict
 ) -> list[str]:
-    """Copy a manual category and note the keeper lacks. Return the conflicts."""
+    """Copy a manual category, note and gain the keeper lacks. Return the conflicts."""
     conflicts = []
     if data["category_method"] == "manual":
         if keep.category_method != "manual":
@@ -321,10 +321,12 @@ async def _fold_manual_fields(
             await supersede_active_decisions(session, keep.id)
         elif keep.category != data["category"]:
             conflicts.append("category")
-    if not keep.note:
-        keep.note = data["note"]
-    elif data["note"] and data["note"] != keep.note:
-        conflicts.append("note")
+    for name in ("note", "gain"):
+        kept, dropped = getattr(keep, name), data[name]
+        if kept in (None, ""):
+            setattr(keep, name, dropped)
+        elif dropped not in (None, "") and dropped != kept:
+            conflicts.append(name)
     if keep.exclude_from_cashflow != data["exclude_from_cashflow"]:
         conflicts.append("exclude_from_cashflow")
     if keep.voided != data["voided"]:

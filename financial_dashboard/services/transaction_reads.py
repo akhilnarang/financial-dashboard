@@ -157,6 +157,7 @@ def transaction_read(row: Transaction) -> transaction_schemas.TransactionRead:
         category_method=row.category_method,
         exclude_from_cashflow=row.exclude_from_cashflow,
         voided=row.voided,
+        gain=row.gain,
         review_status=row.review_status,
         created_at=row.created_at,
         enriched_at=row.enriched_at,

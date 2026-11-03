@@ -64,6 +64,7 @@ from financial_dashboard.schemas.cashflow import (
 from financial_dashboard.services.cashflow.buckets import (
     BUCKET_BY_SLUG,
     FAMILY_SLUG,
+    OTHER_INCOME_SLUG,
     TRANSFERS_IN_SLUG,
     bucket_for_slug,
     internal_slugs_for_scope,
@@ -111,6 +112,9 @@ SIGNED_AMOUNT = case(
 )
 SIGNED_FLOW = func.sum(SIGNED_AMOUNT)
 ROW_COUNT = func.count()
+GAIN_SUM = func.sum(Transaction.gain)
+# The buckets of the grouped scan. A gain moves out of these into other income.
+GAIN_BUCKETS = frozenset({"income", "expense", "investment"})
 
 # NULL, empty and whitespace-only are the same absence of a value, and one line of
 # the report must never list rows a different line's link would claim. So every
@@ -242,6 +246,7 @@ async def cashflow_summary(
                 Transaction.direction,
                 SIGNED_FLOW,
                 ROW_COUNT,
+                GAIN_SUM,
             )
             .where(in_range, INR_OR_NULL, BANK_SCOPE, INCLUDED)
             .group_by(Transaction.category, Transaction.direction)
@@ -252,9 +257,13 @@ async def cashflow_summary(
     expense: dict[str | None, CategoryLine] = {}
     investment: list[CategoryLine] = []
 
-    for slug, direction, flow, count in grouped:
-        signed = _decimal(flow)
+    for slug, direction, flow, count, gain_sum in grouped:
         bucket = bucket_for_slug(slug, scope=REPORT_SCOPE, direction=direction)
+        gain = _decimal(gain_sum) if bucket in GAIN_BUCKETS else Decimal(0)
+        signed = _decimal(flow) - gain
+        if gain:
+            # shortcut: other_income's drill-through and count omit the credits whose gain it adds; give gains their own linked line if that confuses.
+            _merge(income, OTHER_INCOME_SLUG, gain, 0)
         if bucket == "income":
             _merge(income, slug, signed, count)
         elif bucket == "expense":
@@ -449,15 +458,21 @@ async def _expense_detail(
     """
     rows = (
         await session.execute(
-            select(Transaction.category, Transaction.direction, SIGNED_FLOW, ROW_COUNT)
+            select(
+                Transaction.category,
+                Transaction.direction,
+                SIGNED_FLOW,
+                ROW_COUNT,
+                GAIN_SUM,
+            )
             .where(in_range, INR_OR_NULL, INCLUDED)
             .group_by(Transaction.category, Transaction.direction)
         )
     ).all()
     lines: dict[str | None, CategoryLine] = {}
-    for slug, direction, flow, count in rows:
+    for slug, direction, flow, count, gain in rows:
         if bucket_for_slug(slug, direction=direction) == "expense":
-            _merge(lines, slug, -_decimal(flow), count)
+            _merge(lines, slug, _decimal(gain) - _decimal(flow), count)
     return _bucket(sorted(lines.values(), key=_by_magnitude))
 
 
@@ -607,6 +622,7 @@ async def cashflow_trend(
                 Transaction.category,
                 Transaction.direction,
                 SIGNED_FLOW,
+                GAIN_SUM,
             )
             .where(in_window, INR_OR_NULL, BANK_SCOPE, INCLUDED)
             .group_by(month_key, Transaction.category, Transaction.direction)
@@ -640,10 +656,12 @@ async def cashflow_trend(
         for key in keys
     }
 
-    for month, slug, direction, flow in rows:
+    for month, slug, direction, flow, gain_sum in rows:
         point = points[month]
-        signed = _decimal(flow)
         bucket = bucket_for_slug(slug, scope=REPORT_SCOPE, direction=direction)
+        gain = _decimal(gain_sum) if bucket in GAIN_BUCKETS else Decimal(0)
+        point.income += gain
+        signed = _decimal(flow) - gain
         if bucket == "income":
             point.income += signed
         elif bucket == "expense":

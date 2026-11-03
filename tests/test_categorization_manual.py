@@ -318,6 +318,39 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         owed_id,
         first_id,
     ]
+    # A gain needs a credit, and a profit cannot exceed the amount.
+    no_gain = await client.post(
+        "/api/transactions/apply",
+        json={
+            "dry_run": False,
+            "changes": [
+                {"id": first_id, "gain": "1"},
+                {"id": credit_id, "gain": "5.01"},
+            ],
+        },
+    )
+    assert [e["id"] for e in no_gain.json()["detail"]["errors"]] == [
+        first_id,
+        credit_id,
+    ]
+    # An amount edit cannot shrink the amount below a stored gain.
+    sale = await _txn(session, amount="5", gain=Decimal("4"))
+    sale.direction = "credit"
+    await session.commit()
+    shrink = await client.post(
+        "/api/transactions/apply",
+        json={"dry_run": False, "changes": [{"id": sale.id, "amount": "3"}]},
+    )
+    assert shrink.status_code == 400
+    # A stored gain above the amount does not block a change that sets neither.
+    stale = await _txn(session, amount="5", gain=Decimal("9"))
+    stale.direction = "credit"
+    await session.commit()
+    noted = await client.post(
+        "/api/transactions/apply",
+        json={"dry_run": False, "changes": [{"id": stale.id, "note": "x"}]},
+    )
+    assert noted.status_code == 200, noted.text
 
     applied = await client.post(
         "/api/transactions/apply", json={"dry_run": False, "changes": changes}
@@ -337,6 +370,18 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     )
     assert again.json()["changed"] == []
     assert again.json()["unchanged"] == [first_id, second_id, credit_id]
+    # A loss may exceed the amount.
+    gain = await client.post(
+        "/api/transactions/apply",
+        json={"dry_run": False, "changes": [{"id": credit_id, "gain": "-50.00"}]},
+    )
+    assert gain.status_code == 200, gain.text
+    assert gain.json()["changed"][0]["changes"]["gain"] == {
+        "before": None,
+        "after": "-50.00",
+    }
+    detail = await client.get(f"/api/transactions/{credit_id}")
+    assert detail.json()["gain"] == "-50.00"
 
     categories = await client.get("/api/categories")
     buckets = {item["slug"]: item["bucket"] for item in categories.json()["items"]}

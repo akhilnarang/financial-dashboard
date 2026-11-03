@@ -111,12 +111,21 @@ async def test_reconciliation_identity(session: AsyncSession):
     # A received gift is income; a given gift is spend.
     await _add(session, direction="credit", amount=D("70"), category="gift")
     await _add(session, direction="debit", amount=D("60"), category="gift")
-    # Transfers in: 200.
-    await _add(session, direction="credit", amount=D("200"), category="repayment")
+    # Transfers in: 200. Its gain stays out of income, as the line has its own query.
+    await _add(
+        session,
+        direction="credit",
+        amount=D("200"),
+        category="repayment",
+        gain=D("7"),
+    )
     # Bank expense: 300 dining - 50 refund - 20 cashback + (400 - 100) of card
     # bills = 530.
     await _add(session, direction="debit", amount=D("300"), category="dining")
-    await _add(session, direction="credit", amount=D("50"), category="refund")
+    # The refund holds an 8 profit, so the refund line nets only 42.
+    await _add(
+        session, direction="credit", amount=D("50"), category="refund", gain=D("8")
+    )
     await _add(session, direction="credit", amount=D("20"), category="cashback_rewards")
     await _add(
         session, direction="debit", amount=D("400"), category="credit_card_payment"
@@ -124,11 +133,22 @@ async def test_reconciliation_identity(session: AsyncSession):
     await _add(
         session, direction="credit", amount=D("100"), category="credit_card_payment"
     )
-    # Net invested: 100 - 15 - 40 = 45. One slug in both directions is two lines.
+    # Net invested: 100 - (15 + 5) - (40 - 10) = 50. One slug in both
+    # directions is two lines. Other income: 10 gain - 5 loss + 8 refund gain.
     await _add(session, direction="debit", amount=D("100"), category="investment")
-    await _add(session, direction="credit", amount=D("15"), category="investment")
     await _add(
-        session, direction="credit", amount=D("40"), category="investment_redemption"
+        session,
+        direction="credit",
+        amount=D("15"),
+        category="investment",
+        gain=D("-5"),
+    )
+    await _add(
+        session,
+        direction="credit",
+        amount=D("40"),
+        category="investment_redemption",
+        gain=D("10"),
     )
     # Internal: excluded from every term above; gross 900, net -500.
     await _add(session, direction="debit", amount=D("700"), category="self_transfer")
@@ -158,31 +178,32 @@ async def test_reconciliation_identity(session: AsyncSession):
 
     s = await cashflow_summary(session, JUN, JUN_END)
 
-    assert s.income.total == D("1120")
+    assert s.income.total == D("1133")
     assert s.transfers_in.total == D("200")
-    assert s.expense.total == D("590")
-    assert s.investment.net == D("45")
+    assert s.expense.total == D("598")
+    assert s.investment.net == D("50")
     assert s.investment.contributions == D("100")
-    assert s.investment.redemptions == D("55")
-    # 1120 + 200 - 590 - 45, to the paisa.
+    assert s.investment.redemptions == D("50")
+    # 1133 + 200 - 598 - 50, to the paisa.
     assert s.net_cash_retained == D("685")
 
     # A line total is its effect on the bucket: a contra line is negative.
     expense = {ln.slug: ln.total for ln in s.expense.lines}
     assert expense["dining"] == D("300")
-    assert expense["refund"] == D("-50")
+    assert expense["refund"] == D("-42")
     assert expense["gift"] == D("60")
-    assert {ln.slug: ln.total for ln in s.income.lines}["gift"] == D("70")
+    income = {ln.slug: ln.total for ln in s.income.lines}
+    assert (income["gift"], income["other_income"]) == (D("70"), D("13"))
     assert expense["credit_card_payment"] == D("300")
     by_kind = {
         ln.kind: ln.total for ln in s.investment.lines if ln.slug == "investment"
     }
-    assert by_kind == {"contribution": D("100"), "redemption": D("-15")}
+    assert by_kind == {"contribution": D("100"), "redemption": D("-20")}
 
     # The detail is a different question over a different population: every
-    # account's expense-bucket rows (300 - 50 - 20 + 60 + 900 + 111). The card
+    # account's expense-bucket rows (300 - 42 - 20 + 60 + 900 + 111). The card
     # bill is internal here, or the swipe it settled would count twice.
-    assert s.expense_detail.total == D("1301")
+    assert s.expense_detail.total == D("1309")
     assert "credit_card_payment" not in {ln.slug for ln in s.expense_detail.lines}
 
     assert s.footnotes.internal_count == 2
@@ -246,6 +267,24 @@ async def test_trend_is_bank_scoped_zero_filled_and_stops_at_today(
         category="gift",
         transaction_date=datetime.date(2026, 6, 9),
     )
+    # A sale at a 100 gain: 500 back to net invested, 100 to income. A refund
+    # at a 10 loss: 40 off spend, -10 to income.
+    await _add(
+        session,
+        direction="credit",
+        amount=D("30"),
+        category="refund",
+        gain=D("-10"),
+        transaction_date=datetime.date(2026, 6, 11),
+    )
+    await _add(
+        session,
+        direction="credit",
+        amount=D("600"),
+        category="investment_redemption",
+        gain=D("100"),
+        transaction_date=datetime.date(2026, 6, 10),
+    )
     # A row after today is out of the partial month.
     await _add(
         session,
@@ -271,9 +310,9 @@ async def test_trend_is_bank_scoped_zero_filled_and_stops_at_today(
         assert (empty.income, empty.expense, empty.net_invested) == (0, 0, 0)
         assert empty.salary_count == 0
     jun = pts[-1]
-    assert jun.income == D("2300")
+    assert (jun.income, jun.net_invested) == (D("2390"), D("-500"))
     assert jun.salary_count == 3
-    assert jun.expense == D("2500")  # the bank's card bill, not the card swipe
+    assert jun.expense == D("2460")  # the bank's card bill, not the card swipe
 
 
 def test_resolve_range_independent_bounds():

@@ -222,6 +222,7 @@ async def answer(
         await move_receivable_links(session, recorded.id, target.id)
         await requeue_after_enrichment(session, target)
 
+        # shortcut: a hand-set gain on the deleted row is not carried to the target; copy it if gains on held rows become common.
         await session.delete(recorded)
         entry["imported_txn_id"] = target.id
         entry["ambiguous"] = False

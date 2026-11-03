@@ -183,6 +183,9 @@ async def test_batch_merges_each_pair_once(client, session):
     paid_alert, paid_statement, _ = await _seed_pair(
         session, alert_ref="555666", statement_ref="UTR000555666", direction="credit"
     )
+    paid_row = await session.get(Transaction, paid_statement)
+    assert paid_row is not None
+    paid_row.gain = Decimal("10.00")
     # A receivable links a row once, and a payment row pays one receivable.
     shared, own, paid, paid_twice = (
         Receivable(person=f"Friend {name}", amount=Decimal("100.00")) for name in "ABCD"
@@ -257,6 +260,8 @@ async def test_batch_merges_each_pair_once(client, session):
     assert keeper.balance == Decimal("5000.00")
     assert (keeper.category, keeper.category_method) == ("groceries", "manual")
     assert keeper.note == "weekly shop"
+    paid_keeper = await session.get(Transaction, paid_alert)
+    assert paid_keeper is not None and paid_keeper.gain == Decimal("10.00")
     stray = await session.scalar(
         select(SmsMessage).where(SmsMessage.body == "synthetic repeat 123456")
     )
