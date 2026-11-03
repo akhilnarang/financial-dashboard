@@ -137,9 +137,13 @@ async def test_non_inr_zero_lists_inr_and_null_currency_rows(client, session):
 
 
 async def test_provisional_lists_only_unconfirmed_screenshot_rows(client, session):
-    """A bank match appends its source, so only a bare screenshot row is provisional."""
+    """Only a bare, live screenshot row waits for a bank source to confirm it."""
     await _seed(session)
-    for amount, source in (("41", "screenshot"), ("42", "screenshot+sms")):
+    for amount, source, voided in (
+        ("41", "screenshot", False),
+        ("42", "screenshot+sms", False),
+        ("43", "screenshot", True),
+    ):
         session.add(
             Transaction(
                 bank="sbi",
@@ -147,6 +151,7 @@ async def test_provisional_lists_only_unconfirmed_screenshot_rows(client, sessio
                 direction="credit",
                 amount=Decimal(amount),
                 source=source,
+                voided=voided,
                 currency="INR",
                 transaction_date=DATED,
             )
@@ -161,7 +166,8 @@ async def test_provisional_lists_only_unconfirmed_screenshot_rows(client, sessio
     assert 'aria-label="Clear filters"' in r.text
 
     every = _transaction_rows_html((await client.get("/transactions")).text)
-    assert every.count(">Provisional<") == 1  # the confirmed row has no badge
+    # The confirmed row and the voided row have no badge.
+    assert every.count(">Provisional<") == 1
 
 
 # ---------------------------------------------------------------------------

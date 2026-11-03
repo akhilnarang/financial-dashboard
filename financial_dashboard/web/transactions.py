@@ -436,7 +436,7 @@ async def transaction_list(
         stmt = stmt.where(INCLUDED)
     if provisional == "1":
         # A bank match appends its source, so a bare "screenshot" is unconfirmed.
-        stmt = stmt.where(Transaction.source == "screenshot")
+        stmt = stmt.where(Transaction.source == "screenshot", NOT_VOIDED)
     account_scope = scope_predicate(scope)
     if account_scope is not None:
         # The report's own predicate, imported rather than restated: a cash-basis
