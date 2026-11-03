@@ -522,8 +522,10 @@ async def _merge_pair(
         if value
         for part in value.split("+")
     ]
-    # A bank statement import leaves the source empty. Its link still confirms
-    # a screenshot row, so the merged source must say so.
+    # A statement import or an email reparse leaves the source empty. Its link
+    # still confirms a screenshot row, so the merged source must say so.
+    if keep.email_id is not None:
+        parts.append("email")
     if keep.bank_statement_upload_id is not None:
         parts.append("bank_statement")
     sources = set(parts)

@@ -11,6 +11,7 @@ from financial_dashboard.db.models import as_utc, utc_now
 from financial_dashboard.db.models import (
     Account,
     BankStatementUpload,
+    Email,
     Category,
     CategoryReviewDecision,
     AuditInteraction,
@@ -1004,8 +1005,10 @@ async def test_void_and_merge_wait_for_a_yes(session, tool):
         account_id=1,
         voided=tool == "voided_keeper",
         attachment_path="bank.pdf" if tool == "two_attachments" else None,
-        # A statement import links the upload and leaves the source empty.
-        bank_statement_upload_id=1,
+        # A statement import or an email reparse links its source row and
+        # leaves the source empty.
+        email_id=1 if tool == "screenshot_keeper" else None,
+        bank_statement_upload_id=None if tool == "screenshot_keeper" else 1,
         email_type="bank_statement",
         direction="debit",
         amount=251 if tool == "refused_merge" else 250,
@@ -1023,6 +1026,7 @@ async def test_void_and_merge_wait_for_a_yes(session, tool):
             BankStatementUpload(
                 id=1, account_id=1, bank="sbi", filename="s.pdf", file_path="s.pdf"
             ),
+            Email(id=1, provider="test", message_id="<m@test>"),
             shot,
             bank_row,
         ]
@@ -1104,7 +1108,7 @@ async def test_void_and_merge_wait_for_a_yes(session, tool):
     elif tool == "screenshot_keeper":
         # The keeper keeps its screenshot source and gains the bank source.
         assert reply == f"Merged #{bank_row.id} into #{shot.id}. Not merged: note."
-        assert stored == [(shot.id, False, "shot.png", "screenshot+bank_statement")]
+        assert stored == [(shot.id, False, "shot.png", "screenshot+email")]
     else:
         assert reply == f"Merged #{shot.id} into #{bank_row.id}."
         assert stored == [(bank_row.id, False, "shot.png", "screenshot+bank_statement")]
