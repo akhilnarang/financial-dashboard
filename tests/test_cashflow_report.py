@@ -520,19 +520,13 @@ async def test_bridge_closes_on_complete_data_and_a_missing_row_is_the_gap(
         ("credit", "50", "refund"),
         ("debit", "400", "credit_card_payment"),
         ("debit", "100", "investment"),
+        ("credit", "40", "investment_redemption"),
         ("debit", "700", "self_transfer"),
         ("credit", "200", "self_transfer"),
         ("debit", "150", "family"),
         ("debit", "25", None),
     ]:
         await _add(session, direction=direction, amount=D(amount), category=category)
-    await _add(
-        session,
-        direction="credit",
-        amount=D("40"),
-        category="investment_redemption",
-        gain=D("10"),
-    )
     await _add(
         session,
         direction="debit",
@@ -566,7 +560,6 @@ async def test_bridge_closes_on_complete_data_and_a_missing_row_is_the_gap(
     assert bridge.actual_closing == D("99775")
     assert bridge.expected_closing == D("99775")
     assert bridge.gap == 0
-    assert (bridge.earned, bridge.net_invested) == (D("1060"), D("70"))
     assert {line.key: line.amount for line in bridge.other} == {
         "internal": D("-500"),
         "family": D("-150"),

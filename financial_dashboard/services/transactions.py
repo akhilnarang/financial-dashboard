@@ -271,13 +271,7 @@ async def _category_and_gain_error(
         txn.direction != "credit" or slug != INVESTMENT_REDEMPTION_SLUG
     ):
         return "A gain needs a credit row in investment_redemption"
-    if "gain" in change.model_fields_set:
-        gain = change.gain
-    elif (gain := txn.gain) is not None and change.currency not in (
-        None,
-        txn.currency,
-    ):
-        return "A currency change must set the gain in that currency too"
+    gain = change.gain if "gain" in change.model_fields_set else txn.gain
     if gain is not None and abs(gain) > (change.amount or txn.amount):
         return "A gain cannot be more than the amount"
     return None

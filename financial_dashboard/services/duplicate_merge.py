@@ -321,6 +321,7 @@ async def _fold_manual_fields(
             await supersede_active_decisions(session, keep.id)
         elif keep.category != data["category"]:
             conflicts.append("category")
+    # shortcut: copies gain across a currency-override merge; add a currency check if non-INR redemptions ever carry a gain.
     for name in ("note", "gain"):
         kept, dropped = getattr(keep, name), data[name]
         if kept in (None, ""):
