@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.db import Account, Card, Transaction
 from financial_dashboard.db.models import ReceivableLink
 from financial_dashboard.schemas import transactions as transaction_schemas
-from financial_dashboard.services.cashflow.buckets import INVESTMENT_REDEMPTION_SLUG
 from financial_dashboard.services.cc_disambiguation import (
     should_auto_reconcile_statement,
 )
@@ -260,19 +259,14 @@ async def _category_and_gain_error(
         find_manual_category,
     )
 
-    slug = txn.category
-    if change.category is not None:
-        slug = None
-        if change.category.strip():
-            if (found := await find_manual_category(session, change.category)) is None:
-                return f"Invalid category: {change.category!r}"
-            slug = found.slug
-    if change.gain is not None and (
-        txn.direction != "credit" or slug != INVESTMENT_REDEMPTION_SLUG
-    ):
-        return "A gain needs a credit row in investment_redemption"
+    category = change.category
+    if category and category.strip():
+        if await find_manual_category(session, category) is None:
+            return f"Invalid category: {category!r}"
+    if change.gain is not None and txn.direction != "credit":
+        return "A gain needs a credit row"
     gain = change.gain if "gain" in change.model_fields_set else txn.gain
-    if gain is not None and abs(gain) > (change.amount or txn.amount):
+    if gain is not None and gain > (change.amount or txn.amount):
         return "A gain cannot be more than the amount"
     return None
 

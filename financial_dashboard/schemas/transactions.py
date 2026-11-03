@@ -266,8 +266,8 @@ class TransactionApplyChange(BaseModel):
     An empty ``category`` clears the category. A null or empty ``note`` clears
     the note. ``amount`` and ``currency`` fix a row by hand, for example a
     foreign-currency charge whose rupee amount the bank shows before the
-    statement. ``gain`` sets the profit part of an ``investment_redemption``
-    credit. A null ``gain`` clears it.
+    statement. ``gain`` sets the profit part of a credit.
+    A null ``gain`` clears it.
     """
 
     id: DatabaseId

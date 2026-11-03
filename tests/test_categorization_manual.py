@@ -178,7 +178,7 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     the batch before any write, and the 400 names each invalid id. A real run
     writes every change with the side effects of /category. The category list
     names each slug's bank-scope bucket."""
-    for slug in ("groceries", "dining", "credit_card_payment", "investment_redemption"):
+    for slug in ("groceries", "dining", "credit_card_payment"):
         await ensure_category(session, slug)
     first = await _txn(
         session,
@@ -318,18 +318,14 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         owed_id,
         first_id,
     ]
-    # A gain needs a redemption credit, and it cannot exceed the amount.
+    # A gain needs a credit, and a profit cannot exceed the amount.
     no_gain = await client.post(
         "/api/transactions/apply",
         json={
             "dry_run": False,
             "changes": [
-                {"id": first_id, "category": "investment_redemption", "gain": "1"},
-                {
-                    "id": credit_id,
-                    "category": "investment_redemption",
-                    "gain": "-5.01",
-                },
+                {"id": first_id, "gain": "1"},
+                {"id": credit_id, "gain": "5.01"},
             ],
         },
     )
@@ -338,9 +334,7 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         credit_id,
     ]
     # An amount edit cannot shrink the amount below a stored gain.
-    sale = await _txn(
-        session, category="investment_redemption", amount="5", gain=Decimal("4")
-    )
+    sale = await _txn(session, amount="5", gain=Decimal("4"))
     sale.direction = "credit"
     await session.commit()
     shrink = await client.post(
@@ -367,22 +361,18 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     )
     assert again.json()["changed"] == []
     assert again.json()["unchanged"] == [first_id, second_id, credit_id]
+    # A loss may exceed the amount.
     gain = await client.post(
         "/api/transactions/apply",
-        json={
-            "dry_run": False,
-            "changes": [
-                {"id": credit_id, "category": "investment_redemption", "gain": "-5.00"}
-            ],
-        },
+        json={"dry_run": False, "changes": [{"id": credit_id, "gain": "-50.00"}]},
     )
     assert gain.status_code == 200, gain.text
     assert gain.json()["changed"][0]["changes"]["gain"] == {
         "before": None,
-        "after": "-5.00",
+        "after": "-50.00",
     }
     detail = await client.get(f"/api/transactions/{credit_id}")
-    assert detail.json()["gain"] == "-5.00"
+    assert detail.json()["gain"] == "-50.00"
 
     categories = await client.get("/api/categories")
     buckets = {item["slug"]: item["bucket"] for item in categories.json()["items"]}

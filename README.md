@@ -484,7 +484,7 @@ scripts/
 | `EmailSource` | `email_sources` | Gmail/Fastmail account with encrypted credentials and sync cursor |
 | `FetchRule` | `fetch_rules` | Sender/subject/folder/bank match rule linked to a source |
 | `Email` | `emails` | One row per fetched email; tracks parse status and links to a rule |
-| `Transaction` | `transactions` | Parsed financial transaction; links to email, account, card. `gain` is the profit part of an `investment_redemption` credit, which cashflow counts as other income |
+| `Transaction` | `transactions` | Parsed financial transaction; links to email, account, card. `gain` is the profit part of a credit, which cashflow counts as other income |
 | `Account` | `accounts` | Bank account, savings account, or credit card |
 | `Card` | `cards` | Physical payment card linked to an account (supports addon cards) |
 | `StatementUpload` | `statement_uploads` | CC statement PDF upload with reconciliation results stored as JSON |

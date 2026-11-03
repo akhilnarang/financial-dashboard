@@ -46,8 +46,7 @@ PERSONAL_LOAN_SLUG = "personal_loan"
 FAMILY_SLUG = "family"
 # A gift the owner gives is spend. A gift the owner receives is income.
 GIFT_SLUG = "gift"
-INVESTMENT_REDEMPTION_SLUG = "investment_redemption"
-# The income line that the gain of a redemption joins.
+# The income line that the gain of a credit joins.
 OTHER_INCOME_SLUG = "other_income"
 # Credits that reduce spend rather than count as income.
 CONTRA_EXPENSE_SLUGS = frozenset({"refund", "cashback_rewards", "reimbursement"})
@@ -71,16 +70,14 @@ BANK_INTERNAL_SLUGS = frozenset(
 # movement, not earnings; repayment is somebody handing money back and gets its
 # own line so it never inflates income.
 INCOME_BUCKET = frozenset(
-    INCOME_SLUGS
-    - CONTRA_EXPENSE_SLUGS
-    - {INVESTMENT_REDEMPTION_SLUG, TRANSFERS_IN_SLUG}
+    INCOME_SLUGS - CONTRA_EXPENSE_SLUGS - {"investment_redemption", TRANSFERS_IN_SLUG}
 )
 # cash_withdrawal is already an expense-guard slug; misc is neutral there. Both
 # are unioned in explicitly so the expense line is complete regardless.
 EXPENSE_BUCKET = frozenset(
     EXPENSE_SLUGS | CONTRA_EXPENSE_SLUGS | {"cash_withdrawal", "misc"}
 )
-INVESTMENT_BUCKET = frozenset({"investment", INVESTMENT_REDEMPTION_SLUG})
+INVESTMENT_BUCKET = frozenset({"investment", "investment_redemption"})
 
 BUCKET_BY_SLUG: dict[str, str] = {
     **{s: "income" for s in INCOME_BUCKET},

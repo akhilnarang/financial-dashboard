@@ -64,7 +64,6 @@ from financial_dashboard.schemas.cashflow import (
 from financial_dashboard.services.cashflow.buckets import (
     BUCKET_BY_SLUG,
     FAMILY_SLUG,
-    INVESTMENT_REDEMPTION_SLUG,
     OTHER_INCOME_SLUG,
     TRANSFERS_IN_SLUG,
     bucket_for_slug,
@@ -114,6 +113,8 @@ SIGNED_AMOUNT = case(
 SIGNED_FLOW = func.sum(SIGNED_AMOUNT)
 ROW_COUNT = func.count()
 GAIN_SUM = func.sum(Transaction.gain)
+# The buckets of the grouped scan. A gain moves out of these into other income.
+GAIN_BUCKETS = frozenset({"income", "expense", "investment"})
 
 # NULL, empty and whitespace-only are the same absence of a value, and one line of
 # the report must never list rows a different line's link would claim. So every
@@ -212,24 +213,6 @@ def _decimal(value: Decimal | None) -> Decimal:
     return Decimal(0) if value is None else value
 
 
-def _gain_of(slug: str | None, direction: str, gain: Decimal | None) -> Decimal:
-    """Give the part of a group's flow that is the gain of a redemption.
-
-    Args:
-        slug: The group's category.
-        direction: The group's direction.
-        gain: The sum of the group's ``gain`` column. It is None when no row
-            of the group has a gain.
-
-    Returns:
-        The gain of an ``investment_redemption`` credit group, else zero. The
-        report counts it as other income and not as redemption.
-    """
-    if slug == INVESTMENT_REDEMPTION_SLUG and direction == "credit" and gain:
-        return gain
-    return Decimal(0)
-
-
 def _by_magnitude(line: CategoryLine | CounterpartyLine) -> tuple[Decimal, str]:
     # Biggest contribution first, label breaking ties so the order is stable.
     return (-abs(line.total), line.label)
@@ -275,11 +258,12 @@ async def cashflow_summary(
     investment: list[CategoryLine] = []
 
     for slug, direction, flow, count, gain_sum in grouped:
-        gain = _gain_of(slug, direction, gain_sum)
+        bucket = bucket_for_slug(slug, scope=REPORT_SCOPE, direction=direction)
+        gain = _decimal(gain_sum) if bucket in GAIN_BUCKETS else Decimal(0)
         signed = _decimal(flow) - gain
         if gain:
+            # shortcut: other_income's drill-through and count omit the credits whose gain it adds; give gains their own linked line if that confuses.
             _merge(income, OTHER_INCOME_SLUG, gain, 0)
-        bucket = bucket_for_slug(slug, scope=REPORT_SCOPE, direction=direction)
         if bucket == "income":
             _merge(income, slug, signed, count)
         elif bucket == "expense":
@@ -668,10 +652,10 @@ async def cashflow_trend(
 
     for month, slug, direction, flow, gain_sum in rows:
         point = points[month]
-        gain = _gain_of(slug, direction, gain_sum)
+        bucket = bucket_for_slug(slug, scope=REPORT_SCOPE, direction=direction)
+        gain = _decimal(gain_sum) if bucket in GAIN_BUCKETS else Decimal(0)
         point.income += gain
         signed = _decimal(flow) - gain
-        bucket = bucket_for_slug(slug, scope=REPORT_SCOPE, direction=direction)
         if bucket == "income":
             point.income += signed
         elif bucket == "expense":

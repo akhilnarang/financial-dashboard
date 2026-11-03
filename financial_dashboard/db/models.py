@@ -690,9 +690,9 @@ class Transaction(Base):
     A voided row never counts as money. A statement row never matches it. An
     alert that arrives again still matches it, so a reparse does not add it again."""
     gain: Mapped[Decimal | None] = mapped_column(Numeric(precision=12, scale=2))
-    """The profit part of an ``investment_redemption`` credit. A loss is
+    """The profit part of a credit, such as a redemption or a resale. A loss is
     negative. The cashflow report counts it as other income and counts only the
-    rest as redemption. Null means the whole amount is redemption."""
+    rest on the row's own line. Null means no part is profit."""
     category: Mapped[str | None] = mapped_column(String)
     category_method: Mapped[str | None] = mapped_column(String)
     category_confidence: Mapped[float | None] = mapped_column(Float)
