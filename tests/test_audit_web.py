@@ -53,10 +53,17 @@ async def test_audit_detail_shows_model_and_action_evidence(session, client):
         model="test-model",
         prompt_version="assistant-v7",
         output_mode="json_schema",
+        error_code="screenshot_unreadable",
+        error_detail='Traceback (most recent call last):\n  File "test.py", line 1\nValueError: bad screenshot',
         conversation_id=conversation.id,
     )
     session.add(interaction)
     await session.commit()
+
+    list_response = await client.get("/audit")
+    assert list_response.status_code == 200
+    assert f'href="/audit/{interaction.id}"' in list_response.text
+    assert "set note to lunch" in list_response.text
 
     response = await client.get(f"/audit/{interaction.id}")
 
@@ -68,6 +75,10 @@ async def test_audit_detail_shows_model_and_action_evidence(session, client):
     assert "bounded explanation" in response.text
     assert "assistant-v7" in response.text
     assert "json_schema" in response.text
+    assert "screenshot_unreadable" in response.text
+    assert "Traceback (most recent call last):" in response.text
+    assert "ValueError: bad screenshot" in response.text
+    assert " ms · ?/?" not in response.text
     assert 'href="https://example.com/merchant"' in response.text
     assert 'href="javascript:' not in response.text
 

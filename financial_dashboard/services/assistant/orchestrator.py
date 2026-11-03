@@ -5,13 +5,14 @@ transport resolves the trusted reply target and passes it here.
 """
 
 import asyncio
+import datetime
 import hashlib
 import json
-import datetime
 import logging
 import re
-from decimal import Decimal, InvalidOperation
+import traceback
 from collections.abc import Awaitable, Callable, Sequence
+from decimal import Decimal, InvalidOperation
 from typing import NamedTuple, cast
 
 from sqlalchemy import select, update
@@ -150,6 +151,9 @@ _UNSUPPORTED_AGGREGATE = re.compile(
 
 
 _CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
+_SECRET_TRACEBACK_RE = re.compile(
+    r"(https?://api\.telegram\.org/(?:file/)?bot)[^/\s'\"]+|(Bearer\s+)[^\s'\"]+|(\bsk-[A-Za-z0-9_-]{8,})"
+)
 
 
 class OrchestrationResult(NamedTuple):
@@ -168,6 +172,7 @@ class OrchestrationResult(NamedTuple):
     latency_ms: int | None = None
     transaction_ids: tuple[int, ...] = ()
     confirmed_write: bool = False
+    error_detail: str | None = None
 
 
 class AuthorizationChanged(MutationRejected):
@@ -176,6 +181,34 @@ class AuthorizationChanged(MutationRejected):
 
 class ProcessingLeaseLost(Exception):
     """Another worker reclaimed this interaction while a turn was running."""
+
+
+def _format_exception_detail(exc: BaseException) -> str:
+    """Format an exception with its full stack trace for audit storage.
+
+    Args:
+        exc: The caught exception.
+
+    Returns:
+        The formatted traceback string.
+    """
+    from financial_dashboard.services.settings import (
+        get_gemini_api_key,
+        get_openai_api_key,
+        get_telegram_bot_token,
+    )
+
+    text = "".join(traceback.format_exception(exc)).strip()
+    for secret in (
+        get_telegram_bot_token(),
+        get_openai_api_key(),
+        get_gemini_api_key(),
+    ):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return _SECRET_TRACEBACK_RE.sub(
+        lambda m: f"{m.group(1) or m.group(2) or ''}[REDACTED]", text
+    )
 
 
 def _request_direction_policy(
@@ -521,6 +554,7 @@ async def run_turn(
         response: AssistantResponse,
         mutation_result: MutationResult | None = mutation,
         decision_id: int | None = None,
+        error_detail: str | None = None,
     ) -> OrchestrationResult:
         return OrchestrationResult(
             response,
@@ -541,6 +575,8 @@ async def run_turn(
                 if isinstance(record.get("latency_ms"), int)
             ),
             tuple(sorted(read_transaction_ids)),
+            False,
+            error_detail,
         )
 
     active_categories = list(categories) or await get_active_slugs(session)
@@ -577,13 +613,14 @@ async def run_turn(
                 {"payload": dict(result.raw_payload), "latency_ms": result.latency_ms}
             )
             response = parse_response(result.response.model_dump())
-        except ProviderFailure, ValueError, TypeError:
+        except (ProviderFailure, ValueError, TypeError) as exc:
             return completed(
                 Error(
                     outcome="error",
                     message="I couldn't safely interpret that request. Please rephrase it.",
                     code="invalid_model_output",
-                )
+                ),
+                error_detail=_format_exception_detail(exc),
             )
         writes_target = (
             isinstance(response, CategoryProposal)
@@ -710,7 +747,8 @@ async def run_turn(
                                 outcome="error",
                                 message=str(exc),
                                 code="confirmation_rejected",
-                            )
+                            ),
+                            error_detail=_format_exception_detail(exc),
                         )
             if isinstance(response, CategoryProposal):
                 try:
@@ -726,7 +764,8 @@ async def run_turn(
                                 "category plainly, e.g. 'category groceries'."
                             ),
                             code="proposal_rejected",
-                        )
+                        ),
+                        error_detail=_format_exception_detail(exc),
                     )
                 return completed(saved.proposal, None, saved.decision_id)
             return completed(response, mutation)
@@ -920,7 +959,8 @@ async def run_turn(
                             "'exclude from cashflow'."
                         ),
                         code="mutation_rejected",
-                    )
+                    ),
+                    error_detail=_format_exception_detail(exc),
                 )
             read_transaction_ids.update(pending_read_ids)
             tool_results.extend(pending_tool_results)
@@ -942,6 +982,7 @@ async def run_turn(
                             code="chain_stopped",
                         ),
                         mutation,
+                        error_detail=_format_exception_detail(exc),
                     )
                 return completed(
                     question.model_copy(
@@ -1600,6 +1641,7 @@ async def _queue_result(
         prompt_version=result.prompt_version,
         output_mode=result.output_mode,
         error_code=result.response.code if isinstance(result.response, Error) else None,
+        error_detail=result.error_detail,
         input_tokens=result.input_tokens,
         output_tokens=result.output_tokens,
         latency_ms=result.latency_ms,
@@ -1961,13 +2003,14 @@ async def _process_text_interaction(
             if result is None:
                 try:
                     provider = _provider_from_application_settings()
-                except ProviderFailure, ValueError, TypeError:
+                except (ProviderFailure, ValueError, TypeError) as exc:
                     result = OrchestrationResult(
                         Error(
                             outcome="error",
                             message="The assistant provider is not configured correctly.",
                             code="provider_configuration",
-                        )
+                        ),
+                        error_detail=_format_exception_detail(exc),
                     )
                 else:
                     result = await run_turn(
@@ -2093,10 +2136,11 @@ async def resume_claimed_interactions(*, bot=None, limit: int = 50) -> int:
                     )
                     if not isinstance(attachment_payload.get("file_id"), str):
                         raise ValueError
-                except ValueError, json.JSONDecodeError, AttributeError:
+                except (ValueError, json.JSONDecodeError, AttributeError) as exc:
                     interaction.status = "failed"
                     interaction.outcome = "error"
                     interaction.error_code = "invalid_attachment_payload"
+                    interaction.error_detail = _format_exception_detail(exc)
                     interaction.worker_token = None
                     interaction.processing_lease_until = None
                     await session.commit()
@@ -2136,12 +2180,28 @@ async def resume_claimed_interactions(*, bot=None, limit: int = 50) -> int:
                         replied_to_interaction_id=replied_to_interaction_id,
                         recipient_chat_id=recipient_chat_id,
                     )
-        except Exception:
+        except Exception as exc:
             # The lease expires and a later cycle retries the turn. One bad
             # turn must not stop the turns and deliveries after it.
             logger.exception(
                 "Assistant turn %s failed on attempt %s", interaction_id, attempt
             )
+            try:
+                async with async_session() as err_session:
+                    await err_session.execute(
+                        update(AuditInteraction)
+                        .where(
+                            AuditInteraction.id == interaction_id,
+                            AuditInteraction.status == "processing",
+                            AuditInteraction.worker_token == worker_token,
+                        )
+                        .values(error_detail=_format_exception_detail(exc))
+                    )
+                    await err_session.commit()
+            except Exception:
+                logger.exception(
+                    "Failed to record error detail for interaction %s", interaction_id
+                )
             continue
         resumed += 1
     return resumed
@@ -2445,7 +2505,8 @@ async def _process_attachment_interaction(
             if stored is not None:
                 remove_attachment(stored.relative_path)
             result = OrchestrationResult(
-                Error(outcome="error", message=str(exc), code="attachment_failed")
+                Error(outcome="error", message=str(exc), code="attachment_failed"),
+                error_detail=_format_exception_detail(exc),
             )
         except (
             OSError,
@@ -2453,7 +2514,7 @@ async def _process_attachment_interaction(
             TelegramError,
             RuntimeError,
             SQLAlchemyError,
-        ):
+        ) as exc:
             if committed:
                 import logging
 
@@ -2468,7 +2529,8 @@ async def _process_attachment_interaction(
                     outcome="error",
                     message="I couldn't download or store that receipt.",
                     code="attachment_failed",
-                )
+                ),
+                error_detail=_format_exception_detail(exc),
             )
     async with async_session() as session:
         try:
@@ -2530,6 +2592,8 @@ async def _process_screenshot_interaction(
 
     stored = None
     read = None
+    error_detail: str | None = None
+    vision_model = get_setting("openai.vision_model") or "gpt-6-luna"
     try:
         telegram_file = await bot.get_file(file_id)
         if not telegram_file.file_path:
@@ -2541,10 +2605,14 @@ async def _process_screenshot_interaction(
             image=stored.absolute_path.read_bytes(),
             media_type=stored.media_type,
             api_key=get_openai_api_key(),
-            model=get_setting("openai.vision_model") or "gpt-6-luna",
+            model=vision_model,
             base_url=get_openai_base_url(),
         )
-    except OSError, ValueError, httpx.HTTPError, TelegramError, OpenAIError:
+    except (OSError, ValueError, httpx.HTTPError, TelegramError, OpenAIError) as exc:
+        if stored is not None:
+            remove_attachment(stored.relative_path)
+            stored = None
+        error_detail = _format_exception_detail(exc)
         logger.exception("Screenshot %s could not be read", interaction_id)
     async with async_session() as session:
         try:
@@ -2555,21 +2623,26 @@ async def _process_screenshot_interaction(
                         outcome="error",
                         message="I couldn't read that screenshot.",
                         code="screenshot_unreadable",
-                    )
+                    ),
+                    provider="openai",
+                    model=vision_model,
+                    error_detail=error_detail,
                 )
             else:
-                result = await _screenshot_result(
-                    session,
-                    await review_screenshot(
+                result = (
+                    await _screenshot_result(
                         session,
-                        read,
-                        attachment_path=stored.relative_path,
-                        media_type=stored.media_type,
-                        not_duplicates=[],
-                    ),
-                    conversation_id=conversation_id,
-                    interaction_id=interaction_id,
-                )
+                        await review_screenshot(
+                            session,
+                            read,
+                            attachment_path=stored.relative_path,
+                            media_type=stored.media_type,
+                            not_duplicates=[],
+                        ),
+                        conversation_id=conversation_id,
+                        interaction_id=interaction_id,
+                    )
+                )._replace(provider="openai", model=vision_model)
             delivery_ids = await _queue_result(
                 session,
                 interaction_id=interaction_id,
@@ -2847,7 +2920,8 @@ async def _apply_pending(
         raise
     except MutationRejected as exc:
         return OrchestrationResult(
-            Error(outcome="error", message=str(exc), code="confirmation_rejected")
+            Error(outcome="error", message=str(exc), code="confirmation_rejected"),
+            error_detail=_format_exception_detail(exc),
         )
     done = mutation if isinstance(mutation, str) else "Saved."
     result = (
@@ -2879,7 +2953,8 @@ async def _apply_pending(
                 outcome="error",
                 message=f"{lead}I stopped and did not do the other changes: {exc}.",
                 code="chain_stopped",
-            )
+            ),
+            error_detail=_format_exception_detail(exc),
         )
     return result._replace(
         response=question.model_copy(

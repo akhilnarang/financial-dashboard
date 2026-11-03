@@ -471,6 +471,27 @@
         }
 
         /* ---------------------------------------------------------------
+           Detail & Audit Views
+        --------------------------------------------------------------- */
+        .row-link-target { position: relative; }
+        .row-link::after { content: ""; position: absolute; inset: 0; z-index: 1; }
+        .row-nested-link { position: relative; z-index: 2; }
+        .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0.75rem 1.25rem; margin: 0; }
+        .detail-grid dt, .audit-action-grid dt { font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.55; margin: 0; }
+        .detail-grid dd { margin: 0.15rem 0 0 0; font-size: 0.92rem; }
+        .detail-grid dd:empty::after { content: "\2014"; opacity: 0.35; }
+        .audit-card { background: var(--surface-muted); border: 1px solid var(--border-light); border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+        .audit-section-title { font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.65; margin: 1.5rem 0 0.6rem 0; }
+        .audit-prose { white-space: pre-wrap; word-break: break-word; background: var(--surface-muted); border: 1px solid var(--border-light); padding: 0.85rem 1rem; border-radius: 8px; font-size: 0.9rem; line-height: 1.5; }
+        .audit-json, .audit-error { white-space: pre-wrap; word-break: break-word; font-family: var(--font-mono); font-size: 0.78rem; margin: 0; overflow-x: auto; }
+        .audit-json { background: var(--surface-inset); border: 1px solid var(--border-light); padding: 0.75rem 0.9rem; border-radius: 6px; }
+        .audit-error { background: color-mix(in srgb, var(--clr-debit) 8%, var(--surface-muted)); border: 1px solid color-mix(in srgb, var(--clr-debit) 35%, var(--border-light)); padding: 0.85rem 1rem; border-radius: 8px; }
+        .audit-action-card { border: 1px solid var(--border-light); border-radius: 8px; background: var(--surface-muted); margin-bottom: 0.75rem; padding: 0.75rem 1rem; }
+        .audit-action-card > summary { cursor: pointer; font-weight: 600; }
+        .audit-action-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 0.75rem; margin-top: 0.75rem; }
+        .audit-action-grid dt { margin-bottom: 0.25rem; }
+
+        /* ---------------------------------------------------------------
            Footer
         --------------------------------------------------------------- */
         .app-footer {

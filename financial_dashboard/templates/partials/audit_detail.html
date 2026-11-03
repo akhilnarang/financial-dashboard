@@ -2,33 +2,137 @@
 {% block title %}Audit Interaction #{{ detail.interaction.id }} - Ledger{% endblock %}
 {% block content %}
 {% set row = detail.interaction %}
-<style>.audit-json{white-space:pre-wrap;word-break:break-word;background:var(--surface-muted);padding:.7rem;border-radius:7px;font-family:var(--font-mono);font-size:.78rem}</style>
-<h2>Audit interaction #{{ row.id }}</h2>
-<dl class="detail-grid">
-    <div><dt>Status</dt><dd>{{ row.status }}</dd></div>
-    <div><dt>Outcome</dt><dd>{{ row.outcome or '' }}</dd></div>
-    <div><dt>Trigger</dt><dd>{{ row.trigger }}</dd></div>
-    <div><dt>Conversation</dt><dd>{% if row.conversation_id %}#{{ row.conversation_id }}{% else %}none{% endif %}</dd></div>
-    <div><dt>Transaction</dt><dd>{% if row.transaction_id %}<a href="/transactions/{{ row.transaction_id }}">#{{ row.transaction_id }}</a>{% endif %}</dd></div>
-    <div><dt>Provider/model</dt><dd>{{ row.provider or '' }} {{ row.model or '' }}{% if row.prompt_version %} · prompt {{ row.prompt_version }}{% endif %}{% if row.output_mode %} · {{ row.output_mode }}{% endif %}</dd></div>
-    <div><dt>Latency/tokens</dt><dd>{{ row.latency_ms or '' }} ms · {{ row.input_tokens or '?' }}/{{ row.output_tokens or '?' }}</dd></div>
-</dl>
-{% if detail.conversation %}<h3>Conversation context</h3><div class="audit-json">started_by={{ detail.conversation.started_by }}<br>status={{ detail.conversation.status }}<br>started_at={{ detail.conversation.started_at }}<br>last_activity_at={{ detail.conversation.last_activity_at }}<br>expires_at={{ detail.conversation.expires_at }}{% if detail.conversation.pending_confirmation_kind %}<br>pending={{ detail.conversation.pending_confirmation_kind }}{% endif %}</div>{% endif %}
-<h3>User message</h3><div class="audit-json">{{ row.user_text or '' }}</div>
-<h3>Assistant response</h3><div class="audit-json">{{ row.assistant_text or '' }}</div>
-{% if row.model_explanation %}<h3>Model explanation</h3><div class="audit-json">{{ row.model_explanation }}</div>{% endif %}
-{% if merchant_sources %}<h3>Merchant lookup sources</h3><ul>{% for source in merchant_sources %}<li><a href="{{ source.url }}" rel="noopener noreferrer">{{ source.title or source.url }}</a></li>{% endfor %}</ul>{% endif %}
-{% if row.error_code %}<h3>Error</h3><div class="audit-json">{{ row.error_code }}: {{ row.error_detail or '' }}</div>{% endif %}
-{% if row.model_input_json %}<h3>Model input</h3><div class="audit-json">{{ pretty_json(row.model_input_json) }}</div>{% endif %}
-{% if row.model_output_json %}<h3>Model output</h3><div class="audit-json">{{ pretty_json(row.model_output_json) }}</div>{% endif %}
-<h3>Actions</h3>
+<div class="section-header" style="display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1rem;">
+    <h2 style="margin:0;">Audit interaction #{{ row.id }}</h2>
+    <a href="/audit">&larr; All audit interactions</a>
+</div>
+
+<div class="audit-card">
+    <dl class="detail-grid">
+        <div><dt>Status</dt><dd><span class="badge">{{ row.status }}</span></dd></div>
+        <div><dt>Outcome</dt><dd>{% if row.outcome %}<span class="badge {% if row.outcome == 'error' %}danger{% endif %}">{{ row.outcome }}</span>{% endif %}</dd></div>
+        <div><dt>Trigger</dt><dd><span class="badge">{{ row.trigger }}</span></dd></div>
+        <div><dt>Conversation</dt><dd>{% if row.conversation_id %}#{{ row.conversation_id }}{% else %}none{% endif %}</dd></div>
+        <div><dt>Transaction</dt><dd>{% if row.transaction_id %}<a href="/transactions/{{ row.transaction_id }}">#{{ row.transaction_id }}</a>{% endif %}</dd></div>
+        <div><dt>Provider/model</dt><dd>{% set provider_parts = [] %}{% if row.provider and row.model %}{% set _ = provider_parts.append(row.provider ~ ' ' ~ row.model) %}{% elif row.provider %}{% set _ = provider_parts.append(row.provider) %}{% elif row.model %}{% set _ = provider_parts.append(row.model) %}{% endif %}{% if row.prompt_version %}{% set _ = provider_parts.append('prompt ' ~ row.prompt_version) %}{% endif %}{% if row.output_mode %}{% set _ = provider_parts.append(row.output_mode) %}{% endif %}{{ provider_parts | join(' · ') }}</dd></div>
+        <div><dt>Latency/tokens</dt><dd>{% if row.latency_ms is not none or row.input_tokens is not none or row.output_tokens is not none %}{% if row.latency_ms is not none %}{{ row.latency_ms }} ms{% endif %}{% if row.latency_ms is not none and (row.input_tokens is not none or row.output_tokens is not none) %} · {% endif %}{% if row.input_tokens is not none or row.output_tokens is not none %}{{ row.input_tokens if row.input_tokens is not none else '?' }}/{{ row.output_tokens if row.output_tokens is not none else '?' }} tokens{% endif %}{% endif %}</dd></div>
+    </dl>
+</div>
+
+{% if detail.conversation %}
+<h3 class="audit-section-title">Conversation context</h3>
+<div class="audit-card">
+    <dl class="detail-grid">
+        <div><dt>Started by</dt><dd><span class="badge">{{ detail.conversation.started_by }}</span></dd></div>
+        <div><dt>Status</dt><dd><span class="badge">{{ detail.conversation.status }}</span></dd></div>
+        <div><dt>Started at</dt><dd>{{ detail.conversation.started_at }}</dd></div>
+        <div><dt>Last activity</dt><dd>{{ detail.conversation.last_activity_at }}</dd></div>
+        <div><dt>Expires at</dt><dd>{{ detail.conversation.expires_at or '' }}</dd></div>
+        {% if detail.conversation.pending_confirmation_kind %}
+        <div><dt>Pending confirmation</dt><dd><span class="badge">{{ detail.conversation.pending_confirmation_kind }}</span></dd></div>
+        {% endif %}
+    </dl>
+</div>
+{% endif %}
+
+<h3 class="audit-section-title">User message</h3>
+<div class="audit-prose">{{ row.user_text or '—' }}</div>
+
+<h3 class="audit-section-title">Assistant response</h3>
+<div class="audit-prose">{{ row.assistant_text or '—' }}</div>
+
+{% if row.model_explanation %}
+<h3 class="audit-section-title">Model explanation</h3>
+<div class="audit-prose">{{ row.model_explanation }}</div>
+{% endif %}
+
+{% if merchant_sources %}
+<h3 class="audit-section-title">Merchant lookup sources</h3>
+<div class="audit-card">
+    <ul style="margin:0;padding-left:1.25rem;">
+    {% for source in merchant_sources %}
+        <li><a href="{{ source.url }}" rel="noopener noreferrer">{{ source.title or source.url }}</a></li>
+    {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+{% if row.error_code or row.error_detail %}
+<h3 class="audit-section-title">Error</h3>
+<pre class="audit-error">{% if row.error_code %}{{ row.error_code }}{% if row.error_detail %}: {{ row.error_detail }}{% endif %}{% else %}{{ row.error_detail }}{% endif %}</pre>
+{% endif %}
+
+{% if row.model_input_json %}
+<h3 class="audit-section-title">Model input</h3>
+<pre class="audit-json">{{ pretty_json(row.model_input_json) }}</pre>
+{% endif %}
+
+{% if row.model_output_json %}
+<h3 class="audit-section-title">Model output</h3>
+<pre class="audit-json">{{ pretty_json(row.model_output_json) }}</pre>
+{% endif %}
+
+<h3 class="audit-section-title">Actions</h3>
 {% for action in detail.actions %}
-<details><summary>{{ action.action_type }} · {{ action.status }}</summary>
-<div class="audit-json">arguments={{ pretty_json(action.arguments_json) }}<br>before={{ pretty_json(action.before_json) }}<br>after={{ pretty_json(action.after_json) }}<br>undo={{ action.undo_status or 'n/a' }}{% if action.undone_by_interaction_id %}<br>undone_by=<a href="/audit/{{ action.undone_by_interaction_id }}">#{{ action.undone_by_interaction_id }}</a>{% endif %}</div>
+<details class="audit-action-card" open>
+    <summary><span class="badge">{{ action.action_type }}</span> · <span class="badge">{{ action.status }}</span> · {{ action.target_type }} #{{ action.target_id }} · undo: {{ action.undo_status or 'n/a' }}{% if action.undone_by_interaction_id %} · undone by <a href="/audit/{{ action.undone_by_interaction_id }}">#{{ action.undone_by_interaction_id }}</a>{% endif %}</summary>
+    <div class="audit-action-grid">
+        <div>
+            <dt>Arguments</dt>
+            <pre class="audit-json">{{ pretty_json(action.arguments_json) }}</pre>
+        </div>
+        <div>
+            <dt>Before</dt>
+            <pre class="audit-json">{{ pretty_json(action.before_json) }}</pre>
+        </div>
+        <div>
+            <dt>After</dt>
+            <pre class="audit-json">{{ pretty_json(action.after_json) }}</pre>
+        </div>
+    </div>
 </details>
-{% else %}<p>No mutations.</p>{% endfor %}
-<h3>Deliveries</h3>
-{% for delivery in detail.deliveries %}<div class="audit-json">#{{ delivery.id }} {{ delivery.status }} attempts={{ delivery.delivery_attempts }} recipient={{ delivery.recipient_chat_id }}<br>{{ delivery.text }}</div>{% else %}<p>No outbound messages.</p>{% endfor %}
-<h3>Telegram message contexts</h3>
-{% for context in detail.message_contexts %}<div class="audit-json">#{{ context.id }} kind={{ context.context_kind }} chat={{ context.chat_id }} message={{ context.message_id }} conversation={{ context.conversation_id or '' }} transaction={{ context.transaction_id or '' }} interaction={{ context.interaction_id or '' }} delivery={{ context.outbound_delivery_id or '' }}</div>{% else %}<p>No physical message mappings.</p>{% endfor %}
+{% else %}
+<p class="text-muted">No mutations.</p>
+{% endfor %}
+
+<h3 class="audit-section-title">Deliveries</h3>
+{% for delivery in detail.deliveries %}
+<div class="audit-card">
+    <div style="display:flex;flex-wrap:wrap;gap:0.75rem;align-items:center;font-size:0.85rem;">
+        <strong>#{{ delivery.id }}</strong>
+        <span class="badge">{{ delivery.status }}</span>
+        <span>Attempts: {{ delivery.delivery_attempts }}</span>
+        <span>Recipient: {{ delivery.recipient_chat_id }}</span>
+        {% if delivery.transaction_id %}<span>Transaction: <a href="/transactions/{{ delivery.transaction_id }}">#{{ delivery.transaction_id }}</a></span>{% endif %}
+    </div>
+    <div class="audit-prose" style="margin-top: 0.6rem;">{{ delivery.text }}</div>
+</div>
+{% else %}
+<p class="text-muted">No outbound messages.</p>
+{% endfor %}
+
+<h3 class="audit-section-title">Telegram message contexts</h3>
+{% if detail.message_contexts %}
+<div class="table" style="overflow-x:auto;">
+<table>
+    <thead><tr><th>ID</th><th>Kind</th><th>Chat</th><th>Message</th><th>Conversation</th><th>Transaction</th><th>Interaction</th><th>Delivery</th></tr></thead>
+    <tbody>
+    {% for context in detail.message_contexts %}
+    <tr>
+        <td>#{{ context.id }}</td>
+        <td><span class="badge">{{ context.context_kind }}</span></td>
+        <td>{{ context.chat_id }}</td>
+        <td>{{ context.message_id }}</td>
+        <td>{% if context.conversation_id %}#{{ context.conversation_id }}{% else %}<span class="text-muted">&mdash;</span>{% endif %}</td>
+        <td>{% if context.transaction_id %}<a href="/transactions/{{ context.transaction_id }}">#{{ context.transaction_id }}</a>{% else %}<span class="text-muted">&mdash;</span>{% endif %}</td>
+        <td>{% if context.interaction_id %}<a href="/audit/{{ context.interaction_id }}">#{{ context.interaction_id }}</a>{% else %}<span class="text-muted">&mdash;</span>{% endif %}</td>
+        <td>{% if context.outbound_delivery_id %}#{{ context.outbound_delivery_id }}{% else %}<span class="text-muted">&mdash;</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+</div>
+{% else %}
+<p class="text-muted">No physical message mappings.</p>
+{% endif %}
 {% endblock %}
