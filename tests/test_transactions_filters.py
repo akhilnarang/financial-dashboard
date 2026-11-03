@@ -136,6 +136,34 @@ async def test_non_inr_zero_lists_inr_and_null_currency_rows(client, session):
     assert _count_rows(r.text) == 2
 
 
+async def test_provisional_lists_only_unconfirmed_screenshot_rows(client, session):
+    """A bank match appends its source, so only a bare screenshot row is provisional."""
+    await _seed(session)
+    for amount, source in (("41", "screenshot"), ("42", "screenshot+sms")):
+        session.add(
+            Transaction(
+                bank="sbi",
+                email_type="upi_screenshot",
+                direction="credit",
+                amount=Decimal(amount),
+                source=source,
+                currency="INR",
+                transaction_date=DATED,
+            )
+        )
+    await session.flush()
+
+    r = await client.get("/transactions?provisional=1")
+    rows = _transaction_rows_html(r.text)
+    assert _count_rows(r.text) == 1
+    assert "41.00" in rows
+    assert "Provisional" in rows
+    assert 'aria-label="Clear filters"' in r.text
+
+    every = _transaction_rows_html((await client.get("/transactions")).text)
+    assert every.count(">Provisional<") == 1  # the confirmed row has no badge
+
+
 # ---------------------------------------------------------------------------
 # ?scope= — the account perimeter a cashflow figure was drawn over.
 #

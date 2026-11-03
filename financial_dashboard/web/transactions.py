@@ -281,6 +281,10 @@ async def transaction_list(
             "it; omit for no filter"
         ),
     ] = None,
+    provisional: Annotated[
+        str | None,
+        Query(description="Set to 1 for screenshot rows no bank source confirmed yet"),
+    ] = None,
     scope: Annotated[
         Scope | None,
         Query(
@@ -315,6 +319,8 @@ async def transaction_list(
             legacy rows without a currency.
         undated: ``"1"`` selects rows without a transaction date that are not
             voided.
+        provisional: ``"1"`` selects screenshot rows that no bank source
+            confirms yet.
         scope: Optional account perimeter used by cash-flow drill-down links.
         sort: Requested sort key; invalid values fall back to transaction date.
         order: Sort direction; invalid values fall back to descending.
@@ -428,6 +434,9 @@ async def transaction_list(
         # The rows still in the cashflow. The report's figures sum these. Every
         # headline drill carries this value, so a tile links to the rows it counted.
         stmt = stmt.where(INCLUDED)
+    if provisional == "1":
+        # A bank match appends its source, so a bare "screenshot" is unconfirmed.
+        stmt = stmt.where(Transaction.source == "screenshot")
     account_scope = scope_predicate(scope)
     if account_scope is not None:
         # The report's own predicate, imported rather than restated: a cash-basis
@@ -578,6 +587,7 @@ async def transaction_list(
         "non_inr": non_inr,
         "undated": undated,
         "excluded": excluded,
+        "provisional": provisional,
         # A drill param like any other, so paging and re-sorting keep it: a page-2
         # or newly-sorted link that dropped the scope would widen the listing to
         # every account while still claiming to be the figure's rows.
