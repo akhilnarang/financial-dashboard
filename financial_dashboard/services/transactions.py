@@ -267,11 +267,12 @@ async def _category_and_gain_error(
             if (found := await find_manual_category(session, change.category)) is None:
                 return f"Invalid category: {change.category!r}"
             slug = found.slug
-    if change.gain is None:
-        return None
-    if txn.direction != "credit" or slug != INVESTMENT_REDEMPTION_SLUG:
+    if change.gain is not None and (
+        txn.direction != "credit" or slug != INVESTMENT_REDEMPTION_SLUG
+    ):
         return "A gain needs a credit row in investment_redemption"
-    if abs(change.gain) > (change.amount or txn.amount):
+    gain = change.gain if "gain" in change.model_fields_set else txn.gain
+    if gain is not None and abs(gain) > (change.amount or txn.amount):
         return "A gain cannot be more than the amount"
     return None
 

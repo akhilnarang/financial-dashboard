@@ -337,6 +337,17 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         first_id,
         credit_id,
     ]
+    # An amount edit cannot shrink the amount below a stored gain.
+    sale = await _txn(
+        session, category="investment_redemption", amount="5", gain=Decimal("4")
+    )
+    sale.direction = "credit"
+    await session.commit()
+    shrink = await client.post(
+        "/api/transactions/apply",
+        json={"dry_run": False, "changes": [{"id": sale.id, "amount": "3"}]},
+    )
+    assert shrink.status_code == 400
 
     applied = await client.post(
         "/api/transactions/apply", json={"dry_run": False, "changes": changes}
