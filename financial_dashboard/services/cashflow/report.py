@@ -458,15 +458,21 @@ async def _expense_detail(
     """
     rows = (
         await session.execute(
-            select(Transaction.category, Transaction.direction, SIGNED_FLOW, ROW_COUNT)
+            select(
+                Transaction.category,
+                Transaction.direction,
+                SIGNED_FLOW,
+                ROW_COUNT,
+                GAIN_SUM,
+            )
             .where(in_range, INR_OR_NULL, INCLUDED)
             .group_by(Transaction.category, Transaction.direction)
         )
     ).all()
     lines: dict[str | None, CategoryLine] = {}
-    for slug, direction, flow, count in rows:
+    for slug, direction, flow, count, gain in rows:
         if bucket_for_slug(slug, direction=direction) == "expense":
-            _merge(lines, slug, -_decimal(flow), count)
+            _merge(lines, slug, _decimal(gain) - _decimal(flow), count)
     return _bucket(sorted(lines.values(), key=_by_magnitude))
 
 

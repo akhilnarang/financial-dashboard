@@ -201,9 +201,9 @@ async def test_reconciliation_identity(session: AsyncSession):
     assert by_kind == {"contribution": D("100"), "redemption": D("-20")}
 
     # The detail is a different question over a different population: every
-    # account's expense-bucket rows (300 - 50 - 20 + 60 + 900 + 111). The card
+    # account's expense-bucket rows (300 - 42 - 20 + 60 + 900 + 111). The card
     # bill is internal here, or the swipe it settled would count twice.
-    assert s.expense_detail.total == D("1301")
+    assert s.expense_detail.total == D("1309")
     assert "credit_card_payment" not in {ln.slug for ln in s.expense_detail.lines}
 
     assert s.footnotes.internal_count == 2

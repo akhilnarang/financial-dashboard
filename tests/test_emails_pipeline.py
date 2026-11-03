@@ -717,6 +717,7 @@ async def test_reparse_applies_the_name_rule(
 
     A label must not replace the name the bank states. A label that fills an
     empty name must also store its source, so a later bank name can replace it.
+    A new amount drops the stored gain, as the gain was part of the old amount.
     """
     rule_id = await _seed_rule(session_maker, bank="hdfc")
     async with session_maker() as s:
@@ -743,6 +744,7 @@ async def test_reparse_applies_the_name_rule(
                 counterparty_source="bank",
                 email_id=em.id,
                 source="email",
+                gain=Decimal("5"),
             )
         )
         await s.commit()
@@ -751,6 +753,7 @@ async def test_reparse_applies_the_name_rule(
     txn_data = _txn_data(
         bank="hdfc",
         email_type="hdfc_account_neft_debit_alert",
+        amount=Decimal("400"),
         transaction_date=datetime.date(2026, 6, 2),
         transaction_time=None,
         counterparty="My Saved Payee",
@@ -763,6 +766,7 @@ async def test_reparse_applies_the_name_rule(
     async with session_maker() as s:
         row = (await s.execute(select(Transaction))).scalars().one()
         assert (row.counterparty, row.counterparty_source) == expected
+        assert row.gain is None
 
 
 def test_populate_imports_only_the_leg_that_owns_the_row():

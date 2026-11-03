@@ -535,6 +535,8 @@ async def _apply_reparsed_transaction(
                 refresh_diff.filled.keys() | refresh_diff.overwritten.keys()
             ):
                 existing.amount_source = "bank"
+                # A gain is part of the old amount, so a new amount drops it.
+                existing.gain = None
             if existing.transaction_time != previous_transaction_time:
                 # This column describes the stored time. If a refresh changes
                 # the time, it must also change the time source. If it does
