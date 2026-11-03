@@ -174,7 +174,7 @@ async def transactions_apply(
     payload: transaction_schemas.TransactionApplyRequest,
     session: AsyncSessionDep,
 ) -> transaction_schemas.TransactionApplyResponse:
-    """Apply note, category, exclusion and void changes to many rows at once.
+    """Apply note, category, exclusion, void, amount and gain changes to many rows at once.
 
     ``dry_run`` defaults to true and writes nothing. One invalid change rejects
     the whole request with a 400 that lists each invalid change, and nothing is

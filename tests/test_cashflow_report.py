@@ -124,11 +124,23 @@ async def test_reconciliation_identity(session: AsyncSession):
     await _add(
         session, direction="credit", amount=D("100"), category="credit_card_payment"
     )
-    # Net invested: 100 - 15 - 40 = 45. One slug in both directions is two lines.
+    # Net invested: 100 - 15 - (40 - 10) = 55. One slug in both directions is
+    # two lines. The 10 gain of the redemption is other income. A gain on any
+    # other slug is ignored.
     await _add(session, direction="debit", amount=D("100"), category="investment")
-    await _add(session, direction="credit", amount=D("15"), category="investment")
     await _add(
-        session, direction="credit", amount=D("40"), category="investment_redemption"
+        session,
+        direction="credit",
+        amount=D("15"),
+        category="investment",
+        gain=D("5"),
+    )
+    await _add(
+        session,
+        direction="credit",
+        amount=D("40"),
+        category="investment_redemption",
+        gain=D("10"),
     )
     # Internal: excluded from every term above; gross 900, net -500.
     await _add(session, direction="debit", amount=D("700"), category="self_transfer")
@@ -158,13 +170,13 @@ async def test_reconciliation_identity(session: AsyncSession):
 
     s = await cashflow_summary(session, JUN, JUN_END)
 
-    assert s.income.total == D("1120")
+    assert s.income.total == D("1130")
     assert s.transfers_in.total == D("200")
     assert s.expense.total == D("590")
-    assert s.investment.net == D("45")
+    assert s.investment.net == D("55")
     assert s.investment.contributions == D("100")
-    assert s.investment.redemptions == D("55")
-    # 1120 + 200 - 590 - 45, to the paisa.
+    assert s.investment.redemptions == D("45")
+    # 1130 + 200 - 590 - 55, to the paisa.
     assert s.net_cash_retained == D("685")
 
     # A line total is its effect on the bucket: a contra line is negative.
@@ -172,7 +184,8 @@ async def test_reconciliation_identity(session: AsyncSession):
     assert expense["dining"] == D("300")
     assert expense["refund"] == D("-50")
     assert expense["gift"] == D("60")
-    assert {ln.slug: ln.total for ln in s.income.lines}["gift"] == D("70")
+    income = {ln.slug: ln.total for ln in s.income.lines}
+    assert (income["gift"], income["other_income"]) == (D("70"), D("10"))
     assert expense["credit_card_payment"] == D("300")
     by_kind = {
         ln.kind: ln.total for ln in s.investment.lines if ln.slug == "investment"
@@ -246,6 +259,15 @@ async def test_trend_is_bank_scoped_zero_filled_and_stops_at_today(
         category="gift",
         transaction_date=datetime.date(2026, 6, 9),
     )
+    # A sale at a 100 gain: 500 back to net invested, 100 to income.
+    await _add(
+        session,
+        direction="credit",
+        amount=D("600"),
+        category="investment_redemption",
+        gain=D("100"),
+        transaction_date=datetime.date(2026, 6, 10),
+    )
     # A row after today is out of the partial month.
     await _add(
         session,
@@ -271,7 +293,7 @@ async def test_trend_is_bank_scoped_zero_filled_and_stops_at_today(
         assert (empty.income, empty.expense, empty.net_invested) == (0, 0, 0)
         assert empty.salary_count == 0
     jun = pts[-1]
-    assert jun.income == D("2300")
+    assert (jun.income, jun.net_invested) == (D("2400"), D("-500"))
     assert jun.salary_count == 3
     assert jun.expense == D("2500")  # the bank's card bill, not the card swipe
 
@@ -498,13 +520,19 @@ async def test_bridge_closes_on_complete_data_and_a_missing_row_is_the_gap(
         ("credit", "50", "refund"),
         ("debit", "400", "credit_card_payment"),
         ("debit", "100", "investment"),
-        ("credit", "40", "investment_redemption"),
         ("debit", "700", "self_transfer"),
         ("credit", "200", "self_transfer"),
         ("debit", "150", "family"),
         ("debit", "25", None),
     ]:
         await _add(session, direction=direction, amount=D(amount), category=category)
+    await _add(
+        session,
+        direction="credit",
+        amount=D("40"),
+        category="investment_redemption",
+        gain=D("10"),
+    )
     await _add(
         session,
         direction="debit",
@@ -538,6 +566,7 @@ async def test_bridge_closes_on_complete_data_and_a_missing_row_is_the_gap(
     assert bridge.actual_closing == D("99775")
     assert bridge.expected_closing == D("99775")
     assert bridge.gap == 0
+    assert (bridge.earned, bridge.net_invested) == (D("1060"), D("70"))
     assert {line.key: line.amount for line in bridge.other} == {
         "internal": D("-500"),
         "family": D("-150"),

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.db import Account, Card, Transaction
 from financial_dashboard.db.models import ReceivableLink
 from financial_dashboard.schemas import transactions as transaction_schemas
+from financial_dashboard.services.cashflow.buckets import INVESTMENT_REDEMPTION_SLUG
 from financial_dashboard.services.cc_disambiguation import (
     should_auto_reconcile_statement,
 )
@@ -36,6 +37,7 @@ class ApplySnapshot(NamedTuple):
     amount: Decimal
     currency: str | None
     amount_source: str
+    gain: Decimal | None
 
 
 def _apply_snapshot(txn: Transaction) -> ApplySnapshot:
@@ -52,6 +54,7 @@ def _apply_snapshot(txn: Transaction) -> ApplySnapshot:
         amount=txn.amount,
         currency=txn.currency,
         amount_source=txn.amount_source,
+        gain=txn.gain,
     )
 
 
@@ -238,6 +241,41 @@ class ApplyResult(NamedTuple):
     unchanged: list[int]
 
 
+async def _category_and_gain_error(
+    session: AsyncSession,
+    txn: Transaction,
+    change: transaction_schemas.TransactionApplyChange,
+) -> str | None:
+    """Check the category and the gain of one change. Do not write.
+
+    Args:
+        session: Request session.
+        txn: The row to change.
+        change: The fields to set.
+
+    Returns:
+        The reason the change is invalid, or None when it is valid.
+    """
+    from financial_dashboard.services.categorization.manual import (
+        find_manual_category,
+    )
+
+    slug = txn.category
+    if change.category is not None:
+        slug = None
+        if change.category.strip():
+            if (found := await find_manual_category(session, change.category)) is None:
+                return f"Invalid category: {change.category!r}"
+            slug = found.slug
+    if change.gain is None:
+        return None
+    if txn.direction != "credit" or slug != INVESTMENT_REDEMPTION_SLUG:
+        return "A gain needs a credit row in investment_redemption"
+    if abs(change.gain) > (change.amount or txn.amount):
+        return "A gain cannot be more than the amount"
+    return None
+
+
 async def _validate_change(
     session: AsyncSession, change: transaction_schemas.TransactionApplyChange
 ) -> str | None:
@@ -250,17 +288,11 @@ async def _validate_change(
     Returns:
         The reason the change is invalid, or None when it is valid.
     """
-    from financial_dashboard.services.categorization.manual import (
-        find_manual_category,
-    )
-
     txn = await session.get(Transaction, change.id)
     if txn is None:
         return "Transaction not found"
-    category = change.category
-    if category and category.strip():
-        if await find_manual_category(session, category) is None:
-            return f"Invalid category: {category!r}"
+    if (error := await _category_and_gain_error(session, txn, change)) is not None:
+        return error
     if change.voided is not None:
         try:
             await check_voidable(session, txn, change.voided)
@@ -306,6 +338,10 @@ async def _apply_change_no_commit(
         )
     if change.voided is not None:
         await set_transaction_voided_no_commit(session, txn_id, change.voided)
+    if "gain" in change.model_fields_set:
+        txn = await session.get(Transaction, txn_id)
+        assert txn is not None
+        txn.gain = change.gain
     if change.amount is not None or change.currency is not None:
         txn = await session.get(Transaction, txn_id)
         assert txn is not None
@@ -322,7 +358,7 @@ async def apply_transaction_changes(
     *,
     dry_run: bool,
 ) -> ApplyResult:
-    """Apply note, category, exclusion, void, amount and currency changes as one unit.
+    """Apply note, category, exclusion, void, amount, currency and gain changes as one unit.
 
     The function checks every change before it changes a row, so a rejected
     batch takes no write lock. Each change then goes through the same per-row

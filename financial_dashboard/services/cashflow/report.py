@@ -64,6 +64,8 @@ from financial_dashboard.schemas.cashflow import (
 from financial_dashboard.services.cashflow.buckets import (
     BUCKET_BY_SLUG,
     FAMILY_SLUG,
+    INVESTMENT_REDEMPTION_SLUG,
+    OTHER_INCOME_SLUG,
     TRANSFERS_IN_SLUG,
     bucket_for_slug,
     internal_slugs_for_scope,
@@ -111,6 +113,7 @@ SIGNED_AMOUNT = case(
 )
 SIGNED_FLOW = func.sum(SIGNED_AMOUNT)
 ROW_COUNT = func.count()
+GAIN_SUM = func.sum(Transaction.gain)
 
 # NULL, empty and whitespace-only are the same absence of a value, and one line of
 # the report must never list rows a different line's link would claim. So every
@@ -209,6 +212,24 @@ def _decimal(value: Decimal | None) -> Decimal:
     return Decimal(0) if value is None else value
 
 
+def _gain_of(slug: str | None, direction: str, gain: Decimal | None) -> Decimal:
+    """Give the part of a group's flow that is the gain of a redemption.
+
+    Args:
+        slug: The group's category.
+        direction: The group's direction.
+        gain: The sum of the group's ``gain`` column. It is None when no row
+            of the group has a gain.
+
+    Returns:
+        The gain of an ``investment_redemption`` credit group, else zero. The
+        report counts it as other income and not as redemption.
+    """
+    if slug == INVESTMENT_REDEMPTION_SLUG and direction == "credit" and gain:
+        return gain
+    return Decimal(0)
+
+
 def _by_magnitude(line: CategoryLine | CounterpartyLine) -> tuple[Decimal, str]:
     # Biggest contribution first, label breaking ties so the order is stable.
     return (-abs(line.total), line.label)
@@ -242,6 +263,7 @@ async def cashflow_summary(
                 Transaction.direction,
                 SIGNED_FLOW,
                 ROW_COUNT,
+                GAIN_SUM,
             )
             .where(in_range, INR_OR_NULL, BANK_SCOPE, INCLUDED)
             .group_by(Transaction.category, Transaction.direction)
@@ -252,8 +274,11 @@ async def cashflow_summary(
     expense: dict[str | None, CategoryLine] = {}
     investment: list[CategoryLine] = []
 
-    for slug, direction, flow, count in grouped:
-        signed = _decimal(flow)
+    for slug, direction, flow, count, gain_sum in grouped:
+        gain = _gain_of(slug, direction, gain_sum)
+        signed = _decimal(flow) - gain
+        if gain:
+            _merge(income, OTHER_INCOME_SLUG, gain, 0)
         bucket = bucket_for_slug(slug, scope=REPORT_SCOPE, direction=direction)
         if bucket == "income":
             _merge(income, slug, signed, count)
@@ -607,6 +632,7 @@ async def cashflow_trend(
                 Transaction.category,
                 Transaction.direction,
                 SIGNED_FLOW,
+                GAIN_SUM,
             )
             .where(in_window, INR_OR_NULL, BANK_SCOPE, INCLUDED)
             .group_by(month_key, Transaction.category, Transaction.direction)
@@ -640,9 +666,11 @@ async def cashflow_trend(
         for key in keys
     }
 
-    for month, slug, direction, flow in rows:
+    for month, slug, direction, flow, gain_sum in rows:
         point = points[month]
-        signed = _decimal(flow)
+        gain = _gain_of(slug, direction, gain_sum)
+        point.income += gain
+        signed = _decimal(flow) - gain
         bucket = bucket_for_slug(slug, scope=REPORT_SCOPE, direction=direction)
         if bucket == "income":
             point.income += signed

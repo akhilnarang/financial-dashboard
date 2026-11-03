@@ -178,7 +178,7 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     the batch before any write, and the 400 names each invalid id. A real run
     writes every change with the side effects of /category. The category list
     names each slug's bank-scope bucket."""
-    for slug in ("groceries", "dining", "credit_card_payment"):
+    for slug in ("groceries", "dining", "credit_card_payment", "investment_redemption"):
         await ensure_category(session, slug)
     first = await _txn(
         session,
@@ -318,6 +318,25 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         owed_id,
         first_id,
     ]
+    # A gain needs a redemption credit, and it cannot exceed the amount.
+    no_gain = await client.post(
+        "/api/transactions/apply",
+        json={
+            "dry_run": False,
+            "changes": [
+                {"id": first_id, "category": "investment_redemption", "gain": "1"},
+                {
+                    "id": credit_id,
+                    "category": "investment_redemption",
+                    "gain": "-5.01",
+                },
+            ],
+        },
+    )
+    assert [e["id"] for e in no_gain.json()["detail"]["errors"]] == [
+        first_id,
+        credit_id,
+    ]
 
     applied = await client.post(
         "/api/transactions/apply", json={"dry_run": False, "changes": changes}
@@ -337,6 +356,22 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
     )
     assert again.json()["changed"] == []
     assert again.json()["unchanged"] == [first_id, second_id, credit_id]
+    gain = await client.post(
+        "/api/transactions/apply",
+        json={
+            "dry_run": False,
+            "changes": [
+                {"id": credit_id, "category": "investment_redemption", "gain": "-5.00"}
+            ],
+        },
+    )
+    assert gain.status_code == 200, gain.text
+    assert gain.json()["changed"][0]["changes"]["gain"] == {
+        "before": None,
+        "after": "-5.00",
+    }
+    detail = await client.get(f"/api/transactions/{credit_id}")
+    assert detail.json()["gain"] == "-5.00"
 
     categories = await client.get("/api/categories")
     buckets = {item["slug"]: item["bucket"] for item in categories.json()["items"]}

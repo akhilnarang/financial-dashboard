@@ -406,6 +406,12 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                 )
             )
         try:
+            await conn.execute(text("SELECT gain FROM transactions LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text("ALTER TABLE transactions ADD COLUMN gain NUMERIC(12,2)")
+            )
+        try:
             await conn.execute(text("SELECT card_holder FROM transactions LIMIT 0"))
         except Exception:
             await conn.execute(
