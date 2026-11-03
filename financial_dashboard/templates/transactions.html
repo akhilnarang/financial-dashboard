@@ -148,6 +148,10 @@
         <input type="checkbox" name="uncategorized" value="1" id="uncategorized-toggle" {% if filters.uncategorized == "1" %}checked{% endif %}>
         Uncategorized only
     </label>
+    <label data-field data-checkbox style="flex-direction: row; align-items: center; gap: 0.4rem; min-width: auto;">
+        <input type="checkbox" name="provisional" value="1" id="provisional-toggle" {% if filters.provisional == "1" %}checked{% endif %}>
+        Provisional only
+    </label>
     <label data-field>
         <span class="filter-caption">Date From <small class="text-muted">DD-MM-YYYY</small></span>
         <input type="hidden" name="date_from" id="date-from-iso" value="{{ filters.date_from or '' }}">
@@ -158,7 +162,7 @@
         <input type="hidden" name="date_to" id="date-to-iso" value="{{ filters.date_to or '' }}">
         <input type="text" id="date-to-display" value="{{ date_to_display }}" placeholder="DD-MM-YYYY" autocomplete="off">
     </label>
-    {% if filters.bank or filters.direction or filters.date_from or filters.date_to or filters.account_id or filters.card_id or filters.category or filters.uncategorized %}
+    {% if filters.bank or filters.direction or filters.date_from or filters.date_to or filters.account_id or filters.card_id or filters.category or filters.uncategorized or filters.provisional %}
     <a
         href="/transactions"
         aria-label="Clear filters"
@@ -223,7 +227,7 @@
                         <span class="badge success">credit</span>
                         {% endif %}
                     </td>
-                    <td class="amt {% if txn.direction == 'debit' %}amt-debit{% else %}amt-credit{% endif %}">{% if txn.voided %}<s>{% endif %}{% if txn.direction == "debit" %}&minus;{% else %}+{% endif %}{{ txn.currency|currency_symbol }}{{ "{:,.2f}".format(txn.amount) }}{% if txn.voided %}</s> <span class="badge">Voided</span>{% endif %}</td>
+                    <td class="amt {% if txn.direction == 'debit' %}amt-debit{% else %}amt-credit{% endif %}">{% if txn.voided %}<s>{% endif %}{% if txn.direction == "debit" %}&minus;{% else %}+{% endif %}{{ txn.currency|currency_symbol }}{{ "{:,.2f}".format(txn.amount) }}{% if txn.voided %}</s> <span class="badge">Voided</span>{% endif %}{% if txn.source == "screenshot" and not txn.voided %} <span class="badge badge-pending" title="From a screenshot. No bank alert or statement confirms it yet.">Provisional</span>{% endif %}</td>
                     <td class="cell-counterparty">
                         <span class="truncate" title="{{ txn.counterparty or '' }}">{{ txn.counterparty or "&mdash;"|safe }}</span>
                         {% if txn.channel %}<small>{{ txn.channel }}</small>{% endif %}

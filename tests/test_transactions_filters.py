@@ -136,6 +136,40 @@ async def test_non_inr_zero_lists_inr_and_null_currency_rows(client, session):
     assert _count_rows(r.text) == 2
 
 
+async def test_provisional_lists_only_unconfirmed_screenshot_rows(client, session):
+    """Only a bare, live screenshot row waits for a bank source to confirm it."""
+    await _seed(session)
+    for amount, source, voided in (
+        ("41", "screenshot", False),
+        ("42", "screenshot+sms", False),
+        ("43", "screenshot", True),
+    ):
+        session.add(
+            Transaction(
+                bank="sbi",
+                email_type="upi_screenshot",
+                direction="credit",
+                amount=Decimal(amount),
+                source=source,
+                voided=voided,
+                currency="INR",
+                transaction_date=DATED,
+            )
+        )
+    await session.flush()
+
+    r = await client.get("/transactions?provisional=1")
+    rows = _transaction_rows_html(r.text)
+    assert _count_rows(r.text) == 1
+    assert "41.00" in rows
+    assert "Provisional" in rows
+    assert 'aria-label="Clear filters"' in r.text
+
+    every = _transaction_rows_html((await client.get("/transactions")).text)
+    # The confirmed row and the voided row have no badge.
+    assert every.count(">Provisional<") == 1
+
+
 # ---------------------------------------------------------------------------
 # ?scope= — the account perimeter a cashflow figure was drawn over.
 #
