@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from financial_dashboard.db.models import as_utc, utc_now
 from financial_dashboard.db.models import (
     Account,
+    BankStatementUpload,
     Category,
     CategoryReviewDecision,
     AuditInteraction,
@@ -1003,8 +1004,9 @@ async def test_void_and_merge_wait_for_a_yes(session, tool):
         account_id=1,
         voided=tool == "voided_keeper",
         attachment_path="bank.pdf" if tool == "two_attachments" else None,
-        email_type="test",
-        source="bank_statement",
+        # A statement import links the upload and leaves the source empty.
+        bank_statement_upload_id=1,
+        email_type="bank_statement",
         direction="debit",
         amount=251 if tool == "refused_merge" else 250,
         counterparty="UPI TEST MERCHANT",
@@ -1016,7 +1018,14 @@ async def test_void_and_merge_wait_for_a_yes(session, tool):
         inbound_chat_id=7, trigger="reply", conversation_id=conversation.id
     )
     session.add_all(
-        [Account(id=1, bank="sbi", label="SBI", type="bank_account"), shot, bank_row]
+        [
+            Account(id=1, bank="sbi", label="SBI", type="bank_account"),
+            BankStatementUpload(
+                id=1, account_id=1, bank="sbi", filename="s.pdf", file_path="s.pdf"
+            ),
+            shot,
+            bank_row,
+        ]
     )
     session.add(interaction)
     await session.flush()
@@ -1090,7 +1099,7 @@ async def test_void_and_merge_wait_for_a_yes(session, tool):
         assert reply == f"Voided #{shot.id}."
         assert stored == [
             (shot.id, True, "shot.png", "screenshot"),
-            (bank_row.id, False, None, "bank_statement"),
+            (bank_row.id, False, None, None),
         ]
     elif tool == "screenshot_keeper":
         # The keeper keeps its screenshot source and gains the bank source.
