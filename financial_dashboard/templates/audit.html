@@ -18,14 +18,14 @@
     <thead><tr><th>Time</th><th>ID</th><th>Trigger</th><th>Transaction</th><th>Outcome</th><th>Status</th><th>Message</th></tr></thead>
     <tbody>
     {% for row in interactions %}
-    <tr>
+    <tr class="row-link-target">
         <td>{{ row.created_at.strftime('%d %b %Y %H:%M:%S') }}</td>
-        <td><a href="/audit/{{ row.id }}">#{{ row.id }}</a></td>
-        <td>{{ row.trigger }}</td>
-        <td>{% if row.transaction_id %}<a href="/transactions/{{ row.transaction_id }}">#{{ row.transaction_id }}</a>{% endif %}</td>
-        <td>{{ row.outcome or '' }}</td>
+        <td><a class="row-link" href="/audit/{{ row.id }}">#{{ row.id }}</a></td>
+        <td><span class="badge">{{ row.trigger }}</span></td>
+        <td>{% if row.transaction_id %}<a class="row-nested-link" href="/transactions/{{ row.transaction_id }}">#{{ row.transaction_id }}</a>{% else %}<span class="text-muted">&mdash;</span>{% endif %}</td>
+        <td>{% if row.outcome %}<span class="badge {% if row.outcome == 'error' %}danger{% endif %}">{{ row.outcome }}</span>{% else %}<span class="text-muted">&mdash;</span>{% endif %}</td>
         <td><span class="badge">{{ row.status }}</span></td>
-        <td>{{ (row.user_text or '')[:100] }}</td>
+        <td style="white-space: normal; max-width: 36rem;">{{ (row.user_text or '')[:100] }}</td>
     </tr>
     {% else %}
     <tr><td colspan="7">No matching audit interactions.</td></tr>

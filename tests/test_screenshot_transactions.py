@@ -255,6 +255,48 @@ async def test_failed_screenshot_is_refused(
     assert not (shot.root / "shot.png").exists()
     assert await _rows(shot) == []
 
+    async def raise_empty_value_error(
+        *, image: bytes, media_type: str, api_key: str, model: str, base_url: str
+    ) -> ScreenshotTransaction:
+        raise ValueError(
+            "https://api.telegram.org/file/botSECRET_BOT_TOKEN/photos/1.jpg"
+        )
+
+    monkeypatch.setattr(openai_provider, "read_screenshot", raise_empty_value_error)
+    async with shot.maker() as s:
+        interaction = AuditInteraction(
+            inbound_chat_id=CHAT,
+            trigger="screenshot",
+            status="processing",
+            worker_token="worker-err",
+            conversation_id=asked.conversation_id,
+        )
+        s.add(interaction)
+        await s.commit()
+
+    async def get_file(file_id: str) -> SimpleNamespace:
+        return SimpleNamespace(file_path="https://api.telegram.org/file/botT/p")
+
+    await _process_screenshot_interaction(
+        bot=SimpleNamespace(get_file=get_file),
+        interaction_id=interaction.id,
+        worker_token="worker-err",
+        conversation_id=asked.conversation_id,
+        recipient_chat_id=CHAT,
+        file_id="file-id",
+        declared_size=len(PNG),
+    )
+    async with shot.maker() as s:
+        stored_interaction = await s.get(AuditInteraction, interaction.id)
+    assert stored_interaction is not None
+    assert stored_interaction.error_code == "screenshot_unreadable"
+    assert stored_interaction.model == "gpt-6-luna"
+    assert stored_interaction.error_detail is not None
+    assert "Traceback" in stored_interaction.error_detail
+    assert "ValueError" in stored_interaction.error_detail
+    assert "bot[REDACTED]" in stored_interaction.error_detail
+    assert "SECRET_BOT_TOKEN" not in stored_interaction.error_detail
+
 
 @pytest.mark.parametrize("amount", [Decimal("0.001"), Decimal("1e30")])
 async def test_missing_fields_ask_and_a_reply_fills_them_before_yes_saves(
