@@ -342,6 +342,15 @@ async def test_apply_previews_rejects_and_applies_like_single_endpoints(
         json={"dry_run": False, "changes": [{"id": sale.id, "amount": "3"}]},
     )
     assert shrink.status_code == 400
+    # A stored gain above the amount does not block a change that sets neither.
+    stale = await _txn(session, amount="5", gain=Decimal("9"))
+    stale.direction = "credit"
+    await session.commit()
+    noted = await client.post(
+        "/api/transactions/apply",
+        json={"dry_run": False, "changes": [{"id": stale.id, "note": "x"}]},
+    )
+    assert noted.status_code == 200, noted.text
 
     applied = await client.post(
         "/api/transactions/apply", json={"dry_run": False, "changes": changes}

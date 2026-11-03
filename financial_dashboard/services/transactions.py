@@ -265,6 +265,8 @@ async def _category_and_gain_error(
             return f"Invalid category: {category!r}"
     if change.gain is not None and txn.direction != "credit":
         return "A gain needs a credit row"
+    if not {"gain", "amount"} & change.model_fields_set:
+        return None
     gain = change.gain if "gain" in change.model_fields_set else txn.gain
     if gain is not None and gain > (change.amount or txn.amount):
         return "A gain cannot be more than the amount"
