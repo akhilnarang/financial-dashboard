@@ -255,13 +255,16 @@ class AssistantWriteConfirmation(StrictModel):
 
 
 class ScreenshotTransaction(StrictModel):
-    """What the vision model reads off one UPI app screenshot.
+    """What the vision model reads off one payment screenshot.
 
-    The model output is untrusted. Code checks every field before a row is
-    proposed.
+    The screenshot is a UPI app screen or a card app screen. The model output is
+    untrusted. Code checks every field before a row is proposed.
+
+    ``status`` holds ``reversed`` when a refund or a reversal returned money.
+    A reversed read always has ``direction`` of ``credit``.
     """
 
-    status: Literal["success", "pending", "failed", "unknown"]
+    status: Literal["success", "pending", "failed", "reversed", "unknown"]
     direction: Literal["debit", "credit"]
     amount: (
         Annotated[
@@ -282,8 +285,39 @@ class ScreenshotTransaction(StrictModel):
         ]
         | None
     )
-    app: Literal["gpay", "phonepe", "paytm", "bhim", "other"]
+    app: Literal[
+        "gpay",
+        "phonepe",
+        "paytm",
+        "bhim",
+        "cred",
+        "supermoney",
+        "bank",
+        "other",
+    ]
+    channel: Literal["upi", "card"] = "upi"
     account_hint: StrictStr | None = Field(max_length=100)
+
+    @model_validator(mode="after")
+    def reversed_is_a_credit(self) -> ScreenshotTransaction:
+        """Set the direction of a reversed read, and drop the UTR of a card read.
+
+        A refund or a reversal returns money to the owner. The model can read
+        the direction of the original payment. The status decides the money
+        flow, so the read always records a credit.
+
+        A UTR is a UPI reference. A card read has none, and a stored reference
+        would match or collide with rows of another payment.
+
+        Returns:
+            The read, with ``direction`` set to ``credit`` when reversed and
+            ``utr`` set to None for a card read.
+        """
+        if self.status == "reversed":
+            self.direction = "credit"
+        if self.channel == "card":
+            self.utr = None
+        return self
 
     @field_validator("amount")
     @classmethod

@@ -37,12 +37,23 @@ REASONING_EFFORTS: dict[str, ReasoningEffort] = {
 }
 
 SCREENSHOT_PROMPT = (
-    "Read this UPI payment app screenshot. Return only what the screen shows. "
+    "Read this payment screenshot or notification. It can come from a UPI app "
+    "or from a card app. Return only what the screen shows. "
     "direction is debit when the owner paid and credit when the owner received. "
+    "status is success when the payment went through. status is reversed when "
+    "the screen shows a reversal, a refund or a refund credit, for example "
+    "'reversed by <merchant>' or 'refunded'. Use failed only when a payment did "
+    "not go through and no reversal of a prior charge occurred. "
     "amount is in rupees with digits and an optional dot. utr is the UPI "
     "transaction ID, UTR or RRN. occurred_at is the date and time shown, in IST. "
-    "account_hint is the bank account text shown, such as 'SBI 1234'. Use null "
-    "for a field the screen does not show. Never guess."
+    "channel is card for a credit card app or a credit card notification, "
+    "such as OneCard. channel is upi for a UPI payment screen. A debit card "
+    "notification is a bank account message, so it is not a card screenshot. "
+    "counterparty is the merchant or the person "
+    "name, for example the merchant in 'reversed by <merchant>'. account_hint "
+    "is the bank or card name and any last 4 digits shown, for example "
+    "'OneCard' or 'SBI 1234'. Use null for a field the screen does not show. "
+    "Never guess."
 )
 
 
@@ -244,7 +255,7 @@ async def classify(
 async def read_screenshot(
     *, image: bytes, media_type: str, api_key: str, model: str, base_url: str
 ) -> ScreenshotTransaction:
-    """Read one UPI screenshot with a vision model and a strict output schema.
+    """Read one payment screenshot with a vision model and a strict schema.
 
     The call stores nothing on the provider side.
 

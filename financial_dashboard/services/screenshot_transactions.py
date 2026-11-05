@@ -1,9 +1,11 @@
-"""Provisional transactions from UPI screenshots sent to the Telegram bot.
+"""Provisional transactions from screenshots sent to the Telegram bot.
 
+The screenshot shows a UPI payment or a card notification. A card or UPI
+screenshot of a refund or a reversal also becomes a provisional row.
 The vision model reads the screenshot. Code checks every mandatory field.
-Nothing is saved without a Yes tap. A bank alert or statement with the same
-UTR later confirms the row. A row that no bank source confirms in 60 days is
-flagged once on Telegram. The owner replies with what happened, and the
+Nothing is saved without a Yes tap. A bank alert or statement for the same
+payment later confirms the row. A row that no bank source confirms in 60 days
+is flagged once on Telegram. The owner replies with what happened, and the
 assistant proposes the fix.
 """
 
@@ -14,7 +16,7 @@ from decimal import Decimal
 from typing import NamedTuple
 
 from pydantic import ValidationError
-from sqlalchemy import or_, select
+from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.dates import IST, parse_datetime
@@ -24,6 +26,7 @@ from financial_dashboard.db import async_session
 from financial_dashboard.db.models import (
     Account,
     AuditInteraction,
+    Card,
     Transaction,
     utc_now,
 )
@@ -48,7 +51,10 @@ logger = logging.getLogger(__name__)
 
 FLAG_AGE = datetime.timedelta(days=60)
 
+DUPLICATE_WINDOW = datetime.timedelta(days=1)
+
 _UTR = re.compile(r"\d{12}")
+_NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]")
 _TRAILING_LAST4 = re.compile(r"(\d{4})[\s).]*$")
 _KEYED_AMOUNT = re.compile(
     r"(?:(?:is|was)\s+)?(?:₹|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d{1,2})?)"
@@ -60,10 +66,33 @@ _RUPEES = re.compile(
 )
 
 
-class ScreenshotCheck(NamedTuple):
-    """The resolved account, the failed mandatory fields and a stored duplicate."""
+def _saved_status(read: ScreenshotTransaction) -> bool:
+    """Tell if the read shows a payment that a provisional row can hold.
+
+    A card screenshot saves only a refund. A card bill payment or a card
+    spend has its own alert, and that alert must create the row.
+    """
+    return read.status == "reversed" or (
+        read.status == "success" and read.channel == "upi"
+    )
+
+
+class ScreenshotTarget(NamedTuple):
+    """The account and card that a read points at, or the cards it may mean.
+
+    ``choices`` lists the cards that an ambiguous card hint fits, as
+    "label 1234".
+    """
 
     account: Account | None
+    card: Card | None = None
+    choices: tuple[str, ...] = ()
+
+
+class ScreenshotCheck(NamedTuple):
+    """The resolved target, the failed mandatory fields and a stored duplicate."""
+
+    target: ScreenshotTarget
     missing: list[str]
     duplicate: Transaction | None
 
@@ -75,48 +104,168 @@ class ScreenshotReview(NamedTuple):
     action: ScreenshotTransactionConfirmation | None
 
 
-async def _check(
-    session: AsyncSession, read: ScreenshotTransaction, not_duplicates: list[int]
-) -> ScreenshotCheck:
-    """Run the mandatory-field and duplicate checks on one read.
+def _normalize_hint(text: str) -> str:
+    """Reduce a card hint to its lowercase letters and digits.
 
-    The account resolves only by an exact last-4 match to exactly one active
-    bank account. The hint must end with those 4 digits. A duplicate is a row
-    with the same UTR and direction. Otherwise it is a live row with the same
-    account, direction and amount within one day whose reference is not
-    another UTR, and that the owner did not call another payment.
+    Args:
+        text: The card or bank text that the screen shows.
+
+    Returns:
+        The letters and digits only, in lowercase.
     """
-    account = None
-    if (hint := _TRAILING_LAST4.search(read.account_hint or "")) is not None:
-        last4 = hint.group(1)
-        accounts = [
-            row
-            for row in await session.scalars(
-                select(Account).where(
-                    Account.type == "bank_account", Account.active.is_(True)
-                )
+    return _NON_ALPHANUMERIC.sub("", text.lower())
+
+
+async def _resolve_credit_card_target(
+    session: AsyncSession, hint: str
+) -> ScreenshotTarget:
+    """Resolve a card read to one credit card account and its card.
+
+    A last-4 run at the end of the hint selects the card with that mask.
+    Without one, the bank name or the label of one credit card account must appear in the
+    hint. An account with one card returns that card. An ambiguous hint
+    returns an empty target, so the reply asks for the card.
+
+    Args:
+        session: The turn session.
+        hint: The card or bank text that the screen shows.
+
+    Returns:
+        The account and its card, or an empty target when no unique card
+        matches. An ambiguous name lists the cards that it fits.
+    """
+    accounts = list(
+        await session.scalars(
+            select(Account).where(
+                Account.type == "credit_card", Account.active.is_(True)
             )
-            if mask_last4(row.account_number) == last4
-        ]
-        account = accounts[0] if len(accounts) == 1 else None
-    now = datetime.datetime.now(IST).replace(tzinfo=None)
-    missing = [
-        field
-        for field, ok in (
-            ("amount", read.amount is not None and read.amount > 0),
-            ("name or VPA", bool(read.counterparty or read.vpa)),
-            ("UTR (12 digits)", _UTR.fullmatch(read.utr or "") is not None),
-            (
-                "date and time",
-                read.occurred_at is not None and read.occurred_at <= now,
-            ),
-            ("account (last 4 digits)", account is not None),
         )
-        if not ok
+    )
+    cards = list(
+        await session.scalars(
+            select(Card)
+            .where(Card.active.is_(True), Card.account_id.in_([a.id for a in accounts]))
+            .order_by(Card.id)
+        )
+    )
+    if (found := _TRAILING_LAST4.search(hint)) is not None:
+        matched = [c for c in cards if mask_last4(c.card_mask) == found.group(1)]
+        if len(matched) != 1:
+            return ScreenshotTarget(None)
+        card = matched[0]
+        return ScreenshotTarget(
+            next(a for a in accounts if a.id == card.account_id), card
+        )
+    normalized = _normalize_hint(hint)
+    if not normalized:
+        return ScreenshotTarget(None)
+    selected: set[int] = set()
+    for account in accounts:
+        names = (
+            _normalize_hint(account.bank or ""),
+            _normalize_hint(account.label or ""),
+        )
+        if any(name and name in normalized for name in names):
+            selected.add(account.id)
+    owned = [card for card in cards if card.account_id in selected]
+    if len(selected) == 1 and len(owned) <= 1:
+        account = next(a for a in accounts if a.id in selected)
+        return ScreenshotTarget(account, owned[0] if owned else None)
+    labels = {a.id: a.label for a in accounts}
+    return ScreenshotTarget(
+        None,
+        None,
+        tuple(
+            f"{labels[card.account_id]} {last4}"
+            for card in owned
+            if (last4 := mask_last4(card.card_mask))
+        ),
+    )
+
+
+async def _resolve_target(
+    session: AsyncSession, read: ScreenshotTransaction
+) -> ScreenshotTarget:
+    """Resolve the account and card that one screenshot read points at.
+
+    A UPI read resolves by an exact last-4 match to exactly one active bank
+    account. The hint must end with those 4 digits. A card read resolves by
+    the card digits, else by the bank name or the account label.
+
+    Args:
+        session: The turn session.
+        read: The fields read off the screenshot.
+
+    Returns:
+        The account and card of the read. A field is None when it does not
+        resolve to one row.
+    """
+    hint = read.account_hint or ""
+    if read.channel == "card":
+        return await _resolve_credit_card_target(session, hint)
+    if (found := _TRAILING_LAST4.search(hint)) is None:
+        return ScreenshotTarget(None)
+    last4 = found.group(1)
+    accounts = [
+        row
+        for row in await session.scalars(
+            select(Account).where(
+                Account.type == "bank_account", Account.active.is_(True)
+            )
+        )
+        if mask_last4(row.account_number) == last4
     ]
+    return ScreenshotTarget(accounts[0] if len(accounts) == 1 else None, None)
+
+
+def _owner_filter(target: ScreenshotTarget) -> ColumnElement[bool] | None:
+    """Return the filter that names the card or the account of one target.
+
+    A card target matches rows on that card, and also rows on its account that
+    record no card yet.
+
+    Args:
+        target: The account and card that a read resolves to.
+
+    Returns:
+        The card filter when the target has a card, else the account filter.
+        None when the target has no account.
+    """
+    if target.account is None:
+        return None
+    if target.card is not None:
+        return or_(
+            Transaction.card_id == target.card.id,
+            (Transaction.account_id == target.account.id)
+            & Transaction.card_id.is_(None),
+        )
+    return Transaction.account_id == target.account.id
+
+
+async def _find_duplicate(
+    session: AsyncSession,
+    read: ScreenshotTransaction,
+    target: ScreenshotTarget,
+    not_duplicates: list[int],
+) -> Transaction | None:
+    """Find the stored row that holds the same payment as the read.
+
+    A row with the same UTR and direction holds the payment. Otherwise a live
+    row for the same target, direction and amount within one day holds it,
+    when its reference is not another UTR.
+
+    Args:
+        session: The turn session.
+        read: The fields read off the screenshot.
+        target: The account and card that the read resolves to.
+        not_duplicates: Rows that the owner called another payment.
+
+    Returns:
+        The stored row, or None when no row holds the payment.
+    """
     utr = read.utr if read.utr and _UTR.fullmatch(read.utr) else None
-    duplicate = (
-        await session.scalar(
+    if utr:
+        found = await session.scalar(
             select(Transaction)
             .where(
                 Transaction.reference_number == utr,
@@ -125,31 +274,118 @@ async def _check(
             .order_by(Transaction.id)
             .limit(1)
         )
-        if utr
-        else None
-    )
-    if duplicate is None and account is not None and read.amount and read.occurred_at:
-        day = read.occurred_at.date()
-        duplicate = await session.scalar(
-            select(Transaction)
-            .where(
-                Transaction.account_id == account.id,
-                Transaction.direction == read.direction,
-                Transaction.amount == read.amount,
-                Transaction.transaction_date.between(
-                    day - datetime.timedelta(days=1), day + datetime.timedelta(days=1)
-                ),
-                Transaction.id.not_in(not_duplicates),
-                Transaction.voided.is_(False),
-                or_(
-                    Transaction.reference_number.is_(None),
-                    ~Transaction.reference_number.regexp_match(r"^\d{12}$"),
-                ),
-            )
-            .order_by(Transaction.id)
-            .limit(1)
+        if found is not None:
+            return found
+    owner = _owner_filter(target)
+    if owner is None or not read.amount or read.occurred_at is None:
+        return None
+    day = read.occurred_at.date()
+    stmt = (
+        select(Transaction)
+        .where(
+            owner,
+            Transaction.direction == read.direction,
+            Transaction.amount == read.amount,
+            Transaction.transaction_date.between(
+                day - DUPLICATE_WINDOW, day + DUPLICATE_WINDOW
+            ),
+            Transaction.id.not_in(not_duplicates),
+            Transaction.voided.is_(False),
         )
-    return ScreenshotCheck(account, missing, duplicate)
+        .order_by(Transaction.id)
+        .limit(1)
+    )
+    if read.channel == "upi":
+        stmt = stmt.where(
+            or_(
+                Transaction.reference_number.is_(None),
+                ~Transaction.reference_number.regexp_match(r"^\d{12}$"),
+            )
+        )
+    return await session.scalar(stmt)
+
+
+async def _check(
+    session: AsyncSession, read: ScreenshotTransaction, not_duplicates: list[int]
+) -> ScreenshotCheck:
+    """Run the mandatory-field and duplicate checks on one read.
+
+    Args:
+        session: The turn session.
+        read: The fields read off the screenshot.
+        not_duplicates: Rows that the owner called another payment.
+
+    Returns:
+        The resolved target, the failed mandatory fields and the stored
+        duplicate if one exists.
+    """
+    target = await _resolve_target(session, read)
+    now = datetime.datetime.now(IST).replace(tzinfo=None)
+    checks = [
+        ("amount", read.amount is not None and read.amount > 0),
+        ("name or VPA", bool(read.counterparty or read.vpa)),
+        ("date and time", read.occurred_at is not None and read.occurred_at <= now),
+    ]
+    if read.channel == "upi":
+        checks.append(("UTR (12 digits)", _UTR.fullmatch(read.utr or "") is not None))
+    if read.channel == "card":
+        checks.append(("card", target.account is not None))
+    else:
+        checks.append(("account (last 4 digits)", target.account is not None))
+    missing = [field for field, ok in checks if not ok]
+    duplicate = await _find_duplicate(session, read, target, not_duplicates)
+    return ScreenshotCheck(target, missing, duplicate)
+
+
+def _headline(read: ScreenshotTransaction) -> str:
+    """Word the first line of the question for one read.
+
+    Args:
+        read: The fields read off the screenshot.
+
+    Returns:
+        The line that names the source, the amount and the other party.
+    """
+    credit = read.direction == "credit"
+    amount_text = format_inr_exact(read.amount) if read.amount is not None else "?"
+    party = (
+        " ".join(
+            part
+            for part in (read.counterparty, f"({read.vpa})" if read.vpa else "")
+            if part
+        )[:200]
+        or "?"
+    )
+    if read.channel == "card":
+        # A card screenshot saves only a refund, so no other card read gets here.
+        return f"Card refund: {amount_text} from {party}"
+    return (
+        f"UPI screenshot ({read.app}): {'received' if credit else 'paid'} "
+        f"{amount_text} {'from' if credit else 'to'} {party}"
+    )
+
+
+def _detail_line(read: ScreenshotTransaction, target: ScreenshotTarget) -> str:
+    """Word the second line of the question for one read.
+
+    The line holds the UTR when a bank source can confirm the row with it, the
+    date and time, and the account or card that the read resolves to.
+
+    Args:
+        read: The fields read off the screenshot.
+        target: The account and card that the read resolves to.
+
+    Returns:
+        The detail line.
+    """
+    parts = []
+    if read.utr:
+        parts.append(f"UTR {read.utr}")
+    parts.append(
+        read.occurred_at.strftime("%Y-%m-%d %H:%M") if read.occurred_at else "?"
+    )
+    parts.append(target.account.label if target.account else read.account_hint or "?")
+    return " · ".join(parts)
 
 
 async def review_screenshot(
@@ -162,9 +398,10 @@ async def review_screenshot(
 ) -> ScreenshotReview:
     """Check one screenshot read and word the question for the owner.
 
-    A screenshot that does not show a success is refused. A duplicate offers
-    to attach the screenshot to the stored row. A read with a missing field
-    names each field and asks for it. Otherwise the question asks to save.
+    A screenshot that does not show a success or a reversal is refused. A
+    duplicate offers to attach the screenshot to the stored row. A read with
+    a missing field names each field and asks for it. Otherwise the question
+    asks to save.
 
     Args:
         session: The turn session.
@@ -176,27 +413,19 @@ async def review_screenshot(
         The reply text, and the action that a Yes applies. The action is
         ``None`` for a refused screenshot.
     """
-    if read.status != "success":
+    if not _saved_status(read):
         return ScreenshotReview(
-            f"This screenshot shows a {read.status} payment, not a success. "
+            "This card screenshot is not a refund. I save only refunds from "
+            "card screenshots. I saved nothing."
+            if read.channel == "card"
+            else f"This screenshot shows a {read.status} payment, not a success. "
             "I saved nothing.",
             None,
         )
-    account, missing, duplicate = await _check(session, read, not_duplicates)
-    credit = read.direction == "credit"
-    party = " ".join(
-        part
-        for part in (read.counterparty, f"({read.vpa})" if read.vpa else "")
-        if part
-    )
+    target, missing, duplicate = await _check(session, read, not_duplicates)
     lines = [
-        f"UPI screenshot ({read.app}): "
-        f"{'received' if credit else 'paid'} "
-        f"{format_inr_exact(read.amount) if read.amount is not None else '?'} "
-        f"{'from' if credit else 'to'} {party[:200] or '?'}",
-        f"UTR {read.utr or '?'} · "
-        f"{read.occurred_at.strftime('%Y-%m-%d %H:%M') if read.occurred_at else '?'}"
-        f" · {account.label if account else read.account_hint or '?'}",
+        _headline(read),
+        _detail_line(read, target),
     ]
     if duplicate is not None and read.utr and duplicate.reference_number == read.utr:
         lines.append(
@@ -215,10 +444,14 @@ async def review_screenshot(
         )
     elif missing:
         lines.append(f"Missing or not valid: {', '.join(missing)}.")
-        lines.append(
-            'Reply with the values, for example "utr 123456789012, account 1234", '
-            "or tap Skip."
+        if target.choices:
+            lines.append(f"Which card: {', '.join(target.choices)}?")
+        example = (
+            '"card 1234, amount 100"'
+            if read.channel == "card"
+            else '"utr 123456789012, account 1234"'
         )
+        lines.append(f"Reply with the values, for example {example}, or tap Skip.")
     else:
         lines.append("Save this as a provisional transaction?")
     return ScreenshotReview(
@@ -260,6 +493,9 @@ def apply_corrections(read: ScreenshotTransaction, text: str) -> ScreenshotTrans
                 updates["utr"] = value
             case "account" | "acct" | "a/c":
                 updates["account_hint"] = value
+            case "card":
+                updates["account_hint"] = value
+                updates["channel"] = "card"
             case "name" | "to" | "from":
                 updates["counterparty"] = value or None
             case "vpa" | "upi":
@@ -291,6 +527,39 @@ def apply_corrections(read: ScreenshotTransaction, text: str) -> ScreenshotTrans
     return read
 
 
+def _row_fields(read: ScreenshotTransaction, target: ScreenshotTarget) -> dict:
+    """Build the row columns that a confirmed screenshot saves.
+
+    Args:
+        read: The fields read off the screenshot.
+        target: The account and card that the read resolves to.
+
+    Returns:
+        The column values of the new row.
+    """
+    account, card = target.account, target.card
+    assert account is not None
+    suffix = "refund_screenshot" if read.status == "reversed" else "screenshot"
+    return {
+        "bank": account.bank.strip().lower(),
+        "account_id": account.id,
+        "account_mask": f"XX{last4}"
+        if (last4 := mask_last4(account.account_number))
+        else None,
+        "card_id": card.id if card is not None else None,
+        "card_mask": card.card_mask if card is not None else None,
+        "source": "screenshot",
+        "email_type": f"{read.channel}_{suffix}",
+        "channel": read.channel,
+        "direction": read.direction,
+        "amount": read.amount,
+        "currency": "INR",
+        "reference_number": read.utr,
+        "counterparty": read.counterparty or read.vpa,
+        "raw_description": read.vpa,
+    }
+
+
 async def save_screenshot_transaction(
     session: AsyncSession,
     action: ScreenshotTransactionConfirmation,
@@ -319,48 +588,37 @@ async def save_screenshot_transaction(
         action.media_type,
     )
     read = action.read
-    account, missing, duplicate = await _check(session, read, action.not_duplicates)
+    target, missing, duplicate = await _check(session, read, action.not_duplicates)
     if action.duplicate_of is not None:
         if (
-            (target := duplicate) is None
-            or target.id != action.duplicate_of
-            or target.voided != action.duplicate_voided
+            (found := duplicate) is None
+            or found.id != action.duplicate_of
+            or found.voided != action.duplicate_voided
         ):
             raise MutationRejected(
                 f"#{action.duplicate_of} no longer matches this screenshot"
             )
-        if target.attachment_path:
-            raise MutationRejected(f"#{target.id} already has an attachment")
+        if found.attachment_path:
+            raise MutationRejected(f"#{found.id} already has an attachment")
         await attach_downloaded_attachment(
-            session, target.id, stored, interaction_id=interaction_id
+            session, found.id, stored, interaction_id=interaction_id
         )
-        if target.voided:
-            await set_transaction_voided_no_commit(session, target.id, False)
-            return f"Attached the screenshot to #{target.id} and un-voided it."
-        return f"Attached the screenshot to #{target.id}."
+        if found.voided:
+            await set_transaction_voided_no_commit(session, found.id, False)
+            return f"Attached the screenshot to #{found.id} and un-voided it."
+        return f"Attached the screenshot to #{found.id}."
     if duplicate is not None:
         raise MutationRejected(f"already recorded as #{duplicate.id}")
     if (
         missing
-        or account is None
+        or target.account is None
         or read.amount is None
         or read.occurred_at is None
-        or read.status != "success"
+        or not _saved_status(read)
     ):
         raise MutationRejected(f"missing or not valid: {', '.join(missing)}")
     txn = Transaction(
-        bank=account.bank.strip().lower(),
-        account_id=account.id,
-        account_mask=f"XX{mask_last4(account.account_number)}",
-        source="screenshot",
-        email_type="upi_screenshot",
-        channel="upi",
-        direction=read.direction,
-        amount=read.amount,
-        currency="INR",
-        reference_number=read.utr,
-        counterparty=read.counterparty or read.vpa,
-        raw_description=read.vpa,
+        **_row_fields(read, target),
         transaction_date=read.occurred_at.date(),
         transaction_time=read.occurred_at.time(),
     )
@@ -369,6 +627,11 @@ async def save_screenshot_transaction(
     await attach_downloaded_attachment(
         session, txn.id, stored, interaction_id=interaction_id
     )
+    if read.utr is None:
+        return (
+            f"Saved #{txn.id} with the screenshot. It stays provisional until a "
+            "bank alert or statement confirms it."
+        )
     return (
         f"Saved #{txn.id} with the screenshot. It stays provisional until a bank "
         "alert or statement shows the same UTR."

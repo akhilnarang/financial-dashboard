@@ -175,7 +175,7 @@ async def test_batch_merges_each_pair_once(client, session):
         currency="INR",
         transaction_date=DAY,
         reference_number="XUTR000777888",
-        source="email",
+        email_id=13,
     )
     session.add(email_copy)
     await session.commit()
@@ -257,6 +257,9 @@ async def test_batch_merges_each_pair_once(client, session):
     assert keeper.balance == Decimal("5000.00")
     assert (keeper.category, keeper.category_method) == ("groceries", "manual")
     assert keeper.note == "weekly shop"
+    # The email link names the email source. A statement link names none.
+    other = await session.get(Transaction, other_alert)
+    assert other is not None and other.source == "sms+email"
     stray = await session.scalar(
         select(SmsMessage).where(SmsMessage.body == "synthetic repeat 123456")
     )
