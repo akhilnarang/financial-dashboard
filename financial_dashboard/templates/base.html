@@ -490,6 +490,25 @@
         .audit-action-card > summary { cursor: pointer; font-weight: 600; }
         .audit-action-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 0.75rem; margin-top: 0.75rem; }
         .audit-action-grid dt { margin-bottom: 0.25rem; }
+        .jv { border: 1px solid var(--border-light); border-radius: 6px; overflow: hidden; background: var(--surface-inset); }
+        .jv-toolbar { display: flex; flex-wrap: wrap; gap: 0.35rem; padding: 0.45rem 0.55rem; border-bottom: 1px solid var(--border-light); background: var(--surface-muted); }
+        .jv-btn { font-family: var(--font-body); font-size: 0.72rem; font-weight: 600; padding: 0.18rem 0.55rem; border-radius: 999px; border: 1px solid var(--border-light); background: transparent; color: inherit; cursor: pointer; opacity: 0.7; }
+        .jv-btn:hover { opacity: 1; background: var(--nav-pill-hover); }
+        .jv-btn.is-active { opacity: 1; background: var(--nav-pill-active-bg); color: var(--nav-pill-active-fg); border-color: transparent; }
+        .jv-tree { padding: 0.6rem 0.75rem; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.55; max-height: 32rem; overflow: auto; }
+        .jv-node, .jv-text { margin: 0.15rem 0; }
+        .jv-summary { cursor: pointer; } .jv-summary::marker { opacity: 0.5; }
+        .jv-children { margin-left: 0.85rem; padding-left: 0.65rem; border-left: 1px dashed var(--border-light); }
+        .jv-row { padding-left: 1rem; white-space: pre-wrap; word-break: break-word; }
+        .jv-key { color: var(--clr-credit); }
+        .jv-meta { opacity: 0.5; font-size: 0.7rem; margin-left: 0.4rem; }
+        .jv-bracket { opacity: 0.6; }
+        .jv-string { color: var(--clr-credit); }
+        .jv-preview { opacity: 0.85; }
+        .jv-number { color: var(--clr-debit); }
+        .jv-bool { color: var(--clr-pending-fg); }
+        .jv-null { opacity: 0.5; font-style: italic; }
+        .jv-multiline { white-space: pre-wrap; word-break: break-word; margin: 0.3rem 0 0.5rem 1rem; padding: 0.5rem 0.65rem; border-radius: 4px; background: var(--surface-muted); border: 1px solid var(--border-light); font-family: var(--font-mono); font-size: 0.76rem; }
 
         /* ---------------------------------------------------------------
            Footer

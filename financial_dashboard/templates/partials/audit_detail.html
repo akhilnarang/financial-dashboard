@@ -2,6 +2,7 @@
 {% block title %}Audit Interaction #{{ detail.interaction.id }} - Ledger{% endblock %}
 {% block content %}
 {% set row = detail.interaction %}
+{% macro json_view(raw) %}{% set block = json_block(raw) %}<pre class="audit-json"{% if block.tree is not none %} data-json-viewer data-compact="{{ block.compact }}" data-tree="{{ block.tree }}"{% endif %}>{{ block.text }}</pre>{% endmacro %}
 <div class="section-header" style="display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1rem;">
     <h2 style="margin:0;">Audit interaction #{{ row.id }}</h2>
     <a href="/audit">&larr; All audit interactions</a>
@@ -64,12 +65,12 @@
 
 {% if row.model_input_json %}
 <h3 class="audit-section-title">Model input</h3>
-<pre class="audit-json">{{ pretty_json(row.model_input_json) }}</pre>
+{{ json_view(row.model_input_json) }}
 {% endif %}
 
 {% if row.model_output_json %}
 <h3 class="audit-section-title">Model output</h3>
-<pre class="audit-json">{{ pretty_json(row.model_output_json) }}</pre>
+{{ json_view(row.model_output_json) }}
 {% endif %}
 
 <h3 class="audit-section-title">Actions</h3>
@@ -79,15 +80,15 @@
     <div class="audit-action-grid">
         <div>
             <dt>Arguments</dt>
-            <pre class="audit-json">{{ pretty_json(action.arguments_json) }}</pre>
+            {{ json_view(action.arguments_json) }}
         </div>
         <div>
             <dt>Before</dt>
-            <pre class="audit-json">{{ pretty_json(action.before_json) }}</pre>
+            {{ json_view(action.before_json) }}
         </div>
         <div>
             <dt>After</dt>
-            <pre class="audit-json">{{ pretty_json(action.after_json) }}</pre>
+            {{ json_view(action.after_json) }}
         </div>
     </div>
 </details>
@@ -135,4 +136,8 @@
 {% else %}
 <p class="text-muted">No physical message mappings.</p>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script defer src="/static/js/json-viewer.js"></script>
 {% endblock %}
