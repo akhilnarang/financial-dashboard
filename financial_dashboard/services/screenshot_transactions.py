@@ -500,6 +500,7 @@ async def review_screenshot(
     attachment_path: str,
     media_type: str,
     not_duplicates: list[int],
+    notes: list[str],
 ) -> ScreenshotReview:
     """Check one screenshot read and word the question for the owner.
 
@@ -513,6 +514,7 @@ async def review_screenshot(
         read: The fields read off the screenshot, with any corrections.
         attachment_path: The stored screenshot file.
         media_type: Its MIME type.
+        notes: The owner's caption and replies, oldest first.
 
     Returns:
         The reply text, and the action that a Yes applies. The action is
@@ -571,6 +573,7 @@ async def review_screenshot(
             duplicate_of=duplicate.id if duplicate is not None else None,
             duplicate_voided=duplicate is not None and duplicate.voided,
             not_duplicates=not_duplicates,
+            notes=notes,
         ),
     )
 

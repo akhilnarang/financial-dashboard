@@ -3011,23 +3011,33 @@ async def _screenshot_reply_result(
     from financial_dashboard.services.assistant.conversations import (
         clear_pending_confirmation,
     )
-    from financial_dashboard.services.settings import get_openai_vision_model
+    from financial_dashboard.services.settings import (
+        get_openai_vision_model,
+        get_self_identifier_tokens,
+    )
     from financial_dashboard.services.transaction_attachments import (
         resolve_attachment_path,
     )
 
     is_new = draft.duplicate_of is not None and user_text.strip().lower() == "new"
+    notes = draft.notes if is_new else [*draft.notes, user_text][-20:]
     corrected = draft.read
     model = None
     if not is_new:
         model = get_openai_vision_model()
         try:
-            corrected = await _vision_read(
+            reread = await _vision_read(
                 resolve_attachment_path(draft.attachment_path).read_bytes(),
                 draft.media_type,
                 model=model,
-                note=user_text,
+                notes=notes,
                 current=draft.read,
+            )
+            oriented = orient_read(reread, get_self_identifier_tokens())
+            corrected = (
+                reread
+                if oriented.direction == reread.direction
+                else oriented.model_copy(update={"account_hint": reread.account_hint})
             )
         except OSError, ValueError, httpx.HTTPError, OpenAIError:
             logger.exception("Screenshot reply %s was not read", interaction_id)
@@ -3041,6 +3051,7 @@ async def _screenshot_reply_result(
             *draft.not_duplicates,
             *([draft.duplicate_of] if is_new else []),
         ],
+        notes=notes,
     )
     if corrected == draft.read and not is_new:
         review = review._replace(
@@ -3064,7 +3075,7 @@ async def _vision_read(
     media_type: str,
     *,
     model: str,
-    note: str | None = None,
+    notes: list[str],
     current: ScreenshotTransaction | None = None,
 ) -> ScreenshotTransaction:
     """Read a screenshot with the vision model.
@@ -3073,8 +3084,8 @@ async def _vision_read(
         image: The screenshot file.
         media_type: Its MIME type.
         model: The vision model id.
-        note: The owner's caption or reply, if any.
-        current: The read that the note corrects, if any.
+        notes: The owner's caption and replies, oldest first.
+        current: The read that the newest note corrects, if any.
 
     Returns:
         The read.
@@ -3091,7 +3102,7 @@ async def _vision_read(
         api_key=get_openai_api_key(),
         model=model,
         base_url=get_openai_base_url(),
-        note=note,
+        notes=notes,
         current=current,
     )
 
@@ -3143,7 +3154,7 @@ async def _process_screenshot_interaction(
                 stored.absolute_path.read_bytes(),
                 stored.media_type,
                 model=vision_model,
-                note=caption,
+                notes=[caption] if caption else [],
             ),
             get_self_identifier_tokens(),
         )
@@ -3177,6 +3188,7 @@ async def _process_screenshot_interaction(
                             attachment_path=stored.relative_path,
                             media_type=stored.media_type,
                             not_duplicates=[],
+                            notes=[caption] if caption else [],
                         ),
                         conversation_id=conversation_id,
                         interaction_id=interaction_id,

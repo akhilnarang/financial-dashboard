@@ -3,7 +3,7 @@
 import base64
 import datetime
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -160,10 +160,10 @@ async def _send(
         api_key: str,
         model: str,
         base_url: str,
-        note: str | None = None,
+        notes: Sequence[str] = (),
         current: ScreenshotTransaction | None = None,
     ) -> ScreenshotTransaction:
-        shot.vision_calls.append({"image": image, "model": model, "note": note})
+        shot.vision_calls.append({"image": image, "model": model, "notes": notes})
         return current or read
 
     async def get_file(file_id: str) -> SimpleNamespace:
@@ -275,7 +275,7 @@ async def test_failed_screenshot_is_refused(
 ) -> None:
     asked = await _send(shot, monkeypatch, _read(status="failed"))
 
-    assert shot.vision_calls == [{"image": PNG, "model": "gpt-6-luna", "note": None}]
+    assert shot.vision_calls == [{"image": PNG, "model": "gpt-6-luna", "notes": []}]
     assert "failed payment" in asked.text
     assert "saved nothing" in asked.text
     assert asked.buttons == []
@@ -295,7 +295,7 @@ async def test_failed_screenshot_is_refused(
         api_key: str,
         model: str,
         base_url: str,
-        note: str | None = None,
+        notes: Sequence[str] = (),
         current: ScreenshotTransaction | None = None,
     ) -> ScreenshotTransaction:
         assert current is not None
@@ -320,7 +320,7 @@ async def test_failed_screenshot_is_refused(
         api_key: str,
         model: str,
         base_url: str,
-        note: str | None = None,
+        notes: Sequence[str] = (),
         current: ScreenshotTransaction | None = None,
     ) -> ScreenshotTransaction:
         raise ValueError(
@@ -720,7 +720,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
 
     caption = "Sent you payment via UPI. Let me know when you get it"
     asked = await _send(shot, monkeypatch, receipt, caption)
-    assert shot.vision_calls[-1]["note"] == caption
+    assert shot.vision_calls[-1]["notes"] == [caption]
     assert (
         "UPI screenshot (supermoney): received ₹1,234.00 from ALEX SMITH (test0000@upi)"
         in asked.text
@@ -735,7 +735,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         api_key: str,
         model: str,
         base_url: str,
-        note: str | None = None,
+        notes: Sequence[str] = (),
         current: ScreenshotTransaction | None = None,
     ) -> ScreenshotTransaction:
         raise ValueError("vision model down")
@@ -759,14 +759,26 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     monkeypatch.setattr(openai_provider, "AsyncOpenAI", MagicMock(return_value=client))
     note = "The UPI ref ID is printed below. The sender is ALEX S SMITH."
     proposed = await _reply(shot, asked.conversation_id, note)
-    [first, previous, reply] = create.call_args.kwargs["messages"]
+    [first, *earlier, previous, reply] = create.call_args.kwargs["messages"]
     [_, image] = first["content"]
+    assert earlier == [
+        {"role": "user", "content": caption},
+        {"role": "user", "content": "thanks"},
+    ]
     assert previous == {"role": "assistant", "content": current.model_dump_json()}
     assert reply == {"role": "user", "content": note}
     assert image["image_url"]["url"] == (
         f"data:image/png;base64,{base64.b64encode(PNG).decode()}"
     )
     assert "Save this as a provisional transaction?" in proposed.text
+    assert "from ALEX S SMITH" in proposed.text
+
+    # A reread that flips the receipt back to the owner's payment is
+    # oriented again by the receipt blocks.
+    flipped = receipt.model_copy(update={"utr": UTR, "account_hint": "SBI savings"})
+    create.return_value.choices[0].message.content = flipped.model_dump_json()
+    proposed = await _reply(shot, asked.conversation_id, "ok")
+    assert "received ₹1,234.00 from ALEX SMITH (test0000@upi)" in proposed.text
     assert (await _yes(shot, asked.conversation_id)).startswith("Saved #")
     [row] = await _rows(shot)
     assert (
@@ -783,7 +795,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         "credit",
         Decimal("1234.00"),
         UTR,
-        "ALEX S SMITH",
+        "ALEX SMITH",
         "test0000@upi",
         paid_at.date(),
         datetime.time(18, 16),
