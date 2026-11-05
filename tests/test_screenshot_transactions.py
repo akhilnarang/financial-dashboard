@@ -1,5 +1,6 @@
 """UPI screenshots become provisional rows. All names, amounts and UTRs are synthetic."""
 
+import base64
 import datetime
 import json
 from collections.abc import AsyncIterator
@@ -7,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from bank_statement_parser.models import BankTransaction, ParsedBankStatement
@@ -284,6 +286,32 @@ async def test_failed_screenshot_is_refused(
     assert "pending payment" in pending.text
     assert "saved nothing" in pending.text
     assert pending.buttons == []
+    assert await _rows(shot) == []
+
+    async def reads_failed(
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        note: str | None = None,
+        current: ScreenshotTransaction | None = None,
+    ) -> ScreenshotTransaction:
+        assert current is not None
+        return current.model_copy(update={"status": "failed"})
+
+    # A reply that shows the payment failed drops the earlier Save question.
+    ready = await _send(shot, monkeypatch, _read())
+    assert "Save this as a provisional transaction?" in ready.text
+    monkeypatch.setattr(openai_provider, "read_screenshot", reads_failed)
+    refused = await _reply(shot, ready.conversation_id, "this one failed")
+    assert "failed payment" in refused.text
+    async with shot.maker() as s:
+        conversation = await s.get(TelegramConversation, ready.conversation_id)
+    assert conversation is not None
+    assert conversation.pending_confirmation_json is None
+    assert not (shot.root / "shot.png").exists()
     assert await _rows(shot) == []
 
     async def raise_empty_value_error(
@@ -605,6 +633,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     Without the From and To blocks, a receipt paid to the owner reads as a
     payment the owner made.
     """
+    real_read_screenshot = openai_provider.read_screenshot
     settings_service._cache["categorization.self_identifiers"] = (
         "JANE DOE, jane@testyes"
     )
@@ -717,29 +746,26 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     unchanged = await _reply(shot, asked.conversation_id, "thanks")
     assert unchanged.text.startswith("I found no new value in your reply.\n")
 
-    seen: list[dict] = []
-
-    async def vision_with_note(
-        *,
-        image: bytes,
-        media_type: str,
-        api_key: str,
-        model: str,
-        base_url: str,
-        note: str | None = None,
-        current: ScreenshotTransaction | None = None,
-    ) -> ScreenshotTransaction:
-        seen.append({"image": image, "note": note, "current": current})
-        assert current is not None
-        return current.model_copy(update={"utr": UTR})
-
     # A plain-language reply goes to the model with the image and current read.
-    monkeypatch.setattr(openai_provider, "read_screenshot", vision_with_note)
-    note = "The UPI ref ID is printed below. I have only one SBI account."
+    current = screenshot_transactions.orient_read(receipt, owner)
+    answer = current.model_copy(
+        update={"utr": UTR, "counterparty": "ALEX S SMITH"}
+    ).model_dump_json()
+    create = AsyncMock(
+        return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=answer))])
+    )
+    client = MagicMock()
+    client.chat.completions.create = create
+    monkeypatch.setattr(openai_provider, "read_screenshot", real_read_screenshot)
+    monkeypatch.setattr(openai_provider, "AsyncOpenAI", MagicMock(return_value=client))
+    note = "The UPI ref ID is printed below. The sender is ALEX S SMITH."
     proposed = await _reply(shot, asked.conversation_id, note)
-    assert [(c["image"], c["note"], c["current"].utr) for c in seen] == [
-        (PNG, note, None)
-    ]
+    [text, image] = create.call_args.kwargs["messages"][0]["content"]
+    assert f"Note: {note}" in text["text"]
+    assert f"Current read: {current.model_dump_json()}" in text["text"]
+    assert image["image_url"]["url"] == (
+        f"data:image/png;base64,{base64.b64encode(PNG).decode()}"
+    )
     assert "Save this as a provisional transaction?" in proposed.text
     assert (await _yes(shot, asked.conversation_id)).startswith("Saved #")
     [row] = await _rows(shot)
@@ -757,7 +783,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         "credit",
         Decimal("1234.00"),
         UTR,
-        "ALEX SMITH",
+        "ALEX S SMITH",
         "test0000@upi",
         paid_at.date(),
         datetime.time(18, 16),

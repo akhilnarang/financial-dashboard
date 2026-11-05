@@ -2622,7 +2622,11 @@ async def _screenshot_reply_result(
     """
     import httpx
     from openai import OpenAIError
+    from financial_dashboard.services.assistant.conversations import (
+        clear_pending_confirmation,
+    )
     from financial_dashboard.services.transaction_attachments import (
+        remove_attachment,
         resolve_attachment_path,
     )
 
@@ -2656,6 +2660,11 @@ async def _screenshot_reply_result(
         review = review._replace(
             text=f"I found no new value in your reply.\n{review.text}"
         )
+    if review.action is None:
+        conversation = await session.get(TelegramConversation, conversation_id)
+        if conversation is not None:
+            clear_pending_confirmation(conversation)
+        remove_attachment(draft.attachment_path)
     result = await _screenshot_result(
         session,
         review,
@@ -2680,7 +2689,7 @@ async def _vision_read(
     note: str | None = None,
     current: ScreenshotTransaction | None = None,
 ) -> ScreenshotTransaction:
-    """Read a screenshot with the vision model and orient it to the owner.
+    """Read a screenshot with the vision model.
 
     Args:
         image: The screenshot file.
@@ -2690,26 +2699,22 @@ async def _vision_read(
         current: The read that the note corrects, if any.
 
     Returns:
-        The oriented read.
+        The read.
     """
     from financial_dashboard.services.categorization import openai_provider
     from financial_dashboard.services.settings import (
         get_openai_api_key,
         get_openai_base_url,
-        get_self_identifier_tokens,
     )
 
-    return orient_read(
-        await openai_provider.read_screenshot(
-            image=image,
-            media_type=media_type,
-            api_key=get_openai_api_key(),
-            model=model,
-            base_url=get_openai_base_url(),
-            note=note,
-            current=current,
-        ),
-        get_self_identifier_tokens(),
+    return await openai_provider.read_screenshot(
+        image=image,
+        media_type=media_type,
+        api_key=get_openai_api_key(),
+        model=model,
+        base_url=get_openai_base_url(),
+        note=note,
+        current=current,
     )
 
 
@@ -2733,6 +2738,7 @@ async def _process_screenshot_interaction(
     from openai import OpenAIError
     from telegram.error import TelegramError
     from financial_dashboard.db import async_session
+    from financial_dashboard.services.settings import get_self_identifier_tokens
     from financial_dashboard.services.transaction_attachments import (
         AttachmentError,
         download_attachment,
@@ -2751,11 +2757,14 @@ async def _process_screenshot_interaction(
         stored = await download_attachment(
             str(telegram_file.file_path), transaction_id=0, declared_size=declared_size
         )
-        read = await _vision_read(
-            stored.absolute_path.read_bytes(),
-            stored.media_type,
-            model=vision_model,
-            note=caption,
+        read = orient_read(
+            await _vision_read(
+                stored.absolute_path.read_bytes(),
+                stored.media_type,
+                model=vision_model,
+                note=caption,
+            ),
+            get_self_identifier_tokens(),
         )
     except (OSError, ValueError, httpx.HTTPError, TelegramError, OpenAIError) as exc:
         if stored is not None:
