@@ -286,7 +286,16 @@ async def test_failed_screenshot_is_refused(
     assert pending.buttons == []
     assert await _rows(shot) == []
 
-    async def raise_empty_value_error(**kwargs: object) -> ScreenshotTransaction:
+    async def raise_empty_value_error(
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        note: str | None = None,
+        current: ScreenshotTransaction | None = None,
+    ) -> ScreenshotTransaction:
         raise ValueError(
             "https://api.telegram.org/file/botSECRET_BOT_TOKEN/photos/1.jpg"
         )
@@ -691,7 +700,16 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert f"{paid_at:%Y-%m-%d %H:%M} · SBI savings" in asked.text
     assert "Missing or not valid: UTR (12 digits)." in asked.text
 
-    async def vision_down(**kwargs: object) -> ScreenshotTransaction:
+    async def vision_down(
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        note: str | None = None,
+        current: ScreenshotTransaction | None = None,
+    ) -> ScreenshotTransaction:
         raise ValueError("vision model down")
 
     # When the model fails, the reply still gets the strict parser.
