@@ -75,6 +75,10 @@ async def test_list_matches_filters_and_exclusion_semantics(session):
                 counterparty="ACME",
             ),
             _transaction(id=3, exclude_from_cashflow=True),
+            # A bank cut the name short, and the row has no description.
+            _transaction(id=4, counterparty="SAMPLE", note=None),
+            # A stored text this short is a prefix of too many searches.
+            _transaction(id=5, counterparty="SAM", note=None),
         ]
     )
     await session.flush()
@@ -89,9 +93,11 @@ async def test_list_matches_filters_and_exclusion_semantics(session):
         excluded=False,
     )
     excluded = await list_transactions(session, excluded=True)
+    by_full_name = await list_transactions(session, search="Friend Samplename Kumar")
 
     assert [row.id for row in included] == [1]
     assert [row.id for row in excluded] == [3]
+    assert [row.id for row in by_full_name] == [4]
 
 
 @pytest.mark.anyio

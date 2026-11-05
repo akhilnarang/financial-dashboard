@@ -1,5 +1,6 @@
 """UPI screenshots become provisional rows. All names, amounts and UTRs are synthetic."""
 
+import base64
 import datetime
 import json
 from collections.abc import AsyncIterator
@@ -7,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from bank_statement_parser.models import BankTransaction, ParsedBankStatement
@@ -137,7 +139,10 @@ async def shot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIterator
 
 
 async def _send(
-    shot: Shot, monkeypatch: pytest.MonkeyPatch, read: ScreenshotTransaction
+    shot: Shot,
+    monkeypatch: pytest.MonkeyPatch,
+    read: ScreenshotTransaction,
+    caption: str | None = None,
 ) -> Asked:
     """Send one screenshot through the bot and return the question it asks."""
 
@@ -149,10 +154,17 @@ async def _send(
         return transaction_attachments.StoredAttachment("shot.png", path, "image/png")
 
     async def fake_vision(
-        *, image: bytes, media_type: str, api_key: str, model: str, base_url: str
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        note: str | None = None,
+        current: ScreenshotTransaction | None = None,
     ) -> ScreenshotTransaction:
-        shot.vision_calls.append({"image": image, "model": model})
-        return read
+        shot.vision_calls.append({"image": image, "model": model, "note": note})
+        return current or read
 
     async def get_file(file_id: str) -> SimpleNamespace:
         return SimpleNamespace(file_path="https://api.telegram.org/file/botT/p")
@@ -186,6 +198,7 @@ async def _send(
         recipient_chat_id=CHAT,
         file_id="file-id",
         declared_size=len(PNG),
+        caption=caption,
     )
     return await _asked(shot, conversation.id, interaction.id)
 
@@ -262,7 +275,7 @@ async def test_failed_screenshot_is_refused(
 ) -> None:
     asked = await _send(shot, monkeypatch, _read(status="failed"))
 
-    assert shot.vision_calls == [{"image": PNG, "model": "gpt-6-luna"}]
+    assert shot.vision_calls == [{"image": PNG, "model": "gpt-6-luna", "note": None}]
     assert "failed payment" in asked.text
     assert "saved nothing" in asked.text
     assert asked.buttons == []
@@ -275,8 +288,40 @@ async def test_failed_screenshot_is_refused(
     assert pending.buttons == []
     assert await _rows(shot) == []
 
+    async def reads_failed(
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        note: str | None = None,
+        current: ScreenshotTransaction | None = None,
+    ) -> ScreenshotTransaction:
+        assert current is not None
+        return current.model_copy(update={"status": "failed"})
+
+    # A reply that shows the payment failed drops the earlier Save question.
+    ready = await _send(shot, monkeypatch, _read())
+    assert "Save this as a provisional transaction?" in ready.text
+    monkeypatch.setattr(openai_provider, "read_screenshot", reads_failed)
+    refused = await _reply(shot, ready.conversation_id, "this one failed")
+    assert "failed payment" in refused.text
+    async with shot.maker() as s:
+        conversation = await s.get(TelegramConversation, ready.conversation_id)
+    assert conversation is not None
+    assert conversation.pending_confirmation_json is None
+    assert await _rows(shot) == []
+
     async def raise_empty_value_error(
-        *, image: bytes, media_type: str, api_key: str, model: str, base_url: str
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        note: str | None = None,
+        current: ScreenshotTransaction | None = None,
     ) -> ScreenshotTransaction:
         raise ValueError(
             "https://api.telegram.org/file/botSECRET_BOT_TOKEN/photos/1.jpg"
@@ -305,6 +350,7 @@ async def test_failed_screenshot_is_refused(
         recipient_chat_id=CHAT,
         file_id="file-id",
         declared_size=len(PNG),
+        caption=None,
     )
     async with shot.maker() as s:
         stored_interaction = await s.get(AuditInteraction, interaction.id)
@@ -586,6 +632,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     Without the From and To blocks, a receipt paid to the owner reads as a
     payment the owner made.
     """
+    real_read_screenshot = openai_provider.read_screenshot
     settings_service._cache["categorization.self_identifiers"] = (
         "JANE DOE, jane@testyes"
     )
@@ -616,6 +663,9 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     # A single name can be a friend's name, so it never marks the owner.
     lone_name = screenshot_transactions.orient_read(receipt, ("DOE",))
     assert lone_name.direction == "debit"
+    name_only = receipt.model_copy(update={"payee": UpiParty(name="JANE Q DOE")})
+    two_words = screenshot_transactions.orient_read(name_only, ("JANE", "DOE"))
+    assert two_words.direction == "credit"
     owner = ("JANE DOE", "jane@testyes")
     # A refund to the owner stays a credit, and shown last 4 digits stay.
     refund = receipt.model_copy(
@@ -656,6 +706,10 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         receipt, "my account number is 999999999999"
     )
     assert account_number.utr is None
+    assert (
+        screenshot_transactions.apply_corrections(receipt, f"UPI ref ID is {UTR}").utr
+        == UTR
+    )
 
     # With one active SBI account, "State Bank of India" resolves the account.
     async with shot.maker() as s:
@@ -664,7 +718,9 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         other.active = False
         await s.commit()
 
-    asked = await _send(shot, monkeypatch, receipt)
+    caption = "Sent you payment via UPI. Let me know when you get it"
+    asked = await _send(shot, monkeypatch, receipt, caption)
+    assert shot.vision_calls[-1]["note"] == caption
     assert (
         "UPI screenshot (supermoney): received ₹1,234.00 from ALEX SMITH (test0000@upi)"
         in asked.text
@@ -672,13 +728,43 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert f"{paid_at:%Y-%m-%d %H:%M} · SBI savings" in asked.text
     assert "Missing or not valid: UTR (12 digits)." in asked.text
 
+    async def vision_down(
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        note: str | None = None,
+        current: ScreenshotTransaction | None = None,
+    ) -> ScreenshotTransaction:
+        raise ValueError("vision model down")
+
+    # When the model fails, the reply still gets the strict parser.
+    monkeypatch.setattr(openai_provider, "read_screenshot", vision_down)
     unchanged = await _reply(shot, asked.conversation_id, "thanks")
     assert unchanged.text.startswith("I found no new value in your reply.\n")
 
-    proposed = await _reply(
-        shot,
-        asked.conversation_id,
-        f"UPI ref ID is {UTR}. I have only one SBI account.",
+    # A plain-language reply goes to the model with the image and current read.
+    current = screenshot_transactions.orient_read(receipt, owner)
+    answer = current.model_copy(
+        update={"utr": UTR, "counterparty": "ALEX S SMITH"}
+    ).model_dump_json()
+    create = AsyncMock(
+        return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=answer))])
+    )
+    client = MagicMock()
+    client.chat.completions.create = create
+    monkeypatch.setattr(openai_provider, "read_screenshot", real_read_screenshot)
+    monkeypatch.setattr(openai_provider, "AsyncOpenAI", MagicMock(return_value=client))
+    note = "The UPI ref ID is printed below. The sender is ALEX S SMITH."
+    proposed = await _reply(shot, asked.conversation_id, note)
+    [first, previous, reply] = create.call_args.kwargs["messages"]
+    [_, image] = first["content"]
+    assert previous == {"role": "assistant", "content": current.model_dump_json()}
+    assert reply == {"role": "user", "content": note}
+    assert image["image_url"]["url"] == (
+        f"data:image/png;base64,{base64.b64encode(PNG).decode()}"
     )
     assert "Save this as a provisional transaction?" in proposed.text
     assert (await _yes(shot, asked.conversation_id)).startswith("Saved #")
@@ -697,7 +783,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         "credit",
         Decimal("1234.00"),
         UTR,
-        "ALEX SMITH",
+        "ALEX S SMITH",
         "test0000@upi",
         paid_at.date(),
         datetime.time(18, 16),

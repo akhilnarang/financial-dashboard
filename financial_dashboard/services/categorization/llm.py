@@ -116,6 +116,10 @@ def build_prompt(
         "when the context establishes that purpose. Unclear person-to-person "
         "transfers and payment gateways alone do not establish a spending purpose; "
         "return needs_review when the distinction remains unclear.",
+        "The owner's note, when present, is written by the account owner and "
+        "states the purpose of the transaction. Use it to decide the category, "
+        "even when the bank narration does not show the purpose. The bank "
+        "narration does not override it.",
         "",
     ]
     if examples:
@@ -141,6 +145,8 @@ def build_prompt(
     lines.append(
         f"description: {_sanitize_description(fields.get('raw_description'), name_tokens)}"
     )
+    if note := fields.get("note"):
+        lines.append(f"owner's note: {_sanitize_counterparty(note, name_tokens)}")
     return "\n".join(lines)
 
 

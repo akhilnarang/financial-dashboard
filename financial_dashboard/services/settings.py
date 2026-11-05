@@ -333,6 +333,14 @@ def get_openai_api_key() -> str:
     return get_setting("openai.api_key") or settings.openai_api_key
 
 
+def get_openai_vision_model() -> str:
+    """Vision model that reads screenshots. A blank setting uses the default."""
+    return (
+        get_setting("openai.vision_model")
+        or SETTINGS_REGISTRY["openai.vision_model"].default
+    )
+
+
 def get_openai_base_url() -> str:
     """OpenAI-compatible base URL. DB setting `openai.base_url` takes precedence;
     falls back to the OPENAI_BASE_URL .env value."""

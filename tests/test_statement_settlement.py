@@ -37,6 +37,7 @@ from financial_dashboard.services.assistant.contracts import (
     VoidTransaction,
     AssistantWriteConfirmation,
     StoredConfirmation,
+    TransactionChangesConfirmation,
 )
 from financial_dashboard.services.assistant.intent_policy import POLICY_VERSION
 from tests.conftest import new_test_engine
@@ -290,6 +291,34 @@ async def test_a_fold_states_what_the_statement_states(maker):
                 pending_confirmation_kind="receivable_write",
             )
         )
+        # So does a found-row question that offers the folded row.
+        session.add(
+            TelegramConversation(
+                chat_id=7,
+                started_by="reply",
+                pending_confirmation_json=StoredConfirmation(
+                    action=TransactionChangesConfirmation(
+                        kind="transaction_changes",
+                        requests=[
+                            {
+                                "name": "apply_transaction_changes",
+                                "transaction_id": 1,
+                                "changes": {
+                                    "exclude_from_cashflow": {
+                                        "op": "set",
+                                        "value": True,
+                                    }
+                                },
+                            }
+                        ],
+                        choose=0,
+                        candidates=[1, 2],
+                    ),
+                    policy_version=POLICY_VERSION,
+                ).model_dump_json(),
+                pending_confirmation_kind="transaction_changes",
+            )
+        )
         session.add(
             Receivable(
                 kind="payable",
@@ -332,6 +361,7 @@ async def test_a_fold_states_what_the_statement_states(maker):
         None,
         None,
         _link_confirmation(1),
+        None,
         None,
         None,
         None,

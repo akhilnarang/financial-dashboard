@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from urllib.parse import urlsplit
 
 from openai import AsyncOpenAI, omit
+from openai.types.chat import ChatCompletionMessageParam
 from openai.types.shared import ReasoningEffort
 from openai.types.shared_params import ResponseFormatJSONSchema
 
@@ -55,11 +56,15 @@ SCREENSHOT_PROMPT = (
     "channel is card for a credit card app or a credit card notification, "
     "such as OneCard. channel is upi for a UPI payment screen. A debit card "
     "notification is a bank account message, so it is not a card screenshot. "
-    "counterparty is the merchant or the person "
-    "name, for example the merchant in 'reversed by <merchant>'. account_hint "
+    "counterparty is the merchant or the person on the other side, never the "
+    "owner, for example the merchant in 'reversed by <merchant>'. account_hint "
     "is the bank or card name and any last 4 digits shown, for example "
     "'OneCard' or 'SBI 1234'. Use null for a field the screen does not show. "
-    "Never guess."
+    "Never guess. The owner can add notes. Use them to fill what the screen "
+    "does not show or does not make clear. Where a note and the screen "
+    "disagree, the screen wins. The screen does not show which party is the "
+    "owner, so a note can tell. In a note, I means the owner. In a message "
+    "forwarded from the other party, you means the owner."
 )
 
 
@@ -259,7 +264,14 @@ async def classify(
 
 
 async def read_screenshot(
-    *, image: bytes, media_type: str, api_key: str, model: str, base_url: str
+    *,
+    image: bytes,
+    media_type: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+    note: str | None = None,
+    current: ScreenshotTransaction | None = None,
 ) -> ScreenshotTransaction:
     """Read one payment screenshot with a vision model and a strict schema.
 
@@ -271,6 +283,8 @@ async def read_screenshot(
         api_key: The OpenAI-compatible API key.
         model: The vision model id.
         base_url: The endpoint, or "" for the official API.
+        note: The owner's caption or reply, sent as a user turn, if any.
+        current: The previous read, sent as the model's turn, if any.
 
     Returns:
         The validated read. A malformed answer raises ``ValueError``.
@@ -279,22 +293,25 @@ async def read_screenshot(
         api_key=api_key, base_url=base_url or None, timeout=LLM_TIMEOUT_MS / 1000
     )
     data_url = f"data:{media_type};base64,{base64.b64encode(image).decode()}"
+    prompt = SCREENSHOT_PROMPT.format(
+        today=datetime.datetime.now(IST).date().isoformat()
+    )
+    messages: list[ChatCompletionMessageParam] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    if current is not None:
+        messages.append({"role": "assistant", "content": current.model_dump_json()})
+    if note:
+        messages.append({"role": "user", "content": note})
     response = await client.chat.completions.create(
         model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": SCREENSHOT_PROMPT.format(
-                            today=datetime.datetime.now(IST).date().isoformat()
-                        ),
-                    },
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ],
+        messages=messages,
         response_format=ResponseFormatJSONSchema(
             type="json_schema",
             json_schema={

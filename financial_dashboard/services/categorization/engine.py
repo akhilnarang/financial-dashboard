@@ -230,6 +230,7 @@ async def categorize_one(
         # None when the transaction has no linked account. The rules layer needs
         # it: what a credit can possibly mean depends on the account it lands on.
         "account_type": account_type,
+        "note": txn.note,
     }
 
     rule_hit = match_rules(fields, load_rule_config())
@@ -259,7 +260,7 @@ async def categorize_one(
     # 'rule') so the stale-vocab requeue in select_needs_work_stmt reconsiders it
     # after a new slug is added; the guard above re-skips cheaply (no API call)
     # unless enrichment later populated text.
-    if not (txn.counterparty or txn.raw_description):
+    if not (txn.counterparty or txn.raw_description or txn.note):
         txn.category = "unknown"
         txn.category_method = "llm"
         txn.category_confidence = 0.0
@@ -357,6 +358,9 @@ async def categorize_one(
             )
             proposed_slug = None if proposal_changed else proposed
         txn.category = resolved
+        if result.slug == NEEDS_REVIEW:
+            # The model chose no category, so the stored fallback has no support.
+            txn.category_confidence = 0.0
         txn.review_status = "pending"
         txn.review_reason = result.reason
         gate_reason = (

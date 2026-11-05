@@ -18,11 +18,16 @@ def test_prompt_lists_slugs_and_redacts():
             "channel": "upi",
             "amount": "500",
             "currency": "INR",
+            # The narration hides the purpose; only the owner's note shows it.
+            "note": "Car loan EMI 2/60 for Friend A, ref 123456789",
         },
         examples=[],
         active_slugs=["groceries", "dining"],
+        name_tokens=("Friend",),
     )
     assert "groceries" in prompt and "dining" in prompt
+    assert "owner's note: Car loan EMI 2/60 for [redacted-name] A" in prompt
+    assert "123456789" not in prompt
     assert NEEDS_REVIEW in prompt
     assert "1234567890123456" not in prompt
     assert "9876543210" not in prompt

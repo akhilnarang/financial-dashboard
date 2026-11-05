@@ -921,6 +921,212 @@ async def test_guessed_category_keeps_the_other_writes(session, first):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("case", ["both", "changed", "choose", "too_many", "invented"])
+async def test_found_row_changes_ask_one_question(session, case):
+    """A change on a searched row used to fail, or apply without the row shown."""
+    account = Account(bank="testbank", label="Savings", type="savings")
+    session.add(account)
+    await session.flush()
+    emi = Transaction(
+        bank="testbank",
+        email_type="test",
+        direction="debit",
+        amount=15000,
+        counterparty="CAR LOAN EMI",
+        account_id=account.id,
+        transaction_date=datetime.date(2026, 10, 5),
+    )
+    # The bank cut the name short, so only the prefix search finds this row.
+    recent = Transaction(
+        bank="testbank",
+        email_type="test",
+        direction="credit",
+        amount=15000,
+        counterparty="SAMPLE",
+        account_id=account.id,
+        transaction_date=datetime.date(2026, 10, 3),
+    )
+    session.add_all([emi, recent])
+    if case in ("choose", "too_many"):
+        older = Transaction(
+            bank="testbank",
+            email_type="test",
+            direction="credit",
+            amount=15000,
+            counterparty="NEFT SAMPLENAME KUMAR",
+            account_id=account.id,
+            transaction_date=datetime.date(2026, 9, 3),
+        )
+        session.add(older)
+    if case == "too_many":
+        # Four rows match, more than the buttons offer.
+        session.add_all(
+            Transaction(
+                bank="testbank",
+                email_type="test",
+                direction="credit",
+                amount=15000,
+                counterparty="SAMPLENAME KUMAR",
+                account_id=account.id,
+                transaction_date=datetime.date(2026, month, 3),
+            )
+            for month in (7, 8)
+        )
+    await session.flush()
+    conversation = await start_conversation(
+        session, chat_id=7, started_by="reply", transaction_id=emi.id
+    )
+    turns = [
+        AuditInteraction(
+            inbound_chat_id=7,
+            trigger="reply",
+            conversation_id=conversation.id,
+            status="processing",
+            worker_token="worker",
+        )
+        for _ in range(2)
+    ]
+    session.add_all([Setting(key="telegram.chat_id", value="7"), *turns])
+    await session.flush()
+    # In the choose case the model picks the older row.
+    picked = older.id if case in ("choose", "too_many") else recent.id
+    exclude = {"exclude_from_cashflow": {"op": "set", "value": True}}
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "list_transactions",
+                        "search": "Samplename Kumar",
+                        "amount": "15000",
+                        "direction": "credit",
+                    }
+                ],
+            ),
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": emi.id,
+                        "changes": exclude,
+                    },
+                    {
+                        "name": "apply_transaction_changes",
+                        "transaction_id": picked,
+                        "changes": exclude,
+                    },
+                    # A row that no read returned spoils the whole batch.
+                    *(
+                        [
+                            {
+                                "name": "apply_transaction_changes",
+                                "transaction_id": 999,
+                                "changes": exclude,
+                            }
+                        ]
+                        if case == "invented"
+                        else []
+                    ),
+                ],
+            ),
+        ]
+    )
+
+    async def answer(choice: int | None = None) -> OrchestrationResult:
+        """Tap Yes, or the candidate row ``choice``, on the question."""
+        return await _apply_pending(
+            session,
+            conversation,
+            user_message="yes",
+            source_interaction_id=turns[0].id,
+            interaction_id=turns[1].id,
+            recipient_chat_id=7,
+            choice=choice,
+        )
+
+    result = await run_turn(
+        session,
+        provider,
+        user_message=(
+            "Car loan EMI 2/60. Exclude from cashflow along with the recent "
+            "Samplename Kumar NEFT credit of the same amount"
+        ),
+        transaction_id=emi.id,
+        conversation_id=conversation.id,
+        interaction_id=turns[0].id,
+    )
+
+    # Nothing applies before the Yes, and the question shows every row in full.
+    assert (emi.exclude_from_cashflow, recent.exclude_from_cashflow) == (False, False)
+    if case == "invented":
+        assert result.response.code == "ambiguous_target"
+        assert conversation.pending_confirmation_json is None
+        return
+    if case == "too_many":
+        # The bot must not hide a match behind the button limit.
+        assert result.response.code == "mutation_rejected"
+        assert "4 rows match" in result.response.message
+        assert conversation.pending_confirmation_json is None
+        return
+    # A free reply must not fall back to the replied-to row.
+    assert conversation.transaction_id is None
+    question = result.response.question
+    assert (
+        f"Exclude it from cashflow: #{emi.id} · 2026-10-05 · debit ₹15,000.00 · "
+        "testbank Savings · CAR LOAN EMI"
+    ) in question
+    recent_line = (
+        f"#{recent.id} · 2026-10-03 · credit ₹15,000.00 · testbank Savings · SAMPLE"
+    )
+    assert recent_line in question
+    await _queue_result(
+        session,
+        interaction_id=turns[0].id,
+        worker_token="worker",
+        result=result,
+        transaction_id=emi.id,
+        recipient_chat_id=7,
+    )
+    deliveries = (
+        await session.scalars(
+            select(TelegramOutboundDelivery).where(
+                TelegramOutboundDelivery.interaction_id == turns[0].id
+            )
+        )
+    ).all()
+    # One message that binds no row, so a free reply cannot reach one row.
+    assert [d.transaction_id for d in deliveries] == [None]
+    buttons = [b["text"] for b in json.loads(deliveries[0].reply_markup_json)[0]]
+    if case == "choose":
+        # Newest first, one button per row, and a typed yes picks no row.
+        assert question.index(recent_line) < question.index(f"#{older.id} · 2026-09-03")
+        assert buttons == [f"#{recent.id}", f"#{older.id}", "No"]
+        assert (await answer()).response.code == "confirmation_rejected"
+        await answer(choice=0)
+        assert older.exclude_from_cashflow is False
+        assert (emi.exclude_from_cashflow, recent.exclude_from_cashflow) == (True, True)
+        return
+    assert buttons == ["Yes", "No"]
+    if case == "changed":
+        recent.note = "edited elsewhere"
+        await session.flush()
+        assert (await answer()).response.code == "confirmation_rejected"
+        assert (emi.exclude_from_cashflow, recent.exclude_from_cashflow) == (
+            False,
+            False,
+        )
+        return
+    reply = _response_text(await answer(), None)
+    assert reply == (
+        f"Saved exclude_from_cashflow for #{emi.id}.\n"
+        f"Saved exclude_from_cashflow for #{recent.id}."
+    )
+    assert (emi.exclude_from_cashflow, recent.exclude_from_cashflow) == (True, True)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "message",
     ["create a dry cleaning category", "don't create a dry cleaning category"],

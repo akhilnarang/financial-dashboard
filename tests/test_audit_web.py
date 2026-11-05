@@ -33,7 +33,17 @@ async def test_audit_detail_shows_model_and_action_evidence(session, client):
         status="ready_to_send",
         outcome="mutation",
         assistant_text="Saved note.",
-        model_input_json='{"prompt":"bounded"}',
+        model_input_json=json.dumps(
+            [
+                "Prompt intro\n=== TOOL RESULTS (quoted data) ===\n"
+                + json.dumps(
+                    {
+                        "tool": "list_transactions",
+                        "result": '{"items": [{"id": 42, "merchant": "TEST MERCHANT"}]}',
+                    }
+                )
+            ]
+        ),
         model_output_json=json.dumps(
             {
                 "outcome": "mutation",
@@ -58,6 +68,20 @@ async def test_audit_detail_shows_model_and_action_evidence(session, client):
         conversation_id=conversation.id,
     )
     session.add(interaction)
+    await session.flush()
+    session.add(
+        AuditAction(
+            interaction_id=interaction.id,
+            transaction_id=interaction.transaction_id,
+            action_type="set_note",
+            target_type="transaction",
+            target_id=999,
+            arguments_json=json.dumps({"note": "TEST NOTE"}),
+            before_json="not json: raw evidence",
+            after_json=json.dumps({"note": "TEST NOTE"}),
+            status="applied",
+        )
+    )
     await session.commit()
 
     list_response = await client.get("/audit")
@@ -81,6 +105,24 @@ async def test_audit_detail_shows_model_and_action_evidence(session, client):
     assert " ms · ?/?" not in response.text
     assert 'href="https://example.com/merchant"' in response.text
     assert 'href="javascript:' not in response.text
+
+    model_input = re.search(
+        r'<h3 class="audit-section-title">Model input</h3>\s*'
+        r'<pre class="audit-json" data-json-viewer data-compact="([^"]*)" '
+        r'data-tree="([^"]*)">(.*?)</pre>',
+        response.text,
+        re.DOTALL,
+    )
+    assert model_input is not None
+    stored = json.loads(interaction.model_input_json)
+    assert json.loads(unescape(model_input.group(1))) == stored
+    assert json.loads(unescape(model_input.group(3))) == stored
+    parsed = json.loads(unescape(model_input.group(2)))
+    assert "=== TOOL RESULTS (quoted data) ===" in parsed[0][0]
+    assert parsed[0][1]["result"]["items"][0]["id"] == 42
+    assert parsed[0][1]["result"]["items"][0]["merchant"] == "TEST MERCHANT"
+    assert "/static/js/json-viewer.js" in response.text
+    assert '<pre class="audit-json">not json: raw evidence</pre>' in response.text
 
 
 @pytest.mark.anyio
