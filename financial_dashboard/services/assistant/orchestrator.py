@@ -815,9 +815,9 @@ async def run_turn(
                 and found_ids <= read_rows.keys()
                 and len(apply_calls) == len(writes)
             )
-            if (
-                not confirm_found
-                and mutation_calls
+            if not confirm_found and (
+                found_ids & read_rows.keys()
+                or mutation_calls
                 and mutation_calls[0].transaction_id != transaction_id
                 and named_state_hashes.get(mutation_calls[0].transaction_id) is None
             ):
@@ -1794,6 +1794,11 @@ async def _confirm_found_changes(
         transaction_state_hash=state_hash,
         direction_policy=policy,
     )
+    # The question can leave out the replied-to row, so a free reply targets none.
+    if conversation_id is not None and (
+        conversation := await session.get(TelegramConversation, conversation_id)
+    ):
+        conversation.transaction_id = None
     return Clarification(outcome="clarification", question=question)
 
 

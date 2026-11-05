@@ -920,7 +920,7 @@ async def test_guessed_category_keeps_the_other_writes(session, first):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("case", ["both", "changed", "choose"])
+@pytest.mark.parametrize("case", ["both", "changed", "choose", "invented"])
 async def test_found_row_changes_ask_one_question(session, case):
     """A change on a searched row used to fail, or apply without the row shown."""
     account = Account(bank="testbank", label="Savings", type="savings")
@@ -1002,6 +1002,18 @@ async def test_found_row_changes_ask_one_question(session, case):
                         "transaction_id": picked,
                         "changes": exclude,
                     },
+                    # A row that no read returned spoils the whole batch.
+                    *(
+                        [
+                            {
+                                "name": "apply_transaction_changes",
+                                "transaction_id": 999,
+                                "changes": exclude,
+                            }
+                        ]
+                        if case == "invented"
+                        else []
+                    ),
                 ],
             ),
         ]
@@ -1033,6 +1045,12 @@ async def test_found_row_changes_ask_one_question(session, case):
 
     # Nothing applies before the Yes, and the question shows every row in full.
     assert (emi.exclude_from_cashflow, recent.exclude_from_cashflow) == (False, False)
+    if case == "invented":
+        assert result.response.code == "ambiguous_target"
+        assert conversation.pending_confirmation_json is None
+        return
+    # A free reply must not fall back to the replied-to row.
+    assert conversation.transaction_id is None
     question = result.response.question
     assert (
         f"Exclude it from cashflow: #{emi.id} · 2026-10-05 · debit ₹15,000.00 · "

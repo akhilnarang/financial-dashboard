@@ -260,7 +260,7 @@ async def categorize_one(
     # 'rule') so the stale-vocab requeue in select_needs_work_stmt reconsiders it
     # after a new slug is added; the guard above re-skips cheaply (no API call)
     # unless enrichment later populated text.
-    if not (txn.counterparty or txn.raw_description):
+    if not (txn.counterparty or txn.raw_description or txn.note):
         txn.category = "unknown"
         txn.category_method = "llm"
         txn.category_confidence = 0.0

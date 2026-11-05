@@ -23,6 +23,7 @@ from financial_dashboard.services.assistant.contracts import (
     AssistantWriteConfirmation,
     StoredConfirmation,
     TransactionChangeConfirmation,
+    TransactionChangesConfirmation,
     VoidTransaction,
 )
 
@@ -206,6 +207,10 @@ async def move_transaction_references(
                 named = {transaction_id}
             case AssistantWriteConfirmation(request=request):
                 named = _named_rows(request)
+            case TransactionChangesConfirmation(
+                requests=requests, candidates=candidates
+            ):
+                named = {*(call.transaction_id for call in requests), *candidates}
             case ScreenshotTransactionConfirmation(
                 duplicate_of=duplicate_of, not_duplicates=not_duplicates
             ):
