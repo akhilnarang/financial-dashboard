@@ -815,9 +815,20 @@ async def run_turn(
                 and found_ids <= read_rows.keys()
                 and len(apply_calls) == len(writes)
             )
+            if not confirm_found and found_ids & read_rows.keys():
+                return completed(
+                    Error(
+                        outcome="error",
+                        message=(
+                            "I can confirm a found row only with transaction "
+                            "changes on rows I found or you named. Ask for the "
+                            "other changes separately."
+                        ),
+                        code="ambiguous_target",
+                    )
+                )
             if not confirm_found and (
-                found_ids & read_rows.keys()
-                or mutation_calls
+                mutation_calls
                 and mutation_calls[0].transaction_id != transaction_id
                 and named_state_hashes.get(mutation_calls[0].transaction_id) is None
             ):
@@ -857,8 +868,8 @@ async def run_turn(
                         }
                     )
                 if confirm_found:
-                    return completed(
-                        await _confirm_found_changes(
+                    try:
+                        found_question = await _confirm_found_changes(
                             session,
                             apply_calls,
                             read_rows,
@@ -868,7 +879,16 @@ async def run_turn(
                             interaction_id=interaction_id,
                             direction_policy=direction_policy,
                         )
-                    )
+                    except MutationRejected as exc:
+                        return completed(
+                            Error(
+                                outcome="error",
+                                message=f"I couldn't safely apply that: {exc}.",
+                                code="mutation_rejected",
+                            ),
+                            error_detail=_format_exception_detail(exc),
+                        )
+                    return completed(found_question)
                 if receivable_calls:
                     return completed(
                         await _confirm_assistant_write(
@@ -1763,8 +1783,14 @@ async def _confirm_found_changes(
         > 1
     }
     if len(choices) > 1:
-        raise MutationRejected("more than one change matches several rows")
+        raise MutationRejected(
+            "more than one change matches several rows; give the row numbers"
+        )
     choose, candidates = next(iter(choices.items()), (None, []))
+    if len(candidates) > MAX_FOUND_CANDIDATES:
+        raise MutationRejected(
+            f"{len(candidates)} rows match; give a date or the row number"
+        )
     policies = {
         _request_direction_policy(call, user_message, direction_policy)
         for call in calls

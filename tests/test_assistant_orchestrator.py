@@ -920,7 +920,7 @@ async def test_guessed_category_keeps_the_other_writes(session, first):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("case", ["both", "changed", "choose", "invented"])
+@pytest.mark.parametrize("case", ["both", "changed", "choose", "too_many", "invented"])
 async def test_found_row_changes_ask_one_question(session, case):
     """A change on a searched row used to fail, or apply without the row shown."""
     account = Account(bank="testbank", label="Savings", type="savings")
@@ -946,7 +946,7 @@ async def test_found_row_changes_ask_one_question(session, case):
         transaction_date=datetime.date(2026, 10, 3),
     )
     session.add_all([emi, recent])
-    if case == "choose":
+    if case in ("choose", "too_many"):
         older = Transaction(
             bank="testbank",
             email_type="test",
@@ -957,6 +957,20 @@ async def test_found_row_changes_ask_one_question(session, case):
             transaction_date=datetime.date(2026, 9, 3),
         )
         session.add(older)
+    if case == "too_many":
+        # Four rows match, more than the buttons offer.
+        session.add_all(
+            Transaction(
+                bank="testbank",
+                email_type="test",
+                direction="credit",
+                amount=15000,
+                counterparty="SAMPLENAME KUMAR",
+                account_id=account.id,
+                transaction_date=datetime.date(2026, month, 3),
+            )
+            for month in (7, 8)
+        )
     await session.flush()
     conversation = await start_conversation(
         session, chat_id=7, started_by="reply", transaction_id=emi.id
@@ -974,7 +988,7 @@ async def test_found_row_changes_ask_one_question(session, case):
     session.add_all([Setting(key="telegram.chat_id", value="7"), *turns])
     await session.flush()
     # In the choose case the model picks the older row.
-    picked = older.id if case == "choose" else recent.id
+    picked = older.id if case in ("choose", "too_many") else recent.id
     exclude = {"exclude_from_cashflow": {"op": "set", "value": True}}
     provider = FakeProvider(
         [
@@ -1047,6 +1061,12 @@ async def test_found_row_changes_ask_one_question(session, case):
     assert (emi.exclude_from_cashflow, recent.exclude_from_cashflow) == (False, False)
     if case == "invented":
         assert result.response.code == "ambiguous_target"
+        assert conversation.pending_confirmation_json is None
+        return
+    if case == "too_many":
+        # The bot must not hide a match behind the button limit.
+        assert result.response.code == "mutation_rejected"
+        assert "4 rows match" in result.response.message
         assert conversation.pending_confirmation_json is None
         return
     # A free reply must not fall back to the replied-to row.
