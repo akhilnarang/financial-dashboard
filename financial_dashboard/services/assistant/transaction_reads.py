@@ -11,7 +11,7 @@ import datetime
 from decimal import Decimal
 from typing import Any, NamedTuple, cast
 
-from sqlalchemy import Select, select
+from sqlalchemy import ColumnElement, Select, and_, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.db.models import CategoryReviewDecision, Transaction
@@ -26,6 +26,9 @@ from financial_dashboard.services.settings import get_redact_name_tokens
 
 MAX_CONTEXT_ROWS = 20
 MAX_FIELD_LENGTH = 2_000
+# A shorter stored counterparty, such as "UPI", would match too many searches.
+MIN_PREFIX_COUNTERPARTY = 4
+MAX_SEARCH_WORDS = 8
 
 
 class AssistantTransaction(NamedTuple):
@@ -95,6 +98,34 @@ def _projection(
         review_status=_bounded(row.review_status),
         review_reason=_bounded(row.review_reason),
         review_gate_reason=_bounded(review_gate_reason),
+    )
+
+
+def _search_clause(search: str) -> ColumnElement[bool]:
+    """Match the search text, or a counterparty that a bank cut short.
+
+    A bank can store only the start of a name, such as "SAMPLE" for
+    "Samplename". Such a counterparty matches when it is the start of the search
+    text from one of its words on.
+
+    Args:
+        search: The free text that the model searches for.
+
+    Returns:
+        One clause that matches either form.
+    """
+    words = search.lower().split()[:MAX_SEARCH_WORDS]
+    stored = func.lower(func.trim(Transaction.counterparty))
+    return or_(
+        *build_transaction_filter_clauses(search=search),
+        *(
+            and_(
+                func.length(stored) >= MIN_PREFIX_COUNTERPARTY,
+                func.substr(literal(" ".join(words[start:])), 1, func.length(stored))
+                == stored,
+            )
+            for start in range(len(words))
+        ),
     )
 
 
@@ -178,7 +209,6 @@ async def list_transactions(
             date_to=date_to,
             direction=direction,
             category=category,
-            search=search,
             excluded=excluded,
             transaction_ids=transaction_ids,
             amount=amount,
@@ -187,6 +217,7 @@ async def list_transactions(
             review_status=review_status,
             reference=reference,
         )
+        .where(*([_search_clause(search)] if search and search.strip() else []))
         .order_by(
             Transaction.transaction_date.desc().nullslast(), Transaction.id.desc()
         )
