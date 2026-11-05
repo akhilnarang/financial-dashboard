@@ -311,7 +311,6 @@ async def test_failed_screenshot_is_refused(
         conversation = await s.get(TelegramConversation, ready.conversation_id)
     assert conversation is not None
     assert conversation.pending_confirmation_json is None
-    assert not (shot.root / "shot.png").exists()
     assert await _rows(shot) == []
 
     async def raise_empty_value_error(

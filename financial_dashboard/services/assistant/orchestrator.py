@@ -2626,7 +2626,6 @@ async def _screenshot_reply_result(
         clear_pending_confirmation,
     )
     from financial_dashboard.services.transaction_attachments import (
-        remove_attachment,
         resolve_attachment_path,
     )
 
@@ -2664,7 +2663,6 @@ async def _screenshot_reply_result(
         conversation = await session.get(TelegramConversation, conversation_id)
         if conversation is not None:
             clear_pending_confirmation(conversation)
-        remove_attachment(draft.attachment_path)
     result = await _screenshot_result(
         session,
         review,
