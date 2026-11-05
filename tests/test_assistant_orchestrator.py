@@ -18,6 +18,7 @@ from financial_dashboard.db.models import (
     PersonIdentifier,
     Receivable,
     Setting,
+    StatementUpload,
     TelegramConversation,
     TelegramOutboundDelivery,
     Transaction,
@@ -1008,6 +1009,7 @@ async def test_void_and_merge_wait_for_a_yes(session, tool):
         # A statement import or an email reparse links its source row and
         # leaves the source empty.
         email_id=1 if tool == "screenshot_keeper" else None,
+        statement_upload_id=1 if tool == "screenshot_keeper" else None,
         bank_statement_upload_id=None if tool == "screenshot_keeper" else 1,
         email_type="bank_statement",
         direction="debit",
@@ -1025,6 +1027,9 @@ async def test_void_and_merge_wait_for_a_yes(session, tool):
             Account(id=1, bank="sbi", label="SBI", type="bank_account"),
             BankStatementUpload(
                 id=1, account_id=1, bank="sbi", filename="s.pdf", file_path="s.pdf"
+            ),
+            StatementUpload(
+                id=1, account_id=1, bank="sbi", filename="c.pdf", file_path="c.pdf"
             ),
             Email(id=1, provider="test", message_id="<m@test>"),
             shot,
@@ -1108,7 +1113,7 @@ async def test_void_and_merge_wait_for_a_yes(session, tool):
     elif tool == "screenshot_keeper":
         # The keeper keeps its screenshot source and gains the bank source.
         assert reply == f"Merged #{bank_row.id} into #{shot.id}. Not merged: note."
-        assert stored == [(shot.id, False, "shot.png", "screenshot+email")]
+        assert stored == [(shot.id, False, "shot.png", "screenshot+email+cc_statement")]
     else:
         assert reply == f"Merged #{shot.id} into #{bank_row.id}."
         assert stored == [(bank_row.id, False, "shot.png", "screenshot+bank_statement")]

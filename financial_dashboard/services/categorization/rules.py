@@ -173,8 +173,8 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
     # there's no counterparty/narration. Spend alerts lack these tokens (so are
     # excluded); generic cc_credit is ambiguous and left to the rules/LLM below.
     email_type = (fields.get("email_type") or "").lower()
-    if "cc_refund" in email_type:
-        return RuleResult("refund", 0.9)
+    if "cc_refund" in email_type or email_type.endswith("refund_screenshot"):
+        return RuleResult(REFUND_SLUG, 0.9)
     if (
         "cc_payment" in email_type
         or "cc_bill_paid" in email_type

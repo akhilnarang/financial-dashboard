@@ -29,6 +29,7 @@ from financial_dashboard.services.categorization.engine import requeue_after_enr
 from financial_dashboard.services.categorization.self_transfer import (
     apply_reference_self_transfer_rule,
 )
+from financial_dashboard.services.linker import expected_account_type
 from financial_dashboard.services.email_attachments import (
     TransactionSlotConflict,
     claim_transaction_source_slot,
@@ -378,6 +379,37 @@ def _counterparty_match(a: str | None, b: str | None) -> bool:
     return na in nb or nb in na
 
 
+def _card_screenshot_fits(candidate: Transaction, txn_data: dict) -> bool:
+    """Tell if an incoming event can confirm a card screenshot row.
+
+    A card screenshot row holds the card that the owner confirmed. An alert
+    on another card is another event. A bank account event is another event
+    too: it has an account mask, or its email_type names a bank account. Card
+    alerts carry no account mask.
+
+    Args:
+        candidate: A stored row that the incoming event can match.
+        txn_data: The incoming event.
+
+    Returns:
+        False when the candidate is a card screenshot row and the event is on
+        another card or on a bank account. Else True.
+    """
+    if not (
+        (candidate.source or "").startswith("screenshot")
+        and (candidate.email_type or "").startswith("card_")
+    ):
+        return True
+    if (
+        normalize_mask(txn_data.get("account_mask"))
+        or expected_account_type(txn_data.get("email_type")) == "bank_account"
+    ):
+        return False
+    incoming = normalize_mask(txn_data.get("card_mask"))
+    stored = normalize_mask(candidate.card_mask)
+    return not incoming or (bool(stored) and mask_matches(incoming, stored))
+
+
 def _card_payment_mask_match(existing: Transaction, txn_data: dict) -> bool:
     """Tell if both messages report the same card payment.
 
@@ -525,6 +557,10 @@ async def _gather_fuzzy_candidates(
         ]
         if not candidates:
             return []
+
+    candidates = [c for c in candidates if _card_screenshot_fits(c, txn_data)]
+    if not candidates:
+        return []
 
     incoming_cp = txn_data.get("counterparty")
 

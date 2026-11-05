@@ -136,6 +136,7 @@ from financial_dashboard.services.categorization.slugs import MANUAL_ONLY_SLUGS
 from financial_dashboard.services.screenshot_transactions import (
     ScreenshotReview,
     apply_corrections,
+    orient_read,
     review_screenshot,
     save_screenshot_transaction,
 )
@@ -2021,23 +2022,10 @@ async def _process_text_interaction(
                             )
                         )
                     case ScreenshotTransactionConfirmation() as draft:
-                        result = await _screenshot_result(
+                        result = await _screenshot_reply_result(
                             session,
-                            await review_screenshot(
-                                session,
-                                apply_corrections(draft.read, user_text),
-                                attachment_path=draft.attachment_path,
-                                media_type=draft.media_type,
-                                not_duplicates=[
-                                    *draft.not_duplicates,
-                                    *(
-                                        [draft.duplicate_of]
-                                        if draft.duplicate_of is not None
-                                        and user_text.strip().lower() == "new"
-                                        else []
-                                    ),
-                                ],
-                            ),
+                            draft,
+                            user_text=user_text,
                             conversation_id=conversation.id,
                             interaction_id=interaction_id,
                         )
@@ -2610,6 +2598,50 @@ async def _process_attachment_interaction(
         await dispatch_saved_delivery(delivery_id)
 
 
+async def _screenshot_reply_result(
+    session: AsyncSession,
+    draft: ScreenshotTransactionConfirmation,
+    *,
+    user_text: str,
+    conversation_id: int,
+    interaction_id: int,
+) -> OrchestrationResult:
+    """Apply a user reply to a pending screenshot draft and build the result.
+
+    Args:
+        session: The turn session.
+        draft: The stored pending screenshot confirmation.
+        user_text: The owner's reply text.
+        conversation_id: The active Telegram conversation id.
+        interaction_id: The inbound audit interaction id.
+
+    Returns:
+        The orchestration result for the updated screenshot review.
+    """
+    is_new = draft.duplicate_of is not None and user_text.strip().lower() == "new"
+    corrected = apply_corrections(draft.read, user_text)
+    review = await review_screenshot(
+        session,
+        corrected,
+        attachment_path=draft.attachment_path,
+        media_type=draft.media_type,
+        not_duplicates=[
+            *draft.not_duplicates,
+            *([draft.duplicate_of] if is_new else []),
+        ],
+    )
+    if corrected == draft.read and not is_new:
+        review = review._replace(
+            text=f"I found no new value in your reply.\n{review.text}"
+        )
+    return await _screenshot_result(
+        session,
+        review,
+        conversation_id=conversation_id,
+        interaction_id=interaction_id,
+    )
+
+
 async def _process_screenshot_interaction(
     *,
     bot: Bot,
@@ -2633,6 +2665,7 @@ async def _process_screenshot_interaction(
     from financial_dashboard.services.settings import (
         get_openai_api_key,
         get_openai_base_url,
+        get_self_identifier_tokens,
         get_setting,
     )
     from financial_dashboard.services.transaction_attachments import (
@@ -2653,12 +2686,15 @@ async def _process_screenshot_interaction(
         stored = await download_attachment(
             str(telegram_file.file_path), transaction_id=0, declared_size=declared_size
         )
-        read = await openai_provider.read_screenshot(
-            image=stored.absolute_path.read_bytes(),
-            media_type=stored.media_type,
-            api_key=get_openai_api_key(),
-            model=vision_model,
-            base_url=get_openai_base_url(),
+        read = orient_read(
+            await openai_provider.read_screenshot(
+                image=stored.absolute_path.read_bytes(),
+                media_type=stored.media_type,
+                api_key=get_openai_api_key(),
+                model=vision_model,
+                base_url=get_openai_base_url(),
+            ),
+            get_self_identifier_tokens(),
         )
     except (OSError, ValueError, httpx.HTTPError, TelegramError, OpenAIError) as exc:
         if stored is not None:

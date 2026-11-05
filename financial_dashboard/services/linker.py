@@ -129,7 +129,7 @@ class LinkContext:
     Slice CC when the SMS body carries no mask."""
 
 
-def _expected_account_type(email_type: str | None) -> str | None:
+def expected_account_type(email_type: str | None) -> str | None:
     """Infer the Account.type a transaction's email_type implies.
 
     Returns:
@@ -344,7 +344,7 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
     if not txn.card_mask and not txn.account_mask:
         bank_key = txn.bank.strip().lower()
         acct_ids = ctx.accounts_by_bank.get(bank_key, [])
-        expected_type = _expected_account_type(txn.email_type)
+        expected_type = expected_account_type(txn.email_type)
         if expected_type is not None:
             acct_ids = [
                 a for a in acct_ids if ctx.account_types.get(a) == expected_type

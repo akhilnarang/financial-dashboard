@@ -47,7 +47,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import NamedTuple
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1316,7 +1316,9 @@ async def enrich_matched_transactions(recon: dict) -> int:
     The counterparty takes the statement narration when it is empty, a generic
     placeholder or a user alias. A paired foreign-currency row takes the
     statement's rupee amount, and so does a row with a manual amount. The row
-    takes the cardholder that the statement names for the line.
+    takes the cardholder that the statement names for the line. A screenshot
+    row that is the only candidate of its line gets ``+cc_statement``
+    appended to its source.
 
     Args:
         recon: The reconciliation from ``reconcile_statement``. Each updated
@@ -1327,6 +1329,21 @@ async def enrich_matched_transactions(recon: dict) -> int:
     """
     enriched = 0
     async with async_session() as session:
+        await session.execute(
+            update(Transaction)
+            .where(
+                Transaction.id.in_(
+                    [
+                        entry["db_txn_id"]
+                        for entry in recon.get("matched", [])
+                        if entry.get("db_txn_id") and entry["candidate_count"] == 1
+                    ]
+                ),
+                Transaction.source.startswith("screenshot"),
+                Transaction.source.not_like("%cc_statement%"),
+            )
+            .values(source=Transaction.source + "+cc_statement")
+        )
         for entry in recon.get("matched", []):
             db_txn_id = entry.get("db_txn_id")
             if not db_txn_id or not (txn := await session.get(Transaction, db_txn_id)):
@@ -1348,8 +1365,7 @@ async def enrich_matched_transactions(recon: dict) -> int:
             enriched += 1
             entry["enriched"] = True
 
-        if enriched:
-            await session.commit()
+        await session.commit()
 
     return enriched
 

@@ -10,6 +10,7 @@ from typing import NamedTuple
 
 import pytest
 from bank_statement_parser.models import BankTransaction, ParsedBankStatement
+from cc_parser.parsers.models import Transaction as CcTransaction
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -17,6 +18,7 @@ import financial_dashboard.db as db_package
 from financial_dashboard.db.models import (
     Account,
     AuditInteraction,
+    Card,
     Setting,
     TelegramConversation,
     TelegramOutboundDelivery,
@@ -25,7 +27,10 @@ from financial_dashboard.db.models import (
 from financial_dashboard.services import screenshot_transactions, telegram
 from financial_dashboard.services import settings as settings_service
 from financial_dashboard.services import transaction_attachments
-from financial_dashboard.services.assistant.contracts import ScreenshotTransaction
+from financial_dashboard.services.assistant.contracts import (
+    ScreenshotTransaction,
+    UpiParty,
+)
 from financial_dashboard.services.assistant.message_context import resolve_reply
 from financial_dashboard.services.assistant.mutations import MutationRejected
 from financial_dashboard.services.assistant.orchestrator import (
@@ -34,8 +39,10 @@ from financial_dashboard.services.assistant.orchestrator import (
     run_pending_confirmation,
 )
 from financial_dashboard.services.categorization import openai_provider
+from financial_dashboard.services.categorization.engine import categorize_one
 from financial_dashboard.services.statements import bank as bank_statements
-from financial_dashboard.services.txn_merge import merge_transaction
+from financial_dashboard.services.statements import cc as cc_statements
+from financial_dashboard.services.txn_merge import find_match, merge_transaction
 from tests.conftest import new_test_engine
 
 pytestmark = pytest.mark.anyio
@@ -78,7 +85,13 @@ async def shot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIterator
     """Two SBI accounts, Telegram on, and a vision call that records its input."""
     engine, holder = new_test_engine()
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    for module in (db_package, telegram, screenshot_transactions, bank_statements):
+    for module in (
+        db_package,
+        telegram,
+        screenshot_transactions,
+        bank_statements,
+        cc_statements,
+    ):
         monkeypatch.setattr(module, "async_session", maker)
     monkeypatch.setattr(
         "financial_dashboard.config.settings.transaction_attachment_root",
@@ -251,8 +264,15 @@ async def test_failed_screenshot_is_refused(
 
     assert shot.vision_calls == [{"image": PNG, "model": "gpt-6-luna"}]
     assert "failed payment" in asked.text
+    assert "saved nothing" in asked.text
     assert asked.buttons == []
     assert not (shot.root / "shot.png").exists()
+    assert await _rows(shot) == []
+
+    pending = await _send(shot, monkeypatch, _read(status="pending"))
+    assert "pending payment" in pending.text
+    assert "saved nothing" in pending.text
+    assert pending.buttons == []
     assert await _rows(shot) == []
 
     async def raise_empty_value_error(
@@ -298,6 +318,202 @@ async def test_failed_screenshot_is_refused(
     assert "SECRET_BOT_TOKEN" not in stored_interaction.error_detail
 
 
+def _card_read(**fields: str | Decimal | None) -> ScreenshotTransaction:
+    """Build one card notification read, with synthetic values."""
+    base: dict[str, str | Decimal | None] = {
+        "status": "reversed",
+        "direction": "debit",
+        "channel": "card",
+        "app": "other",
+        "amount": Decimal("100.00"),
+        "counterparty": "Example Merchant",
+        "vpa": None,
+        "utr": "",
+        "account_hint": "OneCard · Groceries",
+    }
+    return _read(**(base | fields))
+
+
+async def test_card_reversal_screenshot_saves_refund_and_merges_with_alert(
+    shot: Shot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that a card refund screenshot saves a refund row and merges its alert.
+
+    Without this path, a card refund has no row. The row must name the card
+    account, carry the refund category, and enrich with the later alert. The
+    same refund on the card statement must confirm the row, not duplicate it.
+    """
+    async with shot.maker() as s:
+        s.add(Account(id=3, bank="OneCard", label="OneCard CC", type="credit_card"))
+        s.add(Card(id=1, account_id=3, card_mask="XX9999", is_primary=True))
+        await s.commit()
+
+    # A card spend or bill payment has its own alert, so only a refund saves.
+    spend = await _send(shot, monkeypatch, _card_read(status="success"))
+    assert "not a refund" in spend.text
+    assert spend.buttons == []
+
+    asked = await _send(shot, monkeypatch, _card_read())
+
+    assert asked.text.startswith("Card refund: ₹100.00 from")
+    assert "UTR" not in asked.text
+    assert asked.buttons == ["Yes", "Skip"]
+    assert (await _yes(shot, asked.conversation_id)).startswith("Saved #")
+    [row] = await _rows(shot)
+    assert (
+        row.account_id,
+        row.account_mask,
+        row.card_id,
+        row.card_mask,
+        row.bank,
+        row.direction,
+        row.channel,
+        row.email_type,
+        row.category,
+        row.category_method,
+        row.category_confidence,
+        row.source,
+        row.reference_number,
+    ) == (
+        3,
+        None,
+        1,
+        "XX9999",
+        "onecard",
+        "credit",
+        "card",
+        "card_refund_screenshot",
+        None,
+        None,
+        None,
+        "screenshot",
+        None,
+    )
+
+    # The rule pass names a refund screenshot before any model call.
+    async with shot.maker() as s:
+        txn = await s.get(Transaction, row.id)
+        assert await categorize_one(s, txn, use_llm=False) == "rule"
+        await s.commit()
+    [row] = await _rows(shot)
+    assert (row.category, row.category_method) == ("refund", "rule")
+
+    # The same screenshot again offers the stored row, not a second row.
+    again = await _send(shot, monkeypatch, _card_read())
+    assert f"may already be recorded as #{row.id}" in again.text
+    assert len(await _rows(shot)) == 1
+
+    # The alert for the same refund enriches the screenshot row.
+    async with shot.maker() as s:
+        outcome, matched, _ = await merge_transaction(s, "sms", _alert("100.00"))
+        # Another amount is another refund, so it becomes a new row.
+        other, _, _ = await merge_transaction(s, "email", _alert("200.00"))
+        repeat, _, _ = await merge_transaction(s, "sms", _alert("100.00"))
+        await s.commit()
+    assert (outcome, matched.id if matched else None) == ("enriched", row.id)
+    assert matched is not None and matched.source == "screenshot+sms"
+    assert other == "created"
+    assert repeat == "enriched"
+    assert len(await _rows(shot)) == 2
+
+    statement = SimpleNamespace(
+        bank="onecard",
+        transactions=[],
+        payments_refunds=[
+            CcTransaction(
+                date="20/10/2026",
+                narration="EXAMPLE MERCHANT REFUND",
+                amount="100.00",
+                card_number="XX9999",
+                person=None,
+                transaction_type="credit",
+            )
+        ],
+        payments_refunds_total="100.00",
+        card_summaries=[],
+        possible_adjustment_pairs=[],
+        overall_total="0.00",
+        overall_reward_points="0",
+    )
+    async with shot.maker() as s:
+        masks = await cc_statements.load_account_card_masks(s, 3)
+    recon = cc_statements.reconcile_statement(statement, await _rows(shot), 3, masks)
+    # A line that could be one of several rows confirms none of them.
+    [entry] = recon["matched"]
+    await cc_statements.enrich_matched_transactions(
+        {"matched": [entry | {"candidate_count": 2}]}
+    )
+    assert (await _rows(shot))[0].source == "screenshot+sms"
+    await cc_statements.enrich_matched_transactions(recon)
+    assert [entry["db_txn_id"] for entry in recon["matched"]] == [row.id]
+    assert recon["missing"] == []
+    stored, _ = await _rows(shot)
+    assert stored.source == "screenshot+sms+cc_statement"
+
+    # A bank account credit of the same amount is not the card refund.
+    async with shot.maker() as s:
+        savings = await find_match(
+            s, _alert("100.00") | {"account_mask": "XX1234"}, "sms"
+        )
+    assert savings.action == "insert"
+
+    # A row with no stored card takes only an alert that names no card.
+    async with shot.maker() as s:
+        bare = await s.get(Transaction, row.id)
+        assert bare is not None
+        bare.card_mask = None
+        await s.flush()
+        debit_card = await find_match(
+            s, _alert("100.00") | {"card_mask": "XX5555"}, "sms"
+        )
+        await s.rollback()
+    assert debit_card.action == "insert"
+
+    # An alert on another card is another refund, even on the same account.
+    async with shot.maker() as s:
+        wrong_card, _, _ = await merge_transaction(
+            s, "sms", _alert("100.00") | {"card_mask": "XX1111"}
+        )
+        await s.commit()
+    assert wrong_card == "created"
+
+
+async def test_card_hint_without_digits_asks_for_the_card_when_ambiguous(
+    shot: Shot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that an ambiguous card hint asks for the card and saves nothing.
+
+    Without the guard, a refund can land on the wrong card account.
+    """
+    async with shot.maker() as s:
+        s.add_all(
+            [
+                Account(id=3, bank="onecard", label="OneCard A", type="credit_card"),
+                Account(id=4, bank="onecard", label="OneCard B", type="credit_card"),
+                Card(id=1, account_id=3, card_mask="XX9999", is_primary=True),
+                Card(id=2, account_id=4, card_mask="XX8888", is_primary=True),
+            ]
+        )
+        await s.commit()
+
+    asked = await _send(shot, monkeypatch, _card_read(account_hint="OneCard"))
+
+    assert "Missing or not valid: card" in asked.text
+    assert "Which card: OneCard A 9999, OneCard B 8888?" in asked.text
+    assert 'for example "card 1234, amount 100"' in asked.text
+    assert asked.buttons == ["Skip"]
+    with pytest.raises(MutationRejected):
+        await _yes(shot, asked.conversation_id)
+    assert await _rows(shot) == []
+
+    # Replying with the card last 4 resolves the card and lets Yes save.
+    proposed = await _reply(shot, asked.conversation_id, "card 9999")
+    assert "Save this as a provisional transaction?" in proposed.text
+    assert (await _yes(shot, asked.conversation_id)).startswith("Saved #")
+    [saved] = await _rows(shot)
+    assert (saved.account_id, saved.card_id) == (3, 1)
+
+
 @pytest.mark.parametrize("amount", [Decimal("0.001"), Decimal("1e30")])
 async def test_missing_fields_ask_and_a_reply_fills_them_before_yes_saves(
     shot: Shot, monkeypatch: pytest.MonkeyPatch, amount: Decimal
@@ -309,7 +525,7 @@ async def test_missing_fields_ask_and_a_reply_fills_them_before_yes_saves(
     )
 
     # An amount below one paisa, or too large to store, is not valid.
-    assert "amount, UTR (12 digits), account (last 4 digits)" in asked.text
+    assert "amount, UTR (12 digits), account (last 4 digits or bank)" in asked.text
     assert asked.buttons == ["Skip"]
     with pytest.raises(MutationRejected):
         await _yes(shot, asked.conversation_id)
@@ -360,6 +576,132 @@ async def test_missing_fields_ask_and_a_reply_fills_them_before_yes_saves(
         "shot.png",
     )
     assert (shot.root / "shot.png").read_bytes() == PNG
+
+
+async def test_payee_receipt_saves_a_credit_on_the_named_bank(
+    shot: Shot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that a receipt paid to the owner saves a credit on the named bank.
+
+    Without the From and To blocks, a receipt paid to the owner reads as a
+    payment the owner made.
+    """
+    settings_service._cache["categorization.self_identifiers"] = (
+        "JANE DOE, jane@testyes"
+    )
+    paid_at = (
+        datetime.datetime.now(screenshot_transactions.IST) - datetime.timedelta(days=1)
+    ).replace(hour=18, minute=16, second=0, microsecond=0, tzinfo=None)
+    receipt = _read(
+        direction="debit",
+        amount=Decimal("1234.00"),
+        counterparty="JANE DOE",
+        vpa="jane@testyes",
+        utr=None,
+        occurred_at=paid_at,
+        app="supermoney",
+        account_hint=None,
+        payer=UpiParty(name="ALEX SMITH", vpa="test0000@upi", bank_text=None),
+        payee=UpiParty(
+            name="JANE DOE", vpa="jane@testyes", bank_text="State Bank of India"
+        ),
+    )
+
+    # With two active SBI accounts, a bank name alone is ambiguous.
+    ambiguous = await _send(shot, monkeypatch, receipt)
+    assert "received ₹1,234.00 from ALEX SMITH (test0000@upi)" in ambiguous.text
+    assert "UTR (12 digits), account (last 4 digits or bank)" in ambiguous.text
+    assert "Which account: SBI savings 4321, SBI other 9999?" in ambiguous.text
+
+    # A single name can be a friend's name, so it never marks the owner.
+    lone_name = screenshot_transactions.orient_read(receipt, ("DOE",))
+    assert lone_name.direction == "debit"
+    owner = ("JANE DOE", "jane@testyes")
+    # A refund to the owner stays a credit, and shown last 4 digits stay.
+    refund = receipt.model_copy(
+        update={"status": "reversed", "payer": receipt.payee, "payee": receipt.payer}
+    )
+    assert screenshot_transactions.orient_read(refund, owner).direction == "credit"
+    with_last4 = receipt.model_copy(update={"account_hint": "SBI 4321"})
+    oriented = screenshot_transactions.orient_read(with_last4, owner)
+    assert oriented.account_hint == "SBI 4321"
+    sender_digits = with_last4.model_copy(
+        update={"payer": UpiParty(name="ALEX SMITH", bank_text="HDFC 4321")}
+    )
+    assert screenshot_transactions.orient_read(sender_digits, owner).account_hint == (
+        "State Bank of India"
+    )
+    # A sender's bank never names the owner's account, and a partial block
+    # keeps the name already read.
+    sender_bank = receipt.model_copy(
+        update={
+            "account_hint": "HDFC",
+            "counterparty": "ALEX SMITH",
+            "payer": UpiParty(bank_text="HDFC"),
+            "payee": UpiParty(name="JANE DOE", vpa="jane@testyes"),
+        }
+    )
+    oriented = screenshot_transactions.orient_read(sender_bank, owner)
+    assert (oriented.account_hint, oriented.counterparty) == (None, "ALEX SMITH")
+    # A free 12-digit number never replaces a valid UTR.
+    kept = screenshot_transactions.apply_corrections(
+        receipt.model_copy(update={"utr": UTR}), "my account number is 999999999999"
+    )
+    assert kept.utr == UTR
+    typed = screenshot_transactions.apply_corrections(
+        receipt, f"utr {UTR}; my account number is 999999999999"
+    )
+    assert typed.utr == UTR
+    account_number = screenshot_transactions.apply_corrections(
+        receipt, "my account number is 999999999999"
+    )
+    assert account_number.utr is None
+
+    # With one active SBI account, "State Bank of India" resolves the account.
+    async with shot.maker() as s:
+        other = await s.get(Account, 2)
+        assert other is not None
+        other.active = False
+        await s.commit()
+
+    asked = await _send(shot, monkeypatch, receipt)
+    assert (
+        "UPI screenshot (supermoney): received ₹1,234.00 from ALEX SMITH (test0000@upi)"
+        in asked.text
+    )
+    assert f"{paid_at:%Y-%m-%d %H:%M} · SBI savings" in asked.text
+    assert "Missing or not valid: UTR (12 digits)." in asked.text
+
+    unchanged = await _reply(shot, asked.conversation_id, "thanks")
+    assert unchanged.text.startswith("I found no new value in your reply.\n")
+
+    proposed = await _reply(
+        shot,
+        asked.conversation_id,
+        f"UPI ref ID is {UTR}. I have only one SBI account.",
+    )
+    assert "Save this as a provisional transaction?" in proposed.text
+    assert (await _yes(shot, asked.conversation_id)).startswith("Saved #")
+    [row] = await _rows(shot)
+    assert (
+        row.account_id,
+        row.direction,
+        row.amount,
+        row.reference_number,
+        row.counterparty,
+        row.raw_description,
+        row.transaction_date,
+        row.transaction_time,
+    ) == (
+        1,
+        "credit",
+        Decimal("1234.00"),
+        UTR,
+        "ALEX SMITH",
+        "test0000@upi",
+        paid_at.date(),
+        datetime.time(18, 16),
+    )
 
 
 @pytest.mark.parametrize(
@@ -504,6 +846,21 @@ async def test_duplicate_utr_offers_to_attach_instead(
     )
     stored = {row.id: (row.attachment_path, row.voided) for row in await _rows(shot)}
     assert stored == {other.id: (None, False), existing.id: ("shot.png", False)}
+
+
+def _alert(amount: str) -> dict:
+    """Build one OneCard refund alert for the merge checks."""
+    return {
+        "bank": "onecard",
+        "email_type": "onecard_cc_refund",
+        "direction": "credit",
+        "amount": Decimal(amount),
+        "currency": "INR",
+        "transaction_date": datetime.date(2026, 10, 20),
+        "transaction_time": datetime.time(14, 6),
+        "counterparty": None,
+        "channel": "card",
+    }
 
 
 def _screenshot_row() -> Transaction:

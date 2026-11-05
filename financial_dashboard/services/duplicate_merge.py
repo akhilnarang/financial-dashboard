@@ -522,15 +522,21 @@ async def _merge_pair(
         if value
         for part in value.split("+")
     ]
-    # A statement import or an email reparse leaves the source empty. Its link
-    # still confirms a screenshot row, so the merged source must say so.
+    # An email reparse or a statement import leaves the source empty. Its link
+    # still names the source. A statement counts only for a screenshot row.
     if keep.email_id is not None:
         parts.append("email")
-    if keep.bank_statement_upload_id is not None:
-        parts.append("bank_statement")
     sources = set(parts)
     if "screenshot" in sources:
-        source = "+".join(dict.fromkeys(["screenshot", *parts]))
+        links = [
+            name
+            for name, link in (
+                ("bank_statement", keep.bank_statement_upload_id),
+                ("cc_statement", keep.statement_upload_id),
+            )
+            if link is not None
+        ]
+        source = "+".join(dict.fromkeys(["screenshot", *parts, *links]))
     else:
         source = (
             "sms+email"
