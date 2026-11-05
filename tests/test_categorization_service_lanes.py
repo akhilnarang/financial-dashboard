@@ -274,6 +274,7 @@ async def test_llm_low_confidence_routes_to_review_at_the_model_boundary(
         amount=Decimal("99"),
         counterparty="MYSTERY MERCHANT",
         raw_description="MYSTERY MERCHANT",
+        note="snacks for the office",
     )
     session.add(txn)
     await session.flush()
@@ -282,6 +283,8 @@ async def test_llm_low_confidence_routes_to_review_at_the_model_boundary(
     assert method == "llm"
     # Low confidence -> 'unknown' -> direction default (debit -> expense).
     assert txn.category == "expense"
+    # A low-confidence proposal keeps the confidence of that proposal.
+    assert txn.category_confidence == 0.10
     assert txn.review_status == "pending"
     assert txn.review_reason.startswith("unsure\nMerchant lookup: completed")
     assert "https://example.com/mystery" in txn.review_reason
@@ -301,6 +304,7 @@ async def test_llm_low_confidence_routes_to_review_at_the_model_boundary(
     # The model boundary really was the seam: the call saw the engine's
     # fields dict and the active-slug list (with 'self_transfer' filtered out).
     assert captured["fields"]["counterparty"] == "MYSTERY MERCHANT"
+    assert captured["fields"]["note"] == "snacks for the office"
     assert "self_transfer" not in captured["active_slugs"]
     assert "groceries" in captured["active_slugs"]
 
@@ -327,6 +331,8 @@ async def test_llm_invalid_slug_preserves_review_gate_reason(session, monkeypatc
     await eng.categorize_one(session, txn, use_llm=True)
     # The NEEDS_REVIEW sentinel is never stored: the direction default is.
     assert txn.category == "expense"
+    # The model chose no category, so its confidence must not back the default.
+    assert txn.category_confidence == 0.0
     assert txn.review_status == "pending"
     assert txn.review_reason == "invalid model category slug: made_up"
     decision = await session.scalar(
