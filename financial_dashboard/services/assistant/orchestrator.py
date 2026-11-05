@@ -2625,6 +2625,7 @@ async def _screenshot_reply_result(
     from financial_dashboard.services.assistant.conversations import (
         clear_pending_confirmation,
     )
+    from financial_dashboard.services.settings import get_openai_vision_model
     from financial_dashboard.services.transaction_attachments import (
         resolve_attachment_path,
     )
@@ -2633,7 +2634,7 @@ async def _screenshot_reply_result(
     corrected = draft.read
     model = None
     if not is_new:
-        model = _vision_model()
+        model = get_openai_vision_model()
         try:
             corrected = await _vision_read(
                 resolve_attachment_path(draft.attachment_path).read_bytes(),
@@ -2670,13 +2671,6 @@ async def _screenshot_reply_result(
         interaction_id=interaction_id,
     )
     return result._replace(provider="openai", model=model) if model else result
-
-
-def _vision_model() -> str:
-    """Return the configured vision model id."""
-    from financial_dashboard.services.settings import get_setting
-
-    return get_setting("openai.vision_model") or "gpt-6-luna"
 
 
 async def _vision_read(
@@ -2736,7 +2730,10 @@ async def _process_screenshot_interaction(
     from openai import OpenAIError
     from telegram.error import TelegramError
     from financial_dashboard.db import async_session
-    from financial_dashboard.services.settings import get_self_identifier_tokens
+    from financial_dashboard.services.settings import (
+        get_openai_vision_model,
+        get_self_identifier_tokens,
+    )
     from financial_dashboard.services.transaction_attachments import (
         AttachmentError,
         download_attachment,
@@ -2747,7 +2744,7 @@ async def _process_screenshot_interaction(
     stored = None
     read = None
     error_detail: str | None = None
-    vision_model = _vision_model()
+    vision_model = get_openai_vision_model()
     try:
         telegram_file = await bot.get_file(file_id)
         if not telegram_file.file_path:
