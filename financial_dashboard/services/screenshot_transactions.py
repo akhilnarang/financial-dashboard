@@ -116,8 +116,8 @@ def _is_owner(party: UpiParty | None, self_tokens: tuple[str, ...]) -> bool:
     """Tell if a receipt party is the owner.
 
     A VPA matches a token exactly or by the part before the @. A name matches
-    a token of two or more words when the name holds each word. A single
-    first name can be a friend's name, so it never matches.
+    when it holds two or more words of the owner's tokens, from one token or
+    several. A single first name can be a friend's name, so it never matches.
 
     Args:
         party: The From or To block of the receipt.
@@ -130,12 +130,11 @@ def _is_owner(party: UpiParty | None, self_tokens: tuple[str, ...]) -> bool:
         return False
     words = set((party.name or "").lower().split())
     vpa = (party.vpa or "").lower()
-    for token in (t.lower() for t in self_tokens):
-        if vpa and token in (vpa, vpa.partition("@")[0]):
-            return True
-        if len(parts := token.split()) > 1 and set(parts) <= words:
-            return True
-    return False
+    tokens = [t.lower() for t in self_tokens]
+    if vpa and any(t in (vpa, vpa.partition("@")[0]) for t in tokens):
+        return True
+    found = {w for t in tokens if (parts := set(t.split())) <= words for w in parts}
+    return len(found) > 1
 
 
 def orient_read(

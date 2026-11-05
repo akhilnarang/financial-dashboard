@@ -137,7 +137,10 @@ async def shot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIterator
 
 
 async def _send(
-    shot: Shot, monkeypatch: pytest.MonkeyPatch, read: ScreenshotTransaction
+    shot: Shot,
+    monkeypatch: pytest.MonkeyPatch,
+    read: ScreenshotTransaction,
+    caption: str | None = None,
 ) -> Asked:
     """Send one screenshot through the bot and return the question it asks."""
 
@@ -149,10 +152,17 @@ async def _send(
         return transaction_attachments.StoredAttachment("shot.png", path, "image/png")
 
     async def fake_vision(
-        *, image: bytes, media_type: str, api_key: str, model: str, base_url: str
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        note: str | None = None,
+        current: ScreenshotTransaction | None = None,
     ) -> ScreenshotTransaction:
-        shot.vision_calls.append({"image": image, "model": model})
-        return read
+        shot.vision_calls.append({"image": image, "model": model, "note": note})
+        return current or read
 
     async def get_file(file_id: str) -> SimpleNamespace:
         return SimpleNamespace(file_path="https://api.telegram.org/file/botT/p")
@@ -186,6 +196,7 @@ async def _send(
         recipient_chat_id=CHAT,
         file_id="file-id",
         declared_size=len(PNG),
+        caption=caption,
     )
     return await _asked(shot, conversation.id, interaction.id)
 
@@ -262,7 +273,7 @@ async def test_failed_screenshot_is_refused(
 ) -> None:
     asked = await _send(shot, monkeypatch, _read(status="failed"))
 
-    assert shot.vision_calls == [{"image": PNG, "model": "gpt-6-luna"}]
+    assert shot.vision_calls == [{"image": PNG, "model": "gpt-6-luna", "note": None}]
     assert "failed payment" in asked.text
     assert "saved nothing" in asked.text
     assert asked.buttons == []
@@ -275,9 +286,7 @@ async def test_failed_screenshot_is_refused(
     assert pending.buttons == []
     assert await _rows(shot) == []
 
-    async def raise_empty_value_error(
-        *, image: bytes, media_type: str, api_key: str, model: str, base_url: str
-    ) -> ScreenshotTransaction:
+    async def raise_empty_value_error(**kwargs: object) -> ScreenshotTransaction:
         raise ValueError(
             "https://api.telegram.org/file/botSECRET_BOT_TOKEN/photos/1.jpg"
         )
@@ -305,6 +314,7 @@ async def test_failed_screenshot_is_refused(
         recipient_chat_id=CHAT,
         file_id="file-id",
         declared_size=len(PNG),
+        caption=None,
     )
     async with shot.maker() as s:
         stored_interaction = await s.get(AuditInteraction, interaction.id)
@@ -616,6 +626,9 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     # A single name can be a friend's name, so it never marks the owner.
     lone_name = screenshot_transactions.orient_read(receipt, ("DOE",))
     assert lone_name.direction == "debit"
+    name_only = receipt.model_copy(update={"payee": UpiParty(name="JANE Q DOE")})
+    two_words = screenshot_transactions.orient_read(name_only, ("JANE", "DOE"))
+    assert two_words.direction == "credit"
     owner = ("JANE DOE", "jane@testyes")
     # A refund to the owner stays a credit, and shown last 4 digits stay.
     refund = receipt.model_copy(
@@ -656,6 +669,10 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         receipt, "my account number is 999999999999"
     )
     assert account_number.utr is None
+    assert (
+        screenshot_transactions.apply_corrections(receipt, f"UPI ref ID is {UTR}").utr
+        == UTR
+    )
 
     # With one active SBI account, "State Bank of India" resolves the account.
     async with shot.maker() as s:
@@ -664,7 +681,9 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         other.active = False
         await s.commit()
 
-    asked = await _send(shot, monkeypatch, receipt)
+    caption = "Sent you payment via UPI. Let me know when you get it"
+    asked = await _send(shot, monkeypatch, receipt, caption)
+    assert shot.vision_calls[-1]["note"] == caption
     assert (
         "UPI screenshot (supermoney): received ₹1,234.00 from ALEX SMITH (test0000@upi)"
         in asked.text
@@ -672,14 +691,37 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert f"{paid_at:%Y-%m-%d %H:%M} · SBI savings" in asked.text
     assert "Missing or not valid: UTR (12 digits)." in asked.text
 
+    async def vision_down(**kwargs: object) -> ScreenshotTransaction:
+        raise ValueError("vision model down")
+
+    # When the model fails, the reply still gets the strict parser.
+    monkeypatch.setattr(openai_provider, "read_screenshot", vision_down)
     unchanged = await _reply(shot, asked.conversation_id, "thanks")
     assert unchanged.text.startswith("I found no new value in your reply.\n")
 
-    proposed = await _reply(
-        shot,
-        asked.conversation_id,
-        f"UPI ref ID is {UTR}. I have only one SBI account.",
-    )
+    seen: list[dict] = []
+
+    async def vision_with_note(
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        note: str | None = None,
+        current: ScreenshotTransaction | None = None,
+    ) -> ScreenshotTransaction:
+        seen.append({"image": image, "note": note, "current": current})
+        assert current is not None
+        return current.model_copy(update={"utr": UTR})
+
+    # A plain-language reply goes to the model with the image and current read.
+    monkeypatch.setattr(openai_provider, "read_screenshot", vision_with_note)
+    note = "The UPI ref ID is printed below. I have only one SBI account."
+    proposed = await _reply(shot, asked.conversation_id, note)
+    assert [(c["image"], c["note"], c["current"].utr) for c in seen] == [
+        (PNG, note, None)
+    ]
     assert "Save this as a provisional transaction?" in proposed.text
     assert (await _yes(shot, asked.conversation_id)).startswith("Saved #")
     [row] = await _rows(shot)
