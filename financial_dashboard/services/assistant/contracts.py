@@ -249,6 +249,28 @@ class TransactionChangeConfirmation(StrictModel):
     request: ApplyTransactionChanges
 
 
+class TransactionChangesConfirmation(StrictModel):
+    """Changes to rows that a search found, which one Yes applies together.
+
+    All the changes apply, or none of them. When ``candidates`` is not empty,
+    the request at index ``choose`` has no fixed row. The user taps one
+    candidate, and that row gets the change.
+    """
+
+    kind: Literal["transaction_changes"]
+    requests: list[ApplyTransactionChanges] = Field(min_length=1, max_length=4)
+    choose: StrictInt | None = Field(default=None, ge=0)
+    candidates: list[StrictInt] = Field(default_factory=list, max_length=3)
+
+    @model_validator(mode="after")
+    def validate_choice(self) -> "TransactionChangesConfirmation":
+        if (self.choose is None) != (not self.candidates):
+            raise ValueError("a choice needs candidates, and candidates a choice")
+        if self.choose is not None and self.choose >= len(self.requests):
+            raise ValueError("the choice names no request")
+        return self
+
+
 class AssistantWriteConfirmation(StrictModel):
     kind: Literal["receivable_write"]
     request: AssistantWrite
@@ -336,6 +358,7 @@ class ScreenshotTransactionConfirmation(StrictModel):
 ConfirmationAction: TypeAlias = Annotated[
     MerchantRuleConfirmation
     | TransactionChangeConfirmation
+    | TransactionChangesConfirmation
     | AssistantWriteConfirmation
     | ScreenshotTransactionConfirmation,
     Field(discriminator="kind"),
@@ -397,7 +420,8 @@ class ToolCalls(StrictModel):
     """Application-owned reads and up to 4 writes.
 
     The first write applies or asks now. The others form a chain that asks for
-    one Yes per write, so the writes are not atomic.
+    one Yes per write, so the writes are not atomic. When a change targets a
+    row that a search found, all the changes ask for one Yes together.
     """
 
     outcome: Literal["tool_calls"]

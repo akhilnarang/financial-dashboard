@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import traceback
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from decimal import Decimal, InvalidOperation
 from typing import NamedTuple, cast
 
@@ -23,6 +23,7 @@ from telegram import Bot
 
 from telegram import Document
 
+from financial_dashboard.core.templating import format_inr_exact
 from financial_dashboard.db.enums import ReceivableStatus
 from financial_dashboard.db.models import (
     Account,
@@ -77,6 +78,7 @@ from financial_dashboard.services.assistant.contracts import (
     StoredConfirmation,
     TransactionChangeConfirmation,
     TransactionChanges,
+    TransactionChangesConfirmation,
     parse_response,
 )
 from financial_dashboard.services.assistant.intent_policy import (
@@ -156,6 +158,8 @@ _UNSUPPORTED_AGGREGATE = re.compile(
 )
 
 
+# Each candidate row gets a button, so the question stays short.
+MAX_FOUND_CANDIDATES = 3
 _CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
 _SECRET_TRACEBACK_RE = re.compile(
     r"(https?://api\.telegram\.org/(?:file/)?bot)[^/\s'\"]+|(Bearer\s+)[^\s'\"]+|(\bsk-[A-Za-z0-9_-]{8,})"
@@ -551,7 +555,7 @@ async def run_turn(
     tool_results: list[dict[str, object]] = []
     calls_used = 0
     mutation: MutationResult | None = None
-    read_transaction_ids: set[int] = set()
+    read_rows: dict[int, AssistantTransaction] = {}
     prompt_records: list[str] = []
     output_records: list[dict[str, object]] = []
     last_result = None
@@ -580,7 +584,7 @@ async def run_turn(
                 for record in output_records
                 if isinstance(record.get("latency_ms"), int)
             ),
-            tuple(sorted(read_transaction_ids)),
+            tuple(sorted(read_rows)),
             False,
             error_detail,
         )
@@ -797,8 +801,23 @@ async def run_turn(
                 if len(writes) > 1
                 else None
             )
+            apply_calls = [
+                call for call in writes if isinstance(call, ApplyTransactionChanges)
+            ]
+            trusted_ids = {
+                *named_state_hashes,
+                *([transaction_id] if transaction_id is not None else []),
+            }
+            found_ids = {call.transaction_id for call in apply_calls} - trusted_ids
+            # A change on a row that an earlier read returned always asks first.
+            confirm_found = (
+                bool(found_ids)
+                and found_ids <= read_rows.keys()
+                and len(apply_calls) == len(writes)
+            )
             if (
-                mutation_calls
+                not confirm_found
+                and mutation_calls
                 and mutation_calls[0].transaction_id != transaction_id
                 and named_state_hashes.get(mutation_calls[0].transaction_id) is None
             ):
@@ -813,7 +832,7 @@ async def run_turn(
                     )
                 )
             pending_tool_results: list[dict[str, object]] = []
-            pending_read_ids: set[int] = set()
+            pending_rows: dict[int, AssistantTransaction] = {}
             unfit_guess: str | None = None
             try:
                 # Validate and execute every read before the first write applies.
@@ -824,10 +843,10 @@ async def run_turn(
                     tool_result = await _dispatch_read(session, call)
                     match tool_result:
                         case AssistantTransaction():
-                            pending_read_ids.add(tool_result.id)
+                            pending_rows[tool_result.id] = tool_result
                         case list():
-                            pending_read_ids.update(
-                                row.id
+                            pending_rows.update(
+                                (row.id, row)
                                 for row in tool_result
                                 if isinstance(row, AssistantTransaction)
                             )
@@ -836,6 +855,19 @@ async def run_turn(
                             "tool": call.name,
                             "result": serialize_tool_result(tool_result),
                         }
+                    )
+                if confirm_found:
+                    return completed(
+                        await _confirm_found_changes(
+                            session,
+                            apply_calls,
+                            read_rows,
+                            trusted_ids=trusted_ids,
+                            user_message=user_message,
+                            conversation_id=conversation_id,
+                            interaction_id=interaction_id,
+                            direction_policy=direction_policy,
+                        )
                     )
                 if receivable_calls:
                     return completed(
@@ -991,7 +1023,7 @@ async def run_turn(
                     ),
                     error_detail=_format_exception_detail(exc),
                 )
-            read_transaction_ids.update(pending_read_ids)
+            read_rows.update(pending_rows)
             tool_results.extend(pending_tool_results)
             if chain is not None:
                 try:
@@ -1082,7 +1114,11 @@ async def claim_pending_confirmation(
     *,
     replied_to_interaction_id: int,
 ) -> (
-    ApplyTransactionChanges | AssistantWrite | ScreenshotTransactionConfirmation | None
+    ApplyTransactionChanges
+    | AssistantWrite
+    | ScreenshotTransactionConfirmation
+    | TransactionChangesConfirmation
+    | None
 ):
     """Use compare-and-swap to claim an application-authored pending action for a direct reply."""
     conversation = await session.get(TelegramConversation, conversation_id)
@@ -1116,7 +1152,7 @@ async def claim_pending_confirmation(
                 return None
         case AssistantWriteConfirmation():
             request = stored.action.request
-        case ScreenshotTransactionConfirmation():
+        case ScreenshotTransactionConfirmation() | TransactionChangesConfirmation():
             request = stored.action
     claimed = await session.execute(
         update(TelegramConversation)
@@ -1134,6 +1170,39 @@ async def claim_pending_confirmation(
     return request if cast(CursorResult, claimed).rowcount == 1 else None
 
 
+async def _fresh_state_hash(
+    session: AsyncSession, action: ConfirmationAction, choice: int | None
+) -> str | None:
+    """Fingerprint the current state of what a pending action changes.
+
+    Args:
+        session: The session that holds the write lock.
+        action: The stored pending action.
+        choice: The candidate row that the user tapped, or None for a Yes.
+
+    Returns:
+        The hash to compare with the hash of the question.
+
+    Raises:
+        MutationRejected: The answer does not fit the question.
+    """
+    if choice is not None and not isinstance(action, TransactionChangesConfirmation):
+        raise MutationRejected("this question has no row to choose")
+    match action:
+        case AssistantWriteConfirmation(request=write):
+            return await assistant_write_state_hash(session, write)
+        case ScreenshotTransactionConfirmation():
+            return _screenshot_state_hash(action)
+        case TransactionChangesConfirmation():
+            _chosen_requests(action, choice)
+            return await _rows_state_hash(session, _confirmation_rows(action))
+        case (
+            MerchantRuleConfirmation(transaction_id=transaction_id)
+            | TransactionChangeConfirmation(transaction_id=transaction_id)
+        ):
+            return await current_confirmation_state_hash(session, transaction_id)
+
+
 async def run_pending_confirmation(
     session: AsyncSession,
     *,
@@ -1143,11 +1212,16 @@ async def run_pending_confirmation(
     replied_to_interaction_id: int,
     interaction_id: int | None = None,
     authorized_chat_id: int | None = None,
+    choice: int | None = None,
 ) -> MutationResult | str:
     """Consume a pending confirmation and apply it atomically.
 
+    ``choice`` is the candidate row that the user tapped, if the question
+    offers rows.
+
     Returns:
-        The transaction change, or the reply text of a receivable write.
+        The transaction change, or the reply text of a receivable write or of
+        several changes.
     """
     if not is_direct_affirmative(user_message):
         raise MutationRejected("confirmation must be a direct affirmative")
@@ -1163,18 +1237,7 @@ async def run_pending_confirmation(
         stored = _stored_confirmation(
             conversation, conversation.pending_confirmation_json
         )
-        match stored.action:
-            case AssistantWriteConfirmation(request=write):
-                fresh_hash = await assistant_write_state_hash(session, write)
-            case ScreenshotTransactionConfirmation():
-                fresh_hash = _screenshot_state_hash(stored.action)
-            case (
-                MerchantRuleConfirmation(transaction_id=transaction_id)
-                | TransactionChangeConfirmation(transaction_id=transaction_id)
-            ):
-                fresh_hash = await current_confirmation_state_hash(
-                    session, transaction_id
-                )
+        fresh_hash = await _fresh_state_hash(session, stored.action, choice)
         pending_direction_policy = DirectionPolicy(stored.direction_policy)
     if fresh_hash != state_hash:
         raise MutationRejected("transaction changed since confirmation was requested")
@@ -1211,6 +1274,19 @@ async def run_pending_confirmation(
                 result = await save_screenshot_transaction(
                     session, request, interaction_id=interaction_id
                 )
+            case TransactionChangesConfirmation():
+                saved = [
+                    await apply_transaction_changes(
+                        session,
+                        change,
+                        current_user_message=user_message,
+                        interaction_id=interaction_id,
+                        confirmed_pending=True,
+                        direction_policy=pending_direction_policy,
+                    )
+                    for change in _chosen_requests(request, choice)
+                ]
+                result = "\n".join(map(_saved_line, saved))
         await session.execute(
             update(TelegramConversation)
             .where(TelegramConversation.id == conversation_id)
@@ -1352,25 +1428,25 @@ def _describe_changes(request: ApplyTransactionChanges) -> str:
     return " and ".join(parts)
 
 
-async def _confirm_change(
+async def _check_confirmable(
     session: AsyncSession,
     request: ApplyTransactionChanges,
-    target: AssistantTransaction,
     *,
     user_message: str,
-    conversation_id: int | None,
-    interaction_id: int | None,
     direction_policy: DirectionPolicy,
-    chain: PendingChain | None = None,
-) -> Clarification:
-    """Ask the user to confirm a change before it is written.
+) -> None:
+    """Check that a Yes can apply a change, and write nothing.
 
-    The bot asks when a bare number names the row, which can be an amount, or
-    when the message does not clearly ask for the change. The user sees the
-    row and the change, and a Yes tap authorizes it. A change that the message
-    forbids, or that is not valid, raises instead. A category the message never
-    names that only the owner may set raises too, so the question never offers
-    it.
+    Args:
+        session: The turn session.
+        request: The change to check.
+        user_message: The message that asks for the change.
+        direction_policy: The policy that the Yes applies with.
+
+    Raises:
+        MutationRejected: The message forbids the change, the change is not
+            valid, or it sets a manual-only category that the message does not
+            name.
     """
     if request.merchant_rule is not None:
         raise MutationRejected("a merchant rule needs a direct instruction")
@@ -1393,6 +1469,31 @@ async def _confirm_change(
         )
     finally:
         await savepoint.rollback()
+
+
+async def _confirm_change(
+    session: AsyncSession,
+    request: ApplyTransactionChanges,
+    target: AssistantTransaction,
+    *,
+    user_message: str,
+    conversation_id: int | None,
+    interaction_id: int | None,
+    direction_policy: DirectionPolicy,
+    chain: PendingChain | None = None,
+) -> Clarification:
+    """Ask the user to confirm a change before it is written.
+
+    The bot asks when a bare number names the row, which can be an amount, or
+    when the message does not clearly ask for the change. The user sees the
+    row and the change, and a Yes tap authorizes it. A change that the message
+    forbids, or that is not valid, raises instead. A category the message never
+    names that only the owner may set raises too, so the question never offers
+    it.
+    """
+    await _check_confirmable(
+        session, request, user_message=user_message, direction_policy=direction_policy
+    )
     state_hash = await current_confirmation_state_hash(session, request.transaction_id)
     if state_hash is None:
         raise MutationRejected("transaction not found")
@@ -1458,6 +1559,240 @@ async def _confirm_assistant_write(
         transaction_state_hash=state_hash,
         direction_policy=DirectionPolicy.INFERRED_STRICT,
         chain=chain,
+    )
+    return Clarification(outcome="clarification", question=question)
+
+
+def _confirmation_rows(action: TransactionChangesConfirmation) -> list[int]:
+    """Return every row that the question shows, so one hash covers them all."""
+    return [
+        *(request.transaction_id for request in action.requests),
+        *action.candidates,
+    ]
+
+
+async def _rows_state_hash(
+    session: AsyncSession, transaction_ids: Sequence[int]
+) -> str | None:
+    """Fingerprint the current state of several rows.
+
+    Args:
+        session: The turn session.
+        transaction_ids: The rows to fingerprint.
+
+    Returns:
+        One hash over all the rows, or None when a row no longer exists.
+    """
+    parts = []
+    for transaction_id in sorted(set(transaction_ids)):
+        state = await current_confirmation_state_hash(session, transaction_id)
+        if state is None:
+            return None
+        parts.append(f"{transaction_id}:{state}")
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
+def _chosen_requests(
+    action: TransactionChangesConfirmation, choice: int | None
+) -> list[ApplyTransactionChanges]:
+    """Return the changes that a Yes or a row tap applies.
+
+    Args:
+        action: The stored question.
+        choice: The index of the tapped candidate row, or None for a Yes.
+
+    Returns:
+        The changes, with the tapped row in the request that had no row.
+
+    Raises:
+        MutationRejected: The answer does not fit the question.
+    """
+    if action.choose is None:
+        if choice is not None:
+            raise MutationRejected("this question has no row to choose")
+        return action.requests
+    if choice is None or not 0 <= choice < len(action.candidates):
+        raise MutationRejected("tap the button of the row you mean")
+    requests = list(action.requests)
+    requests[action.choose] = requests[action.choose].model_copy(
+        update={"transaction_id": action.candidates[choice]}
+    )
+    return requests
+
+
+async def _row_line(session: AsyncSession, transaction_id: int) -> str:
+    """Render one row in full from stored data: id, date, amount, account, payee.
+
+    Raises:
+        MutationRejected: The row does not exist.
+    """
+    if (txn := await session.get(Transaction, transaction_id)) is None:
+        raise MutationRejected("transaction not found")
+    account = (
+        await session.get(Account, txn.account_id)
+        if txn.account_id is not None
+        else None
+    )
+    amount = (
+        format_inr_exact(txn.amount)
+        if (txn.currency or "INR") == "INR"
+        else f"{txn.amount} {txn.currency}"
+    )
+    return " · ".join(
+        (
+            f"#{txn.id}",
+            str(txn.transaction_date or "unknown date"),
+            f"{txn.direction} {amount}",
+            (f"{account.bank} {account.label}" if account else txn.bank)[:40],
+            (txn.counterparty or "unknown")[:60],
+        )
+    )
+
+
+def _plausible_rows(
+    call: ApplyTransactionChanges,
+    read_rows: Mapping[int, AssistantTransaction],
+    taken: set[int],
+) -> list[int]:
+    """Return the read rows that the target of a change could be, newest first.
+
+    A read row is plausible when its direction, amount and currency are the
+    same as those of the row that the model chose.
+
+    Args:
+        call: A change on a row that a read returned.
+        read_rows: The rows that the reads of this turn returned.
+        taken: The rows that the other changes target.
+
+    Returns:
+        The ids of the plausible rows, the chosen row included.
+    """
+    found = read_rows[call.transaction_id]
+    rows = sorted(
+        (
+            row
+            for row in read_rows.values()
+            if row.id not in taken
+            and (row.direction, row.amount, row.currency)
+            == (found.direction, found.amount, found.currency)
+        ),
+        key=lambda row: (row.transaction_date or datetime.date.min, row.id),
+        reverse=True,
+    )
+    return [row.id for row in rows]
+
+
+async def _found_question(
+    session: AsyncSession, action: TransactionChangesConfirmation
+) -> str:
+    """Render the question of a found-row confirmation from stored data.
+
+    Raises:
+        MutationRejected: A row is gone, or the question is too long to send.
+    """
+    lines = ["Make these changes together?"]
+    for index, request in enumerate(action.requests):
+        change = _describe_changes(request)
+        row = (
+            "the row that you tap below"
+            if index == action.choose
+            else await _row_line(session, request.transaction_id)
+        )
+        lines.append(f"{change[0].upper()}{change[1:]}: {row}")
+    if action.candidates:
+        lines.append("Rows that match, newest first:")
+        lines.extend([await _row_line(session, row) for row in action.candidates])
+        lines.append("A tap makes all of these changes, or none.")
+    else:
+        lines.append("A Yes makes all of these changes, or none.")
+    question = "\n".join(lines)
+    if len(question) > 1000:
+        raise MutationRejected("that is too much to confirm at once; ask for less")
+    return question
+
+
+async def _confirm_found_changes(
+    session: AsyncSession,
+    calls: list[ApplyTransactionChanges],
+    read_rows: Mapping[int, AssistantTransaction],
+    *,
+    trusted_ids: set[int],
+    user_message: str,
+    conversation_id: int | None,
+    interaction_id: int | None,
+    direction_policy: DirectionPolicy,
+) -> Clarification:
+    """Ask one question for every change of a message that targets a found row.
+
+    A found row is a row that a read of this turn returned, and that the user
+    did not reply to or name. Such a change never applies at once. The question
+    shows each row in full, and one Yes applies all the changes or none. When
+    the reads hold other rows of the same amount, the user taps the row.
+
+    Args:
+        session: The turn session.
+        calls: Every change of the message.
+        read_rows: The rows that the reads of this turn returned.
+        trusted_ids: The row that the user replied to and the rows they named.
+        user_message: The message that asks for the changes.
+        conversation_id: The conversation that holds the question.
+        interaction_id: The turn that asks the question.
+        direction_policy: The default category direction policy.
+
+    Returns:
+        The question to send.
+
+    Raises:
+        MutationRejected: A change is not valid, or the rows are ambiguous for
+            more than one change.
+    """
+    calls = [
+        _without(call, "exclude_from_cashflow")
+        if unrequested_exclusion(call, user_message)
+        else call
+        for call in calls
+    ]
+    taken = {call.transaction_id for call in calls}
+    choices = {
+        index: plausible
+        for index, call in enumerate(calls)
+        if call.transaction_id not in trusted_ids
+        and len(
+            plausible := _plausible_rows(call, read_rows, taken - {call.transaction_id})
+        )
+        > 1
+    }
+    if len(choices) > 1:
+        raise MutationRejected("more than one change matches several rows")
+    choose, candidates = next(iter(choices.items()), (None, []))
+    policies = {
+        _request_direction_policy(call, user_message, direction_policy)
+        for call in calls
+    }
+    policy = policies.pop() if len(policies) == 1 else DirectionPolicy.INFERRED_STRICT
+    action = TransactionChangesConfirmation(
+        kind="transaction_changes",
+        requests=calls,
+        choose=choose,
+        candidates=candidates[:MAX_FOUND_CANDIDATES],
+    )
+    for choice in range(len(action.candidates)) if action.candidates else [None]:
+        for request in _chosen_requests(action, choice):
+            await _check_confirmable(
+                session, request, user_message=user_message, direction_policy=policy
+            )
+    question = await _found_question(session, action)
+    if (
+        state_hash := await _rows_state_hash(session, _confirmation_rows(action))
+    ) is None:
+        raise MutationRejected("transaction not found")
+    await _persist_pending(
+        session,
+        conversation_id,
+        action,
+        source_interaction_id=interaction_id,
+        transaction_state_hash=state_hash,
+        direction_policy=policy,
     )
     return Clarification(outcome="clarification", question=question)
 
@@ -1589,18 +1924,22 @@ def _provider_from_application_settings() -> AssistantProvider:
     )
 
 
+def _saved_line(mutation: MutationResult) -> str:
+    """Name the fields that one change saved, as in "Saved category for #12."."""
+    changed = [
+        key
+        for key in ("note", "category", "exclude_from_cashflow")
+        if mutation.before.get(key) != mutation.after.get(key)
+    ]
+    return (
+        f"Saved {', '.join(changed) or 'transaction'} for #{mutation.transaction_id}."
+    )
+
+
 def _response_text(result: OrchestrationResult, transaction_id: int | None) -> str:
     response = result.response
     if result.mutation is not None:
-        before = result.mutation.before
-        after = result.mutation.after
-        changed = [
-            key
-            for key in ("note", "category", "exclude_from_cashflow")
-            if before.get(key) != after.get(key)
-        ]
-        label = ", ".join(changed) or "transaction"
-        text = f"Saved {label} for #{result.mutation.transaction_id}."
+        text = _saved_line(result.mutation)
         match response:
             case CategoryProposal():
                 text += f" {response.explanation}"
@@ -1718,7 +2057,10 @@ async def _queue_result(
     if isinstance(result.response, Clarification) and (
         result.mutation is not None
         or result.confirmed_write
-        or isinstance(pending_action, TransactionChangeConfirmation)
+        or isinstance(
+            pending_action,
+            TransactionChangeConfirmation | TransactionChangesConfirmation,
+        )
     ):
         # A transaction-change question binds the row it shows. Any other
         # question after a write binds no row, never the row before it.
@@ -1780,6 +2122,14 @@ async def _queue_result(
                         buttons = [("Skip", "n")]
                     case ScreenshotTransactionConfirmation():
                         buttons = [("Yes", "y"), ("Skip", "n")]
+                    case TransactionChangesConfirmation(candidates=[_, *_] as rows):
+                        buttons = [
+                            *(
+                                (f"#{row}", str(index))
+                                for index, row in enumerate(rows)
+                            ),
+                            ("No", "n"),
+                        ]
                     case _:
                         buttons = [("Yes", "y"), ("No", "n")]
                 delivery.reply_markup_json = json.dumps(
@@ -1822,7 +2172,12 @@ async def _queue_result(
         delivery_ids.append(delivery.id)
     # Each row read gets its own card. A reply then targets a row that the
     # user can see, never a row that the answer text does not show.
-    if transaction_id is None and result.transaction_ids:
+    # A found-row question shows its rows already.
+    if (
+        transaction_id is None
+        and result.transaction_ids
+        and not isinstance(pending_action, TransactionChangesConfirmation)
+    ):
         for transaction_result_id in result.transaction_ids:
             transaction_result = await session.get(Transaction, transaction_result_id)
             if transaction_result is None:
@@ -2948,10 +3303,12 @@ async def _apply_pending(
     source_interaction_id: int,
     interaction_id: int,
     recipient_chat_id: int,
+    choice: int | None = None,
 ) -> OrchestrationResult:
     """Apply the conversation's pending confirmation, or explain why not.
 
-    When the confirmation has a chain, ask for the next write after it.
+    ``choice`` is the candidate row that a button tap chose. When the
+    confirmation has a chain, ask for the next write after it.
     """
     try:
         chain = (
@@ -2967,6 +3324,7 @@ async def _apply_pending(
             replied_to_interaction_id=source_interaction_id,
             interaction_id=interaction_id,
             authorized_chat_id=recipient_chat_id,
+            choice=choice,
         )
     except AuthorizationChanged:
         raise
@@ -3023,7 +3381,10 @@ async def _confirm_from_button(
     recipient_chat_id: int,
     physical_message_id: int | None,
 ) -> OrchestrationResult:
-    """Apply or dismiss the pending confirmation that a Yes/No button shows."""
+    """Apply or dismiss the pending confirmation that a button shows.
+
+    A Yes or a candidate row button applies it. A No dismisses it.
+    """
     from financial_dashboard.db.models import TelegramOutboundDelivery
     from financial_dashboard.services.assistant.conversations import (
         clear_pending_confirmation,
@@ -3056,7 +3417,7 @@ async def _confirm_from_button(
     )
     delivery = await session.get(TelegramOutboundDelivery, delivery_id)
     if (
-        choice not in {"y", "n"}
+        (choice not in {"y", "n"} and not choice.isdecimal())
         or tapped is None
         or tapped.outbound_delivery_id != delivery_id
         or delivery is None
@@ -3098,6 +3459,7 @@ async def _confirm_from_button(
         source_interaction_id=delivery.interaction_id,
         interaction_id=interaction.id,
         recipient_chat_id=recipient_chat_id,
+        choice=int(choice) if choice.isdecimal() else None,
     )
     if result.mutation is not None:
         interaction.transaction_id = result.mutation.transaction_id

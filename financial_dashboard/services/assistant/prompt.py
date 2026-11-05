@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v10"
+PROMPT_VERSION = "telegram-assistant-v11"
 
 
 class PromptContext(NamedTuple):
@@ -102,6 +102,14 @@ def build_prompt(context: PromptContext) -> str:
         "note, not a new target. A transaction number, such as 8788 or #8788, is a",
         "target only when there is no trusted target, or when the user tells you",
         "to change that transaction. Each APPLY changes one transaction.",
+        "To change a row that the user describes but does not name, find it",
+        "with list_transactions first. Filter by amount, direction, account_id",
+        "and a date range. A bank can store only the start of a name, so use a",
+        "name only as a search hint to narrow the rows. When the user says",
+        "recent or latest, choose the newest match. Then APPLY to the row that",
+        "the tool returned, in the same calls as the other changes. Do not ask",
+        "in prose whether to change it. The application shows every row and",
+        "change, and one Yes applies them all.",
         "For a durable merchant rule, include an exact substring",
         "from the current user message as intent_evidence.",
         "Merchant-rule pattern and priority are server-derived; never provide them.",
