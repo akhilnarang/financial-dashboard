@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from urllib.parse import urlsplit
 
 from openai import AsyncOpenAI, omit
+from openai.types.chat import ChatCompletionMessageParam
 from openai.types.shared import ReasoningEffort
 from openai.types.shared_params import ResponseFormatJSONSchema
 
@@ -59,13 +60,11 @@ SCREENSHOT_PROMPT = (
     "owner, for example the merchant in 'reversed by <merchant>'. account_hint "
     "is the bank or card name and any last 4 digits shown, for example "
     "'OneCard' or 'SBI 1234'. Use null for a field the screen does not show. "
-    "Never guess."
-)
-SCREENSHOT_NOTE_PROMPT = (
-    "\n\nThe owner added a note about this screenshot. Use it to fill or "
-    "correct the read. In the note, I means the owner. A forwarded message "
-    "from the other party can be in it, where you means the owner."
-    "\nCurrent read: {current}\nNote: {note}"
+    "Never guess. The owner can add notes. Use them to fill what the screen "
+    "does not show or does not make clear. Where a note and the screen "
+    "disagree, the screen wins. The screen does not show which party is the "
+    "owner, so a note can tell. In a note, I means the owner. In a message "
+    "forwarded from the other party, you means the owner."
 )
 
 
@@ -284,8 +283,8 @@ async def read_screenshot(
         api_key: The OpenAI-compatible API key.
         model: The vision model id.
         base_url: The endpoint, or "" for the official API.
-        note: The owner's caption or reply about the screenshot, if any.
-        current: The read to correct with the note, if any.
+        note: The owner's caption or reply, sent as a user turn, if any.
+        current: The previous read, sent as the model's turn, if any.
 
     Returns:
         The validated read. A malformed answer raises ``ValueError``.
@@ -297,21 +296,22 @@ async def read_screenshot(
     prompt = SCREENSHOT_PROMPT.format(
         today=datetime.datetime.now(IST).date().isoformat()
     )
+    messages: list[ChatCompletionMessageParam] = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    if current is not None:
+        messages.append({"role": "assistant", "content": current.model_dump_json()})
     if note:
-        prompt += SCREENSHOT_NOTE_PROMPT.format(
-            current=current.model_dump_json() if current else "none", note=note
-        )
+        messages.append({"role": "user", "content": note})
     response = await client.chat.completions.create(
         model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ],
+        messages=messages,
         response_format=ResponseFormatJSONSchema(
             type="json_schema",
             json_schema={

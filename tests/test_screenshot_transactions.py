@@ -759,9 +759,10 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     monkeypatch.setattr(openai_provider, "AsyncOpenAI", MagicMock(return_value=client))
     note = "The UPI ref ID is printed below. The sender is ALEX S SMITH."
     proposed = await _reply(shot, asked.conversation_id, note)
-    [text, image] = create.call_args.kwargs["messages"][0]["content"]
-    assert f"Note: {note}" in text["text"]
-    assert f"Current read: {current.model_dump_json()}" in text["text"]
+    [first, previous, reply] = create.call_args.kwargs["messages"]
+    [_, image] = first["content"]
+    assert previous == {"role": "assistant", "content": current.model_dump_json()}
+    assert reply == {"role": "user", "content": note}
     assert image["image_url"]["url"] == (
         f"data:image/png;base64,{base64.b64encode(PNG).decode()}"
     )
