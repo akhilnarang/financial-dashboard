@@ -33,6 +33,7 @@ from financial_dashboard.db.models import (
 from financial_dashboard.services.assistant.contracts import (
     ScreenshotTransaction,
     ScreenshotTransactionConfirmation,
+    UpiParty,
 )
 from financial_dashboard.services.assistant.mutations import MutationRejected
 from financial_dashboard.services.settings import (
@@ -53,9 +54,16 @@ FLAG_AGE = datetime.timedelta(days=60)
 
 DUPLICATE_WINDOW = datetime.timedelta(days=1)
 
-_UTR = re.compile(r"\d{12}")
+_UTR = re.compile(r"(?<!\d)\d{12}(?!\d)")
+_REFERENCE_WORD = re.compile(r"\b(?:utr|ref|rrn|reference|transaction id)\b", re.I)
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]")
 _TRAILING_LAST4 = re.compile(r"(\d{4})[\s).]*$")
+# Full bank names that do not contain the bank key of the account.
+_BANK_NAMES = {
+    "statebankofindia": "sbi",
+    "bankofbaroda": "bob",
+    "unionbankofindia": "uboi",
+}
 _KEYED_AMOUNT = re.compile(
     r"(?:(?:is|was)\s+)?(?:₹|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d{1,2})?)"
     r"\s*(?:rupees|rs\.?|inr|/-)?\.?",
@@ -80,7 +88,7 @@ def _saved_status(read: ScreenshotTransaction) -> bool:
 class ScreenshotTarget(NamedTuple):
     """The account and card that a read points at, or the cards it may mean.
 
-    ``choices`` lists the cards that an ambiguous card hint fits, as
+    ``choices`` lists the accounts or cards that an ambiguous hint fits, as
     "label 1234".
     """
 
@@ -104,16 +112,113 @@ class ScreenshotReview(NamedTuple):
     action: ScreenshotTransactionConfirmation | None
 
 
-def _normalize_hint(text: str) -> str:
-    """Reduce a card hint to its lowercase letters and digits.
+def _is_owner(party: UpiParty | None, self_tokens: tuple[str, ...]) -> bool:
+    """Tell if a receipt party is the owner.
+
+    A VPA matches a token exactly or by the part before the @. A name matches
+    a token of two or more words when the name holds each word. A single
+    first name can be a friend's name, so it never matches.
 
     Args:
-        text: The card or bank text that the screen shows.
+        party: The From or To block of the receipt.
+        self_tokens: The owner's names and VPAs.
+
+    Returns:
+        True when the party is the owner.
+    """
+    if party is None:
+        return False
+    words = set((party.name or "").lower().split())
+    vpa = (party.vpa or "").lower()
+    for token in (t.lower() for t in self_tokens):
+        if vpa and token in (vpa, vpa.partition("@")[0]):
+            return True
+        if len(parts := token.split()) > 1 and set(parts) <= words:
+            return True
+    return False
+
+
+def orient_read(
+    read: ScreenshotTransaction, self_tokens: tuple[str, ...]
+) -> ScreenshotTransaction:
+    """Set the direction and the other party of a read from its receipt blocks.
+
+    When exactly one of the From and To blocks is the owner, the read takes
+    the direction, and the other party's name and VPA when shown. The owner's
+    bank text, or none, replaces the hint, unless the hint ends in last 4
+    digits that the other party's block does not show. With no bank, the
+    review asks for the account. The read validates again, so a refund
+    stays a credit.
+
+    Args:
+        read: The read from the vision model.
+        self_tokens: The owner's names and VPAs.
+
+    Returns:
+        The read with these fields set.
+    """
+    payer_is_owner = _is_owner(read.payer, self_tokens)
+    if payer_is_owner == _is_owner(read.payee, self_tokens):
+        return read
+    own, other = (
+        (read.payer, read.payee) if payer_is_owner else (read.payee, read.payer)
+    )
+    updates: dict[str, object] = {"direction": "debit" if payer_is_owner else "credit"}
+    if other is not None:
+        updates |= {
+            field: value
+            for field, value in (("counterparty", other.name), ("vpa", other.vpa))
+            if value
+        }
+    last4 = _TRAILING_LAST4.search(read.account_hint or "")
+    other_bank = (other.bank_text if other else None) or ""
+    if not last4 or last4.group(1) in other_bank:
+        updates["account_hint"] = own.bank_text if own else None
+    return ScreenshotTransaction.model_validate(read.model_dump() | updates)
+
+
+def _named_accounts(hint: str, accounts: list[Account]) -> list[Account]:
+    """Return the accounts whose bank key or label appears in a hint.
+
+    Args:
+        hint: The bank or card text that the screen shows.
+        accounts: The accounts to choose from.
+
+    Returns:
+        Each account whose bank key or label is in the hint. A hint with a
+        full bank name, such as "State Bank of India", selects only the
+        accounts with that exact bank key.
+    """
+    raw = _NON_ALPHANUMERIC.sub("", hint.lower())
+    if key := next((k for name, k in _BANK_NAMES.items() if name in raw), None):
+        return [account for account in accounts if _normalize_hint(account.bank) == key]
+    if not (normalized := _normalize_hint(hint)):
+        return []
+    return [
+        account
+        for account in accounts
+        if any(
+            name and name in normalized
+            for name in (_normalize_hint(account.bank), _normalize_hint(account.label))
+        )
+    ]
+
+
+def _normalize_hint(text: str) -> str:
+    """Reduce a bank or card text to its lowercase letters and digits.
+
+    A full bank name becomes its bank key, such as "sbi".
+
+    Args:
+        text: The bank or card text.
 
     Returns:
         The letters and digits only, in lowercase.
     """
-    return _NON_ALPHANUMERIC.sub("", text.lower())
+    normalized = _NON_ALPHANUMERIC.sub("", text.lower())
+    for name, key in _BANK_NAMES.items():
+        normalized = normalized.replace(name, key)
+    return normalized
 
 
 async def _resolve_credit_card_target(
@@ -156,17 +261,7 @@ async def _resolve_credit_card_target(
         return ScreenshotTarget(
             next(a for a in accounts if a.id == card.account_id), card
         )
-    normalized = _normalize_hint(hint)
-    if not normalized:
-        return ScreenshotTarget(None)
-    selected: set[int] = set()
-    for account in accounts:
-        names = (
-            _normalize_hint(account.bank or ""),
-            _normalize_hint(account.label or ""),
-        )
-        if any(name and name in normalized for name in names):
-            selected.add(account.id)
+    selected = {account.id for account in _named_accounts(hint, accounts)}
     owned = [card for card in cards if card.account_id in selected]
     if len(selected) == 1 and len(owned) <= 1:
         account = next(a for a in accounts if a.id in selected)
@@ -174,8 +269,7 @@ async def _resolve_credit_card_target(
     labels = {a.id: a.label for a in accounts}
     return ScreenshotTarget(
         None,
-        None,
-        tuple(
+        choices=tuple(
             f"{labels[card.account_id]} {last4}"
             for card in owned
             if (last4 := mask_last4(card.card_mask))
@@ -189,8 +283,10 @@ async def _resolve_target(
     """Resolve the account and card that one screenshot read points at.
 
     A UPI read resolves by an exact last-4 match to exactly one active bank
-    account. The hint must end with those 4 digits. A card read resolves by
-    the card digits, else by the bank name or the account label.
+    account, when the hint ends with 4 digits. Else the bank name or the
+    account label must name one active bank account. A card read resolves by
+    the card digits, else by the bank name or the account label. An ambiguous
+    name lists its choices.
 
     Args:
         session: The turn session.
@@ -203,19 +299,29 @@ async def _resolve_target(
     hint = read.account_hint or ""
     if read.channel == "card":
         return await _resolve_credit_card_target(session, hint)
-    if (found := _TRAILING_LAST4.search(hint)) is None:
-        return ScreenshotTarget(None)
-    last4 = found.group(1)
-    accounts = [
-        row
-        for row in await session.scalars(
+    accounts = list(
+        await session.scalars(
             select(Account).where(
                 Account.type == "bank_account", Account.active.is_(True)
             )
         )
-        if mask_last4(row.account_number) == last4
-    ]
-    return ScreenshotTarget(accounts[0] if len(accounts) == 1 else None, None)
+    )
+    if (found := _TRAILING_LAST4.search(hint)) is not None:
+        matched = [
+            a for a in accounts if mask_last4(a.account_number) == found.group(1)
+        ]
+    else:
+        matched = _named_accounts(hint, accounts)
+    if len(matched) == 1:
+        return ScreenshotTarget(matched[0])
+    return ScreenshotTarget(
+        None,
+        choices=tuple(
+            f"{a.label} {last4}"
+            for a in matched
+            if (last4 := mask_last4(a.account_number))
+        ),
+    )
 
 
 def _owner_filter(target: ScreenshotTarget) -> ColumnElement[bool] | None:
@@ -331,7 +437,7 @@ async def _check(
     if read.channel == "card":
         checks.append(("card", target.account is not None))
     else:
-        checks.append(("account (last 4 digits)", target.account is not None))
+        checks.append(("account (last 4 digits or bank)", target.account is not None))
     missing = [field for field, ok in checks if not ok]
     duplicate = await _find_duplicate(session, read, target, not_duplicates)
     return ScreenshotCheck(target, missing, duplicate)
@@ -445,7 +551,8 @@ async def review_screenshot(
     elif missing:
         lines.append(f"Missing or not valid: {', '.join(missing)}.")
         if target.choices:
-            lines.append(f"Which card: {', '.join(target.choices)}?")
+            noun = "card" if read.channel == "card" else "account"
+            lines.append(f"Which {noun}: {', '.join(target.choices)}?")
         example = (
             '"card 1234, amount 100"'
             if read.channel == "card"
@@ -474,8 +581,10 @@ def apply_corrections(read: ScreenshotTransaction, text: str) -> ScreenshotTrans
 
     Each comma, semicolon or line holds one ``key value`` pair. A comma before
     a digit groups the digits of an amount instead. A part with no known key
-    can still give a rupee amount, such as "it was ₹950". A value that does
-    not parse is ignored, so the checks name its field again.
+    can still give a 12-digit UTR when the read has none and the part names a
+    reference or is the bare number, such as "UPI ref ID is 123456789012". It
+    can also give a rupee amount, such as "it was ₹950". A value that does not parse is
+    ignored, so the checks name its field again.
 
     Args:
         read: The current read.
@@ -498,7 +607,7 @@ def apply_corrections(read: ScreenshotTransaction, text: str) -> ScreenshotTrans
                 updates["channel"] = "card"
             case "name" | "to" | "from":
                 updates["counterparty"] = value or None
-            case "vpa" | "upi":
+            case "vpa" | "upi" if "@" in value or not value:
                 updates["vpa"] = value or None
             case "amount":
                 if (found := _KEYED_AMOUNT.fullmatch(value)) is not None:
@@ -515,6 +624,13 @@ def apply_corrections(read: ScreenshotTransaction, text: str) -> ScreenshotTrans
                     )
                 except ValueError, OverflowError:
                     logger.info("Screenshot date correction did not parse")
+            case _ if (
+                "utr" not in updates
+                and not _UTR.fullmatch(read.utr or "")
+                and (_REFERENCE_WORD.search(part) or _UTR.fullmatch(part.strip()))
+                and (found := _UTR.search(part))
+            ):
+                updates["utr"] = found.group(0)
             case _ if (found := _RUPEES.search(part)) is not None:
                 updates["amount"] = Decimal(found.group(1).replace(",", ""))
     for field, value in updates.items():

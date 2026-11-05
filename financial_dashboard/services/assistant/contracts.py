@@ -254,6 +254,14 @@ class AssistantWriteConfirmation(StrictModel):
     request: AssistantWrite
 
 
+class UpiParty(StrictModel):
+    """One party, From or To, on a UPI receipt."""
+
+    name: StrictStr | None = Field(default=None, max_length=200)
+    vpa: StrictStr | None = Field(default=None, max_length=200)
+    bank_text: StrictStr | None = Field(default=None, max_length=100)
+
+
 class ScreenshotTransaction(StrictModel):
     """What the vision model reads off one payment screenshot.
 
@@ -261,7 +269,8 @@ class ScreenshotTransaction(StrictModel):
     untrusted. Code checks every field before a row is proposed.
 
     ``status`` holds ``reversed`` when a refund or a reversal returned money.
-    A reversed read always has ``direction`` of ``credit``.
+    A reversed read always has ``direction`` of ``credit``. ``payer`` and
+    ``payee`` hold the From and To blocks of a receipt.
     """
 
     status: Literal["success", "pending", "failed", "reversed", "unknown"]
@@ -297,6 +306,8 @@ class ScreenshotTransaction(StrictModel):
     ]
     channel: Literal["upi", "card"] = "upi"
     account_hint: StrictStr | None = Field(max_length=100)
+    payer: UpiParty | None = None
+    payee: UpiParty | None = None
 
     @model_validator(mode="after")
     def reversed_is_a_credit(self) -> ScreenshotTransaction:

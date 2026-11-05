@@ -27,7 +27,10 @@ from financial_dashboard.db.models import (
 from financial_dashboard.services import screenshot_transactions, telegram
 from financial_dashboard.services import settings as settings_service
 from financial_dashboard.services import transaction_attachments
-from financial_dashboard.services.assistant.contracts import ScreenshotTransaction
+from financial_dashboard.services.assistant.contracts import (
+    ScreenshotTransaction,
+    UpiParty,
+)
 from financial_dashboard.services.assistant.message_context import resolve_reply
 from financial_dashboard.services.assistant.mutations import MutationRejected
 from financial_dashboard.services.assistant.orchestrator import (
@@ -522,7 +525,7 @@ async def test_missing_fields_ask_and_a_reply_fills_them_before_yes_saves(
     )
 
     # An amount below one paisa, or too large to store, is not valid.
-    assert "amount, UTR (12 digits), account (last 4 digits)" in asked.text
+    assert "amount, UTR (12 digits), account (last 4 digits or bank)" in asked.text
     assert asked.buttons == ["Skip"]
     with pytest.raises(MutationRejected):
         await _yes(shot, asked.conversation_id)
@@ -573,6 +576,132 @@ async def test_missing_fields_ask_and_a_reply_fills_them_before_yes_saves(
         "shot.png",
     )
     assert (shot.root / "shot.png").read_bytes() == PNG
+
+
+async def test_payee_receipt_saves_a_credit_on_the_named_bank(
+    shot: Shot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies that a receipt paid to the owner saves a credit on the named bank.
+
+    Without the From and To blocks, a receipt paid to the owner reads as a
+    payment the owner made.
+    """
+    settings_service._cache["categorization.self_identifiers"] = (
+        "JANE DOE, jane@testyes"
+    )
+    paid_at = (
+        datetime.datetime.now(screenshot_transactions.IST) - datetime.timedelta(days=1)
+    ).replace(hour=18, minute=16, second=0, microsecond=0, tzinfo=None)
+    receipt = _read(
+        direction="debit",
+        amount=Decimal("1234.00"),
+        counterparty="JANE DOE",
+        vpa="jane@testyes",
+        utr=None,
+        occurred_at=paid_at,
+        app="supermoney",
+        account_hint=None,
+        payer=UpiParty(name="ALEX SMITH", vpa="test0000@upi", bank_text=None),
+        payee=UpiParty(
+            name="JANE DOE", vpa="jane@testyes", bank_text="State Bank of India"
+        ),
+    )
+
+    # With two active SBI accounts, a bank name alone is ambiguous.
+    ambiguous = await _send(shot, monkeypatch, receipt)
+    assert "received ₹1,234.00 from ALEX SMITH (test0000@upi)" in ambiguous.text
+    assert "UTR (12 digits), account (last 4 digits or bank)" in ambiguous.text
+    assert "Which account: SBI savings 4321, SBI other 9999?" in ambiguous.text
+
+    # A single name can be a friend's name, so it never marks the owner.
+    lone_name = screenshot_transactions.orient_read(receipt, ("DOE",))
+    assert lone_name.direction == "debit"
+    owner = ("JANE DOE", "jane@testyes")
+    # A refund to the owner stays a credit, and shown last 4 digits stay.
+    refund = receipt.model_copy(
+        update={"status": "reversed", "payer": receipt.payee, "payee": receipt.payer}
+    )
+    assert screenshot_transactions.orient_read(refund, owner).direction == "credit"
+    with_last4 = receipt.model_copy(update={"account_hint": "SBI 4321"})
+    oriented = screenshot_transactions.orient_read(with_last4, owner)
+    assert oriented.account_hint == "SBI 4321"
+    sender_digits = with_last4.model_copy(
+        update={"payer": UpiParty(name="ALEX SMITH", bank_text="HDFC 4321")}
+    )
+    assert screenshot_transactions.orient_read(sender_digits, owner).account_hint == (
+        "State Bank of India"
+    )
+    # A sender's bank never names the owner's account, and a partial block
+    # keeps the name already read.
+    sender_bank = receipt.model_copy(
+        update={
+            "account_hint": "HDFC",
+            "counterparty": "ALEX SMITH",
+            "payer": UpiParty(bank_text="HDFC"),
+            "payee": UpiParty(name="JANE DOE", vpa="jane@testyes"),
+        }
+    )
+    oriented = screenshot_transactions.orient_read(sender_bank, owner)
+    assert (oriented.account_hint, oriented.counterparty) == (None, "ALEX SMITH")
+    # A free 12-digit number never replaces a valid UTR.
+    kept = screenshot_transactions.apply_corrections(
+        receipt.model_copy(update={"utr": UTR}), "my account number is 999999999999"
+    )
+    assert kept.utr == UTR
+    typed = screenshot_transactions.apply_corrections(
+        receipt, f"utr {UTR}; my account number is 999999999999"
+    )
+    assert typed.utr == UTR
+    account_number = screenshot_transactions.apply_corrections(
+        receipt, "my account number is 999999999999"
+    )
+    assert account_number.utr is None
+
+    # With one active SBI account, "State Bank of India" resolves the account.
+    async with shot.maker() as s:
+        other = await s.get(Account, 2)
+        assert other is not None
+        other.active = False
+        await s.commit()
+
+    asked = await _send(shot, monkeypatch, receipt)
+    assert (
+        "UPI screenshot (supermoney): received ₹1,234.00 from ALEX SMITH (test0000@upi)"
+        in asked.text
+    )
+    assert f"{paid_at:%Y-%m-%d %H:%M} · SBI savings" in asked.text
+    assert "Missing or not valid: UTR (12 digits)." in asked.text
+
+    unchanged = await _reply(shot, asked.conversation_id, "thanks")
+    assert unchanged.text.startswith("I found no new value in your reply.\n")
+
+    proposed = await _reply(
+        shot,
+        asked.conversation_id,
+        f"UPI ref ID is {UTR}. I have only one SBI account.",
+    )
+    assert "Save this as a provisional transaction?" in proposed.text
+    assert (await _yes(shot, asked.conversation_id)).startswith("Saved #")
+    [row] = await _rows(shot)
+    assert (
+        row.account_id,
+        row.direction,
+        row.amount,
+        row.reference_number,
+        row.counterparty,
+        row.raw_description,
+        row.transaction_date,
+        row.transaction_time,
+    ) == (
+        1,
+        "credit",
+        Decimal("1234.00"),
+        UTR,
+        "ALEX SMITH",
+        "test0000@upi",
+        paid_at.date(),
+        datetime.time(18, 16),
+    )
 
 
 @pytest.mark.parametrize(

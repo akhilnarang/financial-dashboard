@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import datetime
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -11,6 +12,7 @@ from openai import AsyncOpenAI, omit
 from openai.types.shared import ReasoningEffort
 from openai.types.shared_params import ResponseFormatJSONSchema
 
+from financial_dashboard.core.dates import IST
 from financial_dashboard.services.assistant.contracts import (
     ScreenshotTransaction,
     screenshot_json_schema,
@@ -44,8 +46,12 @@ SCREENSHOT_PROMPT = (
     "the screen shows a reversal, a refund or a refund credit, for example "
     "'reversed by <merchant>' or 'refunded'. Use failed only when a payment did "
     "not go through and no reversal of a prior charge occurred. "
-    "amount is in rupees with digits and an optional dot. utr is the UPI "
-    "transaction ID, UTR or RRN. occurred_at is the date and time shown, in IST. "
+    "amount is in rupees with digits and an optional dot. utr is the 12-digit "
+    "UPI transaction ID, UTR, RRN or UPI reference ID. occurred_at is the date "
+    "and time shown, in IST. When the date shows no year, occurred_at is the "
+    "latest such date on or before {today}. payer is the From block and payee "
+    "is the To block of a receipt, each with its name, VPA and bank_text, the "
+    "bank name or account text in that block. "
     "channel is card for a credit card app or a credit card notification, "
     "such as OneCard. channel is upi for a UPI payment screen. A debit card "
     "notification is a bank account message, so it is not a card screenshot. "
@@ -279,7 +285,12 @@ async def read_screenshot(
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": SCREENSHOT_PROMPT},
+                    {
+                        "type": "text",
+                        "text": SCREENSHOT_PROMPT.format(
+                            today=datetime.datetime.now(IST).date().isoformat()
+                        ),
+                    },
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
