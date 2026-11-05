@@ -270,7 +270,7 @@ async def read_screenshot(
     api_key: str,
     model: str,
     base_url: str,
-    note: str | None = None,
+    notes: Sequence[str] = (),
     current: ScreenshotTransaction | None = None,
 ) -> ScreenshotTransaction:
     """Read one payment screenshot with a vision model and a strict schema.
@@ -283,7 +283,8 @@ async def read_screenshot(
         api_key: The OpenAI-compatible API key.
         model: The vision model id.
         base_url: The endpoint, or "" for the official API.
-        note: The owner's caption or reply, sent as a user turn, if any.
+        notes: The owner's caption and replies, oldest first, each sent as a
+            user turn. The newest note follows the previous read.
         current: The previous read, sent as the model's turn, if any.
 
     Returns:
@@ -305,10 +306,11 @@ async def read_screenshot(
             ],
         }
     ]
+    messages += [{"role": "user", "content": note} for note in notes[:-1]]
     if current is not None:
         messages.append({"role": "assistant", "content": current.model_dump_json()})
-    if note:
-        messages.append({"role": "user", "content": note})
+    if notes:
+        messages.append({"role": "user", "content": notes[-1]})
     response = await client.chat.completions.create(
         model=model,
         messages=messages,

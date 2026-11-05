@@ -387,7 +387,8 @@ class ScreenshotTransactionConfirmation(StrictModel):
     ``missing`` names the mandatory fields that failed the checks. A Yes
     never saves while it is not empty. ``not_duplicates`` holds the rows the
     owner called another payment. ``duplicate_voided`` is the void state of
-    ``duplicate_of`` that the question showed.
+    ``duplicate_of`` that the question showed. ``notes`` holds the caption and
+    the replies, oldest first, so each new read sees all of them.
     """
 
     kind: Literal["screenshot_transaction"]
@@ -398,6 +399,7 @@ class ScreenshotTransactionConfirmation(StrictModel):
     duplicate_of: StrictInt | None = None
     duplicate_voided: StrictBool = False
     not_duplicates: list[StrictInt] = Field(default_factory=list, max_length=20)
+    notes: list[StrictStr] = Field(default_factory=list, max_length=20)
 
 
 ConfirmationAction: TypeAlias = Annotated[
