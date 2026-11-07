@@ -696,6 +696,8 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     )
     oriented = screenshot_transactions.orient_read(sender_bank, owner)
     assert (oriented.account_hint, oriented.counterparty) == (None, "ALEX SMITH")
+    longer = sender_bank.model_copy(update={"account_hint": "HDFC Bank"})
+    assert screenshot_transactions.orient_read(longer, owner).account_hint is None
     # A hint that is not the sender's bank stays when the owner's block has none.
     own_hint = sender_bank.model_copy(update={"account_hint": "SBI"})
     assert screenshot_transactions.orient_read(own_hint, owner).account_hint == "SBI"

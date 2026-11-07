@@ -252,11 +252,23 @@ def orient_read(
     if not (last4 and last4.group(1) not in other_bank):
         if own_bank:
             updates["account_hint"] = own_bank
-        elif not hint or (
-            other_bank and _normalize_hint(hint) in _normalize_hint(other_bank)
-        ):
+        elif not hint or _same_bank(hint, other_bank):
             updates["account_hint"] = None
     return ScreenshotTransaction.model_validate(read.model_dump() | updates)
+
+
+def _same_bank(hint: str, bank_text: str) -> bool:
+    """Tell if a hint names the bank in a receipt block, such as "HDFC Bank" and "HDFC".
+
+    Args:
+        hint: The account hint.
+        bank_text: The bank text of a receipt block.
+
+    Returns:
+        True when either normalized text holds the other.
+    """
+    a, b = _normalize_hint(hint), _normalize_hint(bank_text)
+    return bool(a and b) and (a in b or b in a)
 
 
 def _named_accounts(hint: str, accounts: list[Account]) -> list[Account]:
