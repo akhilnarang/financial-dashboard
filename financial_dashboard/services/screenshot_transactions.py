@@ -219,10 +219,9 @@ def orient_read(
     When exactly one of the From and To blocks is the owner, the read takes
     the direction, and the other party's name and VPA when shown. A hint that
     ends in last 4 digits that the other party's block does not show stays.
-    Else the owner's bank text replaces the hint. When the owner's block
-    shows no bank, a hint that names the other party's bank is dropped, so
-    the review asks for the account. The read validates again, so a refund
-    stays a credit.
+    Else the owner's bank text, or none, replaces the hint, because a bank
+    name alone can be the other party's bank. With none, the review asks for
+    the account. The read validates again, so a refund stays a credit.
 
     Args:
         read: The read from the vision model.
@@ -245,30 +244,11 @@ def orient_read(
             for field, value in (("counterparty", other.name), ("vpa", other.vpa))
             if value
         }
-    hint = read.account_hint or ""
-    last4 = _TRAILING_LAST4.search(hint)
+    last4 = _TRAILING_LAST4.search(read.account_hint or "")
     other_bank = (other.bank_text if other else None) or ""
-    own_bank = own.bank_text if own else None
-    if not (last4 and last4.group(1) not in other_bank):
-        if own_bank:
-            updates["account_hint"] = own_bank
-        elif not hint or _same_bank(hint, other_bank):
-            updates["account_hint"] = None
+    if not last4 or last4.group(1) in other_bank:
+        updates["account_hint"] = own.bank_text if own else None
     return ScreenshotTransaction.model_validate(read.model_dump() | updates)
-
-
-def _same_bank(hint: str, bank_text: str) -> bool:
-    """Tell if a hint names the bank in a receipt block, such as "HDFC Bank" and "HDFC".
-
-    Args:
-        hint: The account hint.
-        bank_text: The bank text of a receipt block.
-
-    Returns:
-        True when either normalized text holds the other.
-    """
-    a, b = _normalize_hint(hint), _normalize_hint(bank_text)
-    return bool(a and b) and (a in b or b in a)
 
 
 def _named_accounts(hint: str, accounts: list[Account]) -> list[Account]:
