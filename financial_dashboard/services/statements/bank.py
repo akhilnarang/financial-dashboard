@@ -160,7 +160,7 @@ _BANK_RECONCILIATION_GATES = (
 )
 _GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment done"}
 # A counterparty that is only a label and a mask, e.g. "Mobile XXXXXXXXX006",
-# "Acct xxxxxxxxxx8214" or a bare "xxxxxxxxxx8669". A mask names nobody. The
+# "Acct xxxxxxxxxx1234" or a bare "xxxxxxxxxx5678". A mask names nobody. The
 # match must cover the whole value, so a counterparty that holds a mask AND a
 # name ("Acct XXXXXXX7703/AKHIL JYOT") stays authoritative. The trailing digits
 # are required: every mask keeps some of the number, so an X-run on its own is
