@@ -170,23 +170,9 @@ async def retry_cc_statement_upload(
     await ask_about_held_rows(upload_id)
 
     # function-local: breaks cycle with services.reminders (reminders imports services.statements at top)
-    from financial_dashboard.services.reminders import (
-        init_payment_tracking,
-        resync_tracked_cc_payment_state,
-    )
+    from financial_dashboard.services.reminders import track_or_resync_payment
 
-    # init_payment_tracking only initializes an UNTRACKED statement. On a
-    # reparse the statement is usually already tracked, so init no-ops; re-derive
-    # its paid state from current credits, so a reparse self-heals a statement
-    # whose bill was paid before it was first ingested. A PAID statement is left
-    # alone (see resync_tracked_cc_payment_state) so a manual mark survives.
-    if not await init_payment_tracking(upload_id):
-        async with async_session() as session:
-            upload = await session.get(StatementUpload, upload_id)
-            if upload is not None and await resync_tracked_cc_payment_state(
-                session, upload
-            ):
-                await session.commit()
+    await track_or_resync_payment(upload_id)
     return True
 
 

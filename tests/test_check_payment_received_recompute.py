@@ -13,6 +13,7 @@ All values here are fully synthetic.
 """
 
 import datetime as dt
+import json
 from decimal import Decimal
 
 import pytest
@@ -146,6 +147,60 @@ async def test_refund_credit_excluded(session_maker):
     async with session_maker() as s:
         upload = (await s.execute(select(StatementUpload))).scalar_one()
         assert upload.payment_paid_amount == Decimal("1000.00")
+
+
+async def test_credit_listed_on_statement_excluded(session_maker):
+    """A payment-alert credit that the statement lists is already netted into
+    the total due, so it does not count as paid. This holds for a matched row,
+    for a held row that settlement folded into the stored credit, and for an
+    alert dated a day after its statement row. An unlisted payment still counts."""
+    async with session_maker() as s:
+        account = await _cc_account(s)
+        upload = await _upload(s, account, total_due="9500.00")
+        matched = _credit(account, "500.00")
+        settled = _credit(account, "300.00", txn_date=dt.date(2026, 5, 13))
+        day_late = _credit(account, "200.00", txn_date=dt.date(2026, 5, 16))
+        s.add_all([matched, settled, day_late])
+        s.add(_credit(account, "4000.00", txn_date=dt.date(2026, 6, 1)))
+        await s.flush()
+        upload.reconciliation_data = json.dumps(
+            {
+                "matched": [
+                    {"db_txn_id": matched.id, "date": "12/05/2026"},
+                    {"db_txn_id": day_late.id, "date": "15/05/2026"},
+                ],
+                "missing": [{"imported_txn_id": settled.id, "date": "13/05/2026"}],
+            }
+        )
+        await s.commit()
+        account_id = account.id
+
+    await check_payment_received(2, account_id, Decimal("4000.00"))
+
+    async with session_maker() as s:
+        upload = (await s.execute(select(StatementUpload))).scalar_one()
+        assert upload.payment_paid_amount == Decimal("4000.00")
+        assert upload.payment_status == PaymentStatus.PARTIALLY_PAID
+
+
+async def test_email_summary_uses_same_cycle_pdf_listing(session_maker):
+    """An email summary has no reconciliation of its own. When it shares a due
+    date with a PDF, the credit that the PDF lists is still not counted."""
+    async with session_maker() as s:
+        account = await _cc_account(s)
+        pdf = await _upload(s, account, total_due="9500.00")
+        summary = await _upload(
+            s, account, total_due="9500.00", created_at=NEXT_CYCLE_CREATED
+        )
+        listed = _credit(account, "500.00")
+        s.add(listed)
+        s.add(_credit(account, "4000.00", txn_date=dt.date(2026, 6, 1)))
+        await s.flush()
+        pdf.reconciliation_data = json.dumps(
+            {"matched": [{"db_txn_id": listed.id, "date": "12/05/2026"}], "missing": []}
+        )
+
+        assert await recompute_cc_payment_state(s, summary) == Decimal("4000.00")
 
 
 async def test_cycle_scope_excludes_before_includes_on_or_after(session_maker):

@@ -49,7 +49,10 @@ from financial_dashboard.integrations.email.jmap_fastmail import (
 from financial_dashboard.services.accounts import (
     retry_password_required_statements as accounts_retry_password_required_statements,
 )
-from financial_dashboard.services.reminders import init_payment_tracking
+from financial_dashboard.services.reminders import (
+    init_payment_tracking,
+    track_or_resync_payment,
+)
 from financial_dashboard.services.settings import get_telegram_chat_id
 from financial_dashboard.services.statement_payments import build_payments_view
 from financial_dashboard.services.snapshots import emit_cc_snapshot
@@ -775,7 +778,7 @@ async def statement_reprocess(
     await session.commit()
 
     await ask_about_held_rows(upload_id)
-    await init_payment_tracking(upload_id)
+    await track_or_resync_payment(upload_id)
 
     return RedirectResponse(url=f"/statements/{upload_id}", status_code=303)
 

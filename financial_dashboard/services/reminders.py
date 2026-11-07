@@ -44,7 +44,11 @@ from financial_dashboard.services.settings import (
     get_telegram_chat_id,
     is_telegram_configured,
 )
-from financial_dashboard.services.statements.cc import parse_cc_amount, parse_cc_date
+from financial_dashboard.services.statements.cc import (
+    parse_cc_amount,
+    parse_cc_date,
+    reconciliation_from_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +115,25 @@ async def init_payment_tracking(statement_upload_id: int) -> bool:
             "Failed to init payment tracking for statement %s", statement_upload_id
         )
         return False
+
+
+async def track_or_resync_payment(statement_upload_id: int) -> None:
+    """Start payment tracking on a statement, or re-derive its paid state.
+
+    A reparse changes which credits the statement lists, so an already-tracked
+    statement must recompute. A PAID statement stays as it is, so a manual
+    mark survives.
+
+    Args:
+        statement_upload_id: The CC statement upload to track.
+    """
+    if await init_payment_tracking(statement_upload_id):
+        return
+    async with async_session() as session:
+        if (
+            upload := await session.get(StatementUpload, statement_upload_id)
+        ) is not None and await resync_tracked_cc_payment_state(session, upload):
+            await session.commit()
 
 
 async def check_and_send_reminders() -> int:
@@ -344,8 +367,48 @@ async def _qualifying_payment_credit_sum(session, upload: StatementUpload) -> De
     account+cycle in one query and apply the exact predicate in Python. This
     deliberately EXCLUDES refunds/reversals/cashback (those don't satisfy a
     bill), matching the canonical classification in cc_disambiguation.
+
+    A credit that a statement of this cycle lists is skipped. The bank already
+    netted it into ``total_amount_due``, so it does not pay that amount. The
+    check reads every upload that shares this due date, because an email
+    summary carries no reconciliation of its own.
     """
     window = await cc_cycle_window(session, upload)
+
+    try:
+        this_due = parse_cc_date(upload.due_date) if upload.due_date else None
+    except ValueError, InvalidOperation:
+        this_due = None
+    listed_ids: set[int] = set()
+    siblings = await session.execute(
+        select(
+            StatementUpload.id,
+            StatementUpload.due_date,
+            StatementUpload.reconciliation_data,
+        ).where(
+            StatementUpload.account_id == upload.account_id,
+            StatementUpload.reconciliation_data.is_not(None),
+        )
+    )
+    for sibling in siblings:
+        if sibling.id != upload.id:
+            try:
+                same_cycle = (
+                    this_due is not None
+                    and sibling.due_date is not None
+                    and parse_cc_date(sibling.due_date) == this_due
+                )
+            except ValueError, InvalidOperation:
+                same_cycle = False
+            if not same_cycle:
+                continue
+        recon = reconciliation_from_json(sibling.reconciliation_data)
+        listed_ids.update(
+            txn_id
+            for entry in [*recon["matched"], *recon["missing"]]
+            if (txn_id := entry.get("db_txn_id") or entry.get("imported_txn_id"))
+            is not None
+        )
 
     rows = (
         (
@@ -354,6 +417,7 @@ async def _qualifying_payment_credit_sum(session, upload: StatementUpload) -> De
                     Transaction.account_id == upload.account_id,
                     Transaction.direction == "credit",
                     transactions_in_cycle(window),
+                    Transaction.id.not_in(listed_ids),
                 )
             )
         )

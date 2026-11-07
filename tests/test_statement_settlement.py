@@ -12,7 +12,13 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from financial_dashboard.db import Account, Card, StatementUpload, Transaction
+from financial_dashboard.db import (
+    Account,
+    Card,
+    PaymentStatus,
+    StatementUpload,
+    Transaction,
+)
 from financial_dashboard.db.models import (
     AuditInteraction,
     Receivable,
@@ -396,6 +402,39 @@ async def test_only_the_row_the_prompt_showed_is_folded_once(maker):
         second.outcome,
     ) == ("stale", "stale", "merged", "stale")
     assert [row.amount for row in await _rows(maker)] == [Decimal("2529.00")]
+
+
+async def test_folding_a_held_payment_credit_recomputes_the_paid_amount(maker):
+    """Verifies that a fold into a payment alert recomputes the paid amount.
+
+    The statement already netted that credit into its total due. Without the
+    recompute, the alert stays counted as paid and the remaining due reads low.
+    """
+    held = _row()
+    held["direction"] = "credit"
+    upload_id = await _seed(maker, recon=_recon([held]))
+    async with maker() as session:
+        alert = await session.get(Transaction, 1)
+        alert.direction = "credit"
+        alert.email_type = "hdfc_cc_payment_alert"
+        upload = await session.get(StatementUpload, upload_id)
+        upload.created_at = datetime.datetime(2026, 4, 1, tzinfo=datetime.UTC)
+        upload.total_amount_due = "10,000.00"
+        upload.payment_status = PaymentStatus.PARTIALLY_PAID
+        upload.payment_paid_amount = Decimal(AUTHORISED)
+        upload.is_active = True
+        await session.commit()
+
+    async with maker() as session:
+        result = await answer(session, upload_id, 0, row_digest(held), 1)
+    async with maker() as session:
+        upload = await session.get(StatementUpload, upload_id)
+
+    assert result.outcome == "merged"
+    assert (upload.payment_paid_amount, upload.payment_status) == (
+        Decimal("0.00"),
+        PaymentStatus.UNPAID,
+    )
 
 
 async def test_a_row_another_statement_row_holds_is_refused(maker):
