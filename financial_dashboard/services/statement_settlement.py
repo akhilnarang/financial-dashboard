@@ -226,6 +226,17 @@ async def answer(
         entry["imported_txn_id"] = target.id
         entry["ambiguous"] = False
         upload.reconciliation_data = reconciliation_to_json(recon)
+        from financial_dashboard.services.reminders import (
+            _latest_active_cycle,
+            resync_tracked_cc_payment_state,
+        )
+
+        if (
+            cycle := await _latest_active_cycle(
+                session, upload.account_id, include_paid=True
+            )
+        ) is not None:
+            await resync_tracked_cc_payment_state(session, cycle)
         return SettlementResult("merged", target.id)
 
 
