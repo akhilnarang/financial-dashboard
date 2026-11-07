@@ -3059,9 +3059,9 @@ async def _screenshot_reply_result(
         )
     corrected = apply_corrections(corrected, user_text)
     settled = (
-        draft.direction_settled
-        or said is not None
+        said is not None
         or owner_side(corrected, tokens) is not None
+        or (draft.direction_settled and not direction_unclear(corrected, tokens))
     )
     review = await review_screenshot(
         session,

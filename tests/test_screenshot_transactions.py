@@ -783,6 +783,14 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert "Save this as a provisional transaction?" in proposed.text
     assert "from ALEX S SMITH" in proposed.text
 
+    # A reread that matches the owner on both blocks asks again.
+    both = current.model_copy(
+        update={"utr": UTR, "payer": UpiParty(name="JANE DOE", vpa="test0000@upi")}
+    )
+    create.return_value.choices[0].message.content = both.model_dump_json()
+    reasked = await _reply(shot, asked.conversation_id, "ok")
+    assert "Did you receive or pay this?" in reasked.text
+
     # A reread that flips the receipt back to the owner's payment is
     # oriented again by the receipt blocks.
     flipped = receipt.model_copy(update={"utr": UTR, "account_hint": "SBI savings"})
