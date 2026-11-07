@@ -217,10 +217,11 @@ def orient_read(
     """Set the direction and the other party of a read from its receipt blocks.
 
     When exactly one of the From and To blocks is the owner, the read takes
-    the direction, and the other party's name and VPA when shown. The owner's
-    bank text, or none, replaces the hint, unless the hint ends in last 4
-    digits that the other party's block does not show. With no bank, the
-    review asks for the account. The read validates again, so a refund
+    the direction, and the other party's name and VPA when shown. A hint that
+    ends in last 4 digits that the other party's block does not show stays.
+    Else the owner's bank text replaces the hint. When the owner's block
+    shows no bank, a hint that names the other party's bank is dropped, so
+    the review asks for the account. The read validates again, so a refund
     stays a credit.
 
     Args:
@@ -244,10 +245,17 @@ def orient_read(
             for field, value in (("counterparty", other.name), ("vpa", other.vpa))
             if value
         }
-    last4 = _TRAILING_LAST4.search(read.account_hint or "")
+    hint = read.account_hint or ""
+    last4 = _TRAILING_LAST4.search(hint)
     other_bank = (other.bank_text if other else None) or ""
-    if not last4 or last4.group(1) in other_bank:
-        updates["account_hint"] = own.bank_text if own else None
+    own_bank = own.bank_text if own else None
+    if not (last4 and last4.group(1) not in other_bank):
+        if own_bank:
+            updates["account_hint"] = own_bank
+        elif not hint or (
+            other_bank and _normalize_hint(hint) in _normalize_hint(other_bank)
+        ):
+            updates["account_hint"] = None
     return ScreenshotTransaction.model_validate(read.model_dump() | updates)
 
 

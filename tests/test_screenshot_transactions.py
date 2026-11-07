@@ -696,6 +696,9 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     )
     oriented = screenshot_transactions.orient_read(sender_bank, owner)
     assert (oriented.account_hint, oriented.counterparty) == (None, "ALEX SMITH")
+    # A hint that is not the sender's bank stays when the owner's block has none.
+    own_hint = sender_bank.model_copy(update={"account_hint": "SBI"})
+    assert screenshot_transactions.orient_read(own_hint, owner).account_hint == "SBI"
     # A free 12-digit number never replaces a valid UTR.
     kept = screenshot_transactions.apply_corrections(
         receipt.model_copy(update={"utr": UTR}), "my account number is 999999999999"
@@ -751,7 +754,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     # A plain-language reply goes to the model with the image and current read.
     current = screenshot_transactions.orient_read(receipt, owner)
     answer = current.model_copy(
-        update={"utr": UTR, "counterparty": "ALEX S SMITH"}
+        update={"utr": UTR, "counterparty": "ALEX S SMITH", "account_hint": "HDFC"}
     ).model_dump_json()
     create = AsyncMock(
         return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=answer))])

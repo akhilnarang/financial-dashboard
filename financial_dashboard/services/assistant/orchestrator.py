@@ -3041,8 +3041,9 @@ async def _screenshot_reply_result(
             corrected = (
                 reread
                 if owner_side(reread, tokens) is None
-                or oriented.direction == reread.direction
-                else oriented.model_copy(update={"account_hint": reread.account_hint})
+                else (
+                    reread if oriented.direction == reread.direction else oriented
+                ).model_copy(update={"account_hint": oriented.account_hint})
             )
         except OSError, ValueError, httpx.HTTPError, OpenAIError:
             logger.exception("Screenshot reply %s was not read", interaction_id)
