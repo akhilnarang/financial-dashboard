@@ -817,13 +817,8 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     unclear = await _send(shot, monkeypatch, second)
     assert 'Did you receive or pay this? Reply "received" or "paid".' in unclear.text
     assert "received or paid" in unclear.text.partition("Missing or not valid:")[2]
-    with pytest.raises(MutationRejected, match="received or paid"):
-        await _yes(shot, unclear.conversation_id)
-    assert len(await _rows(shot)) == 1
-    answered = await _reply(shot, unclear.conversation_id, "received")
-    assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in answered.text
 
-    async def reads_debit(
+    async def reread(
         *,
         image: bytes,
         media_type: str,
@@ -834,19 +829,33 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         current: ScreenshotTransaction | None = None,
     ) -> ScreenshotTransaction:
         assert current is not None
-        return current.model_copy(
-            update={"direction": "debit", "counterparty": "JANE DOE"}
-        )
+        blocks = {"payer": second.payer, "payee": second.payee}
+        match notes[-1]:
+            case "account 4321":
+                return current.model_copy(update={"payer": None, "payee": None})
+            case "name Paid Ventures":
+                return current.model_copy(update=blocks | {"direction": "debit"})
+            case _:
+                return current.model_copy(update=blocks)
 
-    monkeypatch.setattr(openai_provider, "read_screenshot", reads_debit)
+    monkeypatch.setattr(openai_provider, "read_screenshot", reread)
+    with pytest.raises(MutationRejected, match="received or paid"):
+        await _yes(shot, unclear.conversation_id)
+    assert len(await _rows(shot)) == 1
+    # A reread without the blocks does not settle the open question.
+    still = await _reply(shot, unclear.conversation_id, "account 4321")
+    assert "Did you receive or pay this?" in still.text
+    answered = await _reply(shot, unclear.conversation_id, "received")
+    assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in answered.text
+    # A later typed name stays, and so does the answer.
     again = await _reply(shot, unclear.conversation_id, "name Paid Ventures")
-    assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in again.text
+    assert "received ₹777.00 from Paid Ventures" in again.text
     assert (await _yes(shot, unclear.conversation_id)).startswith("Saved #")
     [new] = [r for r in await _rows(shot) if r.reference_number == "210987654321"]
     assert (new.direction, new.account_id, new.counterparty) == (
         "credit",
         1,
-        "ALEX SMITH",
+        "Paid Ventures",
     )
 
 

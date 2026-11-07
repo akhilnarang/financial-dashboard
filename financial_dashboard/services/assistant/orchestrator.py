@@ -3046,19 +3046,20 @@ async def _screenshot_reply_result(
             )
         except OSError, ValueError, httpx.HTTPError, OpenAIError:
             logger.exception("Screenshot reply %s was not read", interaction_id)
-    corrected = apply_corrections(corrected, user_text)
-    said = direction_word(user_text) or draft.owner_direction
-    if said:
+    if said := direction_word(user_text):
         oriented = orient_read(
             corrected, tokens, side="payee" if said == "credit" else "payer"
         )
         corrected = oriented.model_copy(
             update={"account_hint": corrected.account_hint or oriented.account_hint}
         )
+    elif said := draft.owner_direction:
+        corrected = corrected.model_copy(update={"direction": said})
+    corrected = apply_corrections(corrected, user_text)
     settled = (
         draft.direction_settled
         or said is not None
-        or not direction_unclear(corrected, tokens)
+        or owner_side(corrected, tokens) is not None
     )
     review = await review_screenshot(
         session,
