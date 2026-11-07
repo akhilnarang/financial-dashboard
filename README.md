@@ -67,13 +67,13 @@ Once running:
 
 ### Account and Card Management
 - **Accounts** represent bank accounts, savings accounts, or credit cards. Each has a bank, label, type, and optional account number (last-4 or full number).
-- **Cards** are physical cards linked to an account. An account can have multiple cards (primary + addon cards). Each card has a `card_mask` (e.g. `XX2001`).
+- **Cards** are physical cards linked to an account. An account can have multiple cards (primary + addon cards). Each card has a `card_mask` (e.g. `XX1111`).
 - **Addon card support**: Multiple cards can be linked to a single credit card account (e.g. primary + spouse addon). The linker resolves transactions to the correct card and parent account.
 
 ### Transaction-to-Account Linking (`services/linker.py`)
 Every transaction is auto-linked to an Account (and optionally a Card) using a four-level lookup cascade:
 
-1. **card_mask -> cards table** — sets both `card_id` and `account_id`. Handles all mask formats (`XX2001`, `xx0298`, `XXXXXXX8669`, `4611 XXXX XXXX 2002`, `0567`, etc.) by extracting the last-4 digits.
+1. **card_mask -> cards table** — sets both `card_id` and `account_id`. Handles all mask formats (`XX1111`, `xx2222`, `XXXXXXX3333`, `XXXX XXXX XXXX 4444`, `5555`, etc.) by extracting the last-4 digits.
 2. **card_mask -> accounts table** — fallback for cards stored as Account rows (e.g. debit cards with `account_number` = last-4).
 3. **account_mask -> accounts table** — for savings/current account masks.
 4. **bank-only fallback** — links to the sole account for a bank, but only when exactly one account exists (avoids silent misattribution when a bank has both savings and CC accounts).

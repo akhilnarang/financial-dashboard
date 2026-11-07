@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 if TYPE_CHECKING:
     from bank_statement_parser.models import BankTransaction, ParsedBankStatement
+from financial_dashboard.core.references import payment_references_differ
 from financial_dashboard.db import (
     Account,
     BankStatementUpload,
@@ -78,7 +79,6 @@ from financial_dashboard.services.telegram import (
 logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z]{4,}")
-_UTR = re.compile(r"\d{12}")
 _MIN_REF_SUBSTRING_LEN = 6
 _OVERLAP_STOPWORDS: frozenset[str] = frozenset(
     {
@@ -160,7 +160,7 @@ _BANK_RECONCILIATION_GATES = (
 )
 _GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment done"}
 # A counterparty that is only a label and a mask, e.g. "Mobile XXXXXXXXX006",
-# "Acct xxxxxxxxxx8214" or a bare "xxxxxxxxxx8669". A mask names nobody. The
+# "Acct xxxxxxxxxx1234" or a bare "xxxxxxxxxx5678". A mask names nobody. The
 # match must cover the whole value, so a counterparty that holds a mask AND a
 # name ("Acct XXXXXXX7703/AKHIL JYOT") stays authoritative. The trailing digits
 # are required: every mask keeps some of the number, so an X-run on its own is
@@ -406,12 +406,11 @@ def _is_statement_candidate_compatible(
     if _ref_appears_in(statement_reference, candidate_narration):
         return True
 
-    # A screenshot row holds the UPI UTR. A line with another 12-digit
-    # reference is another payment, even to the same payee.
-    if (candidate_transaction.source or "").startswith("screenshot") and all(
-        _UTR.fullmatch((ref or "").strip())
-        for ref in (candidate_reference, statement_reference)
-    ):
+    # A screenshot row holds the payment's UTR. A line with another reference of
+    # the same form is another payment, even to the same payee.
+    if (candidate_transaction.source or "").startswith(
+        "screenshot"
+    ) and payment_references_differ(candidate_reference, statement_reference):
         return False
 
     if (

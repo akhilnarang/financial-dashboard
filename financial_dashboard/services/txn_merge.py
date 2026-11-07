@@ -8,7 +8,6 @@ does NOT commit and does NOT fire Telegram.
 """
 
 import datetime as _dt
-import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -18,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from financial_dashboard.core.references import payment_references_differ
 from financial_dashboard.core.masks import (
     WILDCARD,
     mask_digits,
@@ -184,7 +184,6 @@ _ENRICHMENT_FIELDS = (
 
 
 _MASK_FIELDS = ("card_mask", "account_mask")
-_UTR = re.compile(r"\d{12}")
 
 
 def _as_str(val: object) -> str | None:
@@ -660,17 +659,15 @@ def _decide(
     if not candidates:
         return MatchDecision("insert")
 
-    # A screenshot row holds the 12-digit UPI UTR. Another 12-digit reference
-    # on any channel, with or without a balance, is another payment.
+    # A screenshot row holds the payment's UTR. Another reference of the same
+    # form on any channel, with or without a balance, is another payment.
     incoming_ref = (txn_data.get("reference_number") or "").strip()
     candidates = [
         c
         for c in candidates
         if _is_source_row(c, channel, source_id)
         or not (c.source or "").startswith("screenshot")
-        or not _UTR.fullmatch(incoming_ref)
-        or not _UTR.fullmatch(c.reference_number or "")
-        or c.reference_number == incoming_ref
+        or not payment_references_differ(incoming_ref, c.reference_number)
     ]
     if not candidates:
         return MatchDecision("insert")

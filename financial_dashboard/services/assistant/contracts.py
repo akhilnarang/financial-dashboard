@@ -287,8 +287,9 @@ class UpiParty(StrictModel):
 class ScreenshotTransaction(StrictModel):
     """What the vision model reads off one payment screenshot.
 
-    The screenshot is a UPI app screen or a card app screen. The model output is
-    untrusted. Code checks every field before a row is proposed.
+    The screenshot is a UPI app screen, a bank transfer receipt or a card app
+    screen. The model output is untrusted. Code checks every field before a
+    row is proposed.
 
     ``status`` holds ``reversed`` when a refund or a reversal returned money.
     A reversed read always has ``direction`` of ``credit``. ``payer`` and
@@ -326,7 +327,7 @@ class ScreenshotTransaction(StrictModel):
         "bank",
         "other",
     ]
-    channel: Literal["upi", "card"] = "upi"
+    channel: Literal["upi", "imps", "neft", "rtgs", "card"] = "upi"
     account_hint: StrictStr | None = Field(max_length=100)
     payer: UpiParty | None = None
     payee: UpiParty | None = None
@@ -371,7 +372,8 @@ class ScreenshotTransaction(StrictModel):
     @field_validator("utr")
     @classmethod
     def strip_utr_spaces(cls, value: str | None) -> str | None:
-        return re.sub(r"\s", "", value) if value is not None else None
+        """Drop spaces and uppercase the reference, as banks print a UTR."""
+        return re.sub(r"\s", "", value).upper() if value is not None else None
 
     @field_validator("occurred_at")
     @classmethod

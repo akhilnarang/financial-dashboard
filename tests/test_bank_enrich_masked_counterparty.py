@@ -82,7 +82,7 @@ async def test_a_mask_is_replaced_by_the_real_name(maker, masked):
 
 
 async def test_a_real_name_is_never_overwritten(maker):
-    real_name = "Acct XXXXXXX0003/ALEX DOE"
+    real_name = "Acct XXXXXXX9876/ALEX DOE"
     row_id = await _store(maker, counterparty=real_name, raw_description="already here")
 
     await _enrich(row_id, counterparty="SOMEONE ELSE", narration="OTHER NARRATION")

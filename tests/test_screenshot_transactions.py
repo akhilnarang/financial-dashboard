@@ -51,6 +51,7 @@ pytestmark = pytest.mark.anyio
 
 CHAT = 77
 UTR = "123456789012"
+NEFT_UTR = "N123456789012345"
 PNG = b"\x89PNG\r\n\x1a\nsynthetic"
 REAL_DISPATCH = telegram.dispatch_saved_delivery
 
@@ -932,6 +933,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         "credit_leg",
         "other_side",
         "other_side_voided",
+        "other_side_neft",
         "maybe_new",
         "maybe_moved",
         "maybe_no_utr",
@@ -961,7 +963,8 @@ async def test_duplicate_utr_offers_to_attach_instead(
             if case.startswith(("credit_leg", "other_side"))
             else "debit",
             amount=Decimal("250.00"),
-            reference_number=UTR,
+            # A NEFT UTR matches whatever its letter case.
+            reference_number=NEFT_UTR.lower() if case == "other_side_neft" else UTR,
             source="sms",
             voided=case in ("voided_utr", "other_side_voided"),
         )
@@ -1003,7 +1006,11 @@ async def test_duplicate_utr_offers_to_attach_instead(
         _read(utr=None)
         if case == "maybe_no_utr"
         # The payer's receipt from an account the owner does not hold.
-        else _read(account_hint="ICICI 0424")
+        else _read(
+            account_hint="ICICI 1111", channel="neft", app="bank", utr=NEFT_UTR.lower()
+        )
+        if case == "other_side_neft"
+        else _read(account_hint="ICICI 1111", channel="imps", app="bank")
         if case.startswith("other_side")
         else _read(),
     )
@@ -1057,7 +1064,10 @@ async def test_duplicate_utr_offers_to_attach_instead(
             await _yes(shot, asked.conversation_id)
         return
     if case.startswith("other_side"):
-        # A voided row says so, because the attach un-voids it.
+        # The read names the transfer mode, and a voided row says so, because
+        # the attach un-voids it.
+        mode = "NEFT" if case == "other_side_neft" else "IMPS"
+        assert asked.text.startswith(f"{mode} screenshot (bank): paid ₹250.00")
         voided = case == "other_side_voided"
         assert (
             f"This is the other side of #{existing.id}, the credit on your account"
@@ -1130,11 +1140,19 @@ def _screenshot_row() -> Transaction:
     )
 
 
+# A NEFT UTR has another form than the 12-digit UPI reference.
+@pytest.mark.parametrize(
+    ("ref", "other_ref"),
+    [(UTR, "210987654321"), (NEFT_UTR, "N543210987654321")],
+    ids=["upi", "neft"],
+)
 async def test_alert_with_the_same_utr_enriches_the_screenshot_row(
-    shot: Shot,
+    shot: Shot, ref: str, other_ref: str
 ) -> None:
     async with shot.maker() as s:
-        s.add(_screenshot_row())
+        row = _screenshot_row()
+        row.reference_number = ref
+        s.add(row)
         await s.flush()
         # An alert a minute later with another UTR is another payment.
         other, _, _ = await merge_transaction(
@@ -1146,7 +1164,7 @@ async def test_alert_with_the_same_utr_enriches_the_screenshot_row(
                 "direction": "debit",
                 "amount": Decimal("250.00"),
                 "currency": "INR",
-                "reference_number": "210987654321",
+                "reference_number": other_ref,
                 "transaction_date": datetime.date(2026, 10, 20),
                 "transaction_time": datetime.time(14, 6),
                 "counterparty": None,
@@ -1163,7 +1181,7 @@ async def test_alert_with_the_same_utr_enriches_the_screenshot_row(
                 "direction": "debit",
                 "amount": Decimal("250.00"),
                 "currency": "INR",
-                "reference_number": UTR,
+                "reference_number": ref,
                 "transaction_date": datetime.date(2026, 10, 20),
                 "transaction_time": datetime.time(14, 6),
                 "counterparty": None,
@@ -1181,7 +1199,7 @@ async def test_alert_with_the_same_utr_enriches_the_screenshot_row(
                 "direction": "debit",
                 "amount": Decimal("250.00"),
                 "currency": "INR",
-                "reference_number": UTR,
+                "reference_number": ref,
                 "transaction_date": datetime.date(2026, 10, 20),
                 "transaction_time": datetime.time(14, 6),
                 "counterparty": None,

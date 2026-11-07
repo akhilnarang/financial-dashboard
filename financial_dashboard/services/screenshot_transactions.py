@@ -16,9 +16,14 @@ from decimal import Decimal
 from typing import Literal, NamedTuple
 
 from pydantic import ValidationError
-from sqlalchemy import ColumnElement, or_, select
+from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from financial_dashboard.core.references import (
+    BANK_UTR_PATTERN,
+    RRN_PATTERN,
+    reference_form,
+)
 from financial_dashboard.core.dates import IST, parse_datetime
 from financial_dashboard.core.masks import mask_last4
 from financial_dashboard.core.templating import format_inr_exact
@@ -55,6 +60,14 @@ FLAG_AGE = datetime.timedelta(days=60)
 DUPLICATE_WINDOW = datetime.timedelta(days=1)
 
 _UTR = re.compile(r"(?<!\d)\d{12}(?!\d)")
+_REFERENCE_RULES: frozendict[str, tuple[str, str]] = frozendict(
+    {
+        "upi": (RRN_PATTERN, "UTR (12 digits)"),
+        "imps": (RRN_PATTERN, "UTR (12 digits)"),
+        "neft": (BANK_UTR_PATTERN, "UTR (16 to 22 letters and digits)"),
+        "rtgs": (BANK_UTR_PATTERN, "UTR (16 to 22 letters and digits)"),
+    }
+)
 _REFERENCE_WORD = re.compile(r"\b(?:utr|ref|rrn|reference|transaction id)\b", re.I)
 _NON_ALPHANUMERIC = re.compile(r"[^a-z0-9]")
 _TRAILING_LAST4 = re.compile(r"(\d{4})[\s).]*$")
@@ -81,7 +94,7 @@ def _saved_status(read: ScreenshotTransaction) -> bool:
     spend has its own alert, and that alert must create the row.
     """
     return read.status == "reversed" or (
-        read.status == "success" and read.channel == "upi"
+        read.status == "success" and read.channel != "card"
     )
 
 
@@ -445,12 +458,12 @@ async def _find_duplicate(
     Returns:
         The stored row, or None when no row holds the payment.
     """
-    utr = read.utr if read.utr and _UTR.fullmatch(read.utr) else None
+    utr = read.utr if reference_form(read.utr) is not None else None
     if utr:
         found = await session.scalar(
             select(Transaction)
             .where(
-                Transaction.reference_number == utr,
+                func.upper(Transaction.reference_number) == utr,
                 Transaction.direction == read.direction,
             )
             .order_by(Transaction.id)
@@ -462,7 +475,7 @@ async def _find_duplicate(
             rows = (
                 await session.scalars(
                     select(Transaction)
-                    .where(Transaction.reference_number == utr)
+                    .where(func.upper(Transaction.reference_number) == utr)
                     .limit(2)
                 )
             ).all()
@@ -487,11 +500,11 @@ async def _find_duplicate(
         .order_by(Transaction.id)
         .limit(1)
     )
-    if read.channel == "upi":
+    if (rule := _REFERENCE_RULES.get(read.channel)) is not None:
         stmt = stmt.where(
             or_(
                 Transaction.reference_number.is_(None),
-                ~Transaction.reference_number.regexp_match(r"^\d{12}$"),
+                ~Transaction.reference_number.regexp_match(f"^{rule[0]}$"),
             )
         )
     return await session.scalar(stmt)
@@ -518,8 +531,9 @@ async def _check(
         ("name or VPA", bool(read.counterparty or read.vpa)),
         ("date and time", read.occurred_at is not None and read.occurred_at <= now),
     ]
-    if read.channel == "upi":
-        checks.append(("UTR (12 digits)", _UTR.fullmatch(read.utr or "") is not None))
+    if (rule := _REFERENCE_RULES.get(read.channel)) is not None:
+        pattern, label = rule
+        checks.append((label, re.fullmatch(pattern, read.utr or "") is not None))
     if read.channel == "card":
         checks.append(("card", target.account is not None))
     else:
@@ -552,7 +566,8 @@ def _headline(read: ScreenshotTransaction) -> str:
         # A card screenshot saves only a refund, so no other card read gets here.
         return f"Card refund: {amount_text} from {party}"
     return (
-        f"UPI screenshot ({read.app}): {'received' if credit else 'paid'} "
+        f"{read.channel.upper()} screenshot ({read.app}): "
+        f"{'received' if credit else 'paid'} "
         f"{amount_text} {'from' if credit else 'to'} {party}"
     )
 
@@ -631,7 +646,7 @@ async def review_screenshot(
     if (
         duplicate is not None
         and read.utr
-        and duplicate.reference_number == read.utr
+        and (duplicate.reference_number or "").upper() == read.utr
         and duplicate.direction != read.direction
     ):
         lines.append(
@@ -642,7 +657,11 @@ async def review_screenshot(
             else f"This is the other side of #{duplicate.id}, the "
             f"{duplicate.direction} on your account. Attach the screenshot to it?"
         )
-    elif duplicate is not None and read.utr and duplicate.reference_number == read.utr:
+    elif (
+        duplicate is not None
+        and read.utr
+        and (duplicate.reference_number or "").upper() == read.utr
+    ):
         lines.append(
             f"This is recorded as #{duplicate.id}, which is voided. Attach the "
             "screenshot and un-void it? The screenshot shows a success."
