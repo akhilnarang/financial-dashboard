@@ -810,6 +810,8 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         "voided_since",
         "other_utr",
         "credit_leg",
+        "other_side",
+        "other_side_voided",
         "maybe_new",
         "maybe_moved",
         "maybe_no_utr",
@@ -835,11 +837,13 @@ async def test_duplicate_utr_offers_to_attach_instead(
         existing = Transaction(
             bank="sbi",
             email_type="sbi_upi_alert",
-            direction="credit" if case == "credit_leg" else "debit",
+            direction="credit"
+            if case.startswith(("credit_leg", "other_side"))
+            else "debit",
             amount=Decimal("250.00"),
             reference_number=UTR,
             source="sms",
-            voided=case == "voided_utr",
+            voided=case in ("voided_utr", "other_side_voided"),
         )
         # A failed attempt the same day is voided; the guess skips it.
         failed = Transaction(
@@ -874,7 +878,14 @@ async def test_duplicate_utr_offers_to_attach_instead(
         await s.commit()
 
     asked = await _send(
-        shot, monkeypatch, _read(utr=None) if case == "maybe_no_utr" else _read()
+        shot,
+        monkeypatch,
+        _read(utr=None)
+        if case == "maybe_no_utr"
+        # The payer's receipt from an account the owner does not hold.
+        else _read(account_hint="ICICI 0424")
+        if case.startswith("other_side")
+        else _read(),
     )
 
     if case.startswith("maybe"):
@@ -924,6 +935,27 @@ async def test_duplicate_utr_offers_to_attach_instead(
             await s.commit()
         with pytest.raises(MutationRejected, match="no longer matches"):
             await _yes(shot, asked.conversation_id)
+        return
+    if case.startswith("other_side"):
+        # A voided row says so, because the attach un-voids it.
+        voided = case == "other_side_voided"
+        assert (
+            f"This is the other side of #{existing.id}, the credit on your account"
+            + (
+                ", which is voided. Attach the screenshot and un-void it?"
+                if voided
+                else ". Attach"
+            )
+        ) in asked.text
+        assert asked.buttons == [f"Attach to #{existing.id}", "Skip"]
+        assert await _yes(shot, asked.conversation_id) == (
+            f"Attached the screenshot to #{existing.id}"
+            + (" and un-voided it." if voided else ".")
+        )
+        stored = {
+            row.id: (row.attachment_path, row.voided) for row in await _rows(shot)
+        }
+        assert stored == {other.id: (None, False), existing.id: ("shot.png", False)}
         return
     if case not in ("same_utr", "voided_utr"):
         assert "Save this as a provisional transaction?" in asked.text
