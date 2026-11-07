@@ -660,12 +660,26 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert "UTR (12 digits), account (last 4 digits or bank)" in ambiguous.text
     assert "Which account: SBI savings 4321, SBI other 9999?" in ambiguous.text
 
-    # A single name can be a friend's name, so it never marks the owner.
-    lone_name = screenshot_transactions.orient_read(receipt, ("DOE",))
-    assert lone_name.direction == "debit"
-    name_only = receipt.model_copy(update={"payee": UpiParty(name="JANE Q DOE")})
-    two_words = screenshot_transactions.orient_read(name_only, ("JANE", "DOE"))
-    assert two_words.direction == "credit"
+    # Any identifier marks its side: a name word, or a handle in the VPA.
+    assert screenshot_transactions.orient_read(receipt, ("DOE",)).direction == "credit"
+    handle_only = receipt.model_copy(
+        update={"payee": UpiParty(vpa="janedoe408@testyes")}
+    )
+    assert (
+        screenshot_transactions.orient_read(handle_only, ("Jane Doe",)).direction
+        == "credit"
+    )
+    # A token on both sides decides nothing, so the bot asks.
+    settings_service._cache["categorization.self_identifiers"] = "DOE, SMITH"
+    unclear = await _send(shot, monkeypatch, receipt)
+    assert "Did you receive or pay this?" in unclear.text
+    assert "received or paid" in unclear.text.partition("Missing or not valid:")[2]
+    answered = await _reply(shot, unclear.conversation_id, "received")
+    assert "Did you receive or pay this?" not in answered.text
+    assert "received ₹1,234.00 from ALEX SMITH (test0000@upi)" in answered.text
+    settings_service._cache["categorization.self_identifiers"] = (
+        "JANE DOE, jane@testyes"
+    )
     owner = ("JANE DOE", "jane@testyes")
     # A refund to the owner stays a credit, and shown last 4 digits stay.
     refund = receipt.model_copy(

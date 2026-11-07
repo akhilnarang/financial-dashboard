@@ -389,6 +389,8 @@ class ScreenshotTransactionConfirmation(StrictModel):
     owner called another payment. ``duplicate_voided`` is the void state of
     ``duplicate_of`` that the question showed. ``notes`` holds the caption and
     the replies, oldest first, so each new read sees all of them.
+    ``direction_settled`` is False while the receipt blocks do not show which
+    side is the owner and the owner has not said received or paid.
     """
 
     kind: Literal["screenshot_transaction"]
@@ -400,6 +402,7 @@ class ScreenshotTransactionConfirmation(StrictModel):
     duplicate_voided: StrictBool = False
     not_duplicates: list[StrictInt] = Field(default_factory=list, max_length=20)
     notes: list[StrictStr] = Field(default_factory=list, max_length=20)
+    direction_settled: StrictBool = True
 
 
 ConfirmationAction: TypeAlias = Annotated[
