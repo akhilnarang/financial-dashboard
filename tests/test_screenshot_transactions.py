@@ -811,7 +811,10 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         update={
             "utr": "210987654321",
             "amount": Decimal("777.00"),
-            "account_hint": "SBI 4321",
+            "account_hint": "HDFC Bank",
+            "payer": UpiParty(
+                name="ALEX SMITH", vpa="test0000@upi", bank_text="HDFC Bank"
+            ),
         }
     )
     unclear = await _send(shot, monkeypatch, second)
@@ -831,7 +834,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         assert current is not None
         blocks = {"payer": second.payer, "payee": second.payee}
         match notes[-1]:
-            case "account 4321":
+            case "utr 210987654321":
                 return current.model_copy(update={"payer": None, "payee": None})
             case "name Paid Ventures":
                 return current.model_copy(update=blocks | {"direction": "debit"})
@@ -843,11 +846,12 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         await _yes(shot, unclear.conversation_id)
     assert len(await _rows(shot)) == 1
     # A reread without the blocks does not settle the open question.
-    still = await _reply(shot, unclear.conversation_id, "account 4321")
+    still = await _reply(shot, unclear.conversation_id, "utr 210987654321")
     assert "Did you receive or pay this?" in still.text
     answered = await _reply(shot, unclear.conversation_id, "received")
     assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in answered.text
-    # A later typed name stays, and so does the answer.
+    # The answer takes the owner's bank, not the sender's. A later typed name
+    # stays, and so does the answer.
     again = await _reply(shot, unclear.conversation_id, "name Paid Ventures")
     assert "received ₹777.00 from Paid Ventures" in again.text
     assert (await _yes(shot, unclear.conversation_id)).startswith("Saved #")
@@ -857,6 +861,33 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         1,
         "Paid Ventures",
     )
+
+    # An open question also holds back attaching to a voided row.
+    async with shot.maker() as s:
+        voided = Transaction(
+            bank="sbi",
+            account_id=1,
+            email_type="sbi_upi_alert",
+            direction="debit",
+            amount=Decimal("555.00"),
+            transaction_date=paid_at.date(),
+            reference_number="310987654321",
+            voided=True,
+        )
+        s.add(voided)
+        await s.commit()
+    third = second.model_copy(
+        update={"utr": "310987654321", "amount": Decimal("555.00")}
+    )
+    held = await _send(shot, monkeypatch, third)
+    assert "Did you receive or pay this?" in held.text
+    assert "Attach" not in held.text
+    with pytest.raises(MutationRejected, match="received or paid"):
+        await _yes(shot, held.conversation_id)
+    async with shot.maker() as s:
+        row = await s.get(Transaction, voided.id)
+    assert row is not None
+    assert (row.voided, row.attachment_path) == (True, None)
 
 
 @pytest.mark.parametrize(

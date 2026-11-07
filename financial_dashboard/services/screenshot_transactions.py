@@ -611,6 +611,7 @@ async def review_screenshot(
     target, missing, duplicate = await _check(session, read, not_duplicates)
     if not direction_settled:
         missing.append("received or paid")
+        duplicate = None
     lines = [
         _headline(read),
         _detail_line(read, target),
@@ -794,6 +795,8 @@ async def save_screenshot_transaction(
         action.media_type,
     )
     read = action.read
+    if not action.direction_settled:
+        raise MutationRejected("missing or not valid: received or paid")
     target, missing, duplicate = await _check(session, read, action.not_duplicates)
     if action.duplicate_of is not None:
         if (
@@ -815,8 +818,6 @@ async def save_screenshot_transaction(
         return f"Attached the screenshot to #{found.id}."
     if duplicate is not None:
         raise MutationRejected(f"already recorded as #{duplicate.id}")
-    if not action.direction_settled:
-        raise MutationRejected("missing or not valid: received or paid")
     if (
         missing
         or target.account is None

@@ -3051,7 +3051,7 @@ async def _screenshot_reply_result(
             corrected, tokens, side="payee" if said == "credit" else "payer"
         )
         corrected = oriented.model_copy(
-            update={"account_hint": corrected.account_hint or oriented.account_hint}
+            update={"account_hint": oriented.account_hint or corrected.account_hint}
         )
     elif said := draft.owner_direction:
         corrected = corrected.model_copy(update={"direction": said})
