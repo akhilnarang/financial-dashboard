@@ -660,12 +660,15 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert "UTR (12 digits), account (last 4 digits or bank)" in ambiguous.text
     assert "Which account: SBI savings 4321, SBI other 9999?" in ambiguous.text
 
-    # A single name can be a friend's name, so it never marks the owner.
-    lone_name = screenshot_transactions.orient_read(receipt, ("DOE",))
-    assert lone_name.direction == "debit"
-    name_only = receipt.model_copy(update={"payee": UpiParty(name="JANE Q DOE")})
-    two_words = screenshot_transactions.orient_read(name_only, ("JANE", "DOE"))
-    assert two_words.direction == "credit"
+    # Any identifier marks its side: a name word, or a handle in the VPA.
+    assert screenshot_transactions.orient_read(receipt, ("DOE",)).direction == "credit"
+    handle_only = receipt.model_copy(
+        update={"payee": UpiParty(vpa="janedoe408@testyes")}
+    )
+    assert (
+        screenshot_transactions.orient_read(handle_only, ("Jane Doe",)).direction
+        == "credit"
+    )
     owner = ("JANE DOE", "jane@testyes")
     # A refund to the owner stays a credit, and shown last 4 digits stay.
     refund = receipt.model_copy(
@@ -693,6 +696,13 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     )
     oriented = screenshot_transactions.orient_read(sender_bank, owner)
     assert (oriented.account_hint, oriented.counterparty) == (None, "ALEX SMITH")
+    masked = sender_bank.model_copy(
+        update={
+            "account_hint": "HDFC Bank",
+            "payer": UpiParty(bank_text="HDFC XX1234"),
+        }
+    )
+    assert screenshot_transactions.orient_read(masked, owner).account_hint is None
     # A free 12-digit number never replaces a valid UTR.
     kept = screenshot_transactions.apply_corrections(
         receipt.model_copy(update={"utr": UTR}), "my account number is 999999999999"
@@ -748,7 +758,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     # A plain-language reply goes to the model with the image and current read.
     current = screenshot_transactions.orient_read(receipt, owner)
     answer = current.model_copy(
-        update={"utr": UTR, "counterparty": "ALEX S SMITH"}
+        update={"utr": UTR, "counterparty": "ALEX S SMITH", "account_hint": "HDFC"}
     ).model_dump_json()
     create = AsyncMock(
         return_value=MagicMock(choices=[MagicMock(message=MagicMock(content=answer))])
@@ -772,6 +782,14 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     )
     assert "Save this as a provisional transaction?" in proposed.text
     assert "from ALEX S SMITH" in proposed.text
+
+    # A reread that matches the owner on both blocks asks again.
+    both = current.model_copy(
+        update={"utr": UTR, "payer": UpiParty(name="JANE DOE", vpa="test0000@upi")}
+    )
+    create.return_value.choices[0].message.content = both.model_dump_json()
+    reasked = await _reply(shot, asked.conversation_id, "ok")
+    assert "Did you receive or pay this?" in reasked.text
 
     # A reread that flips the receipt back to the owner's payment is
     # oriented again by the receipt blocks.
@@ -800,6 +818,108 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         paid_at.date(),
         datetime.time(18, 16),
     )
+
+    # A token on both sides decides nothing: Yes waits for received or paid,
+    # and the answer holds when a later reread says debit.
+    settings_service._cache["categorization.self_identifiers"] = "DOE, SMITH"
+    async with shot.maker() as s:
+        s.add(
+            Account(
+                id=3,
+                bank="hdfc",
+                label="HDFC savings",
+                type="bank_account",
+                account_number="XXXXXX5555",
+            )
+        )
+        await s.commit()
+    second = receipt.model_copy(
+        update={
+            "utr": "210987654321",
+            "amount": Decimal("777.00"),
+            "account_hint": "HDFC Bank",
+            "payer": UpiParty(
+                name="ALEX SMITH", vpa="test0000@upi", bank_text="HDFC Bank"
+            ),
+            "payee": UpiParty(name="JANE DOE", vpa="jane@testyes"),
+        }
+    )
+    unclear = await _send(shot, monkeypatch, second)
+    assert 'Did you receive or pay this? Reply "received" or "paid".' in unclear.text
+    assert "received or paid" in unclear.text.partition("Missing or not valid:")[2]
+
+    async def reread(
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        notes: Sequence[str] = (),
+        current: ScreenshotTransaction | None = None,
+    ) -> ScreenshotTransaction:
+        assert current is not None
+        blocks = {"payer": second.payer, "payee": second.payee}
+        match notes[-1]:
+            case "utr 210987654321":
+                return current.model_copy(update={"payer": None, "payee": None})
+            case "name Paid Ventures":
+                return current.model_copy(
+                    update=blocks | {"direction": "debit", "account_hint": "HDFC Bank"}
+                )
+            case _:
+                return current.model_copy(update=blocks)
+
+    monkeypatch.setattr(openai_provider, "read_screenshot", reread)
+    with pytest.raises(MutationRejected, match="received or paid"):
+        await _yes(shot, unclear.conversation_id)
+    assert len(await _rows(shot)) == 1
+    # A reread without the blocks does not settle the open question.
+    still = await _reply(shot, unclear.conversation_id, "utr 210987654321")
+    assert "Did you receive or pay this?" in still.text
+    answered = await _reply(shot, unclear.conversation_id, "received")
+    assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in answered.text
+    # The owner's block shows no bank, so the sender's bank never stays.
+    assert "account (last 4 digits or bank)" in answered.text
+    answered = await _reply(shot, unclear.conversation_id, "account SBI 4321")
+    # The answer takes the owner's bank, not the sender's. A later reread
+    # keeps the answer and that bank, and a typed name still applies.
+    again = await _reply(shot, unclear.conversation_id, "name Paid Ventures")
+    assert "received ₹777.00 from Paid Ventures" in again.text
+    assert (await _yes(shot, unclear.conversation_id)).startswith("Saved #")
+    [new] = [r for r in await _rows(shot) if r.reference_number == "210987654321"]
+    assert (new.direction, new.account_id, new.counterparty) == (
+        "credit",
+        1,
+        "Paid Ventures",
+    )
+
+    # An open question also holds back attaching to a voided row.
+    async with shot.maker() as s:
+        voided = Transaction(
+            bank="sbi",
+            account_id=1,
+            email_type="sbi_upi_alert",
+            direction="debit",
+            amount=Decimal("555.00"),
+            transaction_date=paid_at.date(),
+            reference_number="310987654321",
+            voided=True,
+        )
+        s.add(voided)
+        await s.commit()
+    third = second.model_copy(
+        update={"utr": "310987654321", "amount": Decimal("555.00")}
+    )
+    held = await _send(shot, monkeypatch, third)
+    assert "Did you receive or pay this?" in held.text
+    assert "Attach" not in held.text
+    with pytest.raises(MutationRejected, match="received or paid"):
+        await _yes(shot, held.conversation_id)
+    async with shot.maker() as s:
+        row = await s.get(Transaction, voided.id)
+    assert row is not None
+    assert (row.voided, row.attachment_path) == (True, None)
 
 
 @pytest.mark.parametrize(

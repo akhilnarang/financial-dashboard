@@ -13,7 +13,7 @@ import datetime
 import logging
 import re
 from decimal import Decimal
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from pydantic import ValidationError
 from sqlalchemy import ColumnElement, or_, select
@@ -115,9 +115,10 @@ class ScreenshotReview(NamedTuple):
 def _is_owner(party: UpiParty | None, self_tokens: tuple[str, ...]) -> bool:
     """Tell if a receipt party is the owner.
 
-    A VPA matches a token exactly or by the part before the @. A name matches
-    when it holds two or more words of the owner's tokens, from one token or
-    several. A single first name can be a friend's name, so it never matches.
+    The owner sends only their own receipts, so any of their identifiers is
+    enough. A token with an @ must equal the VPA. Another token matches a
+    whole word run in the name, or sits inside the VPA before the @ with its
+    spaces removed.
 
     Args:
         party: The From or To block of the receipt.
@@ -128,37 +129,111 @@ def _is_owner(party: UpiParty | None, self_tokens: tuple[str, ...]) -> bool:
     """
     if party is None:
         return False
-    words = set((party.name or "").lower().split())
+    name = (party.name or "").lower()
     vpa = (party.vpa or "").lower()
-    tokens = [t.lower() for t in self_tokens]
-    if vpa and any(t in (vpa, vpa.partition("@")[0]) for t in tokens):
-        return True
-    found = {w for t in tokens if (parts := set(t.split())) <= words for w in parts}
-    return len(found) > 1
+    handle = _NON_ALPHANUMERIC.sub("", vpa.partition("@")[0])
+    for token in (t.lower() for t in self_tokens):
+        if "@" in token:
+            if token == vpa:
+                return True
+        elif re.search(rf"\b{re.escape(token)}\b", name) or (
+            handle and _NON_ALPHANUMERIC.sub("", token) in handle
+        ):
+            return True
+    return False
 
 
-def orient_read(
+def owner_side(
     read: ScreenshotTransaction, self_tokens: tuple[str, ...]
-) -> ScreenshotTransaction:
-    """Set the direction and the other party of a read from its receipt blocks.
-
-    When exactly one of the From and To blocks is the owner, the read takes
-    the direction, and the other party's name and VPA when shown. The owner's
-    bank text, or none, replaces the hint, unless the hint ends in last 4
-    digits that the other party's block does not show. With no bank, the
-    review asks for the account. The read validates again, so a refund
-    stays a credit.
+) -> Literal["payer", "payee"] | None:
+    """Return the receipt block that is the owner.
 
     Args:
         read: The read from the vision model.
         self_tokens: The owner's names and VPAs.
 
     Returns:
+        The payer or the payee. None when both blocks match or neither does.
+    """
+    payer, payee = (
+        _is_owner(read.payer, self_tokens),
+        _is_owner(read.payee, self_tokens),
+    )
+    if payer == payee:
+        return None
+    return "payer" if payer else "payee"
+
+
+def direction_unclear(
+    read: ScreenshotTransaction, self_tokens: tuple[str, ...]
+) -> bool:
+    """Tell if the owner must say whether they received or paid.
+
+    Args:
+        read: The read from the vision model.
+        self_tokens: The owner's names and VPAs.
+
+    Returns:
+        True when both receipt blocks show a party and neither or both of
+        them is the owner. A screen without both blocks keeps the model's
+        direction.
+    """
+    both = all(p is not None and (p.name or p.vpa) for p in (read.payer, read.payee))
+    return both and owner_side(read, self_tokens) is None
+
+
+def direction_word(text: str) -> Literal["credit", "debit"] | None:
+    """Return the direction that the owner's reply names.
+
+    Only a reply part that is the word itself counts, such as "received",
+    or a "direction credit" part. A forwarded "Sent you money" and a value
+    such as "name Credit Suisse" do not count.
+
+    Args:
+        text: The owner's reply.
+
+    Returns:
+        Credit for received or credit. Debit for paid or debit. None when no
+        part names one, or the parts disagree.
+    """
+    found: set[str] = set()
+    for part in re.split(r"[;\n,]", text.lower()):
+        key, _, value = part.strip().rstrip(".!").partition(" ")
+        word = value.strip() if key == "direction" else part.strip().rstrip(".!")
+        if word in ("received", "credit"):
+            found.add("credit")
+        elif word in ("paid", "debit"):
+            found.add("debit")
+    if len(found) != 1:
+        return None
+    return "credit" if "credit" in found else "debit"
+
+
+def orient_read(
+    read: ScreenshotTransaction,
+    self_tokens: tuple[str, ...],
+    side: Literal["payer", "payee"] | None = None,
+) -> ScreenshotTransaction:
+    """Set the direction and the other party of a read from its receipt blocks.
+
+    When exactly one of the From and To blocks is the owner, the read takes
+    the direction, and the other party's name and VPA when shown. A hint that
+    ends in last 4 digits that the other party's block does not show stays.
+    Else the owner's bank text, or none, replaces the hint, because a bank
+    name alone can be the other party's bank. With none, the review asks for
+    the account. The read validates again, so a refund stays a credit.
+
+    Args:
+        read: The read from the vision model.
+        self_tokens: The owner's names and VPAs.
+        side: The owner's block when the owner named it, else None.
+
+    Returns:
         The read with these fields set.
     """
-    payer_is_owner = _is_owner(read.payer, self_tokens)
-    if payer_is_owner == _is_owner(read.payee, self_tokens):
+    if (side := side or owner_side(read, self_tokens)) is None:
         return read
+    payer_is_owner = side == "payer"
     own, other = (
         (read.payer, read.payee) if payer_is_owner else (read.payee, read.payer)
     )
@@ -513,6 +588,8 @@ async def review_screenshot(
     media_type: str,
     not_duplicates: list[int],
     notes: list[str],
+    direction_settled: bool,
+    owner_direction: Literal["credit", "debit"] | None = None,
 ) -> ScreenshotReview:
     """Check one screenshot read and word the question for the owner.
 
@@ -527,6 +604,8 @@ async def review_screenshot(
         attachment_path: The stored screenshot file.
         media_type: Its MIME type.
         notes: The owner's caption and replies, oldest first.
+        direction_settled: False when the owner must say received or paid.
+        owner_direction: What the owner said, kept for the next read.
 
     Returns:
         The reply text, and the action that a Yes applies. The action is
@@ -542,6 +621,9 @@ async def review_screenshot(
             None,
         )
     target, missing, duplicate = await _check(session, read, not_duplicates)
+    if not direction_settled:
+        missing.append("received or paid")
+        duplicate = None
     lines = [
         _headline(read),
         _detail_line(read, target),
@@ -577,6 +659,11 @@ async def review_screenshot(
         )
     elif missing:
         lines.append(f"Missing or not valid: {', '.join(missing)}.")
+        if not direction_settled:
+            lines.append(
+                "I could not tell which side is you. Did you receive or pay "
+                'this? Reply "received" or "paid".'
+            )
         if target.choices:
             noun = "card" if read.channel == "card" else "account"
             lines.append(f"Which {noun}: {', '.join(target.choices)}?")
@@ -600,6 +687,8 @@ async def review_screenshot(
             duplicate_voided=duplicate is not None and duplicate.voided,
             not_duplicates=not_duplicates,
             notes=notes,
+            direction_settled=direction_settled,
+            owner_direction=owner_direction,
         ),
     )
 
@@ -732,6 +821,8 @@ async def save_screenshot_transaction(
         action.media_type,
     )
     read = action.read
+    if not action.direction_settled:
+        raise MutationRejected("missing or not valid: received or paid")
     target, missing, duplicate = await _check(session, read, action.not_duplicates)
     if action.duplicate_of is not None:
         if (

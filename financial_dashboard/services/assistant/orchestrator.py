@@ -139,7 +139,10 @@ from financial_dashboard.services.categorization.slugs import MANUAL_ONLY_SLUGS
 from financial_dashboard.services.screenshot_transactions import (
     ScreenshotReview,
     apply_corrections,
+    direction_unclear,
+    direction_word,
     orient_read,
+    owner_side,
     review_screenshot,
     save_screenshot_transaction,
 )
@@ -3021,6 +3024,7 @@ async def _screenshot_reply_result(
 
     is_new = draft.duplicate_of is not None and user_text.strip().lower() == "new"
     notes = draft.notes if is_new else [*draft.notes, user_text][-20:]
+    tokens = get_self_identifier_tokens()
     corrected = draft.read
     model = None
     if not is_new:
@@ -3033,15 +3037,32 @@ async def _screenshot_reply_result(
                 notes=notes,
                 current=draft.read,
             )
-            oriented = orient_read(reread, get_self_identifier_tokens())
+            oriented = orient_read(reread, tokens)
             corrected = (
                 reread
-                if oriented.direction == reread.direction
-                else oriented.model_copy(update={"account_hint": reread.account_hint})
+                if owner_side(reread, tokens) is None
+                else (
+                    reread if oriented.direction == reread.direction else oriented
+                ).model_copy(update={"account_hint": oriented.account_hint})
             )
         except OSError, ValueError, httpx.HTTPError, OpenAIError:
             logger.exception("Screenshot reply %s was not read", interaction_id)
+    if said := direction_word(user_text):
+        corrected = orient_read(
+            corrected, tokens, side="payee" if said == "credit" else "payer"
+        )
+    elif said := draft.owner_direction:
+        corrected = corrected.model_copy(
+            update=draft.read.model_dump(
+                include={"direction", "counterparty", "vpa", "account_hint"}
+            )
+        )
     corrected = apply_corrections(corrected, user_text)
+    settled = (
+        said is not None
+        or owner_side(corrected, tokens) is not None
+        or (draft.direction_settled and not direction_unclear(corrected, tokens))
+    )
     review = await review_screenshot(
         session,
         corrected,
@@ -3052,6 +3073,8 @@ async def _screenshot_reply_result(
             *([draft.duplicate_of] if is_new else []),
         ],
         notes=notes,
+        direction_settled=settled,
+        owner_direction=said,
     )
     if corrected == draft.read and not is_new:
         review = review._replace(
@@ -3189,6 +3212,9 @@ async def _process_screenshot_interaction(
                             media_type=stored.media_type,
                             not_duplicates=[],
                             notes=[caption] if caption else [],
+                            direction_settled=not direction_unclear(
+                                read, get_self_identifier_tokens()
+                            ),
                         ),
                         conversation_id=conversation_id,
                         interaction_id=interaction_id,
