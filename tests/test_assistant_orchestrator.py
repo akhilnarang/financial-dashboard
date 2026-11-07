@@ -1380,8 +1380,14 @@ async def test_multi_transaction_query_queues_individually_mapped_results(
             direction="debit",
             amount=amount,
             counterparty=counterparty,
+            reference_number=reference,
+            channel="neft" if reference else None,
+            sms_message_id=9 if reference else None,
         )
-        for amount, counterparty in [(10, "ONE"), (20, "TWO")][:rows]
+        for amount, counterparty, reference in [
+            (10, "ONE", "N123456789012345"),
+            (20, "TWO", None),
+        ][:rows]
     ]
     interaction = AuditInteraction(
         inbound_chat_id=7,
@@ -1440,6 +1446,8 @@ async def test_multi_transaction_query_queues_individually_mapped_results(
     ]
     for delivery, transaction in zip(deliveries[1:], transactions, strict=True):
         assert f"#{transaction.id}" in delivery.text
+    # The card shows the full reference, which the model may see only redacted.
+    assert "ref: N123456789012345 · neft · SMS #9" in deliveries[1].text
     await session.refresh(interaction)
     assert interaction.outcome == "query_result"
     assert interaction.model_input_json is not None

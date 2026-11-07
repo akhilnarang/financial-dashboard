@@ -2002,7 +2002,12 @@ def _response_text(result: OrchestrationResult, transaction_id: int | None) -> s
     return "Done."
 
 
-def _transaction_result_text(transaction: AssistantTransaction | Transaction) -> str:
+def _transaction_result_text(transaction: Transaction) -> str:
+    """Word the card that the bot sends for one row, outside the model.
+
+    The card goes to the owner only, so it shows the reference and the
+    source message ids that the model never sees.
+    """
     date = str(transaction.transaction_date or "unknown date")
     currency = transaction.currency or "INR"
     lines = [
@@ -2021,6 +2026,22 @@ def _transaction_result_text(transaction: AssistantTransaction | Transaction) ->
     ]
     if details:
         lines.append(" · ".join(details))
+    sources = [
+        value
+        for value in (
+            f"ref: {transaction.reference_number}"
+            if transaction.reference_number
+            else None,
+            transaction.channel,
+            f"SMS #{transaction.sms_message_id}"
+            if transaction.sms_message_id
+            else None,
+            f"email #{transaction.email_id}" if transaction.email_id else None,
+        )
+        if value is not None
+    ]
+    if sources:
+        lines.append(" · ".join(sources))
     return "\n".join(lines)
 
 
