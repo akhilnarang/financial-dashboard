@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 if TYPE_CHECKING:
     from bank_statement_parser.models import BankTransaction, ParsedBankStatement
+from financial_dashboard.core.references import payment_references_differ
 from financial_dashboard.db import (
     Account,
     BankStatementUpload,
@@ -78,7 +79,6 @@ from financial_dashboard.services.telegram import (
 logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z]{4,}")
-_UTR = re.compile(r"\d{12}")
 _MIN_REF_SUBSTRING_LEN = 6
 _OVERLAP_STOPWORDS: frozenset[str] = frozenset(
     {
@@ -406,12 +406,11 @@ def _is_statement_candidate_compatible(
     if _ref_appears_in(statement_reference, candidate_narration):
         return True
 
-    # A screenshot row holds the UPI UTR. A line with another 12-digit
-    # reference is another payment, even to the same payee.
-    if (candidate_transaction.source or "").startswith("screenshot") and all(
-        _UTR.fullmatch((ref or "").strip())
-        for ref in (candidate_reference, statement_reference)
-    ):
+    # A screenshot row holds the payment's UTR. A line with another reference of
+    # the same form is another payment, even to the same payee.
+    if (candidate_transaction.source or "").startswith(
+        "screenshot"
+    ) and payment_references_differ(candidate_reference, statement_reference):
         return False
 
     if (
