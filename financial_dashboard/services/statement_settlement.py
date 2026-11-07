@@ -22,6 +22,10 @@ from financial_dashboard.services.categorization.decision_lifecycle import (
 )
 from financial_dashboard.services.categorization.engine import requeue_after_enrichment
 from financial_dashboard.services.receivables import move_receivable_links
+from financial_dashboard.services.reminders import (
+    _latest_active_cycle,
+    resync_tracked_cc_payment_state,
+)
 from financial_dashboard.services.statements.cc import (
     parse_cc_amount,
     parse_cc_date,
@@ -226,11 +230,6 @@ async def answer(
         entry["imported_txn_id"] = target.id
         entry["ambiguous"] = False
         upload.reconciliation_data = reconciliation_to_json(recon)
-        from financial_dashboard.services.reminders import (
-            _latest_active_cycle,
-            resync_tracked_cc_payment_state,
-        )
-
         if (
             cycle := await _latest_active_cycle(
                 session, upload.account_id, include_paid=True
