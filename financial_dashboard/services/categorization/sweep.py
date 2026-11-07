@@ -10,6 +10,7 @@ from typing import NamedTuple
 from sqlalchemy import ColumnElement, and_, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from financial_dashboard.core.links import page_link
 from financial_dashboard.db import async_session
 from financial_dashboard.db.models import CategoryReviewDecision, Transaction, utc_now
 from financial_dashboard.services.categorization.engine import (
@@ -299,14 +300,6 @@ async def _review_decision(
     return decision
 
 
-def _id_label(txn_id: int, base_url: str) -> str:
-    """Return the HTML id of a row, linked to its page when a base URL is set."""
-    if not base_url:
-        return f"#{txn_id}"
-    href = html.escape(f"{base_url}/transactions/{txn_id}", quote=True)
-    return f'<a href="{href}">#{txn_id}</a>'
-
-
 async def _notify_assistant(
     session: AsyncSession,
     txn: Transaction,
@@ -337,7 +330,9 @@ async def _notify_assistant(
         f"{next_step}"
     )
     chunks = [html.escape(c) for c in split_plain_text(assistant_text, limit=4000)]
-    chunks[0] = chunks[0].replace(f"#{txn.id}", _id_label(txn.id, base_url), 1)
+    chunks[0] = chunks[0].replace(
+        f"#{txn.id}", page_link(f"#{txn.id}", f"/transactions/{txn.id}", base_url), 1
+    )
     deliveries = []
     for ordinal, chunk in enumerate(chunks):
         delivery = await ensure_decision_delivery(
@@ -388,7 +383,7 @@ async def _notify_plain(txn: Transaction, chat_id: int, base_url: str) -> bool:
     # output) that could otherwise contain & or " or < and break Telegram's
     # HTML parser, stranding the row — as is the literal <note>/<category>
     # hint. txn.amount is a Decimal, so it's safe as-is.
-    id_label = _id_label(txn.id, base_url)
+    id_label = page_link(f"#{txn.id}", f"/transactions/{txn.id}", base_url)
     detail = html.escape(txn.counterparty or txn.raw_description or "")
     reason = html.escape(txn.review_reason or "low confidence")
     direction = html.escape(txn.direction or "")
