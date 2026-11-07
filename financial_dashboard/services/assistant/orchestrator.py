@@ -2027,7 +2027,7 @@ def _transaction_result_html(transaction: Transaction, base_url: str) -> str:
         f"{row_link} · {date} · {html.escape(transaction.direction)} "
         f"{transaction.amount} {html.escape(currency)}"
     ]
-    # One message holds the card. Escaping can make text five times longer,
+    # One message holds the card. Escaping can make text six times longer,
     # so free text is cut to fit Telegram's limit even then.
     if transaction.counterparty:
         lines.append(html.escape(transaction.counterparty[:200]))
@@ -2035,7 +2035,7 @@ def _transaction_result_html(transaction: Transaction, base_url: str) -> str:
         html.escape(value)
         for value in (
             f"category: {transaction.category}" if transaction.category else None,
-            f"note: {transaction.note[:400]}" if transaction.note else None,
+            f"note: {transaction.note[:300]}" if transaction.note else None,
         )
         if value is not None
     ]

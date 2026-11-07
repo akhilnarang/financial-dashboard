@@ -1111,9 +1111,9 @@ async def test_individually_mapped_long_results_stay_within_telegram_limit(
             email_type="purchase",
             direction="debit",
             amount="10.00",
-            counterparty="&" * 9000,
-            note="&" * 9000,
-            reference_number="&" * 9000,
+            counterparty="'" * 9000,
+            note="'" * 9000,
+            reference_number="'" * 9000,
         ),
         Transaction(
             bank="hdfc",
