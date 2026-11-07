@@ -390,7 +390,9 @@ class ScreenshotTransactionConfirmation(StrictModel):
     ``duplicate_of`` that the question showed. ``notes`` holds the caption and
     the replies, oldest first, so each new read sees all of them.
     ``direction_settled`` is False while the receipt blocks do not show which
-    side is the owner and the owner has not said received or paid.
+    side is the owner and the owner has not said received or paid. A Yes
+    never saves while it is False. ``owner_direction`` is what the owner said,
+    and each new read keeps it.
     """
 
     kind: Literal["screenshot_transaction"]
@@ -403,6 +405,7 @@ class ScreenshotTransactionConfirmation(StrictModel):
     not_duplicates: list[StrictInt] = Field(default_factory=list, max_length=20)
     notes: list[StrictStr] = Field(default_factory=list, max_length=20)
     direction_settled: StrictBool = True
+    owner_direction: Literal["credit", "debit"] | None = None
 
 
 ConfirmationAction: TypeAlias = Annotated[

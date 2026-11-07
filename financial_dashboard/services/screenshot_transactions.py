@@ -185,19 +185,28 @@ def direction_unclear(
 def direction_word(text: str) -> Literal["credit", "debit"] | None:
     """Return the direction that the owner's reply names.
 
+    Only a reply part that is the word itself counts, such as "received",
+    or a "direction credit" part. A forwarded "Sent you money" and a value
+    such as "name Credit Suisse" do not count.
+
     Args:
         text: The owner's reply.
 
     Returns:
-        Credit for received or credit. Debit for paid, sent or debit.
-        None when the reply names neither or both.
+        Credit for received or credit. Debit for paid or debit. None when no
+        part names one, or the parts disagree.
     """
-    words = set(re.findall(r"[a-z]+", text.lower()))
-    credit = bool(words & {"received", "credit"})
-    debit = bool(words & {"paid", "sent", "debit"})
-    if credit == debit:
+    found: set[str] = set()
+    for part in re.split(r"[;\n,]", text.lower()):
+        key, _, value = part.strip().rstrip(".!").partition(" ")
+        word = value.strip() if key == "direction" else part.strip().rstrip(".!")
+        if word in ("received", "credit"):
+            found.add("credit")
+        elif word in ("paid", "debit"):
+            found.add("debit")
+    if len(found) != 1:
         return None
-    return "credit" if credit else "debit"
+    return "credit" if "credit" in found else "debit"
 
 
 def orient_read(
@@ -568,6 +577,7 @@ async def review_screenshot(
     not_duplicates: list[int],
     notes: list[str],
     direction_settled: bool,
+    owner_direction: Literal["credit", "debit"] | None = None,
 ) -> ScreenshotReview:
     """Check one screenshot read and word the question for the owner.
 
@@ -583,6 +593,7 @@ async def review_screenshot(
         media_type: Its MIME type.
         notes: The owner's caption and replies, oldest first.
         direction_settled: False when the owner must say received or paid.
+        owner_direction: What the owner said, kept for the next read.
 
     Returns:
         The reply text, and the action that a Yes applies. The action is
@@ -623,7 +634,8 @@ async def review_screenshot(
         lines.append(f"Missing or not valid: {', '.join(missing)}.")
         if not direction_settled:
             lines.append(
-                "I could not tell which side is you. Did you receive or pay this?"
+                "I could not tell which side is you. Did you receive or pay "
+                'this? Reply "received" or "paid".'
             )
         if target.choices:
             noun = "card" if read.channel == "card" else "account"
@@ -649,6 +661,7 @@ async def review_screenshot(
             not_duplicates=not_duplicates,
             notes=notes,
             direction_settled=direction_settled,
+            owner_direction=owner_direction,
         ),
     )
 
@@ -671,8 +684,6 @@ def apply_corrections(read: ScreenshotTransaction, text: str) -> ScreenshotTrans
         The read with the corrected fields, validated again.
     """
     updates: dict[str, str | Decimal | datetime.datetime | None] = {}
-    if direction := direction_word(text):
-        updates["direction"] = direction
     for part in re.split(r"[;\n]|,(?!\d)", text):
         key, _, value = part.strip().partition(" ")
         value = value.strip()
@@ -804,6 +815,8 @@ async def save_screenshot_transaction(
         return f"Attached the screenshot to #{found.id}."
     if duplicate is not None:
         raise MutationRejected(f"already recorded as #{duplicate.id}")
+    if not action.direction_settled:
+        raise MutationRejected("missing or not valid: received or paid")
     if (
         missing
         or target.account is None

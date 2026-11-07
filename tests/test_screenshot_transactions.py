@@ -669,17 +669,6 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         screenshot_transactions.orient_read(handle_only, ("Jane Doe",)).direction
         == "credit"
     )
-    # A token on both sides decides nothing, so the bot asks.
-    settings_service._cache["categorization.self_identifiers"] = "DOE, SMITH"
-    unclear = await _send(shot, monkeypatch, receipt)
-    assert "Did you receive or pay this?" in unclear.text
-    assert "received or paid" in unclear.text.partition("Missing or not valid:")[2]
-    answered = await _reply(shot, unclear.conversation_id, "received")
-    assert "Did you receive or pay this?" not in answered.text
-    assert "received ₹1,234.00 from ALEX SMITH (test0000@upi)" in answered.text
-    settings_service._cache["categorization.self_identifiers"] = (
-        "JANE DOE, jane@testyes"
-    )
     owner = ("JANE DOE", "jane@testyes")
     # A refund to the owner stays a credit, and shown last 4 digits stay.
     refund = receipt.model_copy(
@@ -813,6 +802,51 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         "test0000@upi",
         paid_at.date(),
         datetime.time(18, 16),
+    )
+
+    # A token on both sides decides nothing: Yes waits for received or paid,
+    # and the answer holds when a later reread says debit.
+    settings_service._cache["categorization.self_identifiers"] = "DOE, SMITH"
+    second = receipt.model_copy(
+        update={
+            "utr": "210987654321",
+            "amount": Decimal("777.00"),
+            "account_hint": "SBI 4321",
+        }
+    )
+    unclear = await _send(shot, monkeypatch, second)
+    assert 'Did you receive or pay this? Reply "received" or "paid".' in unclear.text
+    assert "received or paid" in unclear.text.partition("Missing or not valid:")[2]
+    with pytest.raises(MutationRejected, match="received or paid"):
+        await _yes(shot, unclear.conversation_id)
+    assert len(await _rows(shot)) == 1
+    answered = await _reply(shot, unclear.conversation_id, "received")
+    assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in answered.text
+
+    async def reads_debit(
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        notes: Sequence[str] = (),
+        current: ScreenshotTransaction | None = None,
+    ) -> ScreenshotTransaction:
+        assert current is not None
+        return current.model_copy(
+            update={"direction": "debit", "counterparty": "JANE DOE"}
+        )
+
+    monkeypatch.setattr(openai_provider, "read_screenshot", reads_debit)
+    again = await _reply(shot, unclear.conversation_id, "name Paid Ventures")
+    assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in again.text
+    assert (await _yes(shot, unclear.conversation_id)).startswith("Saved #")
+    [new] = [r for r in await _rows(shot) if r.reference_number == "210987654321"]
+    assert (new.direction, new.account_id, new.counterparty) == (
+        "credit",
+        1,
+        "ALEX SMITH",
     )
 
 
