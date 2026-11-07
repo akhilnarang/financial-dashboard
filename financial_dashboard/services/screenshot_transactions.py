@@ -355,9 +355,11 @@ async def _find_duplicate(
 ) -> Transaction | None:
     """Find the stored row that holds the same payment as the read.
 
-    A row with the same UTR and direction holds the payment. Otherwise a live
-    row for the same target, direction and amount within one day holds it,
-    when its reference is not another UTR.
+    A row with the same UTR and direction holds the payment. When the read
+    names no account of the owner, the screenshot shows the other party's
+    side, so the one row with that UTR holds the payment in either direction.
+    Otherwise a live row for the same target, direction and amount within one
+    day holds it, when its reference is not another UTR.
 
     Args:
         session: The turn session.
@@ -381,6 +383,16 @@ async def _find_duplicate(
         )
         if found is not None:
             return found
+        if target.account is None:
+            rows = (
+                await session.scalars(
+                    select(Transaction)
+                    .where(Transaction.reference_number == utr)
+                    .limit(2)
+                )
+            ).all()
+            if len(rows) == 1:
+                return rows[0]
     owner = _owner_filter(target)
     if owner is None or not read.amount or read.occurred_at is None:
         return None
@@ -534,7 +546,21 @@ async def review_screenshot(
         _headline(read),
         _detail_line(read, target),
     ]
-    if duplicate is not None and read.utr and duplicate.reference_number == read.utr:
+    if (
+        duplicate is not None
+        and read.utr
+        and duplicate.reference_number == read.utr
+        and duplicate.direction != read.direction
+    ):
+        lines.append(
+            f"This is the other side of #{duplicate.id}, the {duplicate.direction} "
+            "on your account, which is voided. Attach the screenshot and un-void "
+            "it? The screenshot shows a success."
+            if duplicate.voided
+            else f"This is the other side of #{duplicate.id}, the "
+            f"{duplicate.direction} on your account. Attach the screenshot to it?"
+        )
+    elif duplicate is not None and read.utr and duplicate.reference_number == read.utr:
         lines.append(
             f"This is recorded as #{duplicate.id}, which is voided. Attach the "
             "screenshot and un-void it? The screenshot shows a success."
