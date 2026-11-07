@@ -7,6 +7,7 @@ transport resolves the trusted reply target and passes it here.
 import asyncio
 import datetime
 import hashlib
+import html
 import json
 import logging
 import re
@@ -23,6 +24,7 @@ from telegram import Bot
 
 from telegram import Document
 
+from financial_dashboard.core.links import page_link
 from financial_dashboard.core.templating import format_inr_exact
 from financial_dashboard.db.enums import ReceivableStatus
 from financial_dashboard.db.models import (
@@ -2002,25 +2004,69 @@ def _response_text(result: OrchestrationResult, transaction_id: int | None) -> s
     return "Done."
 
 
-def _transaction_result_text(transaction: AssistantTransaction | Transaction) -> str:
+def _transaction_result_html(transaction: Transaction, base_url: str) -> str:
+    """Word the card that the bot sends for one row, outside the model.
+
+    The card goes to the owner only, so it shows the reference and the
+    source messages that the model never sees. The row id and the source
+    messages link to their dashboard pages when a base URL is set.
+
+    Args:
+        transaction: The row.
+        base_url: The dashboard base URL. Empty means no links.
+
+    Returns:
+        The card in Telegram HTML.
+    """
     date = str(transaction.transaction_date or "unknown date")
     currency = transaction.currency or "INR"
+    row_link = page_link(
+        f"#{transaction.id}", f"/transactions/{transaction.id}", base_url
+    )
     lines = [
-        f"#{transaction.id} · {date} · {transaction.direction} "
-        f"{transaction.amount} {currency}"
+        f"{row_link} · {date} · {html.escape(transaction.direction)} "
+        f"{transaction.amount} {html.escape(currency)}"
     ]
+    # One message holds the card. Escaping can make text six times longer,
+    # so free text is cut to fit Telegram's limit even then.
     if transaction.counterparty:
-        lines.append(transaction.counterparty)
+        lines.append(html.escape(transaction.counterparty[:200]))
     details = [
-        value
+        html.escape(value)
         for value in (
             f"category: {transaction.category}" if transaction.category else None,
-            f"note: {transaction.note}" if transaction.note else None,
+            f"note: {transaction.note[:300]}" if transaction.note else None,
         )
         if value is not None
     ]
     if details:
         lines.append(" · ".join(details))
+    sources = [
+        value
+        for value in (
+            html.escape(f"ref: {transaction.reference_number[:100]}")
+            if transaction.reference_number
+            else None,
+            html.escape(transaction.channel) if transaction.channel else None,
+            page_link(
+                f"SMS #{transaction.sms_message_id}",
+                f"/sms/{transaction.sms_message_id}",
+                base_url,
+            )
+            if transaction.sms_message_id
+            else None,
+            page_link(
+                f"email #{transaction.email_id}",
+                f"/emails/{transaction.email_id}",
+                base_url,
+            )
+            if transaction.email_id
+            else None,
+        )
+        if value is not None
+    ]
+    if sources:
+        lines.append(" · ".join(sources))
     return "\n".join(lines)
 
 
@@ -2214,25 +2260,25 @@ async def _queue_result(
         and result.transaction_ids
         and not isinstance(pending_action, TransactionChangesConfirmation)
     ):
+        from financial_dashboard.services.settings import get_app_base_url
+
+        base_url = get_app_base_url()
         for transaction_result_id in result.transaction_ids:
             transaction_result = await session.get(Transaction, transaction_result_id)
             if transaction_result is None:
                 continue
-            for chunk in split_plain_text(
-                _transaction_result_text(transaction_result), limit=4000
-            ):
-                delivery = make_delivery(
-                    recipient_chat_id=recipient_chat_id,
-                    text=chunk,
-                    ordinal=len(delivery_ids),
-                    interaction_id=interaction_id,
-                    transaction_id=transaction_result.id,
-                    parse_mode=None,
-                )
-                session.add(delivery)
-                await session.flush()
-                delivery.text = f"{delivery.text}\n\nRef: {delivery.delivery_token}"
-                delivery_ids.append(delivery.id)
+            delivery = make_delivery(
+                recipient_chat_id=recipient_chat_id,
+                text=_transaction_result_html(transaction_result, base_url),
+                ordinal=len(delivery_ids),
+                interaction_id=interaction_id,
+                transaction_id=transaction_result.id,
+                parse_mode="HTML",
+            )
+            session.add(delivery)
+            await session.flush()
+            delivery.text = f"{delivery.text}\n\nRef: {delivery.delivery_token}"
+            delivery_ids.append(delivery.id)
     return delivery_ids
 
 

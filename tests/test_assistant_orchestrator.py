@@ -1369,8 +1369,11 @@ async def test_turn_does_not_write_after_its_target_moved(session):
 @pytest.mark.anyio
 @pytest.mark.parametrize(("rows", "names_row"), [(1, False), (2, False), (1, True)])
 async def test_multi_transaction_query_queues_individually_mapped_results(
-    session, rows, names_row
+    session, monkeypatch, rows, names_row
 ):
+    from financial_dashboard.services import settings as settings_module
+
+    monkeypatch.setattr(settings_module, "get_app_base_url", lambda: "http://dash")
     # A single row gets its own card unless the answer names it. The answer
     # text must not be bound to a row that it does not show.
     transactions = [
@@ -1380,8 +1383,14 @@ async def test_multi_transaction_query_queues_individually_mapped_results(
             direction="debit",
             amount=amount,
             counterparty=counterparty,
+            reference_number=reference,
+            channel="neft" if reference else None,
+            sms_message_id=9 if reference else None,
         )
-        for amount, counterparty in [(10, "ONE"), (20, "TWO")][:rows]
+        for amount, counterparty, reference in [
+            (10, "ONE & CO", "N123456789012345"),
+            (20, "TWO", None),
+        ][:rows]
     ]
     interaction = AuditInteraction(
         inbound_chat_id=7,
@@ -1440,6 +1449,14 @@ async def test_multi_transaction_query_queues_individually_mapped_results(
     ]
     for delivery, transaction in zip(deliveries[1:], transactions, strict=True):
         assert f"#{transaction.id}" in delivery.text
+    # The card shows the full reference, which the model may see only redacted,
+    # and links the source SMS. It is HTML, so free text is escaped.
+    assert deliveries[1].parse_mode == "HTML"
+    assert "ONE &amp; CO" in deliveries[1].text
+    assert (
+        'ref: N123456789012345 · neft · <a href="http://dash/sms/9">SMS #9</a>'
+        in deliveries[1].text
+    )
     await session.refresh(interaction)
     assert interaction.outcome == "query_result"
     assert interaction.model_input_json is not None

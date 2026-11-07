@@ -1111,7 +1111,9 @@ async def test_individually_mapped_long_results_stay_within_telegram_limit(
             email_type="purchase",
             direction="debit",
             amount="10.00",
-            counterparty="x" * 9000,
+            counterparty="'" * 9000,
+            note="'" * 9000,
+            reference_number="'" * 9000,
         ),
         Transaction(
             bank="hdfc",
@@ -1145,10 +1147,11 @@ async def test_individually_mapped_long_results_stay_within_telegram_limit(
 
     deliveries = list((await session.scalars(select(TelegramOutboundDelivery))).all())
     assert all(len(delivery.text) <= 4096 for delivery in deliveries)
-    assert (
-        sum(delivery.transaction_id == transactions[0].id for delivery in deliveries)
-        > 1
-    )
+    assert [delivery.transaction_id for delivery in deliveries] == [
+        None,
+        transactions[0].id,
+        transactions[1].id,
+    ]
 
 
 @pytest.mark.anyio
