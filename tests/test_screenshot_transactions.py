@@ -837,7 +837,9 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
             case "utr 210987654321":
                 return current.model_copy(update={"payer": None, "payee": None})
             case "name Paid Ventures":
-                return current.model_copy(update=blocks | {"direction": "debit"})
+                return current.model_copy(
+                    update=blocks | {"direction": "debit", "account_hint": "HDFC Bank"}
+                )
             case _:
                 return current.model_copy(update=blocks)
 
@@ -850,8 +852,8 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert "Did you receive or pay this?" in still.text
     answered = await _reply(shot, unclear.conversation_id, "received")
     assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in answered.text
-    # The answer takes the owner's bank, not the sender's. A later typed name
-    # stays, and so does the answer.
+    # The answer takes the owner's bank, not the sender's. A later reread
+    # keeps the answer and that bank, and a typed name still applies.
     again = await _reply(shot, unclear.conversation_id, "name Paid Ventures")
     assert "received ₹777.00 from Paid Ventures" in again.text
     assert (await _yes(shot, unclear.conversation_id)).startswith("Saved #")

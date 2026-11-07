@@ -3054,7 +3054,11 @@ async def _screenshot_reply_result(
             update={"account_hint": oriented.account_hint or corrected.account_hint}
         )
     elif said := draft.owner_direction:
-        corrected = corrected.model_copy(update={"direction": said})
+        corrected = corrected.model_copy(
+            update=draft.read.model_dump(
+                include={"direction", "counterparty", "vpa", "account_hint"}
+            )
+        )
     corrected = apply_corrections(corrected, user_text)
     settled = (
         draft.direction_settled
