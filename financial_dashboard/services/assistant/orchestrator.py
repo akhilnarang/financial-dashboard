@@ -3047,11 +3047,8 @@ async def _screenshot_reply_result(
         except OSError, ValueError, httpx.HTTPError, OpenAIError:
             logger.exception("Screenshot reply %s was not read", interaction_id)
     if said := direction_word(user_text):
-        oriented = orient_read(
+        corrected = orient_read(
             corrected, tokens, side="payee" if said == "credit" else "payer"
-        )
-        corrected = oriented.model_copy(
-            update={"account_hint": oriented.account_hint or corrected.account_hint}
         )
     elif said := draft.owner_direction:
         corrected = corrected.model_copy(

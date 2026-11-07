@@ -807,6 +807,17 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     # A token on both sides decides nothing: Yes waits for received or paid,
     # and the answer holds when a later reread says debit.
     settings_service._cache["categorization.self_identifiers"] = "DOE, SMITH"
+    async with shot.maker() as s:
+        s.add(
+            Account(
+                id=3,
+                bank="hdfc",
+                label="HDFC savings",
+                type="bank_account",
+                account_number="XXXXXX5555",
+            )
+        )
+        await s.commit()
     second = receipt.model_copy(
         update={
             "utr": "210987654321",
@@ -815,6 +826,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
             "payer": UpiParty(
                 name="ALEX SMITH", vpa="test0000@upi", bank_text="HDFC Bank"
             ),
+            "payee": UpiParty(name="JANE DOE", vpa="jane@testyes"),
         }
     )
     unclear = await _send(shot, monkeypatch, second)
@@ -852,6 +864,9 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert "Did you receive or pay this?" in still.text
     answered = await _reply(shot, unclear.conversation_id, "received")
     assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in answered.text
+    # The owner's block shows no bank, so the sender's bank never stays.
+    assert "account (last 4 digits or bank)" in answered.text
+    answered = await _reply(shot, unclear.conversation_id, "account SBI 4321")
     # The answer takes the owner's bank, not the sender's. A later reread
     # keeps the answer and that bank, and a typed name still applies.
     again = await _reply(shot, unclear.conversation_id, "name Paid Ventures")
