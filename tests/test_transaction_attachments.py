@@ -105,10 +105,12 @@ async def test_attachment_route_serves_only_saved_path(
 
     detail = await client.get(f"/transactions/{transaction.id}/detail")
     assert detail.status_code == 200
-    assert "View / download receipt" in detail.text
-    assert f"/api/transactions/{transaction.id}/attachment" in detail.text
-    # PDFs are served as downloads, so they must not open a blank new tab.
+    receipt_url = f"/api/transactions/{transaction.id}/attachment"
+    # A PDF is a download button, and it must not open a blank new tab.
+    assert "Download receipt" in detail.text
+    assert receipt_url in detail.text
     assert 'target="_blank"' not in detail.text
+    assert "<img" not in detail.text
 
     listing = await client.get("/transactions")
     assert listing.status_code == 200
@@ -118,6 +120,8 @@ async def test_attachment_route_serves_only_saved_path(
     await session.commit()
     detail = await client.get(f"/transactions/{transaction.id}/detail")
     assert detail.status_code == 200
+    # An image shows as a thumbnail that opens the receipt in a new tab.
+    assert f'src="{receipt_url}"' in detail.text
     assert 'target="_blank" rel="noopener"' in detail.text
 
 

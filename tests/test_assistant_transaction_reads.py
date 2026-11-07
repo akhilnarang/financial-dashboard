@@ -31,7 +31,7 @@ def _transaction(**overrides: object) -> Transaction:
 async def test_get_transaction_redacts_identifiers_carries_review_gate_and_misses_as_none(
     session,
 ):
-    settings_service._cache["categorization.hidden_identifiers"] = "Alice"
+    settings_service._cache["categorization.hidden_identifiers"] = "Alice,9000000001"
     transaction = _transaction(
         raw_description="merchant metadata",
         reference_number="123456789",
@@ -55,10 +55,23 @@ async def test_get_transaction_redacts_identifiers_carries_review_gate_and_misse
     assert result is not None
     assert result.id == transaction.id
     assert result.counterparty == "PUREBERRYSMUMBAI"
-    assert result.reference_number == "[redacted-num]"
+    # A reference that is not a payment reference is masked as a reference.
+    assert result.reference_number == "[redacted-ref]"
     assert result.note == "lunch with [redacted-name]"
     assert result.review_gate_reason == "confidence 0.42 below 0.60"
     assert await get_transaction(session, 404) is None
+    # A payment reference names a payment, so the owner sees it whole.
+    utr = _transaction(id=transaction.id + 1, reference_number="123456789012")
+    session.add(utr)
+    await session.flush()
+    shown = await get_transaction(session, utr.id)
+    assert shown is not None and shown.reference_number == "123456789012"
+    # A configured identifier is masked even in a payment-shaped reference.
+    phone = _transaction(id=utr.id + 1, reference_number="919000000001")
+    session.add(phone)
+    await session.flush()
+    masked = await get_transaction(session, phone.id)
+    assert masked is not None and "9000000001" not in (masked.reference_number or "")
 
 
 @pytest.mark.anyio

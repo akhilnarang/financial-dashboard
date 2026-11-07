@@ -8,12 +8,14 @@ and cashflow exclusion state.
 """
 
 import datetime
+import re
 from decimal import Decimal
 from typing import Any, NamedTuple, cast
 
 from sqlalchemy import ColumnElement, Select, and_, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from financial_dashboard.core.references import reference_form
 from financial_dashboard.db.models import CategoryReviewDecision, Transaction
 from financial_dashboard.services.transaction_reads import (
     build_transaction_filter_clauses,
@@ -29,6 +31,9 @@ MAX_FIELD_LENGTH = 2_000
 # A shorter stored counterparty, such as "UPI", would match too many searches.
 MIN_PREFIX_COUNTERPARTY = 4
 MAX_SEARCH_WORDS = 8
+
+_REDACTED_REF = "[redacted-ref]"
+_MASK_LABEL = re.compile(r"\[redacted-[a-z]+\]")
 
 
 class AssistantTransaction(NamedTuple):
@@ -84,7 +89,21 @@ def _projection(
         currency=row.currency,
         transaction_date=row.transaction_date,
         counterparty=_redacted(row.counterparty, name_tokens),
-        reference_number=_redacted(row.reference_number, name_tokens),
+        # A payment reference names a payment, not a person, so it skips the
+        # number mask. Configured identifiers are masked in it all the same.
+        reference_number=None
+        if row.reference_number is None
+        else _bounded(
+            _MASK_LABEL.sub(
+                _REDACTED_REF,
+                redact_names(
+                    row.reference_number
+                    if reference_form(row.reference_number) is not None
+                    else redact_pii(row.reference_number),
+                    name_tokens,
+                ),
+            )
+        ),
         channel=_bounded(row.channel),
         account_id=row.account_id,
         card_id=row.card_id,
