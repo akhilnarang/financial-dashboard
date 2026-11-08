@@ -370,7 +370,11 @@ async def _resolve_target(
     """Resolve the account and card that one screenshot read points at.
 
     A UPI read resolves by an exact last-4 match to exactly one active bank
-    account, when the hint ends with 4 digits. Else the bank name or the
+    account, when the hint ends with 4 digits. When no bank account has those
+    digits, the read resolves to the credit card with them, because a UPI or
+    BBPS payment can go to a card bill. Such a target only finds a stored
+    card row to attach to; the check still asks for a bank account before a
+    new row is saved. Else the bank name or the
     account label must name one active bank account. A card read resolves by
     the card digits, else by the bank name or the account label. An ambiguous
     name lists its choices.
@@ -397,6 +401,8 @@ async def _resolve_target(
         matched = [
             a for a in accounts if mask_last4(a.account_number) == found.group(1)
         ]
+        if not matched:
+            return await _resolve_credit_card_target(session, hint)
     else:
         matched = _named_accounts(hint, accounts)
     if len(matched) == 1:
@@ -537,7 +543,14 @@ async def _check(
     if read.channel == "card":
         checks.append(("card", target.account is not None))
     else:
-        checks.append(("account (last 4 digits or bank)", target.account is not None))
+        # A card target only finds a card row to attach to. A transfer saves
+        # a new row only on a bank account.
+        checks.append(
+            (
+                "account (last 4 digits or bank)",
+                target.account is not None and target.card is None,
+            )
+        )
     missing = [field for field, ok in checks if not ok]
     duplicate = await _find_duplicate(session, read, target, not_duplicates)
     return ScreenshotCheck(target, missing, duplicate)
