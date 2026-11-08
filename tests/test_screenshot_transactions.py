@@ -937,6 +937,8 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         "maybe_new",
         "maybe_moved",
         "maybe_no_utr",
+        "card_bill",
+        "card_bill_no_row",
         "corrupt",
     ],
 )
@@ -990,8 +992,25 @@ async def test_duplicate_utr_offers_to_attach_instead(
             transaction_date=datetime.date(2026, 10, 20),
             source="sms",
         )
+        # A payment to the owner's card bill, from a friend's receipt.
+        card_bill = Transaction(
+            bank="idfc",
+            account_id=5,
+            card_id=5,
+            email_type="idfc_cc_payment_received_alert",
+            direction="credit",
+            amount=Decimal("250.00"),
+            transaction_date=datetime.date(2026, 10, 20),
+            source="sms",
+        )
+        if case.startswith("card_bill"):
+            s.add(Account(id=5, bank="idfc", label="IDFC CC", type="credit_card"))
+            s.add(Card(id=5, account_id=5, card_mask="XX7777", is_primary=True))
+            await s.flush()
         s.add_all(
             {
+                "card_bill": [other, card_bill],
+                "card_bill_no_row": [other],
                 "other_utr": [other],
                 "maybe_new": [other, failed, maybe],
                 "maybe_moved": [other, failed, maybe],
@@ -1005,6 +1024,8 @@ async def test_duplicate_utr_offers_to_attach_instead(
         monkeypatch,
         _read(utr=None)
         if case == "maybe_no_utr"
+        else _read(direction="credit", account_hint="IDFC Bank 7777", utr=None)
+        if case.startswith("card_bill")
         # The payer's receipt from an account the owner does not hold.
         else _read(
             account_hint="ICICI 1111", channel="neft", app="bank", utr=NEFT_UTR.lower()
@@ -1019,6 +1040,17 @@ async def test_duplicate_utr_offers_to_attach_instead(
         assert f"may already be recorded as #{maybe.id}" in asked.text
         assert asked.buttons == [f"Attach to #{maybe.id}", "Skip"]
     if case == "maybe_no_utr":
+        return
+    if case == "card_bill_no_row":
+        # A transfer saves no new row on a card.
+        assert "account (last 4 digits or bank)" in asked.text
+        assert asked.buttons == ["Skip"]
+        return
+    if case == "card_bill":
+        assert f"may already be recorded as #{card_bill.id}" in asked.text
+        assert await _yes(shot, asked.conversation_id) == (
+            f"Attached the screenshot to #{card_bill.id}."
+        )
         return
     if case == "corrupt":
         # A reply to a question whose stored action no longer parses still
