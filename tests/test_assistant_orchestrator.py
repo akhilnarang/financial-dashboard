@@ -34,8 +34,10 @@ from financial_dashboard.services.assistant.message_context import (
     record_physical_message,
 )
 from financial_dashboard.services.assistant.orchestrator import (
+    CASHFLOW_SUMMARY_OUTCOME,
     OrchestrationResult,
     _apply_pending,
+    _history,
     _conversation_for_message,
     _response_text,
     _process_callback_interaction,
@@ -102,14 +104,115 @@ async def test_orchestrator_caps_tool_rounds_and_renews_lease(session):
 
 
 @pytest.mark.anyio
-async def test_orchestrator_refuses_unsupported_aggregate_questions(session):
-    provider = FakeProvider([])
+async def test_cashflow_summary_sends_server_figures_without_a_second_model_step(
+    session, monkeypatch
+):
+    from financial_dashboard.services import settings as settings_module
 
-    result = await run_turn(session, provider, user_message="how much did I spend?")
+    monkeypatch.setattr(settings_module, "get_app_base_url", lambda: "http://dash")
+    account = Account(bank="testbank", label="Savings", type="bank_account")
+    session.add(account)
+    await session.flush()
+    for direction, amount, category in (
+        ("credit", 1000, "salary"),
+        ("debit", 400, "investment"),
+    ):
+        session.add(
+            Transaction(
+                bank="testbank",
+                email_type="test",
+                direction=direction,
+                amount=amount,
+                category=category,
+                account_id=account.id,
+                transaction_date=datetime.date(2026, 5, 1),
+            )
+        )
+    await session.flush()
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[
+                    {
+                        "name": "get_cashflow_summary",
+                        "date_from": "2026-04-01",
+                        "date_to": "2026-11-12",
+                    }
+                ],
+            )
+        ]
+    )
+
+    result = await run_turn(
+        session, provider, user_message="income vs investment in current FY"
+    )
+
+    assert result.response.outcome == "answer"
+    assert "Income: ₹1,000.00" in result.response.text
+    assert "Invested: ₹400.00" in result.response.text
+    assert (
+        "http://dash/cashflow?date_from=2026-04-01&date_to=2026-11-12"
+        in result.response.text
+    )
+    # The figures go to the user, not back to the model.
+    assert provider.calls == 1
+    assert provider.context.today is not None
+    assert result.server_figures
+    # A later turn sees only the heading of the reply.
+    conversation = await start_conversation(session, chat_id=7, started_by="ask")
+    session.add(
+        AuditInteraction(
+            inbound_chat_id=7,
+            trigger="ask",
+            conversation_id=conversation.id,
+            user_text="income vs investment in current FY",
+            assistant_text=result.response.text,
+            outcome=CASHFLOW_SUMMARY_OUTCOME,
+        )
+    )
+    await session.flush()
+    history = await _history(session, conversation.id)
+    assert history[-1]["text"].startswith("Cashflow from 01 Apr 2026 to 12 Nov 2026")
+    assert "₹" not in history[-1]["text"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("calls", "code"),
+    [
+        (
+            [
+                {
+                    "name": "get_cashflow_summary",
+                    "date_from": "2026-11-12",
+                    "date_to": "2026-04-01",
+                }
+            ],
+            "invalid_range",
+        ),
+        (
+            [
+                {
+                    "name": "get_cashflow_summary",
+                    "date_from": "2026-04-01",
+                    "date_to": "2026-11-12",
+                },
+                {"name": "list_categories"},
+            ],
+            "mixed_cashflow_summary",
+        ),
+    ],
+)
+async def test_cashflow_summary_rejects_a_bad_range_or_mixed_calls(
+    session, calls, code
+):
+    provider = FakeProvider([ToolCalls(outcome="tool_calls", calls=calls)])
+
+    result = await run_turn(session, provider, user_message="totals this FY")
 
     assert result.response.outcome == "error"
-    assert result.response.code == "unsupported_aggregate"
-    assert provider.calls == 0
+    assert result.response.code == code
 
 
 @pytest.mark.anyio

@@ -121,6 +121,14 @@ class ListTransactions(StrictModel):
     limit: StrictInt = Field(default=20, ge=1, le=20)
 
 
+class GetCashflowSummary(StrictModel):
+    """Ask the server for the cashflow figures of one inclusive date range."""
+
+    name: Literal["get_cashflow_summary"]
+    date_from: StrictStr = Field(max_length=30)
+    date_to: StrictStr = Field(max_length=30)
+
+
 class ListCategories(StrictModel):
     name: Literal["list_categories"]
 
@@ -205,6 +213,7 @@ ToolCall: TypeAlias = Annotated[
     GetTransaction
     | ListTransactions
     | ListCategories
+    | GetCashflowSummary
     | ApplyTransactionChanges
     | ListReceivables
     | CreateReceivable

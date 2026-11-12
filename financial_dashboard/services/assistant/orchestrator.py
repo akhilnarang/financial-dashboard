@@ -25,6 +25,7 @@ from telegram import Bot
 from telegram import Document
 
 from financial_dashboard.core.links import page_link
+from financial_dashboard.core.dates import IST
 from financial_dashboard.core.templating import format_inr_exact
 from financial_dashboard.db.enums import ReceivableStatus
 from financial_dashboard.db.models import (
@@ -48,6 +49,7 @@ from financial_dashboard.services.assistant.context import (
 from financial_dashboard.services.assistant.contracts import (
     Answer,
     AppendTextValue,
+    GetCashflowSummary,
     ApplyTransactionChanges,
     AssistantResponse,
     ClearValue,
@@ -156,15 +158,6 @@ logger = logging.getLogger(__name__)
 TURN_TIMEOUT_SECONDS = 180
 
 
-_UNSUPPORTED_AGGREGATE = re.compile(
-    r"\b(?:total|sum|average|breakdown)\b"
-    r"|\bhow\s+much\b.{0,80}\b(?:spend|spent|income|earn|earned|expense|cash\s*flow)\b"
-    r"|\b(?:spending|expenses|income|cash\s*flow)\b.{0,80}"
-    r"\b(?:today|week|month|quarter|year|between|from|through)\b",
-    re.IGNORECASE,
-)
-
-
 # Each candidate row gets a button, so the question stays short.
 MAX_FOUND_CANDIDATES = 3
 _CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
@@ -190,6 +183,12 @@ class OrchestrationResult(NamedTuple):
     transaction_ids: tuple[int, ...] = ()
     confirmed_write: bool = False
     error_detail: str | None = None
+    server_figures: bool = False
+
+
+# The audit outcome of a turn that sent server cashflow figures. Model history
+# keeps only the first line of such a reply, so the figures never reach the model.
+CASHFLOW_SUMMARY_OUTCOME = "cashflow_summary"
 
 
 class AuthorizationChanged(MutationRejected):
@@ -391,6 +390,59 @@ async def current_confirmation_state_hash(
     return compute_transaction_confirmation_hash(txn, account_type)
 
 
+async def _cashflow_answer(
+    session: AsyncSession, call: GetCashflowSummary
+) -> Answer | Error:
+    """Render the server cashflow figures for the range that the model chose.
+
+    The figures go to the user and never back to the model.
+
+    Args:
+        session: The turn session.
+        call: The cashflow call with the inclusive date range.
+
+    Returns:
+        The answer with the figures, or an error for a range that is not valid.
+    """
+    from financial_dashboard.services.cashflow.report import cashflow_summary
+    from financial_dashboard.services.settings import get_app_base_url
+
+    try:
+        date_from = datetime.date.fromisoformat(call.date_from)
+        date_to = datetime.date.fromisoformat(call.date_to)
+    except ValueError:
+        date_from = date_to = None
+    if date_from is None or date_to is None or date_from > date_to:
+        return Error(
+            outcome="error",
+            message="I couldn't work out that date range. Please give the dates.",
+            code="invalid_range",
+        )
+    summary = await cashflow_summary(session, date_from, date_to)
+    investment = summary.investment
+    lines = [
+        f"Cashflow from {date_from:%d %b %Y} to {date_to:%d %b %Y} (bank accounts)",
+        f"Income: {format_inr_exact(summary.income.total)}",
+        f"Spent: {format_inr_exact(summary.expense.total)}",
+        f"Invested: {format_inr_exact(investment.contributions)}"
+        f" (taken out {format_inr_exact(investment.redemptions)},"
+        f" net {format_inr_exact(investment.net)})",
+        f"Transfers in: {format_inr_exact(summary.transfers_in.total)}",
+        f"Net retained: {format_inr_exact(summary.net_cash_retained)}",
+    ]
+    if summary.uncategorized.count:
+        lines.append(
+            f"Uncategorized: {summary.uncategorized.count} rows,"
+            " not in the figures above."
+        )
+    if base_url := get_app_base_url():
+        lines.append(
+            f"{base_url}/cashflow?date_from={date_from.isoformat()}"
+            f"&date_to={date_to.isoformat()}"
+        )
+    return Answer(outcome="answer", text="\n".join(lines))
+
+
 async def _dispatch_read(
     session: AsyncSession, call: ReadCall
 ) -> (
@@ -525,17 +577,6 @@ async def run_turn(
     renew_lease: Callable[[], Awaitable[bool]] | None = None,
 ) -> OrchestrationResult:
     """Run at most four model steps and leave all writes uncommitted."""
-    if transaction_id is None and _UNSUPPORTED_AGGREGATE.search(user_message):
-        return OrchestrationResult(
-            Error(
-                outcome="error",
-                message=(
-                    "Aggregate financial reports aren't supported here yet. "
-                    "Use the dashboard cashflow report for totals."
-                ),
-                code="unsupported_aggregate",
-            )
-        )
     await load_user_buckets(session)
     expected_state_hash = (
         await current_confirmation_state_hash(session, transaction_id)
@@ -612,6 +653,7 @@ async def run_turn(
             tool_results=tool_results,
             categories=active_categories,
             fitting_categories=fitting_categories,
+            today=datetime.datetime.now(IST).date(),
         )
         if context_size(prompt_context._asdict()) > MAX_CONTEXT_CHARS:
             return completed(
@@ -786,6 +828,21 @@ async def run_turn(
                     )
                 return completed(saved.proposal, None, saved.decision_id)
             return completed(response, mutation)
+        if isinstance(response, ToolCalls) and (
+            summary_calls := [
+                call for call in response.calls if isinstance(call, GetCashflowSummary)
+            ]
+        ):
+            if len(response.calls) > 1:
+                return completed(
+                    Error(
+                        outcome="error",
+                        message="Ask for totals in a message of their own.",
+                        code="mixed_cashflow_summary",
+                    )
+                )
+            answer = await _cashflow_answer(session, summary_calls[0])
+            return completed(answer)._replace(server_figures=isinstance(answer, Answer))
         if isinstance(response, ToolCalls):
             writes = [
                 call
@@ -856,7 +913,12 @@ async def run_turn(
                 # Validate and execute every read before the first write applies.
                 # A rejected read can therefore never leave an earlier write.
                 for call in response.calls:
-                    if isinstance(call, ApplyTransactionChanges | AssistantWriteCall):
+                    if isinstance(
+                        call,
+                        ApplyTransactionChanges
+                        | AssistantWriteCall
+                        | GetCashflowSummary,
+                    ):
                         continue
                     tool_result = await _dispatch_read(session, call)
                     match tool_result:
@@ -1931,7 +1993,15 @@ async def _history(session: AsyncSession, conversation_id: int) -> list[dict[str
     for row in reversed(rows):
         if row.user_text:
             turns.append({"role": "user", "text": row.user_text})
-        if row.assistant_text:
+        if row.assistant_text and row.outcome == CASHFLOW_SUMMARY_OUTCOME:
+            heading = row.assistant_text.partition("\n")[0]
+            turns.append(
+                {
+                    "role": "assistant",
+                    "text": f"{heading}: figures sent to the user, not shown here.",
+                }
+            )
+        elif row.assistant_text:
             turns.append({"role": "assistant", "text": row.assistant_text})
     return turns
 
@@ -2088,6 +2158,8 @@ async def _queue_result(
     outcome = result.response.outcome
     if result.mutation is not None:
         outcome = "mutation"
+    elif result.server_figures:
+        outcome = CASHFLOW_SUMMARY_OUTCOME
     elif result.transaction_ids and isinstance(result.response, Answer):
         # A read-only answer that returned transaction rows is a query result
         # in the audit taxonomy, even though the provider response itself is

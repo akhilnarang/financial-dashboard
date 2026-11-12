@@ -1,10 +1,11 @@
 """Prompt construction for the conversational assistant."""
 
 from collections.abc import Mapping, Sequence
+import datetime
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v11"
+PROMPT_VERSION = "telegram-assistant-v12"
 
 
 class PromptContext(NamedTuple):
@@ -14,6 +15,7 @@ class PromptContext(NamedTuple):
     tool_results: Sequence[Mapping[str, object]] = ()
     categories: Sequence[str] = ()
     fitting_categories: Sequence[str] = ()
+    today: datetime.date | None = None
 
 
 def _quoted(value: object, limit: int = 2000) -> str:
@@ -113,14 +115,21 @@ def build_prompt(context: PromptContext) -> str:
         "For a durable merchant rule, include an exact substring",
         "from the current user message as intent_evidence.",
         "Merchant-rule pattern and priority are server-derived; never provide them.",
-        "No aggregate financial-report tool is available. Never calculate or estimate",
-        "totals, spending, income, cashflow, averages, or breakdowns from transaction rows.",
-        "Say that aggregate reports are not supported yet.",
+        "For totals of income, spending, investment or cashflow over a period,",
+        'make one call, alone: {"name":"get_cashflow_summary",',
+        '"date_from":"YYYY-MM-DD","date_to":"YYYY-MM-DD"}, with the inclusive',
+        "range the user means. A financial year (FY) runs from 1 April to",
+        "31 March. For a period that has not ended, such as the current FY or",
+        "this month, use today as date_to. The application sends the figures",
+        "to the user. You do not see them. Never calculate or estimate totals,",
+        "averages or breakdowns from transaction rows.",
         "",
         "=== CURRENT USER MESSAGE (trusted for intent only) ===",
         _quoted(context.user_message, 4000),
         "=== END CURRENT USER MESSAGE ===",
     ]
+    if context.today is not None:
+        lines.insert(0, f"Today is {context.today.isoformat()} (India time).")
     if context.transaction is not None:
         lines.extend(["", "=== TRUSTED TRANSACTION TARGET (quoted data) ==="])
         lines.extend(
