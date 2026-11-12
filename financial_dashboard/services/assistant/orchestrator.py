@@ -183,6 +183,12 @@ class OrchestrationResult(NamedTuple):
     transaction_ids: tuple[int, ...] = ()
     confirmed_write: bool = False
     error_detail: str | None = None
+    server_figures: bool = False
+
+
+# The audit outcome of a turn that sent server cashflow figures. Model history
+# keeps only the first line of such a reply, so the figures never reach the model.
+CASHFLOW_SUMMARY_OUTCOME = "cashflow_summary"
 
 
 class AuthorizationChanged(MutationRejected):
@@ -835,7 +841,8 @@ async def run_turn(
                         code="mixed_cashflow_summary",
                     )
                 )
-            return completed(await _cashflow_answer(session, summary_calls[0]))
+            answer = await _cashflow_answer(session, summary_calls[0])
+            return completed(answer)._replace(server_figures=isinstance(answer, Answer))
         if isinstance(response, ToolCalls):
             writes = [
                 call
@@ -1986,7 +1993,15 @@ async def _history(session: AsyncSession, conversation_id: int) -> list[dict[str
     for row in reversed(rows):
         if row.user_text:
             turns.append({"role": "user", "text": row.user_text})
-        if row.assistant_text:
+        if row.assistant_text and row.outcome == CASHFLOW_SUMMARY_OUTCOME:
+            heading = row.assistant_text.partition("\n")[0]
+            turns.append(
+                {
+                    "role": "assistant",
+                    "text": f"{heading}: figures sent to the user, not shown here.",
+                }
+            )
+        elif row.assistant_text:
             turns.append({"role": "assistant", "text": row.assistant_text})
     return turns
 
@@ -2143,6 +2158,8 @@ async def _queue_result(
     outcome = result.response.outcome
     if result.mutation is not None:
         outcome = "mutation"
+    elif result.server_figures:
+        outcome = CASHFLOW_SUMMARY_OUTCOME
     elif result.transaction_ids and isinstance(result.response, Answer):
         # A read-only answer that returned transaction rows is a query result
         # in the audit taxonomy, even though the provider response itself is

@@ -34,8 +34,10 @@ from financial_dashboard.services.assistant.message_context import (
     record_physical_message,
 )
 from financial_dashboard.services.assistant.orchestrator import (
+    CASHFLOW_SUMMARY_OUTCOME,
     OrchestrationResult,
     _apply_pending,
+    _history,
     _conversation_for_message,
     _response_text,
     _process_callback_interaction,
@@ -156,6 +158,23 @@ async def test_cashflow_summary_sends_server_figures_without_a_second_model_step
     # The figures go to the user, not back to the model.
     assert provider.calls == 1
     assert provider.context.today is not None
+    assert result.server_figures
+    # A later turn sees only the heading of the reply.
+    conversation = await start_conversation(session, chat_id=7, started_by="ask")
+    session.add(
+        AuditInteraction(
+            inbound_chat_id=7,
+            trigger="ask",
+            conversation_id=conversation.id,
+            user_text="income vs investment in current FY",
+            assistant_text=result.response.text,
+            outcome=CASHFLOW_SUMMARY_OUTCOME,
+        )
+    )
+    await session.flush()
+    history = await _history(session, conversation.id)
+    assert history[-1]["text"].startswith("Cashflow from 01 Apr 2026 to 12 Nov 2026")
+    assert "₹" not in history[-1]["text"]
 
 
 @pytest.mark.anyio
