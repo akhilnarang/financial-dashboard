@@ -150,7 +150,7 @@
     </section>
 {% endfor %}
     <div style="margin-top: 1rem;">
-        <button type="submit" id="save-btn">Save Settings</button>
+        <button type="submit" id="save-btn" title="Ctrl+S">Save Settings</button>
     </div>
 </form>
 
@@ -178,6 +178,14 @@ document.getElementById('settings-form').addEventListener('submit', function() {
     var btn = document.getElementById('save-btn');
     btn.textContent = 'Saving\u2026';
     btn.disabled = true;
+});
+
+document.addEventListener('keydown', function(e) {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.key.toLowerCase() !== 's') return;
+    e.preventDefault();
+    var btn = document.getElementById('save-btn');
+    if (btn.disabled) return;
+    document.getElementById('settings-form').requestSubmit(btn);
 });
 
 var params = new URLSearchParams(window.location.search);
