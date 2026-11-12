@@ -21,9 +21,9 @@ from financial_dashboard.core.templating import format_inr_exact
 from financial_dashboard.db.models import Account, StatementUpload, Transaction
 from financial_dashboard.services.cashflow.buckets import INVESTMENT_BUCKET
 from financial_dashboard.services.cashflow.report import (
-    BLANK_CHARS,
     INCLUDED,
     INR_OR_NULL,
+    NORMALIZED_COUNTERPARTY,
     cashflow_summary,
 )
 from financial_dashboard.services.cashflow.scope import BANK_SCOPE
@@ -173,15 +173,12 @@ async def _investment_flows(
     The rows are the investment rows that the cashflow report counts, so the
     totals agree with its invested figures.
     """
-    counterparty = func.coalesce(
-        func.nullif(func.trim(Transaction.counterparty, BLANK_CHARS), ""), ""
-    )
     grouped = (
         await session.execute(
             select(
                 Transaction.direction,
                 Transaction.category,
-                counterparty,
+                NORMALIZED_COUNTERPARTY,
                 func.sum(Transaction.amount),
                 func.count(),
             )
@@ -192,7 +189,9 @@ async def _investment_flows(
                 BANK_SCOPE,
                 INCLUDED,
             )
-            .group_by(Transaction.direction, Transaction.category, counterparty)
+            .group_by(
+                Transaction.direction, Transaction.category, NORMALIZED_COUNTERPARTY
+            )
             .order_by(func.sum(Transaction.amount).desc())
         )
     ).all()
@@ -206,14 +205,14 @@ async def _investment_flows(
             {
                 "category": category,
                 "direction": side,
-                "counterparty": name,
+                "counterparty": name or "",
                 **period,
                 "non_inr": "0",
                 "scope": "bank",
                 "excluded": "0",
             }
         )
-        label = name or "(no counterparty)"
+        label = (name or "").strip() or "(no counterparty)"
         rows[side].append(
             f"• {page_link(label, f'/transactions?{query}', base_url)}:"
             f" {_money(amount)} ({count})"

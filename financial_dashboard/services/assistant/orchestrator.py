@@ -190,6 +190,8 @@ class OrchestrationResult(NamedTuple):
 # The audit outcome of a turn that sent a server report. Model history keeps only
 # the heading of such a reply, so the figures never reach the model.
 REPORT_OUTCOME = "server_report"
+# Turns stored before the reports had one outcome name hold figures too.
+REPORT_OUTCOMES = frozenset({REPORT_OUTCOME, "cashflow_summary"})
 
 
 class AuthorizationChanged(MutationRejected):
@@ -1939,7 +1941,7 @@ async def _history(session: AsyncSession, conversation_id: int) -> list[dict[str
     for row in reversed(rows):
         if row.user_text:
             turns.append({"role": "user", "text": row.user_text})
-        if row.assistant_text and row.outcome == REPORT_OUTCOME:
+        if row.assistant_text and row.outcome in REPORT_OUTCOMES:
             heading = html.unescape(
                 re.sub(r"<[^>]+>", "", row.assistant_text.partition("\n")[0])
             ).strip()

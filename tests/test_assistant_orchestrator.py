@@ -163,21 +163,23 @@ async def test_cashflow_summary_sends_server_figures_without_a_second_model_step
     assert provider.context.today is not None
     assert result.server_figures
     # A later turn sees only the heading of the reply.
-    conversation = await start_conversation(session, chat_id=7, started_by="ask")
-    session.add(
-        AuditInteraction(
-            inbound_chat_id=7,
-            trigger="ask",
-            conversation_id=conversation.id,
-            user_text="income vs investment in current FY",
-            assistant_text=result.response.text,
-            outcome=REPORT_OUTCOME,
+    # A turn stored under the earlier outcome name holds figures too.
+    for outcome in (REPORT_OUTCOME, "cashflow_summary"):
+        conversation = await start_conversation(session, chat_id=7, started_by="ask")
+        session.add(
+            AuditInteraction(
+                inbound_chat_id=7,
+                trigger="ask",
+                conversation_id=conversation.id,
+                user_text="income vs investment in current FY",
+                assistant_text=result.response.text,
+                outcome=outcome,
+            )
         )
-    )
-    await session.flush()
-    history = await _history(session, conversation.id)
-    assert history[-1]["text"].startswith("Cashflow, 01 Apr 2026 to 12 Nov 2026")
-    assert "₹" not in history[-1]["text"]
+        await session.flush()
+        history = await _history(session, conversation.id)
+        assert history[-1]["text"].startswith("Cashflow, 01 Apr 2026 to 12 Nov 2026")
+        assert "₹" not in history[-1]["text"]
 
 
 @pytest.mark.anyio
@@ -190,11 +192,12 @@ async def test_cashflow_summary_sends_server_figures_without_a_second_model_step
                 "date_from": "2026-04-01",
                 "date_to": "2026-11-12",
             },
-            "SAMPLE AMC</a>: ₹400.00 (1)",
+            # The link keeps the stored name, so /transactions finds the row.
+            ("counterparty=+SAMPLE+AMC+&amp;", "SAMPLE AMC</a>: ₹400.00 (1)"),
         ),
-        ({"name": "get_holdings", "search": "example"}, "Example Fund: ₹550.00"),
-        ({"name": "get_networth"}, "Net worth: ₹1,000.00"),
-        ({"name": "get_card_dues"}, "₹1,234.50 due 2026-12-01"),
+        ({"name": "get_holdings", "search": "example"}, ("Example Fund: ₹550.00",)),
+        ({"name": "get_networth"}, ("Net worth: ₹1,000.00",)),
+        ({"name": "get_card_dues"}, ("₹1,234.50 due 2026-12-01",)),
     ],
 )
 async def test_reports_send_server_figures(session, monkeypatch, call, expected):
@@ -213,7 +216,7 @@ async def test_reports_send_server_figures(session, monkeypatch, call, expected)
                 direction="debit",
                 amount=400,
                 category="investment",
-                counterparty="SAMPLE AMC",
+                counterparty=" SAMPLE AMC ",
                 account_id=bank.id,
                 transaction_date=datetime.date(2026, 5, 1),
             ),
@@ -268,7 +271,7 @@ async def test_reports_send_server_figures(session, monkeypatch, call, expected)
     result = await run_turn(session, provider, user_message="show me")
 
     assert result.server_figures
-    assert expected in result.response.text
+    assert all(text in result.response.text for text in expected)
     assert provider.calls == 1
 
 
