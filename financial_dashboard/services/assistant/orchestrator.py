@@ -49,7 +49,7 @@ from financial_dashboard.services.assistant.context import (
 from financial_dashboard.services.assistant.contracts import (
     Answer,
     AppendTextValue,
-    GetCashflowSummary,
+    ReportCall,
     ApplyTransactionChanges,
     AssistantResponse,
     ClearValue,
@@ -107,6 +107,7 @@ from financial_dashboard.services.assistant.mutations import (
     unrequested_exclusion,
 )
 from financial_dashboard.services.assistant.prompt import PromptContext
+from financial_dashboard.services.assistant.reports import render_report
 from financial_dashboard.services.assistant.assistant_writes import (
     apply_assistant_write,
     describe_assistant_write,
@@ -186,9 +187,11 @@ class OrchestrationResult(NamedTuple):
     server_figures: bool = False
 
 
-# The audit outcome of a turn that sent server cashflow figures. Model history
-# keeps only the first line of such a reply, so the figures never reach the model.
-CASHFLOW_SUMMARY_OUTCOME = "cashflow_summary"
+# The audit outcome of a turn that sent a server report. Model history keeps only
+# the heading of such a reply, so the figures never reach the model.
+REPORT_OUTCOME = "server_report"
+# Turns stored before the reports had one outcome name hold figures too.
+REPORT_OUTCOMES = frozenset({REPORT_OUTCOME, "cashflow_summary"})
 
 
 class AuthorizationChanged(MutationRejected):
@@ -388,59 +391,6 @@ async def current_confirmation_state_hash(
         account = await session.get(Account, txn.account_id, populate_existing=True)
         account_type = account.type if account is not None else None
     return compute_transaction_confirmation_hash(txn, account_type)
-
-
-async def _cashflow_answer(
-    session: AsyncSession, call: GetCashflowSummary
-) -> Answer | Error:
-    """Render the server cashflow figures for the range that the model chose.
-
-    The figures go to the user and never back to the model.
-
-    Args:
-        session: The turn session.
-        call: The cashflow call with the inclusive date range.
-
-    Returns:
-        The answer with the figures, or an error for a range that is not valid.
-    """
-    from financial_dashboard.services.cashflow.report import cashflow_summary
-    from financial_dashboard.services.settings import get_app_base_url
-
-    try:
-        date_from = datetime.date.fromisoformat(call.date_from)
-        date_to = datetime.date.fromisoformat(call.date_to)
-    except ValueError:
-        date_from = date_to = None
-    if date_from is None or date_to is None or date_from > date_to:
-        return Error(
-            outcome="error",
-            message="I couldn't work out that date range. Please give the dates.",
-            code="invalid_range",
-        )
-    summary = await cashflow_summary(session, date_from, date_to)
-    investment = summary.investment
-    lines = [
-        f"Cashflow from {date_from:%d %b %Y} to {date_to:%d %b %Y} (bank accounts)",
-        f"Income: {format_inr_exact(summary.income.total)}",
-        f"Spent: {format_inr_exact(summary.expense.total)}",
-        f"Invested: {format_inr_exact(investment.contributions)}"
-        f" (taken out {format_inr_exact(investment.redemptions)},"
-        f" net {format_inr_exact(investment.net)})",
-        f"Transfers in: {format_inr_exact(summary.transfers_in.total)}",
-        f"Net retained: {format_inr_exact(summary.net_cash_retained)}",
-    ]
-    if summary.uncategorized.count:
-        lines.append(
-            f"Uncategorized: {summary.uncategorized.count} rows,"
-            " not in the figures above."
-        )
-    if base_url := get_app_base_url():
-        lines.append(
-            f"{base_url}/cashflow?date_from={date_from.isoformat()}"
-            f"&date_to={date_to.isoformat()}"
-        )
-    return Answer(outcome="answer", text="\n".join(lines))
 
 
 async def _dispatch_read(
@@ -829,19 +779,19 @@ async def run_turn(
                 return completed(saved.proposal, None, saved.decision_id)
             return completed(response, mutation)
         if isinstance(response, ToolCalls) and (
-            summary_calls := [
-                call for call in response.calls if isinstance(call, GetCashflowSummary)
+            report_calls := [
+                call for call in response.calls if isinstance(call, ReportCall)
             ]
         ):
             if len(response.calls) > 1:
                 return completed(
                     Error(
                         outcome="error",
-                        message="Ask for totals in a message of their own.",
-                        code="mixed_cashflow_summary",
+                        message="Ask for that report in a message of its own.",
+                        code="mixed_report",
                     )
                 )
-            answer = await _cashflow_answer(session, summary_calls[0])
+            answer = await render_report(session, report_calls[0])
             return completed(answer)._replace(server_figures=isinstance(answer, Answer))
         if isinstance(response, ToolCalls):
             writes = [
@@ -915,9 +865,7 @@ async def run_turn(
                 for call in response.calls:
                     if isinstance(
                         call,
-                        ApplyTransactionChanges
-                        | AssistantWriteCall
-                        | GetCashflowSummary,
+                        ApplyTransactionChanges | AssistantWriteCall | ReportCall,
                     ):
                         continue
                     tool_result = await _dispatch_read(session, call)
@@ -1993,8 +1941,10 @@ async def _history(session: AsyncSession, conversation_id: int) -> list[dict[str
     for row in reversed(rows):
         if row.user_text:
             turns.append({"role": "user", "text": row.user_text})
-        if row.assistant_text and row.outcome == CASHFLOW_SUMMARY_OUTCOME:
-            heading = row.assistant_text.partition("\n")[0]
+        if row.assistant_text and row.outcome in REPORT_OUTCOMES:
+            heading = html.unescape(
+                re.sub(r"<[^>]+>", "", row.assistant_text.partition("\n")[0])
+            ).strip()
             turns.append(
                 {
                     "role": "assistant",
@@ -2159,7 +2109,7 @@ async def _queue_result(
     if result.mutation is not None:
         outcome = "mutation"
     elif result.server_figures:
-        outcome = CASHFLOW_SUMMARY_OUTCOME
+        outcome = REPORT_OUTCOME
     elif result.transaction_ids and isinstance(result.response, Answer):
         # A read-only answer that returned transaction rows is a query result
         # in the audit taxonomy, even though the provider response itself is
@@ -2234,7 +2184,12 @@ async def _queue_result(
     ):
         # The answer shows this one row, so a reply to it targets the row.
         transaction_id = result.transaction_ids[0]
-    chunks = split_plain_text(response_text, limit=4000)
+    # A server report fits in one message and is HTML, so it is never split.
+    chunks = (
+        [response_text]
+        if result.server_figures
+        else split_plain_text(response_text, limit=4000)
+    )
     delivery_ids: list[int] = []
     for ordinal, chunk in enumerate(chunks):
         delivery = make_delivery(
@@ -2243,7 +2198,7 @@ async def _queue_result(
             ordinal=ordinal,
             interaction_id=interaction_id,
             transaction_id=transaction_id,
-            parse_mode=None,
+            parse_mode="HTML" if result.server_figures else None,
         )
         session.add(delivery)
         await session.flush()

@@ -129,6 +129,48 @@ class GetCashflowSummary(StrictModel):
     date_to: StrictStr = Field(max_length=30)
 
 
+class GetInvestmentFlows(StrictModel):
+    """Ask the server for investment money in and out of one date range."""
+
+    name: Literal["get_investment_flows"]
+    date_from: StrictStr = Field(max_length=30)
+    date_to: StrictStr = Field(max_length=30)
+
+
+class GetHoldings(StrictModel):
+    """Ask the server for current holdings, optionally filtered."""
+
+    name: Literal["get_holdings"]
+    search: StrictStr | None = Field(default=None, max_length=100)
+    asset_class: (
+        Literal[
+            "equity",
+            "preference_share",
+            "bond",
+            "debenture",
+            "etf",
+            "mutual_fund",
+            "aif",
+            "government_security",
+            "sgb",
+            "other",
+        ]
+        | None
+    ) = None
+
+
+class GetNetworth(StrictModel):
+    """Ask the server for net worth and every account balance."""
+
+    name: Literal["get_networth"]
+
+
+class GetCardDues(StrictModel):
+    """Ask the server for the latest bill of each credit card."""
+
+    name: Literal["get_card_dues"]
+
+
 class ListCategories(StrictModel):
     name: Literal["list_categories"]
 
@@ -208,12 +250,19 @@ AssistantWriteCall = (
 )
 AssistantWrite: TypeAlias = Annotated[AssistantWriteCall, Field(discriminator="name")]
 ReadCall = GetTransaction | ListTransactions | ListCategories | ListReceivables
+ReportCall = (
+    GetCashflowSummary | GetInvestmentFlows | GetHoldings | GetNetworth | GetCardDues
+)
 
 ToolCall: TypeAlias = Annotated[
     GetTransaction
     | ListTransactions
     | ListCategories
     | GetCashflowSummary
+    | GetInvestmentFlows
+    | GetHoldings
+    | GetNetworth
+    | GetCardDues
     | ApplyTransactionChanges
     | ListReceivables
     | CreateReceivable

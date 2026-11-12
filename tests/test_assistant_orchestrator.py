@@ -1,5 +1,6 @@
 import datetime
 import json
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import NamedTuple
 
@@ -10,7 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from financial_dashboard.db.models import as_utc, utc_now
 from financial_dashboard.db.models import (
     Account,
+    BalanceSnapshot,
     BankStatementUpload,
+    CasUpload,
     Email,
     Category,
     CategoryReviewDecision,
@@ -34,7 +37,7 @@ from financial_dashboard.services.assistant.message_context import (
     record_physical_message,
 )
 from financial_dashboard.services.assistant.orchestrator import (
-    CASHFLOW_SUMMARY_OUTCOME,
+    REPORT_OUTCOME,
     OrchestrationResult,
     _apply_pending,
     _history,
@@ -152,7 +155,7 @@ async def test_cashflow_summary_sends_server_figures_without_a_second_model_step
     assert "Income: ₹1,000.00" in result.response.text
     assert "Invested: ₹400.00" in result.response.text
     assert (
-        "http://dash/cashflow?date_from=2026-04-01&date_to=2026-11-12"
+        'href="http://dash/cashflow?date_from=2026-04-01&amp;date_to=2026-11-12"'
         in result.response.text
     )
     # The figures go to the user, not back to the model.
@@ -160,21 +163,116 @@ async def test_cashflow_summary_sends_server_figures_without_a_second_model_step
     assert provider.context.today is not None
     assert result.server_figures
     # A later turn sees only the heading of the reply.
-    conversation = await start_conversation(session, chat_id=7, started_by="ask")
-    session.add(
-        AuditInteraction(
-            inbound_chat_id=7,
-            trigger="ask",
-            conversation_id=conversation.id,
-            user_text="income vs investment in current FY",
-            assistant_text=result.response.text,
-            outcome=CASHFLOW_SUMMARY_OUTCOME,
+    # A turn stored under the earlier outcome name holds figures too.
+    for outcome in (REPORT_OUTCOME, "cashflow_summary"):
+        conversation = await start_conversation(session, chat_id=7, started_by="ask")
+        session.add(
+            AuditInteraction(
+                inbound_chat_id=7,
+                trigger="ask",
+                conversation_id=conversation.id,
+                user_text="income vs investment in current FY",
+                assistant_text=result.response.text,
+                outcome=outcome,
+            )
         )
+        await session.flush()
+        history = await _history(session, conversation.id)
+        assert history[-1]["text"].startswith("Cashflow, 01 Apr 2026 to 12 Nov 2026")
+        assert "₹" not in history[-1]["text"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("call", "expected"),
+    [
+        (
+            {
+                "name": "get_investment_flows",
+                "date_from": "2026-04-01",
+                "date_to": "2026-11-12",
+            },
+            # The link keeps the stored name, so /transactions finds the row.
+            ("counterparty=+SAMPLE+AMC+&amp;", "SAMPLE AMC</a>: ₹400.00 (1)"),
+        ),
+        ({"name": "get_holdings", "search": "example"}, ("Example Fund: ₹550.00",)),
+        ({"name": "get_networth"}, ("Net worth: ₹1,000.00",)),
+        ({"name": "get_card_dues"}, ("₹1,234.50 due 2026-12-01",)),
+    ],
+)
+async def test_reports_send_server_figures(session, monkeypatch, call, expected):
+    from financial_dashboard.services import settings as settings_module
+
+    monkeypatch.setattr(settings_module, "get_app_base_url", lambda: "http://dash")
+    bank = Account(bank="testbank", label="Savings", type="bank_account")
+    card = Account(bank="testbank", label="Card", type="credit_card")
+    session.add_all([bank, card])
+    await session.flush()
+    session.add_all(
+        [
+            Transaction(
+                bank="testbank",
+                email_type="test",
+                direction="debit",
+                amount=400,
+                category="investment",
+                counterparty=" SAMPLE AMC ",
+                account_id=bank.id,
+                transaction_date=datetime.date(2026, 5, 1),
+            ),
+            BalanceSnapshot(
+                account_id=bank.id,
+                kind="asset",
+                category="bank_balance",
+                as_of_date=datetime.date(2026, 11, 1),
+                value=Decimal("1000.00"),
+                source="bank_statement",
+            ),
+            StatementUpload(
+                account_id=card.id,
+                bank="testbank",
+                filename="card.pdf",
+                file_path="card.pdf",
+                due_date="2026-12-01",
+                total_amount_due="1,234.50",
+                minimum_amount_due="100.00",
+                payment_status="unpaid",
+            ),
+            CasUpload(
+                portfolio_key="PAN-TEST",
+                depository_source="cdsl",
+                statement_date=datetime.date(2026, 10, 31),
+                grand_total=Decimal("550.00"),
+                raw_holdings_json=json.dumps(
+                    {
+                        "transactions": [],
+                        "folios": [
+                            {
+                                "folio_number": "000/00",
+                                "schemes": [
+                                    {
+                                        "scheme_name": "Example Fund",
+                                        "isin": "INE000A01018",
+                                        "units": "10",
+                                        "nav": "55",
+                                        "value": "550",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+            ),
+        ]
     )
     await session.flush()
-    history = await _history(session, conversation.id)
-    assert history[-1]["text"].startswith("Cashflow from 01 Apr 2026 to 12 Nov 2026")
-    assert "₹" not in history[-1]["text"]
+    provider = FakeProvider([ToolCalls(outcome="tool_calls", calls=[call])])
+
+    result = await run_turn(session, provider, user_message="show me")
+
+    assert result.server_figures
+    assert all(text in result.response.text for text in expected)
+    assert provider.calls == 1
 
 
 @pytest.mark.anyio
@@ -200,7 +298,7 @@ async def test_cashflow_summary_sends_server_figures_without_a_second_model_step
                 },
                 {"name": "list_categories"},
             ],
-            "mixed_cashflow_summary",
+            "mixed_report",
         ),
     ],
 )

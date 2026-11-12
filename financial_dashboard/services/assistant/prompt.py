@@ -5,7 +5,7 @@ import datetime
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v12"
+PROMPT_VERSION = "telegram-assistant-v13"
 
 
 class PromptContext(NamedTuple):
@@ -115,14 +115,26 @@ def build_prompt(context: PromptContext) -> str:
         "For a durable merchant rule, include an exact substring",
         "from the current user message as intent_evidence.",
         "Merchant-rule pattern and priority are server-derived; never provide them.",
-        "For totals of income, spending, investment or cashflow over a period,",
-        'make one call, alone: {"name":"get_cashflow_summary",',
-        '"date_from":"YYYY-MM-DD","date_to":"YYYY-MM-DD"}, with the inclusive',
-        "range the user means. A financial year (FY) runs from 1 April to",
-        "31 March. For a period that has not ended, such as the current FY or",
-        "this month, use today as date_to. The application sends the figures",
-        "to the user. You do not see them. Never calculate or estimate totals,",
-        "averages or breakdowns from transaction rows.",
+        "A REPORT sends server figures straight to the user. You do not see",
+        "them. Make one REPORT call, alone in calls. The REPORTS are:",
+        '- {"name":"get_cashflow_summary","date_from":"YYYY-MM-DD",',
+        '"date_to":"YYYY-MM-DD"}: income, spending, investment and cashflow',
+        "totals over an inclusive range.",
+        '- {"name":"get_investment_flows","date_from":"YYYY-MM-DD",',
+        '"date_to":"YYYY-MM-DD"}: money put into and taken out of',
+        "investments over a range, by counterparty.",
+        '- {"name":"get_holdings","search":null,"asset_class":null}: current',
+        "funds and stocks with value and units. search matches part of a",
+        "holding name. asset_class is one of equity, etf, mutual_fund, bond,",
+        "debenture, preference_share, aif, government_security, sgb, other.",
+        '- {"name":"get_networth"}: net worth, assets, liabilities and the',
+        "latest balance of every account. Use it for account balances.",
+        '- {"name":"get_card_dues"}: the latest bill, due date and payment',
+        "status of each credit card.",
+        "A financial year (FY) runs from 1 April to 31 March. For a period that",
+        "has not ended, such as the current FY or this month, use today as",
+        "date_to. Never calculate or estimate totals, averages or breakdowns",
+        "from transaction rows.",
         "",
         "=== CURRENT USER MESSAGE (trusted for intent only) ===",
         _quoted(context.user_message, 4000),
