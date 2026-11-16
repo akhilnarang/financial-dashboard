@@ -42,6 +42,10 @@ _MAX_CONSECUTIVE_FAILURES = 5
 # Stop retrying a review notification after this many failed sends.
 _MAX_NOTIFY_ATTEMPTS = 5
 
+# A prompt shows this much of the detail lines, so a long account label or
+# note cannot push the prompt past the Telegram message limit.
+_DETAILS_PREVIEW_CHARS = 300
+
 
 def _needs_llm(txn: Transaction) -> bool:
     """Whether a row is still eligible for the LLM pass at write time.
@@ -300,6 +304,39 @@ async def _review_decision(
     return decision
 
 
+def _review_details(txn: Transaction) -> str:
+    """Word the line that tells the owner where and when a row happened.
+
+    Args:
+        txn: The row that needs a category.
+
+    Returns:
+        The date and time, the account or card, the channel, the reference
+        and the source, joined by " · ". Absent fields are left out. A note on
+        the row follows on its own line. The text is cut to
+        ``_DETAILS_PREVIEW_CHARS``.
+    """
+    when = " ".join(
+        str(part) for part in (txn.transaction_date, txn.transaction_time) if part
+    )
+    place = txn.account.label if txn.account is not None else txn.bank
+    if txn.card is not None and txn.card.card_mask:
+        place = f"{place} {txn.card.card_mask}"
+    parts = [
+        when,
+        place,
+        (txn.channel or "").upper(),
+        f"Ref {txn.reference_number}" if txn.reference_number else "",
+        f"via {txn.source}" if txn.source else "",
+    ]
+    details = " · ".join(part for part in parts if part)
+    if txn.note:
+        details = f"{details}\nNote: {txn.note}"
+    if len(details) > _DETAILS_PREVIEW_CHARS:
+        details = f"{details[:_DETAILS_PREVIEW_CHARS]}…"
+    return details
+
+
 async def _notify_assistant(
     session: AsyncSession,
     txn: Transaction,
@@ -324,6 +361,7 @@ async def _notify_assistant(
         f"\U0001f50d Needs a category: #{txn.id}\n"
         f"{txn.direction or ''} {txn.amount} {txn.currency or 'INR'}\n"
         f"{txn.counterparty or txn.raw_description or ''}\n"
+        f"{_review_details(txn)}\n"
         f"Likely category: {proposed or 'uncertain'}\n"
         f"Why I asked: {gate}\n"
         f"Reasoning: {txn.review_reason or 'low confidence'}\n"
@@ -385,6 +423,7 @@ async def _notify_plain(txn: Transaction, chat_id: int, base_url: str) -> bool:
     # hint. txn.amount is a Decimal, so it's safe as-is.
     id_label = page_link(f"#{txn.id}", f"/transactions/{txn.id}", base_url)
     detail = html.escape(txn.counterparty or txn.raw_description or "")
+    details = html.escape(_review_details(txn))
     reason = html.escape(txn.review_reason or "low confidence")
     direction = html.escape(txn.direction or "")
     currency = html.escape(txn.currency or "INR")
@@ -392,6 +431,7 @@ async def _notify_plain(txn: Transaction, chat_id: int, base_url: str) -> bool:
         f"\U0001f50d Needs a category: {id_label}\n"
         f"{direction} {txn.amount} {currency}\n"
         f"{detail}\n"
+        f"{details}\n"
         f"Reason: {reason}\n"
         f"Reply with: &lt;note&gt;\n&lt;category&gt;"
     )
