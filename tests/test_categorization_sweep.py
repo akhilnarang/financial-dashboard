@@ -254,6 +254,11 @@ async def test_pending_row_is_notified_once_with_escaped_fields(memdb, telegram_
         currency="IN&R",
         counterparty="A & B <x>",
         review_reason="unclear <tag>",
+        transaction_date=datetime.date(2026, 11, 12),
+        channel="upi",
+        reference_number="600000000000",
+        source="sms",
+        note="paid for <x>" + "y" * 400,
     )
     async with memdb() as s:
         s.add(
@@ -278,6 +283,11 @@ async def test_pending_row_is_notified_once_with_escaped_fields(memdb, telegram_
     assert mode == "HTML"
     assert 'href="http://host:8000&quot;x/transactions/' in text
     assert "A &amp; B &lt;x&gt;" in text
+    assert "2026-11-12 · testbank · UPI · Ref 600000000000 · via sms" in text
+    assert "Note: paid for &lt;x&gt;" in text
+    assert "y" * 300 not in text and text.split("Note: ")[1].split("\n")[0].endswith(
+        "…"
+    )
     assert "unclear &lt;tag&gt;" in text
     assert "deb&lt;it" in text
     assert "IN&amp;R" in text

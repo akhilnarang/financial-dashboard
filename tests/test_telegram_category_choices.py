@@ -553,6 +553,10 @@ async def test_enabled_long_review_queues_all_chunks_with_buttons_only_first(
         review_status="pending",
         review_reason="ambiguous merchant " + ("reason " * 1200),
         notify_attempts=0,
+        transaction_date=datetime.date(2026, 11, 12),
+        channel="card",
+        reference_number="600000000000",
+        source="email",
     )
     session.add(transaction)
     await session.flush()
@@ -614,6 +618,9 @@ async def test_enabled_long_review_queues_all_chunks_with_buttons_only_first(
     link = f'<a href="http://host:8000/transactions/{transaction.id}">'
     assert first_line.endswith(f"{link}#{transaction.id}</a>")
     assert "A&amp;B &lt;MERCHANT&gt;" in deliveries[0].text
+    assert "2026-11-12 · hdfc · CARD · Ref 600000000000 · via email" in "".join(
+        delivery.text for delivery in deliveries
+    )
     assert deliveries[0].reply_markup_json is not None
     assert "cat:v1:" in deliveries[0].reply_markup_json
     assert all(delivery.reply_markup_json is None for delivery in deliveries[1:])
