@@ -48,7 +48,7 @@ wheels = [
 [[package]]
 name = "bank-email-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-email-parser#0c31378d90dc33b4eea9d0dfd9db300bb1efdfea" }
+source = { git = "https://github.com/akhilnarang/bank-email-parser#79bb560e4b36b5a1c3df1704f1b21be7786f4645" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "pydantic" },
@@ -59,7 +59,7 @@ dependencies = [
 [[package]]
 name = "bank-sms-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/bank-sms-parser#f2f5f778eb1328fa976cb5b6d866980e75a085ae" }
+source = { git = "https://github.com/akhilnarang/bank-sms-parser#089c8d9b62c93c82bcd66fcb8da1383fe5128ed7" }
 dependencies = [
     { name = "pydantic" },
     { name = "python-dateutil" },
