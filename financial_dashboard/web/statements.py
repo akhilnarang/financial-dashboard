@@ -199,7 +199,10 @@ async def statements_list(
 
     # Build JSON for cascading account dropdown (bank -> accounts)
     accounts_by_bank: dict[str, list] = {}
-    for a in [*cc_accounts, *bank_accounts]:
+    for a in sorted(
+        [*cc_accounts, *bank_accounts],
+        key=lambda a: (a.bank, a.type != "credit_card", a.label),
+    ):
         accounts_by_bank.setdefault(a.bank, []).append(
             {
                 "id": a.id,
