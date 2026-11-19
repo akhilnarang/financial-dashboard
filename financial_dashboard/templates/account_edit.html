@@ -101,6 +101,7 @@
                         <span style="font-family: var(--font-mono); font-size: 1rem; letter-spacing: 0.08em;">&bull;&bull;&bull;&bull; {{ card.card_mask }}</span>
                         <div style="margin-top: 0.4rem; display: flex; gap: 0.4rem; flex-wrap: wrap;">
                             {% if card.is_primary %}<span class="badge success">primary</span>{% endif %}
+                            {% if card.is_family %}<span class="badge">family</span>{% endif %}
                             {% if not card.active %}<span class="badge danger">inactive</span>{% endif %}
                         </div>
                     </div>
@@ -114,6 +115,10 @@
                     <label style="display: inline-flex; align-items: center; gap: 0.55rem; min-height: 2.5rem;">
                         <input type="checkbox" name="is_primary" value="1" {% if card.is_primary %}checked{% endif %}>
                         <span class="text-sm">Primary card</span>
+                    </label>
+                    <label style="display: inline-flex; align-items: center; gap: 0.55rem; min-height: 2.5rem;">
+                        <input type="checkbox" name="is_family" value="1" {% if card.is_family %}checked{% endif %}>
+                        <span class="text-sm">Family add-on card. Its spends get the family category.</span>
                     </label>
                 </div>
 
@@ -152,6 +157,10 @@
             <label style="display: inline-flex; align-items: center; gap: 0.55rem; min-height: 2.5rem;">
                 <input type="checkbox" name="is_primary" value="1">
                 <span class="text-sm">Set as primary</span>
+            </label>
+            <label style="display: inline-flex; align-items: center; gap: 0.55rem; min-height: 2.5rem;">
+                <input type="checkbox" name="is_family" value="1">
+                <span class="text-sm">Family add-on card</span>
             </label>
             <button type="submit">Add card</button>
         </form>

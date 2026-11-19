@@ -233,6 +233,16 @@ SETTINGS_REGISTRY: dict[str, SettingDef] = {
         description="Comma-separated family/private tokens to censor before sending to the "
         "LLM but NOT treat as self. e.g. names of family members whose transfers you receive",
     ),
+    "categorization.family_card_holders": SettingDef(
+        default="",
+        data_type="str",
+        category="Categorization",
+        label="Family Card Holders",
+        description="Comma-separated full names of family add-on card holders, as the "
+        "card statement prints them. Spends by these holders get the family category. "
+        "Use this when the add-on card has the same number as your card. "
+        "Do not put your own name here.",
+    ),
     "category_vocab_version": SettingDef(
         default="1",
         data_type="int",

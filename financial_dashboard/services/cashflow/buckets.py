@@ -27,6 +27,7 @@ from financial_dashboard.services.categorization.polarity import (
 )
 from financial_dashboard.services.categorization.slugs import (
     CREDIT_CARD_PAYMENT_SLUG,
+    FAMILY_SLUG,
     REPAYMENT_SLUG,
     UNKNOWN_SLUG,
 )
@@ -42,8 +43,6 @@ SELF_TRANSFER_SLUG = "self_transfer"
 PASSTHROUGH_SLUG = "passthrough"
 # A loan from a person, and the owner paying it back. It moves debt, not wealth.
 PERSONAL_LOAN_SLUG = "personal_loan"
-# Family members' spending routed through the owner's cards, and the repayments.
-FAMILY_SLUG = "family"
 # A gift the owner gives is spend. A gift the owner receives is income.
 GIFT_SLUG = "gift"
 # Credits that reduce spend rather than count as income.

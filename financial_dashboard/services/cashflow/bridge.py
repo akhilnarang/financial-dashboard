@@ -29,7 +29,7 @@ from financial_dashboard.schemas.cashflow import (
     CashBridge,
     CashflowSummary,
 )
-from financial_dashboard.services.cashflow.buckets import FAMILY_SLUG
+from financial_dashboard.services.categorization.slugs import FAMILY_SLUG
 from financial_dashboard.services.cashflow.report import (
     BANK_INTERNAL_SLUGS,
     EXCLUDED,

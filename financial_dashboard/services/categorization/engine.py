@@ -18,6 +18,11 @@ from financial_dashboard.db.models import (
     utc_now,
 )
 from financial_dashboard.services.categorization import gemini, openai_provider
+from financial_dashboard.services.categorization.family import (
+    is_family_spend,
+    load_family_cards,
+    requeue_family_spend,
+)
 from financial_dashboard.services.categorization.fewshot import get_similar_examples
 from financial_dashboard.services.categorization.llm import NEEDS_REVIEW, LlmResult
 from financial_dashboard.services.categorization.hashing import (
@@ -65,7 +70,13 @@ async def resolve_account_type(session: AsyncSession, txn: Transaction) -> str |
 
 
 async def requeue_after_enrichment(session: AsyncSession, txn: Transaction) -> None:
-    """Retry unresolved model results only when classifier inputs changed."""
+    """Retry unresolved model results only when classifier inputs changed.
+
+    A row that the enrichment shows to be a family spend goes back to the rule
+    pass, so that the family rule can set it.
+    """
+    if await requeue_family_spend(session, await load_family_cards(session), txn):
+        return
     if txn.category_method != "llm" or (
         txn.category != "unknown" and txn.review_status not in ("pending", "notified")
     ):
@@ -231,6 +242,7 @@ async def categorize_one(
         # it: what a credit can possibly mean depends on the account it lands on.
         "account_type": account_type,
         "note": txn.note,
+        "family_card": is_family_spend(await load_family_cards(session), txn),
     }
 
     rule_hit = match_rules(fields, load_rule_config())

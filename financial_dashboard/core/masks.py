@@ -18,6 +18,15 @@ matches. Use those to answer "same account?"; ``mask_digits`` and
 WILDCARD_CHARS = frozenset("Xx*#")
 """Characters a bank may use to hide a digit. Each stands for exactly one digit."""
 
+MIN_MASK_DIGITS = 3
+"""Minimum number of *trailing* visible digits required to attempt a match.
+
+ICICI savings SMSes carry as few as 3 (e.g. ``XX234``), so this is the floor
+rather than 4. Fewer than 3 produces dangerous false positives (every account
+ending in ``1``), and digits that are merely *present* are not enough: a mask
+like ``123XXXXXXXXX`` shows only a bank/branch prefix, which accounts share.
+"""
+
 
 def _is_separator(ch: str) -> bool:
     """Whether *ch* is cosmetic grouping, occupying no digit position.
@@ -84,6 +93,11 @@ def trailing_visible_digits(normalized: str) -> int:
             break
         n += 1
     return n
+
+
+def is_usable_mask(normalized: str) -> bool:
+    """Whether a normalized mask carries enough trailing signal to match on."""
+    return trailing_visible_digits(normalized) >= MIN_MASK_DIGITS
 
 
 def mask_matches(pattern: str, stored: str) -> bool:

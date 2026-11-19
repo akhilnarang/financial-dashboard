@@ -28,6 +28,10 @@ MANUAL_ONLY_SLUGS = frozenset({"passthrough", "personal_loan"})
 # A merchant handing money back:
 REFUND_SLUG = "refund"
 
+# Family members' spending routed through the owner's cards, and the repayments.
+# The cashflow report leaves it out, and the rules set it on family add-on cards.
+FAMILY_SLUG = "family"
+
 # Not a category — the sentinel a classifier writes when it could not pick one.
 UNKNOWN_SLUG = "unknown"
 

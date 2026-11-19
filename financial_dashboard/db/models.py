@@ -84,6 +84,9 @@ class Card(Base):
     label: Mapped[str | None] = mapped_column(String)
     is_primary: Mapped[bool | None] = mapped_column(Boolean, default=False)
     active: Mapped[bool | None] = mapped_column(Boolean, default=True)
+    is_family: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
 
     __table_args__ = (
         UniqueConstraint("account_id", "card_mask", name="uq_card_account_mask"),

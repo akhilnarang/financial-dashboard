@@ -227,6 +227,7 @@ async def card_add(
     card_mask: str = Form(...),
     label: str = Form(""),
     is_primary: str = Form(""),
+    is_family: str = Form(""),
     session: AsyncSession = Depends(get_session),
 ):
     account = await session.get(Account, account_id)
@@ -237,6 +238,7 @@ async def card_add(
         card_mask=card_mask.strip(),
         label=label.strip() or "self",
         is_primary=is_primary == "1",
+        is_family=is_family == "1",
         active=True,
     )
     session.add(card)
@@ -250,12 +252,14 @@ async def card_edit(
     card_id: int,
     label: str = Form(...),
     is_primary: str = Form(""),
+    is_family: str = Form(""),
     session: AsyncSession = Depends(get_session),
 ):
     card = await session.get(Card, card_id)
     if card and card.account_id == account_id:
         card.label = label.strip() or card.label
         card.is_primary = is_primary == "1"
+        card.is_family = is_family == "1"
         await session.commit()
     return RedirectResponse(url=f"/accounts/{account_id}/edit", status_code=303)
 
