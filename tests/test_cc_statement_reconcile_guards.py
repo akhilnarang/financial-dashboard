@@ -784,23 +784,14 @@ async def test_find_account_aggregates_conflicts_across_both_routes(session_fact
     assert await cc_module._find_account("hdfc", parsed) is None
 
 
-@pytest.mark.parametrize(
-    ("persons", "winner"),
-    [
-        pytest.param(("SAME HOLDER", "SAME HOLDER"), [0], id="same-holder"),
-        pytest.param(("PRIMARY HOLDER", "ADDON HOLDER"), [], id="other-holder"),
-    ],
-)
 @pytest.mark.anyio
-async def test_interchangeable_rivals_leave_the_winners_match_alone(
-    session_factory, persons, winner
-):
-    """A pairing with no wrong answer is not worth refusing: two identical
-    autopay rows contend for one DB row, but the narration and holder — what a
-    refresh writes here — are the same either way, so the winner keeps its
-    match. The loser is still held back; interchangeable rivals do not make a
-    second copy any less of a duplicate. Rows of two holders are not
-    interchangeable: the refresh would name the wrong holder."""
+async def test_a_second_identical_autopay_line_is_a_second_payment(session_factory):
+    """Two identical autopay lines reach one stored row that both lines name.
+
+    A statement never prints a payment twice, so both lines are real. One
+    line pairs with the stored row, and the other imports as a new row.
+    Without this check, the second payment is dropped or held for a person.
+    """
     await _seed_account(session_factory)
     a_id = await _seed_txn(
         session_factory, amount=Decimal("1000.00"), counterparty="SLICE AUTOPAY"
@@ -808,30 +799,19 @@ async def test_interchangeable_rivals_leave_the_winners_match_alone(
 
     parsed = _parsed(
         [
-            _stmt_txn(
-                date="07/04/2026",
-                amount="1000.00",
-                narration="SLICE AUTOPAY",
-                person=person,
-            )
-            for person in persons
+            _stmt_txn(date="07/04/2026", amount="1000.00", narration="SLICE AUTOPAY")
+            for _ in range(2)
         ]
     )
     recon = await _reconcile(session_factory, parsed)
 
-    assert [entry["stmt_idx"] for entry in recon["matched"]] == winner
-    if not winner:
-        assert all(entry["ambiguous"] for entry in recon["missing"])
-        return
-    assert recon["matched"][0]["db_txn_id"] == a_id
-    assert [entry["stmt_idx"] for entry in recon["missing"]] == [1]
-    assert recon["missing"][0]["ambiguous"] is True
+    assert [entry["db_txn_id"] for entry in recon["matched"]] == [a_id]
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [False]
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert imported == []
-    assert "ambiguous" in recon["missing"][0]["import_error"]
-    assert [row.id for row in rows] == [a_id]
+    assert len(imported) == 1
+    assert [row.id for row in rows] == [a_id, imported[0].id]
 
 
 @pytest.mark.parametrize(
@@ -1131,45 +1111,57 @@ async def test_two_candidates_without_narration_evidence_still_demote(session_fa
 
 
 @pytest.mark.parametrize(
-    ("alerts", "line_dates", "paired"),
+    ("alerts", "line_dates", "pairing", "new_rows"),
     [
         pytest.param(
             [("07/04/2026", None), ("07/04/2026", None)],
             ("07/04/2026", "07/04/2026"),
-            True,
+            {0: 0, 1: 1},
+            0,
             id="same-day",
         ),
         pytest.param(
             [("08/04/2026", None), ("09/04/2026", None)],
             ("07/04/2026", "08/04/2026"),
-            True,
+            {0: 0, 1: 1},
+            0,
             id="consecutive-days",
         ),
         pytest.param(
-            [("07/04/2026", None), ("07/04/2026", "000000000001")],
-            ("07/04/2026", "07/04/2026"),
-            False,
-            id="alert-with-reference",
+            [("07/04/2026", None)],
+            ("07/04/2026", "07/04/2026", "07/04/2026"),
+            {0: 0},
+            2,
+            id="more-lines-than-alerts",
         ),
         pytest.param(
             [("07/04/2026", None), ("07/04/2026", None), ("08/04/2026", None)],
             ("07/04/2026", "07/04/2026"),
-            False,
-            id="outside-alert-reaches-in",
+            {0: 0, 1: 1},
+            0,
+            id="more-alerts-than-lines",
+        ),
+        pytest.param(
+            [("07/04/2026", None), ("07/04/2026", "000000000001")],
+            ("07/04/2026", "07/04/2026"),
+            {},
+            0,
+            id="alert-with-reference",
         ),
     ],
 )
 @pytest.mark.anyio
 async def test_equal_payments_with_blank_alerts_pair_in_date_order(
-    session_factory, alerts, line_dates, paired
+    session_factory, alerts, line_dates, pairing, new_rows
 ):
-    """Two equal card payments give two lines and two alerts that name nothing.
+    """Equal card payments give equal lines and alerts that name nothing.
 
-    Any pairing stores the same ledger, so the lines pair in date order and
-    nothing is imported. Without this check, both lines are recorded as new
-    payments. An alert with a reference, or a third alert in reach, can
-    contradict a pairing. Then the lines wait for a person, and nothing is
-    imported either.
+    Any pairing stores the same ledger, so the lines pair in date order. A
+    statement never prints a purchase twice, so a line left over is a new row,
+    and an alert left over stays as it is. A reprocess adds nothing. Without
+    this check, a paired line is recorded again, or a real line is dropped. An
+    alert with a reference can contradict a pairing. Then the lines wait for a
+    person, and nothing is imported.
     """
     await _seed_account(session_factory)
     alert_ids = [
@@ -1198,19 +1190,21 @@ async def test_equal_payments_with_blank_alerts_pair_in_date_order(
     ]
 
     recon = await _reconcile(session_factory, parsed)
+    await enrich_matched_transactions(recon)
     imported, rows = await _import(session_factory, parsed, recon)
 
-    if paired:
-        assert {e["stmt_idx"]: e["db_txn_id"] for e in recon["matched"]} == {
-            0: alert_ids[0],
-            1: alert_ids[1],
-        }
-        assert recon["missing"] == []
-    else:
-        assert recon["matched"] == []
+    assert {e["stmt_idx"]: e["db_txn_id"] for e in recon["matched"]} == {
+        idx: alert_ids[n] for idx, n in pairing.items()
+    }
+    assert len(imported) == new_rows
+    assert len(rows) == len(alerts) + new_rows
+    if not pairing:
         assert all("ambiguous" in e["import_error"] for e in recon["missing"])
-    assert imported == []
-    assert sorted(row.id for row in rows) == alert_ids
+
+    again = await _reconcile(session_factory, parsed)
+    await enrich_matched_transactions(again)
+    _imported, rows_again = await _import(session_factory, parsed, again)
+    assert len(rows_again) == len(rows)
 
 
 @pytest.mark.anyio
@@ -1275,12 +1269,11 @@ async def test_a_reprocess_keeps_the_question_open(session_factory):
 
 
 @pytest.mark.anyio
-async def test_a_line_a_parser_missed_before_waits_for_a_person(session_factory):
-    """Verifies that a same-amount line is not recorded twice or bound to a copy.
+async def test_a_line_a_parser_missed_before_is_recorded(session_factory):
+    """Verifies that newly discovered statement lines import as distinct transactions.
 
-    The stored copy has the same amount, so the DB may hold any of the lines. A
-    new line is held for a person, and is not given the copy that another line
-    matched. Without this check, a reprocess adds a duplicate row.
+    Without this protection, new lines reuse existing copies and miss legitimate
+    purchases.
     """
     await _seed_account(session_factory)
     before = _parsed(
@@ -1303,9 +1296,7 @@ async def test_a_line_a_parser_missed_before_waits_for_a_person(session_factory)
         _imported, rows = await _import(session_factory, after, recon)
         sizes.append(len(rows))
 
-    assert sizes == [1, 1, 1]
-    assert [entry["imported_txn_id"] for entry in recon["missing"]] == [None, None]
-    assert all("ambiguous" in entry["import_error"] for entry in recon["missing"])
+    assert sizes == [3, 3, 3]
 
 
 @pytest.mark.anyio

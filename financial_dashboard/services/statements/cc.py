@@ -722,18 +722,24 @@ def _pair_exact_ties(
 
     Two equal card payments on one day give two lines and two alerts. No
     narration names an alert, so contention cannot tell which alert is which
-    line. The ledger does not care: it holds two rows either way. Any one-to-one
-    pairing is then correct, so the lines pair in date order.
+    line. The ledger does not care: it holds two rows either way. Any pairing
+    is then correct, so the lines pair in date order.
+
+    A statement never prints a purchase twice, so each line is a real event.
+    When the group has more lines than rows, the lines left over are new and
+    import. When it has more rows than lines, the rows left over stay as they
+    are.
 
     A group pairs only when all of these are true:
 
     - No line or row outside the group reaches into it.
-    - The group has as many lines as rows, and at least two of each.
+    - The group has at least three lines and rows in total.
     - Every line and every row has the same amount and direction.
     - Every row can be on a card of this account and on the card of each line.
     - No row has a reference. A row's counterparty is blank, generic, or named
       by every line.
-    - The pairing in date order uses only reachable rows.
+    - In date order, each line takes the first row it reaches that is still
+      free, and this pairs as many lines as the smaller side holds.
 
     Other groups stay as they are.
 
@@ -743,14 +749,15 @@ def _pair_exact_ties(
         exact_sets: Each line's reachable rows of the same amount.
         db_by_id: The account's rows by ID.
         account_card_masks: Every card the account answers to.
-        matched: The matched entries. Each group's lines are replaced with new
-            entries.
-        missing: The missing entries. Each group's lines are removed.
+        matched: The matched entries. A group's paired lines are added, and its
+            old entries are removed.
+        missing: The missing entries. A group's lines left over are added as
+            new rows to import, and its old entries are removed.
         unsure: The indexes of contested and held lines. Only a group that
             holds one of them is examined.
 
     Returns:
-        The indexes of the lines that paired.
+        The indexes of every line in a group that paired.
     """
     users: dict[int, set[int]] = {}
     for idx, rows in candidate_sets.items():
@@ -769,7 +776,7 @@ def _pair_exact_ties(
                 frontier.extend(users[row_id] - lines)
                 lines |= users[row_id]
         seen |= lines
-        if len(lines) != len(rows) or len(lines) < 2:
+        if len(lines) + len(rows) < 3:
             continue
         line_txns = [stmt_txns[idx] for idx in lines]
         keys = {
@@ -798,9 +805,6 @@ def _pair_exact_ties(
             for row in group_rows
         ):
             continue
-        ordered_lines = sorted(
-            lines, key=lambda idx: (parse_cc_date(stmt_txns[idx][2].date), idx)
-        )
         ordered_rows = sorted(
             group_rows,
             key=lambda row: (
@@ -809,26 +813,57 @@ def _pair_exact_ties(
                 row.id,
             ),
         )
-        pairs = list(zip(ordered_lines, ordered_rows))
-        if any(row.id not in exact_sets[idx] for idx, row in pairs):
+        pairs: dict[int, Transaction] = {}
+        for idx in sorted(
+            lines, key=lambda idx: (parse_cc_date(stmt_txns[idx][2].date), idx)
+        ):
+            if (
+                row := next(
+                    (
+                        row
+                        for row in ordered_rows
+                        if row.id in exact_sets[idx] and row not in pairs.values()
+                    ),
+                    None,
+                )
+            ) is not None:
+                pairs[idx] = row
+        if len(pairs) != min(len(lines), len(rows)):
             continue
-        for idx, row in pairs:
+        for idx in lines:
             entry = entries[idx]
             (matched if any(e is entry for e in matched) else missing).remove(entry)
-            matched.append(
-                {key: entry[key] for key in _LINE_KEYS}
-                | {
-                    "db_txn_id": row.id,
-                    "db_counterparty": row.counterparty,
-                    "db_reference": row.reference_number,
-                    "db_date": str(row.transaction_date),
-                    **candidate_evidence(
-                        candidate_sets[idx],
-                        reason="matched_exact_tie",
-                        gates=_CC_RECONCILIATION_GATES,
-                    ),
-                }
-            )
+            line = {key: entry[key] for key in _LINE_KEYS}
+            if (row := pairs.get(idx)) is None:
+                missing.append(
+                    line
+                    | {
+                        "ambiguous": False,
+                        "settlement_hold": False,
+                        "imported": False,
+                        "imported_txn_id": None,
+                        **candidate_evidence(
+                            candidate_sets[idx],
+                            reason="unpaired_exact_tie",
+                            gates=_CC_RECONCILIATION_GATES,
+                        ),
+                    }
+                )
+            else:
+                matched.append(
+                    line
+                    | {
+                        "db_txn_id": row.id,
+                        "db_counterparty": row.counterparty,
+                        "db_reference": row.reference_number,
+                        "db_date": str(row.transaction_date),
+                        **candidate_evidence(
+                            candidate_sets[idx],
+                            reason="matched_exact_tie",
+                            gates=_CC_RECONCILIATION_GATES,
+                        ),
+                    }
+                )
             paired.add(idx)
     matched.sort(key=lambda entry: entry["stmt_idx"])
     return paired
