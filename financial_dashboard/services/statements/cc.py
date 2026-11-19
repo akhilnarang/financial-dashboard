@@ -1324,6 +1324,17 @@ def reconcile_statement(
                 ),
             }
         )
+    # A statement never prints a purchase twice. When every row a held line
+    # reaches is already the row of a kept match, no row can hold this line,
+    # so it is new.
+    kept = {entry["db_txn_id"] for entry in matched}
+    for entry in missing:
+        if entry.get("ambiguous") and candidate_sets[entry["stmt_idx"]] <= kept:
+            entry |= {
+                "ambiguous": False,
+                "settlement_hold": False,
+                "decision_reason": "candidates_held_by_matches",
+            }
     _pair_foreign_alerts(
         stmt_txns, db_transactions, account_card_masks, matched, missing
     )

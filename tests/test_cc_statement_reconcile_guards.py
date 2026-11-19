@@ -495,12 +495,20 @@ async def test_statement_rows_two_days_apart_still_contend_for_the_row_between_t
     assert [row.id for row in rows] == [a_id]
 
 
+@pytest.mark.parametrize("both_stored", [True, False], ids=["both", "one"])
 @pytest.mark.anyio
-async def test_distinct_addon_cards_disambiguate_contended_rows(session_factory):
+async def test_distinct_addon_cards_disambiguate_contended_rows(
+    session_factory, both_stored
+):
     """Two same-amount rows a day apart, each on its own add-on card, are not
     rivals. Each DB row's card mask pairs it with exactly one statement row, so
     the ``+/-1``-day windows overlap yet the cards resolve the contention and
-    both rows match instead of being demoted."""
+    both rows match instead of being demoted.
+
+    When only the first card's row is stored, the second line reaches only a
+    row that a kept match holds. No row can hold it, so it imports, and a
+    reprocess adds nothing. Without this check, the second purchase is
+    dropped."""
     await _seed_account(session_factory)
     async with session_factory() as session:
         session.add(
@@ -518,13 +526,14 @@ async def test_distinct_addon_cards_disambiguate_contended_rows(session_factory)
         counterparty="MERCHANT X",
         card_mask="4111XXXXXXXX1111",
     )
-    db2 = await _seed_txn(
-        session_factory,
-        amount=Decimal("100.00"),
-        transaction_date=parse_cc_date("08/04/2026"),
-        counterparty="MERCHANT X",
-        card_mask="4111XXXXXXXX2222",
-    )
+    if both_stored:
+        db2 = await _seed_txn(
+            session_factory,
+            amount=Decimal("100.00"),
+            transaction_date=parse_cc_date("08/04/2026"),
+            counterparty="MERCHANT X",
+            card_mask="4111XXXXXXXX2222",
+        )
 
     parsed = _parsed(
         [
@@ -546,11 +555,18 @@ async def test_distinct_addon_cards_disambiguate_contended_rows(session_factory)
     )
     recon = await _reconcile(session_factory, parsed)
 
-    assert recon["missing"] == []
-    assert {entry["stmt_idx"]: entry["db_txn_id"] for entry in recon["matched"]} == {
-        0: db1,
-        1: db2,
-    }
+    if both_stored:
+        assert recon["missing"] == []
+        assert {
+            entry["stmt_idx"]: entry["db_txn_id"] for entry in recon["matched"]
+        } == {0: db1, 1: db2}
+        return
+    assert [entry["db_txn_id"] for entry in recon["matched"]] == [db1]
+    imported, rows = await _import(session_factory, parsed, recon)
+    assert [txn.card_mask for txn in imported] == ["2222"]
+    again = await _reconcile(session_factory, parsed)
+    _imported, rows_again = await _import(session_factory, parsed, again)
+    assert len(rows) == len(rows_again) == 2
 
 
 @pytest.mark.anyio
@@ -1016,7 +1032,8 @@ async def test_counterparty_tiebreak_ignores_a_different_card_namer(session_fact
     Two same-card tax rows resolve by counterparty even though a third row on
     another card shares the amount and date and repeats one narration. Were the
     third row counted as a rival namer, the pair would demote on a card the
-    candidates cannot belong to.
+    candidates cannot belong to. Both rows the third line reaches are held by
+    kept matches, so the third line is new.
     """
     await _seed_account(session_factory)
     async with session_factory() as session:
@@ -1075,7 +1092,7 @@ async def test_counterparty_tiebreak_ignores_a_different_card_namer(session_fact
         "SGST ON FEE": sgst_id,
     }
     assert [entry["stmt_idx"] for entry in recon["missing"]] == [2]
-    assert recon["missing"][0]["ambiguous"] is True
+    assert recon["missing"][0]["ambiguous"] is False
 
 
 @pytest.mark.anyio
