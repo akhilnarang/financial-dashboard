@@ -2,9 +2,9 @@
 # Install the financial-dashboard systemd user unit (one-time per host).
 #
 # Copies deploy/systemd/financial-dashboard.service into the user unit dir,
-# syncs the venv (the unit runs --no-sync), enables it, and starts it. Re-run
-# to pick up unit changes. Stop any manual `uv run uvicorn` first so the
-# unit can bind port 8000.
+# syncs the venv without dev dependencies (the unit runs --no-sync), enables
+# the unit, and restarts it. Re-run to pick up unit changes. Stop any manual
+# `uv run uvicorn` first so the unit can bind port 8000.
 set -eu
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -19,8 +19,11 @@ install -d -m 0755 "$unit_dir"
 install -m 0644 "$unit_src" "$unit_dir/$unit_name"
 
 cd "$root"
-"$uv" sync --locked
+"$uv" sync --locked --no-dev
 
 systemctl --user daemon-reload
-systemctl --user enable --now "$unit_name"
+systemctl --user enable "$unit_name"
+# A restart also starts a stopped unit. "enable --now" does not restart a
+# running unit, so it would keep the old ExecStart.
+systemctl --user restart "$unit_name"
 systemctl --user --no-pager status "$unit_name" | head -n 8
