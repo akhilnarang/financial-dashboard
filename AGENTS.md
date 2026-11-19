@@ -91,7 +91,7 @@ scripts/
 ## How to run
 
 ```bash
-uv run fastapi dev
+uv run uvicorn financial_dashboard.main:create_app --factory --reload
 uv run python scripts/seed.py
 uv run pytest -q
 # optional, dev-only — never touches a production DB:

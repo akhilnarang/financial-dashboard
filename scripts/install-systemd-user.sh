@@ -3,7 +3,7 @@
 #
 # Copies deploy/systemd/financial-dashboard.service into the user unit dir,
 # syncs the venv (the unit runs --no-sync), enables it, and starts it. Re-run
-# to pick up unit changes. Stop any manual `uv run fastapi run` first so the
+# to pick up unit changes. Stop any manual `uv run uvicorn` first so the
 # unit can bind port 8000.
 set -eu
 
