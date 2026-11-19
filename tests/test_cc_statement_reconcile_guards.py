@@ -1624,7 +1624,8 @@ async def test_two_exact_matches_inside_the_band_both_match(session_factory):
 @pytest.mark.anyio
 async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
     """Verifies that a statement line pairs with the foreign-currency alert of
-    its merchant, and that the alert row takes the rupee amount.
+    its merchant, and that the alert row takes the rupee amount. An alert
+    name that the statement narration continues takes the narration.
 
     Without this rule, the statement imports a second row for the same spend.
     """
@@ -1685,7 +1686,9 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
             _stmt_txn(date="07/04/2026", amount="999.00", narration="SAMPLE CAFE"),
             _stmt_txn(date="07/04/2026", amount="1,650.00", narration="SAMPLEMAIL COM"),
             _stmt_txn(date="07/04/2026", amount="914.00", narration="SAMPLEHOST US"),
-            _stmt_txn(date="07/04/2026", amount="700.00", narration="SHOP 42"),
+            _stmt_txn(
+                date="07/04/2026", amount="700.00", narration="SHOP 42 SAMPLE MARKET"
+            ),
             _stmt_txn(date="07/04/2026", amount="350.00", narration="SAMPLESHOP PAY"),
         ]
     )
@@ -1713,6 +1716,10 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
             row.id: row.amount_source
             for row in (await session.scalars(select(Transaction))).all()
         }
+        names = {
+            row.id: row.counterparty
+            for row in (await session.scalars(select(Transaction))).all()
+        }
     assert rows[alert_id] == (Decimal("2529.00"), "INR")
     assert rows[other_id] == (Decimal("12.00"), "USD")
     assert rows[mail_id] == (Decimal("1650.00"), "INR")
@@ -1720,6 +1727,11 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
     assert rows[manual_id] == (Decimal("914.00"), "INR")
     assert rows[matched_manual_id] == (Decimal("700.00"), "INR")
     assert sources[manual_id] == sources[matched_manual_id] == "bank"
+    # A cut alert name takes the full narration. Any other name stays.
+    assert names[alert_id] == NARRATION.strip()
+    assert names[manual_id] == "SAMPLEHOST US"
+    assert names[mail_id] == "SAMPLEMAIL.COM"
+    assert names[matched_manual_id] == "SAMPLESHOP"
     assert len(rows) == 8
     # A reprocess pairs the converted row by amount and imports nothing.
     assert sorted(entry["db_txn_id"] for entry in again["matched"]) == sorted(
