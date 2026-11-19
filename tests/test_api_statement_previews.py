@@ -106,6 +106,7 @@ async def test_cc_statement_parse_and_reconcile_preview(
         amount=Decimal("12.34"),
         currency="INR",
         transaction_date=datetime.date(2030, 1, 2),
+        counterparty="Other synthetic shop",
         card_mask="1234",
     )
     session.add_all([upload, transaction])

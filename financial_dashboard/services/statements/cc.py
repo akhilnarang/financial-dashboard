@@ -42,7 +42,7 @@ import re
 import tempfile
 import unicodedata
 from difflib import SequenceMatcher
-from datetime import date as date_type, timedelta
+from datetime import date as date_type, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import NamedTuple
@@ -205,6 +205,13 @@ class RefreshIdentity(NamedTuple):
 
     narration: str
     holder: str | None
+
+
+class ReachGroup(NamedTuple):
+    """Lines and stored rows that reach each other, directly or through others."""
+
+    lines: set[int]
+    rows: set[int]
 
 
 class CopyKey(NamedTuple):
@@ -708,6 +715,213 @@ def _resolve_contested_by_counterparty(
     return resolved
 
 
+def _reach_group(
+    start: int, candidate_sets: dict[int, set[int]], users: dict[int, set[int]]
+) -> ReachGroup:
+    """Collect every line and row that ``start`` reaches through shared rows.
+
+    Args:
+        start: The index of a line with candidates.
+        candidate_sets: Each line's reachable rows, in or near the band.
+        users: Each row ID mapped to the indexes of the lines that reach it.
+
+    Returns:
+        The lines and the rows of the group.
+    """
+    lines, rows, frontier = {start}, set(), [start]
+    while frontier:
+        for row_id in candidate_sets[frontier.pop()] - rows:
+            rows.add(row_id)
+            frontier.extend(users[row_id] - lines)
+            lines |= users[row_id]
+    return ReachGroup(lines, rows)
+
+
+def _pair_exact_ties(
+    stmt_txns: list[StatementLine],
+    candidate_sets: dict[int, set[int]],
+    exact_sets: dict[int, set[int]],
+    db_by_id: dict[int, Transaction],
+    account_card_masks: list[str],
+    matched: list[dict],
+    missing: list[dict],
+    unsure: set[int],
+) -> set[int]:
+    """Pair a closed group of same-amount lines with same-amount rows.
+
+    Two equal card payments on one day give two lines and two alerts. No
+    narration names an alert, so contention cannot tell which alert is which
+    line. The ledger does not care: it holds two rows either way. Any pairing
+    is then correct, so the lines pair in date order.
+
+    A statement never prints a purchase twice, so each line is a real event.
+    When the group has more lines than rows, the lines left over are new and
+    import. When it has more rows than lines, the rows left over stay as they
+    are.
+
+    A group pairs only when all of these are true:
+
+    - No line or row outside the group reaches into it.
+    - The group has at least three lines and rows in total.
+    - Every line and every row has the same amount and direction.
+    - Every row can be on a card of this account and on the card of each line.
+    - No row has a reference. A row's counterparty is blank, generic, or named
+      by every line.
+    - A row that names a cardholder pairs with a line of that holder. Each
+      such row takes the first free line of its holder, in date order. A
+      row of a holder that no free line has leaves the group unpaired.
+    - Then each free line, in date order, takes the first free row it
+      reaches that names no holder.
+    - This pairs as many lines as the smaller side holds.
+
+    Other groups stay as they are.
+
+    Args:
+        stmt_txns: The statement's lines, indexed by ``stmt_idx``.
+        candidate_sets: Each line's reachable rows, in or near the band.
+        exact_sets: Each line's reachable rows of the same amount.
+        db_by_id: The account's rows by ID.
+        account_card_masks: Every card the account answers to.
+        matched: The matched entries. A group's paired lines are added, and its
+            old entries are removed.
+        missing: The missing entries. A group's lines left over are added as
+            new rows to import, and its old entries are removed.
+        unsure: The indexes of contested and held lines. Only a group that
+            holds one of them is examined.
+
+    Returns:
+        The indexes of every line in a group that paired.
+    """
+    users: dict[int, set[int]] = {}
+    for idx, rows in candidate_sets.items():
+        for row_id in rows:
+            users.setdefault(row_id, set()).add(idx)
+    entries = {entry["stmt_idx"]: entry for entry in (*matched, *missing)}
+    seen: set[int] = set()
+    paired: set[int] = set()
+    for start in sorted(unsure):
+        if start in seen:
+            continue
+        lines, rows = _reach_group(start, candidate_sets, users)
+        seen |= lines
+        if len(lines) + len(rows) < 3:
+            continue
+        line_txns = [stmt_txns[idx] for idx in lines]
+        keys = {
+            (parse_cc_amount(txn.amount), direction) for _l, direction, txn in line_txns
+        }
+        if len(keys) != 1:
+            continue
+        [(amount, direction)] = keys
+        group_rows = [db_by_id[row_id] for row_id in rows]
+        if not all(
+            Decimal(str(row.amount)) == amount
+            and row.direction == direction
+            and not row.reference_number
+            and cc_card_compatible(row.card_mask, account_card_masks)
+            and not any(
+                _confirmed_different_card(txn.card_number, row.card_mask)
+                for _l, _d, txn in line_txns
+            )
+            and (
+                _normalize_narration(row.counterparty) in ("", *_GENERIC_COUNTERPARTIES)
+                or all(
+                    _counterparty_singles_out(txn.narration, row)
+                    for _l, _d, txn in line_txns
+                )
+            )
+            for row in group_rows
+        ):
+            continue
+        ordered_rows = sorted(
+            group_rows,
+            key=lambda row: (
+                row.transaction_date,
+                row.transaction_time or time.min,
+                row.id,
+            ),
+        )
+        ordered_lines = sorted(
+            lines, key=lambda idx: (parse_cc_date(stmt_txns[idx][2].date), idx)
+        )
+        holders = {idx: card_holder_name(stmt_txns[idx][2].person) for idx in lines}
+        pairs: dict[int, Transaction] = {}
+        closed = False
+        for row in ordered_rows:
+            if (holder := card_holder_name(row.card_holder)) is None:
+                continue
+            idx = next(
+                (
+                    idx
+                    for idx in ordered_lines
+                    if idx not in pairs
+                    and holders[idx] == holder
+                    and row.id in exact_sets[idx]
+                ),
+                None,
+            )
+            if idx is None:
+                break
+            pairs[idx] = row
+        else:
+            closed = True
+            for idx in ordered_lines:
+                if idx in pairs:
+                    continue
+                if (
+                    row := next(
+                        (
+                            row
+                            for row in ordered_rows
+                            if card_holder_name(row.card_holder) is None
+                            and row.id in exact_sets[idx]
+                            and row not in pairs.values()
+                        ),
+                        None,
+                    )
+                ) is not None:
+                    pairs[idx] = row
+        if not closed or len(pairs) != min(len(lines), len(rows)):
+            continue
+        for idx in lines:
+            entry = entries[idx]
+            (matched if any(e is entry for e in matched) else missing).remove(entry)
+            line = {key: entry[key] for key in _LINE_KEYS}
+            if (row := pairs.get(idx)) is None:
+                missing.append(
+                    line
+                    | {
+                        "ambiguous": False,
+                        "settlement_hold": False,
+                        "imported": False,
+                        "imported_txn_id": None,
+                        **candidate_evidence(
+                            candidate_sets[idx],
+                            reason="unpaired_exact_tie",
+                            gates=_CC_RECONCILIATION_GATES,
+                        ),
+                    }
+                )
+            else:
+                matched.append(
+                    line
+                    | {
+                        "db_txn_id": row.id,
+                        "db_counterparty": row.counterparty,
+                        "db_reference": row.reference_number,
+                        "db_date": str(row.transaction_date),
+                        **candidate_evidence(
+                            candidate_sets[idx],
+                            reason="matched_exact_tie",
+                            gates=_CC_RECONCILIATION_GATES,
+                        ),
+                    }
+                )
+            paired.add(idx)
+    matched.sort(key=lambda entry: entry["stmt_idx"])
+    return paired
+
+
 def _foreign_candidates(
     txn: ParsedCcTransaction,
     direction: str,
@@ -1052,6 +1266,9 @@ def reconcile_statement(
                     # No DB match, but a non-empty candidate set means it may
                     # only have lost a race — hold it back, don't import.
                     "ambiguous": contended_miss(candidate_sets[stmt_idx]),
+                    # Only a row near an alert's amount is recorded and asked about.
+                    "settlement_hold": contended_miss(candidate_sets[stmt_idx])
+                    and not exact_sets[stmt_idx],
                     "date": txn.date,
                     "amount": txn.amount,
                     "direction": direction,
@@ -1124,6 +1341,18 @@ def reconcile_statement(
         contested, exact_sets, txn_by_idx, db_by_id
     )
     contested = [entry for entry in contested if id(entry) not in resolved]
+    paired = _pair_exact_ties(
+        stmt_txns,
+        candidate_sets,
+        exact_sets,
+        db_by_id,
+        account_card_masks,
+        matched,
+        missing,
+        {entry["stmt_idx"] for entry in contested}
+        | {entry["stmt_idx"] for entry in missing if entry.get("ambiguous")},
+    )
+    contested = [entry for entry in contested if entry["stmt_idx"] not in paired]
 
     for entry in contested:
         matched.remove(entry)
@@ -1132,6 +1361,7 @@ def reconcile_statement(
                 "stmt_idx": entry["stmt_idx"],
                 "stmt_list": entry["stmt_list"],
                 "ambiguous": True,
+                "settlement_hold": False,
                 "date": entry["date"],
                 "amount": entry["amount"],
                 "direction": entry["direction"],
@@ -1147,6 +1377,24 @@ def reconcile_statement(
                 ),
             }
         )
+    # A statement never prints a purchase twice. When kept matches hold every
+    # row of a held line's group, no row is free to hold the line, so it is
+    # new. One free row anywhere in the group could still be this line.
+    kept = {entry["db_txn_id"] for entry in matched}
+    users: dict[int, set[int]] = {}
+    for idx, reached in candidate_sets.items():
+        for row_id in reached:
+            users.setdefault(row_id, set()).add(idx)
+    for entry in missing:
+        if (
+            entry.get("ambiguous")
+            and _reach_group(entry["stmt_idx"], candidate_sets, users).rows <= kept
+        ):
+            entry |= {
+                "ambiguous": False,
+                "settlement_hold": False,
+                "decision_reason": "candidates_held_by_matches",
+            }
     _pair_foreign_alerts(
         stmt_txns, db_transactions, account_card_masks, matched, missing
     )
@@ -1506,6 +1754,11 @@ async def import_missing_cc_txns(
     upload's ``error`` summary can surface them; the upload row stays
     committed with whatever subset succeeded.
 
+    A held row is recorded only when its candidates are near its amount, as
+    with a fuel surcharge. Telegram then asks whether to fold it into the
+    alert. A held row with a same-amount candidate is not imported. It gets an
+    ``import_error``, and a person must resolve it.
+
     Args:
         session: Open async SQLAlchemy session. The caller owns the
             transaction; this function calls ``flush`` but never ``commit``.
@@ -1569,6 +1822,12 @@ async def import_missing_cc_txns(
                 entry["imported_txn_id"] = copy.id
                 entry["import_error"] = None
                 claimed.add(copy.id)
+                continue
+            if not entry.get("settlement_hold"):
+                entry["import_error"] = (
+                    "ambiguous match — the DB may already hold this transaction under a "
+                    "row it could not be safely paired with; resolve manually"
+                )
                 continue
         try:
             amount = parse_cc_amount(entry["amount"])

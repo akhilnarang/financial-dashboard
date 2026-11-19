@@ -242,7 +242,9 @@ async def answer(
 async def ask_about_held_rows(upload_id: int) -> None:
     """Sends one Telegram prompt for each held statement row in an upload.
 
-    The import is already committed, so a failed prompt is logged, not raised.
+    The import is already committed, so a failed prompt is not raised. It is
+    logged and written to the upload's ``error``, where the statement page
+    shows it.
     """
     from financial_dashboard.db import async_session
     from financial_dashboard.services.settings import get_telegram_chat_id
@@ -299,3 +301,13 @@ async def ask_about_held_rows(upload_id: int) -> None:
                 )
     except Exception as exc:
         logger.warning("Settlement prompt failed: %s", exc)
+        notice = f"Telegram prompt for held rows failed: {type(exc).__name__}"
+        try:
+            async with async_session() as session:
+                upload = await session.get(StatementUpload, upload_id)
+                if upload is None or notice in (upload.error or ""):
+                    return
+                upload.error = f"{upload.error} {notice}" if upload.error else notice
+                await session.commit()
+        except Exception:
+            logger.exception("Could not record the failed settlement prompt")
