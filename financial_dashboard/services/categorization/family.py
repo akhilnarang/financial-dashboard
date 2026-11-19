@@ -5,7 +5,11 @@ from typing import NamedTuple
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.core.masks import mask_matches, normalize_mask
+from financial_dashboard.core.masks import (
+    is_usable_mask,
+    mask_matches,
+    normalize_mask,
+)
 from financial_dashboard.db.models import Card, Transaction
 from financial_dashboard.services.categorization.decision_lifecycle import (
     supersede_active_decisions,
@@ -71,7 +75,7 @@ def is_family_spend(family: FamilyCards, txn: Transaction) -> bool:
         matched = [
             card
             for card in family.cards
-            if incoming
+            if is_usable_mask(incoming)
             and card.account_id == txn.account_id
             and mask_matches(incoming, normalize_mask(card.card_mask))
         ]

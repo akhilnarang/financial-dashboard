@@ -59,33 +59,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.masks import (
+    is_usable_mask,
     mask_matches,
     normalize_mask,
-    trailing_visible_digits,
 )
 from financial_dashboard.db import Account, Card, Transaction
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Core helper
-# ---------------------------------------------------------------------------
-
-
-MIN_MASK_DIGITS = 3
-"""Minimum number of *trailing* visible digits required to attempt a match.
-
-ICICI savings SMSes carry as few as 3 (e.g. ``XX234``), so this is the floor
-rather than 4. Fewer than 3 produces dangerous false positives (every account
-ending in ``1``), and digits that are merely *present* are not enough: a mask
-like ``123XXXXXXXXX`` shows only a bank/branch prefix, which accounts share.
-"""
-
-
-def _usable(normalized: str) -> bool:
-    """Whether a normalized mask carries enough trailing signal to match on."""
-    return trailing_visible_digits(normalized) >= MIN_MASK_DIGITS
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +270,7 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
     account_mask = normalize_mask(txn.account_mask)
 
     # ---- 1. card_mask -> cards table ----
-    if _usable(card_mask):
+    if is_usable_mask(card_mask):
         hit = _find_card_match(ctx, bank_key, card_mask)
         if hit is not None:
             acct_id, card_id = hit
@@ -307,7 +287,7 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
             return True
 
     # ---- 2. card_mask -> accounts table ----
-    if _usable(card_mask):
+    if is_usable_mask(card_mask):
         hit = _find_account_match(ctx, bank_key, card_mask)
         if hit is not None:
             txn.account_id = hit
@@ -321,7 +301,7 @@ def link_transaction(ctx: LinkContext, txn: Transaction) -> bool:
             return True
 
     # ---- 3. account_mask -> accounts table ----
-    if _usable(account_mask):
+    if is_usable_mask(account_mask):
         hit = _find_account_match(ctx, bank_key, account_mask)
         if hit is not None:
             txn.account_id = hit

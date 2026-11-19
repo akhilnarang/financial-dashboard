@@ -133,6 +133,8 @@ async def _family_account(session: AsyncSession, client, monkeypatch) -> Account
     [
         # An alert names the add-on by its own mask only.
         ("XX2222", None, "debit", "AMAZON", "family"),
+        # Two digits are too few to name a card, even when only one matches.
+        ("XX22", None, "debit", "AMAZON", None),
         # The issuer prints the primary mask, and only the holder differs.
         ("XX1111", "JANE  ROE", "credit", "REFUND AMAZON", "family"),
         ("XX1111", "Alex Doe", "debit", "AMAZON", None),
