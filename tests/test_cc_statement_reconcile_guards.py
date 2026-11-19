@@ -36,6 +36,7 @@ from financial_dashboard.services.statements import cc as cc_module
 from financial_dashboard.services.statement_settlement import (
     Reconciliation,
     answer,
+    ask_about_held_rows,
     held_rows,
     row_digest,
 )
@@ -223,15 +224,11 @@ async def test_db_card_mask_decides_pairing_or_holdback(
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    if matches:
-        assert imported == []
-        assert [row.id for row in rows] == [txn_id]
-    else:
-        assert len(imported) == 1
-        assert txn_id in [row.id for row in rows]
-        assert next(row for row in rows if row.id == txn_id).counterparty == (
-            "MERCHANT A"
-        )
+    assert imported == []
+    assert [row.id for row in rows] == [txn_id]
+    if not matches:
+        assert "ambiguous" in recon["missing"][0]["import_error"]
+        assert rows[0].counterparty == "MERCHANT A"
 
 
 @pytest.mark.anyio
@@ -319,7 +316,8 @@ async def test_a_card_on_another_account_is_still_not_this_accounts_card(
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert len(imported) == 1
+    assert imported == []
+    assert [row.id for row in rows] == [other_id]
     other = next(row for row in rows if row.id == other_id)
     assert other.counterparty == "MERCHANT ON OTHER ACCOUNT"
 
@@ -456,10 +454,11 @@ async def test_statement_side_collision_is_not_imported_as_a_duplicate(
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert len(imported) == len(recon["missing"])
+    assert imported == []
     for entry in recon["missing"]:
-        assert entry["imported"] is True
-    assert [row.id for row in rows] == [a_id] + [row.id for row in imported]
+        assert entry["imported"] is False
+        assert "ambiguous" in entry["import_error"]
+    assert [row.id for row in rows] == [a_id]
 
 
 @pytest.mark.anyio
@@ -492,8 +491,8 @@ async def test_statement_rows_two_days_apart_still_contend_for_the_row_between_t
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert len(imported) == 2
-    assert [row.id for row in rows] == [a_id] + [row.id for row in imported]
+    assert imported == []
+    assert [row.id for row in rows] == [a_id]
 
 
 @pytest.mark.anyio
@@ -830,8 +829,9 @@ async def test_interchangeable_rivals_leave_the_winners_match_alone(
 
     imported, rows = await _import(session_factory, parsed, recon)
 
-    assert len(imported) == 1
-    assert [row.id for row in rows] == [a_id] + [row.id for row in imported]
+    assert imported == []
+    assert "ambiguous" in recon["missing"][0]["import_error"]
+    assert [row.id for row in rows] == [a_id]
 
 
 @pytest.mark.parametrize(
@@ -1130,9 +1130,94 @@ async def test_two_candidates_without_narration_evidence_still_demote(session_fa
     assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
 
 
+@pytest.mark.parametrize(
+    ("alerts", "line_dates", "paired"),
+    [
+        pytest.param(
+            [("07/04/2026", None), ("07/04/2026", None)],
+            ("07/04/2026", "07/04/2026"),
+            True,
+            id="same-day",
+        ),
+        pytest.param(
+            [("08/04/2026", None), ("09/04/2026", None)],
+            ("07/04/2026", "08/04/2026"),
+            True,
+            id="consecutive-days",
+        ),
+        pytest.param(
+            [("07/04/2026", None), ("07/04/2026", "000000000001")],
+            ("07/04/2026", "07/04/2026"),
+            False,
+            id="alert-with-reference",
+        ),
+        pytest.param(
+            [("07/04/2026", None), ("07/04/2026", None), ("08/04/2026", None)],
+            ("07/04/2026", "07/04/2026"),
+            False,
+            id="outside-alert-reaches-in",
+        ),
+    ],
+)
+@pytest.mark.anyio
+async def test_equal_payments_with_blank_alerts_pair_in_date_order(
+    session_factory, alerts, line_dates, paired
+):
+    """Two equal card payments give two lines and two alerts that name nothing.
+
+    Any pairing stores the same ledger, so the lines pair in date order and
+    nothing is imported. Without this check, both lines are recorded as new
+    payments. An alert with a reference, or a third alert in reach, can
+    contradict a pairing. Then the lines wait for a person, and nothing is
+    imported either.
+    """
+    await _seed_account(session_factory)
+    alert_ids = [
+        await _seed_txn(
+            session_factory,
+            direction="credit",
+            amount=Decimal("5000.00"),
+            transaction_date=parse_cc_date(day),
+            reference_number=reference,
+            counterparty=None,
+            raw_description=None,
+            channel="upi",
+            card_mask=None,
+        )
+        for day, reference in alerts
+    ]
+    parsed = _parsed([])
+    parsed.payments_refunds = [
+        _stmt_txn(
+            date=day,
+            amount="5,000.00",
+            narration=f"UPI PAYMENT RECEIVED REF 00000000000{n}",
+            direction="credit",
+        )
+        for n, day in enumerate(line_dates)
+    ]
+
+    recon = await _reconcile(session_factory, parsed)
+    imported, rows = await _import(session_factory, parsed, recon)
+
+    if paired:
+        assert {e["stmt_idx"]: e["db_txn_id"] for e in recon["matched"]} == {
+            0: alert_ids[0],
+            1: alert_ids[1],
+        }
+        assert recon["missing"] == []
+    else:
+        assert recon["matched"] == []
+        assert all("ambiguous" in e["import_error"] for e in recon["missing"])
+    assert imported == []
+    assert sorted(row.id for row in rows) == alert_ids
+
+
 @pytest.mark.anyio
 async def test_a_reprocess_keeps_the_question_open(session_factory):
     """Verifies that reprocessing a statement keeps held rows open for user resolution.
+
+    The alert is near the billed amount, so each line is held and recorded.
 
     Without this check, repeated processing drops unresolved rows and leaves duplicate
     records. Each held row keeps the copy of its own holder, and a copy with no
@@ -1162,7 +1247,7 @@ async def test_a_reprocess_keeps_the_question_open(session_factory):
         parsed = _parsed(
             [
                 _stmt_txn(
-                    date="07/04/2026", amount="90.00", narration="MERCHANT A", person=p
+                    date="07/04/2026", amount="91.00", narration="MERCHANT A", person=p
                 )
                 for p in persons
             ]
@@ -1190,11 +1275,12 @@ async def test_a_reprocess_keeps_the_question_open(session_factory):
 
 
 @pytest.mark.anyio
-async def test_a_line_a_parser_missed_before_is_recorded(session_factory):
-    """Verifies that newly discovered statement lines import as distinct transactions.
+async def test_a_line_a_parser_missed_before_waits_for_a_person(session_factory):
+    """Verifies that a same-amount line is not recorded twice or bound to a copy.
 
-    Without this protection, new lines reuse existing copies and miss legitimate
-    purchases.
+    The stored copy has the same amount, so the DB may hold any of the lines. A
+    new line is held for a person, and is not given the copy that another line
+    matched. Without this check, a reprocess adds a duplicate row.
     """
     await _seed_account(session_factory)
     before = _parsed(
@@ -1217,19 +1303,21 @@ async def test_a_line_a_parser_missed_before_is_recorded(session_factory):
         _imported, rows = await _import(session_factory, after, recon)
         sizes.append(len(rows))
 
-    assert sizes == [3, 3, 3]
+    assert sizes == [1, 1, 1]
+    assert [entry["imported_txn_id"] for entry in recon["missing"]] == [None, None]
+    assert all("ambiguous" in entry["import_error"] for entry in recon["missing"])
 
 
 @pytest.mark.anyio
-async def test_a_held_row_takes_its_own_copy_not_a_neighbours(session_factory):
-    """Verifies that a held row matches only its own recorded copy.
+async def test_a_held_row_is_never_bound_to_a_neighbours_copy(session_factory):
+    """Verifies that a held row binds only to a copy of its own line.
 
-    Without this check, the row binds to an unrelated transaction with a lower ID.
+    An earlier statement recorded a refund of the same merchant and a purchase
+    of another merchant, at this amount on this day. Without this check, a held
+    line binds to one of them and the purchase is lost.
     """
     await _seed_account(session_factory)
 
-    # An earlier statement records a refund and another merchant's purchase,
-    # both at this amount on this day. Their ids are the low ones.
     earlier = _parsed(
         [_stmt_txn(date="07/04/2026", amount="500.00", narration="OTHER SHOP PUNE")]
     )
@@ -1237,9 +1325,8 @@ async def test_a_held_row_takes_its_own_copy_not_a_neighbours(session_factory):
         _stmt_txn(date="07/04/2026", amount="500.00", narration="SAMPLE FUEL PUNE")
     ]
     recon = await _reconcile(session_factory, earlier)
-    await _import(session_factory, earlier, recon)
+    _imported, before = await _import(session_factory, earlier, recon)
 
-    # This statement prints one purchase, held because an alert names it.
     await _seed_txn(
         session_factory,
         amount=Decimal("500.00"),
@@ -1255,31 +1342,23 @@ async def test_a_held_row_takes_its_own_copy_not_a_neighbours(session_factory):
         ]
     )
 
-    for _ in range(3):
-        recon = await _reconcile(session_factory, parsed)
-        _imported, rows = await _import(session_factory, parsed, recon)
+    recon = await _reconcile(session_factory, parsed)
+    imported, rows = await _import(session_factory, parsed, recon)
 
-    by_id = {row.id: row for row in rows}
-    held = [
-        entry
-        for entry in recon["missing"]
-        if entry.get("ambiguous") and entry.get("imported_txn_id") is not None
-    ]
-
-    assert held, "the shape must hold a row, or it tests nothing"
-    for entry in held:
-        copy = by_id[entry["imported_txn_id"]]
-        assert copy.direction == entry["direction"]
-        assert copy.counterparty == entry["narration"]
+    assert [entry["ambiguous"] for entry in recon["missing"]] == [True, True]
+    assert [entry["imported_txn_id"] for entry in recon["missing"]] == [None, None]
+    assert imported == []
+    assert len(rows) == len(before) + 1
 
 
 @pytest.mark.anyio
-async def test_a_fuel_surcharge_is_held_for_a_person(session_factory):
+async def test_a_fuel_surcharge_is_held_for_a_person(session_factory, monkeypatch):
     """Verifies that the reconciler holds surcharged transactions for user review when
     merchants match.
 
     Without this check, the reconciler does not hold the row or name the stored row
-    as its candidate.
+    as its candidate. The row is recorded, and Telegram offers the stored row. A
+    prompt that fails is written to the upload's error, so a person sees it.
     """
     await _seed_account(session_factory)
     stored_id = await _seed_txn(
@@ -1302,6 +1381,38 @@ async def test_a_fuel_surcharge_is_held_for_a_person(session_factory):
 
     assert recon["missing"][0]["ambiguous"] is True
     assert recon["missing"][0]["candidate_transaction_ids"] == [stored_id]
+
+    imported, rows = await _import(session_factory, parsed, recon)
+    assert [txn.amount for txn in imported] == [Decimal("2529.00")]
+    assert len(rows) == 2
+    async with session_factory() as session:
+        upload = await session.scalar(select(StatementUpload))
+        upload.reconciliation_data = reconciliation_to_json(recon)
+        await session.commit()
+        upload_id = upload.id
+
+    prompts = []
+
+    async def send(payload, chat_id):
+        prompts.append([candidate["id"] for candidate in payload["candidates"]])
+
+    async def fail(payload, chat_id):
+        raise RuntimeError("telegram down")
+
+    monkeypatch.setattr("financial_dashboard.db.async_session", session_factory)
+    monkeypatch.setattr(
+        "financial_dashboard.services.settings.get_telegram_chat_id", lambda: 1
+    )
+    for sender in (send, fail):
+        monkeypatch.setattr(
+            "financial_dashboard.services.telegram.send_settlement_prompt", sender
+        )
+        await ask_about_held_rows(upload_id)
+
+    assert prompts == [[stored_id]]
+    async with session_factory() as session:
+        upload = await session.get(StatementUpload, upload_id)
+        assert "prompt for held rows failed" in upload.error
 
 
 @pytest.mark.anyio
