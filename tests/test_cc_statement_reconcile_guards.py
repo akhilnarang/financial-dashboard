@@ -52,6 +52,8 @@ from tests.conftest import new_test_engine
 
 ACCOUNT_ID = 1
 CARD_NUMBER = "4111XXXXXXXX9012"
+ADDON_1 = "4111XXXXXXXX1111"
+ADDON_2 = "4111XXXXXXXX2222"
 
 NARRATION = "SWIGGY LIMITED           BANGALORE   IN"
 
@@ -495,78 +497,89 @@ async def test_statement_rows_two_days_apart_still_contend_for_the_row_between_t
     assert [row.id for row in rows] == [a_id]
 
 
-@pytest.mark.parametrize("both_stored", [True, False], ids=["both", "one"])
+@pytest.mark.parametrize(
+    ("alerts", "lines", "pairing", "held", "new_rows"),
+    [
+        pytest.param(
+            [("07/04/2026", ADDON_1), ("08/04/2026", ADDON_2)],
+            [("07/04/2026", ADDON_1), ("08/04/2026", ADDON_2)],
+            {0: 0, 1: 1},
+            [],
+            0,
+            id="both-stored",
+        ),
+        pytest.param(
+            [("07/04/2026", ADDON_1)],
+            [("07/04/2026", ADDON_1), ("08/04/2026", ADDON_2)],
+            {0: 0},
+            [False],
+            1,
+            id="one-stored",
+        ),
+        pytest.param(
+            [("07/04/2026", ADDON_1), ("09/04/2026", ADDON_1)],
+            [("08/04/2026", ADDON_1), ("06/04/2026", CARD_NUMBER)],
+            {0: 0},
+            [True],
+            0,
+            id="header-mask-with-a-free-alert",
+        ),
+    ],
+)
 @pytest.mark.anyio
 async def test_distinct_addon_cards_disambiguate_contended_rows(
-    session_factory, both_stored
+    session_factory, alerts, lines, pairing, held, new_rows
 ):
     """Two same-amount rows a day apart, each on its own add-on card, are not
     rivals. Each DB row's card mask pairs it with exactly one statement row, so
     the ``+/-1``-day windows overlap yet the cards resolve the contention and
     both rows match instead of being demoted.
 
-    When only the first card's row is stored, the second line reaches only a
-    row that a kept match holds. No row can hold it, so it imports, and a
-    reprocess adds nothing. Without this check, the second purchase is
-    dropped."""
+    When only the first card's row is stored, kept matches hold every row the
+    second line can reach. No row can hold it, so it imports. A line that
+    prints the primary card's header mask can be either add-on alert. While an
+    alert in its group is free, it is held, not imported. A reprocess adds
+    nothing. Without this check, a purchase is dropped or stored twice."""
     await _seed_account(session_factory)
     async with session_factory() as session:
-        session.add(
-            Card(account_id=ACCOUNT_ID, card_mask="4111XXXXXXXX1111", label="Add-on 1")
-        )
-        session.add(
-            Card(account_id=ACCOUNT_ID, card_mask="4111XXXXXXXX2222", label="Add-on 2")
-        )
+        session.add(Card(account_id=ACCOUNT_ID, card_mask=ADDON_1, label="Add-on 1"))
+        session.add(Card(account_id=ACCOUNT_ID, card_mask=ADDON_2, label="Add-on 2"))
         await session.commit()
 
-    db1 = await _seed_txn(
-        session_factory,
-        amount=Decimal("100.00"),
-        transaction_date=parse_cc_date("07/04/2026"),
-        counterparty="MERCHANT X",
-        card_mask="4111XXXXXXXX1111",
-    )
-    if both_stored:
-        db2 = await _seed_txn(
+    alert_ids = [
+        await _seed_txn(
             session_factory,
             amount=Decimal("100.00"),
-            transaction_date=parse_cc_date("08/04/2026"),
+            transaction_date=parse_cc_date(day),
             counterparty="MERCHANT X",
-            card_mask="4111XXXXXXXX2222",
+            card_mask=mask,
         )
-
+        for day, mask in alerts
+    ]
     parsed = _parsed(
         [
             CcTransaction(
-                date="07/04/2026",
-                narration="MERCHANT X BANGALORE",
+                date=day,
+                narration=f"MERCHANT X BANGALORE {n}",
                 amount="100.00",
-                card_number="4111XXXXXXXX1111",
+                card_number=card,
                 transaction_type="debit",
-            ),
-            CcTransaction(
-                date="08/04/2026",
-                narration="MERCHANT X BANGALORE IN",
-                amount="100.00",
-                card_number="4111XXXXXXXX2222",
-                transaction_type="debit",
-            ),
+            )
+            for n, (day, card) in enumerate(lines)
         ]
     )
     recon = await _reconcile(session_factory, parsed)
 
-    if both_stored:
-        assert recon["missing"] == []
-        assert {
-            entry["stmt_idx"]: entry["db_txn_id"] for entry in recon["matched"]
-        } == {0: db1, 1: db2}
-        return
-    assert [entry["db_txn_id"] for entry in recon["matched"]] == [db1]
+    assert {entry["stmt_idx"]: entry["db_txn_id"] for entry in recon["matched"]} == {
+        idx: alert_ids[n] for idx, n in pairing.items()
+    }
+    assert [entry["ambiguous"] for entry in recon["missing"]] == held
+
     imported, rows = await _import(session_factory, parsed, recon)
-    assert [txn.card_mask for txn in imported] == ["2222"]
+    assert len(imported) == new_rows
     again = await _reconcile(session_factory, parsed)
     _imported, rows_again = await _import(session_factory, parsed, again)
-    assert len(rows) == len(rows_again) == 2
+    assert len(rows) == len(rows_again) == len(alerts) + new_rows
 
 
 @pytest.mark.anyio
@@ -1367,32 +1380,36 @@ async def test_a_fuel_surcharge_is_held_for_a_person(session_factory, monkeypatc
     Without this check, the reconciler does not hold the row or name the stored row
     as its candidate. The row is recorded, and Telegram offers the stored row. A
     prompt that fails is written to the upload's error, so a person sees it.
+    An exact line keeps the stored row, but a second alert in the group is
+    free, so the surcharged line is still held and asked about.
     """
     await _seed_account(session_factory)
-    stored_id = await _seed_txn(
-        session_factory,
-        amount=Decimal("2500.00"),
-        counterparty="SAMPLE ENTERPRISES",
-        raw_description=None,
-    )
+    stored_id, _free_id = [
+        await _seed_txn(
+            session_factory,
+            amount=Decimal("2500.00"),
+            transaction_date=parse_cc_date(day),
+            counterparty="SAMPLE ENTERPRISES",
+            raw_description=None,
+        )
+        for day in ("07/04/2026", "09/04/2026")
+    ]
     parsed = _parsed(
         [
-            _stmt_txn(
-                date="07/04/2026",
-                amount="2,529.00",
-                narration="MW SAMPLE ENTERPRISES Pune",
-            )
+            _stmt_txn(date=day, amount=amount, narration="MW SAMPLE ENTERPRISES Pune")
+            for day, amount in (("08/04/2026", "2,500.00"), ("06/04/2026", "2,529.00"))
         ]
     )
 
     recon = await _reconcile(session_factory, parsed)
 
+    assert [entry["db_txn_id"] for entry in recon["matched"]] == [stored_id]
     assert recon["missing"][0]["ambiguous"] is True
     assert recon["missing"][0]["candidate_transaction_ids"] == [stored_id]
 
     imported, rows = await _import(session_factory, parsed, recon)
     assert [txn.amount for txn in imported] == [Decimal("2529.00")]
-    assert len(rows) == 2
+    assert len(rows) == 3
     async with session_factory() as session:
         upload = await session.scalar(select(StatementUpload))
         upload.reconciliation_data = reconciliation_to_json(recon)

@@ -207,6 +207,13 @@ class RefreshIdentity(NamedTuple):
     holder: str | None
 
 
+class ReachGroup(NamedTuple):
+    """Lines and stored rows that reach each other, directly or through others."""
+
+    lines: set[int]
+    rows: set[int]
+
+
 class CopyKey(NamedTuple):
     """What a statement row states, and so what its recorded copy states."""
 
@@ -708,6 +715,28 @@ def _resolve_contested_by_counterparty(
     return resolved
 
 
+def _reach_group(
+    start: int, candidate_sets: dict[int, set[int]], users: dict[int, set[int]]
+) -> ReachGroup:
+    """Collect every line and row that ``start`` reaches through shared rows.
+
+    Args:
+        start: The index of a line with candidates.
+        candidate_sets: Each line's reachable rows, in or near the band.
+        users: Each row ID mapped to the indexes of the lines that reach it.
+
+    Returns:
+        The lines and the rows of the group.
+    """
+    lines, rows, frontier = {start}, set(), [start]
+    while frontier:
+        for row_id in candidate_sets[frontier.pop()] - rows:
+            rows.add(row_id)
+            frontier.extend(users[row_id] - lines)
+            lines |= users[row_id]
+    return ReachGroup(lines, rows)
+
+
 def _pair_exact_ties(
     stmt_txns: list[StatementLine],
     candidate_sets: dict[int, set[int]],
@@ -769,12 +798,7 @@ def _pair_exact_ties(
     for start in sorted(unsure):
         if start in seen:
             continue
-        lines, rows, frontier = {start}, set(), [start]
-        while frontier:
-            for row_id in candidate_sets[frontier.pop()] - rows:
-                rows.add(row_id)
-                frontier.extend(users[row_id] - lines)
-                lines |= users[row_id]
+        lines, rows = _reach_group(start, candidate_sets, users)
         seen |= lines
         if len(lines) + len(rows) < 3:
             continue
@@ -1324,12 +1348,19 @@ def reconcile_statement(
                 ),
             }
         )
-    # A statement never prints a purchase twice. When every row a held line
-    # reaches is already the row of a kept match, no row can hold this line,
-    # so it is new.
+    # A statement never prints a purchase twice. When kept matches hold every
+    # row of a held line's group, no row is free to hold the line, so it is
+    # new. One free row anywhere in the group could still be this line.
     kept = {entry["db_txn_id"] for entry in matched}
+    users: dict[int, set[int]] = {}
+    for idx, reached in candidate_sets.items():
+        for row_id in reached:
+            users.setdefault(row_id, set()).add(idx)
     for entry in missing:
-        if entry.get("ambiguous") and candidate_sets[entry["stmt_idx"]] <= kept:
+        if (
+            entry.get("ambiguous")
+            and _reach_group(entry["stmt_idx"], candidate_sets, users).rows <= kept
+        ):
             entry |= {
                 "ambiguous": False,
                 "settlement_hold": False,
