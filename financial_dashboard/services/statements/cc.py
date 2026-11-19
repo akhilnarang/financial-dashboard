@@ -767,8 +767,12 @@ def _pair_exact_ties(
     - Every row can be on a card of this account and on the card of each line.
     - No row has a reference. A row's counterparty is blank, generic, or named
       by every line.
-    - In date order, each line takes the first row it reaches that is still
-      free, and this pairs as many lines as the smaller side holds.
+    - A row that names a cardholder pairs with a line of that holder. Each
+      such row takes the first free line of its holder, in date order. A
+      row of a holder that no free line has leaves the group unpaired.
+    - Then each free line, in date order, takes the first free row it
+      reaches that names no holder.
+    - This pairs as many lines as the smaller side holds.
 
     Other groups stay as they are.
 
@@ -837,22 +841,47 @@ def _pair_exact_ties(
                 row.id,
             ),
         )
-        pairs: dict[int, Transaction] = {}
-        for idx in sorted(
+        ordered_lines = sorted(
             lines, key=lambda idx: (parse_cc_date(stmt_txns[idx][2].date), idx)
-        ):
-            if (
-                row := next(
-                    (
-                        row
-                        for row in ordered_rows
-                        if row.id in exact_sets[idx] and row not in pairs.values()
-                    ),
-                    None,
-                )
-            ) is not None:
-                pairs[idx] = row
-        if len(pairs) != min(len(lines), len(rows)):
+        )
+        holders = {idx: card_holder_name(stmt_txns[idx][2].person) for idx in lines}
+        pairs: dict[int, Transaction] = {}
+        closed = False
+        for row in ordered_rows:
+            if (holder := card_holder_name(row.card_holder)) is None:
+                continue
+            idx = next(
+                (
+                    idx
+                    for idx in ordered_lines
+                    if idx not in pairs
+                    and holders[idx] == holder
+                    and row.id in exact_sets[idx]
+                ),
+                None,
+            )
+            if idx is None:
+                break
+            pairs[idx] = row
+        else:
+            closed = True
+            for idx in ordered_lines:
+                if idx in pairs:
+                    continue
+                if (
+                    row := next(
+                        (
+                            row
+                            for row in ordered_rows
+                            if card_holder_name(row.card_holder) is None
+                            and row.id in exact_sets[idx]
+                            and row not in pairs.values()
+                        ),
+                        None,
+                    )
+                ) is not None:
+                    pairs[idx] = row
+        if not closed or len(pairs) != min(len(lines), len(rows)):
             continue
         for idx in lines:
             entry = entries[idx]

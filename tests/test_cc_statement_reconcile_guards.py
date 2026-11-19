@@ -41,6 +41,7 @@ from financial_dashboard.services.statement_settlement import (
     row_digest,
 )
 from financial_dashboard.services.statements.cc import (
+    card_holder_name,
     enrich_matched_transactions,
     reconciliation_to_json,
     import_missing_cc_txns,
@@ -813,34 +814,64 @@ async def test_find_account_aggregates_conflicts_across_both_routes(session_fact
     assert await cc_module._find_account("hdfc", parsed) is None
 
 
+@pytest.mark.parametrize(
+    ("persons", "stored_holder", "winner"),
+    [
+        pytest.param(("SAME HOLDER", "SAME HOLDER"), None, 0, id="same-holder"),
+        pytest.param(
+            ("ADDON HOLDER", "PRIMARY HOLDER"),
+            "Primary Holder",
+            1,
+            id="other-holder",
+        ),
+    ],
+)
 @pytest.mark.anyio
-async def test_a_second_identical_autopay_line_is_a_second_payment(session_factory):
+async def test_a_second_identical_autopay_line_is_a_second_payment(
+    session_factory, persons, stored_holder, winner
+):
     """Two identical autopay lines reach one stored row that both lines name.
 
     A statement never prints a payment twice, so both lines are real. One
     line pairs with the stored row, and the other imports as a new row.
-    Without this check, the second payment is dropped or held for a person.
+    Without this check, the second payment is dropped or held for a person. A
+    stored row that names a cardholder pairs only with that holder's line, so
+    the holder stays and the other holder's line imports.
     """
     await _seed_account(session_factory)
     a_id = await _seed_txn(
-        session_factory, amount=Decimal("1000.00"), counterparty="SLICE AUTOPAY"
+        session_factory,
+        amount=Decimal("1000.00"),
+        counterparty="SLICE AUTOPAY",
+        card_holder=stored_holder,
     )
 
     parsed = _parsed(
         [
-            _stmt_txn(date="07/04/2026", amount="1000.00", narration="SLICE AUTOPAY")
-            for _ in range(2)
+            _stmt_txn(
+                date="07/04/2026",
+                amount="1000.00",
+                narration="SLICE AUTOPAY",
+                person=person,
+            )
+            for person in persons
         ]
     )
     recon = await _reconcile(session_factory, parsed)
 
-    assert [entry["db_txn_id"] for entry in recon["matched"]] == [a_id]
+    assert [(e["stmt_idx"], e["db_txn_id"]) for e in recon["matched"]] == [
+        (winner, a_id)
+    ]
     assert [entry["ambiguous"] for entry in recon["missing"]] == [False]
 
+    await enrich_matched_transactions(recon)
     imported, rows = await _import(session_factory, parsed, recon)
 
     assert len(imported) == 1
-    assert [row.id for row in rows] == [a_id, imported[0].id]
+    assert {row.id: row.card_holder for row in rows} == {
+        a_id: card_holder_name(persons[winner]),
+        imported[0].id: card_holder_name(persons[1 - winner]),
+    }
 
 
 @pytest.mark.parametrize(
