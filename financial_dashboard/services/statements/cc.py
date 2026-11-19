@@ -157,6 +157,8 @@ _LINE_KEYS = (
 
 _GENERIC_COUNTERPARTIES = {"payment received", "payment successful", "payment done"}
 
+_MIN_TRUNCATED_CHARS = 4
+
 # Some statements name an add-on holder only by the card's last 4 digits.
 _ADDON_PERSON = re.compile(r"\s*addon\s*(\d{4})\s*", re.IGNORECASE)
 
@@ -1539,8 +1541,17 @@ def _take_statement_rupees(txn: Transaction, entry: dict) -> bool:
     return True
 
 
-def _takes_narration(txn: Transaction, narration: str) -> bool:
+def _alnum_upper(text: str) -> str:
+    """Return the text in upper case with only its letters and digits."""
+    return "".join(ch for ch in text.upper() if ch.isalnum())
+
+
+def takes_narration(txn: Transaction, narration: str) -> bool:
     """Tell if the row's counterparty must take the statement narration.
+
+    A card alert often cuts the merchant name short, for example "SHOP SW"
+    for "SHOP*SWEETS,CITY". The statement narration then replaces it. The
+    check ignores case and every character that is not a letter or a digit.
 
     Args:
         txn: The matched row.
@@ -1548,13 +1559,22 @@ def _takes_narration(txn: Transaction, narration: str) -> bool:
 
     Returns:
         True when the narration is set and the counterparty is empty, a
-        generic placeholder or a user alias.
+        generic placeholder, a user alias or a truncation of the narration.
+        A truncation has at least ``_MIN_TRUNCATED_CHARS`` letters and
+        digits, and the narration has more.
     """
     existing = (txn.counterparty or "").strip()
+    short = _alnum_upper(existing)
+    full = _alnum_upper(narration)
     return bool(narration) and (
         not existing
         or existing.lower() in _GENERIC_COUNTERPARTIES
         or txn.counterparty_source == "user_alias"
+        or (
+            len(short) >= _MIN_TRUNCATED_CHARS
+            and len(full) > len(short)
+            and full.startswith(short)
+        )
     )
 
 
@@ -1562,7 +1582,7 @@ async def enrich_matched_transactions(recon: dict) -> int:
     """Update matched DB transactions from their statement lines.
 
     The counterparty takes the statement narration when it is empty, a generic
-    placeholder or a user alias. A paired foreign-currency row takes the
+    placeholder, a user alias or a truncation of the narration. A paired foreign-currency row takes the
     statement's rupee amount, and so does a row with a manual amount. The row
     takes the cardholder that the statement names for the line. A screenshot
     row that is the only candidate of its line gets ``+cc_statement``
@@ -1599,7 +1619,7 @@ async def enrich_matched_transactions(recon: dict) -> int:
 
             converted = _take_statement_rupees(txn, entry)
             narration = (entry.get("narration") or "").strip()
-            if named := _takes_narration(txn, narration):
+            if named := takes_narration(txn, narration):
                 txn.counterparty = narration
                 txn.counterparty_source = "bank"
             holder = await statement_card_holder(

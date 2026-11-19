@@ -49,6 +49,7 @@ from financial_dashboard.services.statements.cc import (
     parse_cc_date,
     reconcile_statement,
 )
+from scripts.backfill_statement_narration import backfill_narrations
 from tests.conftest import new_test_engine
 
 ACCOUNT_ID = 1
@@ -1624,7 +1625,8 @@ async def test_two_exact_matches_inside_the_band_both_match(session_factory):
 @pytest.mark.anyio
 async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
     """Verifies that a statement line pairs with the foreign-currency alert of
-    its merchant, and that the alert row takes the rupee amount.
+    its merchant, and that the alert row takes the rupee amount. An alert
+    name that the statement narration continues takes the narration.
 
     Without this rule, the statement imports a second row for the same spend.
     """
@@ -1685,7 +1687,9 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
             _stmt_txn(date="07/04/2026", amount="999.00", narration="SAMPLE CAFE"),
             _stmt_txn(date="07/04/2026", amount="1,650.00", narration="SAMPLEMAIL COM"),
             _stmt_txn(date="07/04/2026", amount="914.00", narration="SAMPLEHOST US"),
-            _stmt_txn(date="07/04/2026", amount="700.00", narration="SHOP 42"),
+            _stmt_txn(
+                date="07/04/2026", amount="700.00", narration="SHOP 42 SAMPLE MARKET"
+            ),
             _stmt_txn(date="07/04/2026", amount="350.00", narration="SAMPLESHOP PAY"),
         ]
     )
@@ -1713,6 +1717,10 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
             row.id: row.amount_source
             for row in (await session.scalars(select(Transaction))).all()
         }
+        names = {
+            row.id: row.counterparty
+            for row in (await session.scalars(select(Transaction))).all()
+        }
     assert rows[alert_id] == (Decimal("2529.00"), "INR")
     assert rows[other_id] == (Decimal("12.00"), "USD")
     assert rows[mail_id] == (Decimal("1650.00"), "INR")
@@ -1720,12 +1728,63 @@ async def test_a_foreign_alert_takes_the_statement_rupees(session_factory):
     assert rows[manual_id] == (Decimal("914.00"), "INR")
     assert rows[matched_manual_id] == (Decimal("700.00"), "INR")
     assert sources[manual_id] == sources[matched_manual_id] == "bank"
+    # A cut alert name takes the full narration. Any other name stays.
+    assert names[alert_id] == NARRATION.strip()
+    assert names[manual_id] == "SAMPLEHOST US"
+    assert names[mail_id] == "SAMPLEMAIL.COM"
+    assert names[matched_manual_id] == "SAMPLESHOP"
     assert len(rows) == 8
     # A reprocess pairs the converted row by amount and imports nothing.
     assert sorted(entry["db_txn_id"] for entry in again["matched"]) == sorted(
         [alert_id, mail_id, manual_id, matched_manual_id] + [txn.id for txn in imported]
     )
     assert again["missing"] == []
+
+
+@pytest.mark.anyio
+async def test_the_backfill_gives_a_cut_name_the_last_narration(session_factory):
+    """Verifies that the backfill writes a stored narration only on apply.
+
+    Two statements matched one cut alert name, and the later narration is
+    longer. A dry run writes nothing. One apply gives the last narration, and
+    a second apply changes nothing.
+    """
+    await _seed_account(session_factory)
+    txn_id = await _seed_txn(session_factory, counterparty="SAMPLE SW")
+    async with session_factory() as session:
+        for narration in ("SAMPLE SW SHOP", "SAMPLE*SW SHOP PUNE"):
+            parsed = _parsed(
+                [_stmt_txn(date="07/04/2026", amount="450.00", narration=narration)]
+            )
+            session.add(
+                StatementUpload(
+                    account_id=ACCOUNT_ID,
+                    bank="hdfc",
+                    filename="statement.pdf",
+                    file_path="/nonexistent/statement.pdf",
+                    reconciliation_data=reconciliation_to_json(
+                        await _reconcile(session_factory, parsed)
+                    ),
+                )
+            )
+        await session.commit()
+
+    async def name() -> str | None:
+        async with session_factory() as session:
+            return (await session.get(Transaction, txn_id)).counterparty
+
+    async with session_factory() as session:
+        dry = await backfill_narrations(session, apply=False)
+    assert await name() == "SAMPLE SW"
+    async with session_factory() as session:
+        applied = await backfill_narrations(session, apply=True)
+    async with session_factory() as session:
+        again = await backfill_narrations(session, apply=True)
+
+    assert [(c.old, c.new) for c in dry] == [("SAMPLE SW", "SAMPLE*SW SHOP PUNE")]
+    assert applied == dry
+    assert await name() == "SAMPLE*SW SHOP PUNE"
+    assert again == []
 
 
 @pytest.mark.parametrize(
