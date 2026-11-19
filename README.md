@@ -19,7 +19,7 @@ cd financial-dashboard
 mkdir -p data
 uv sync --no-dev
 uv run python scripts/seed.py   # generates .env with Fernet key + seeds fetch rules
-uv run fastapi dev      # http://localhost:8000 (with auto-reload)
+uv run uvicorn financial_dashboard.main:create_app --factory --reload   # http://localhost:8000
 ```
 
 > **Warning:** There is currently no authentication on the web UI. Only run this on

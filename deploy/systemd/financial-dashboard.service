@@ -10,7 +10,7 @@ WorkingDirectory=/home/akhil/financial-dashboard
 # --no-sync: do not touch the venv at start. The systemd environment has no
 # git auth, so a sync that had to fetch a git dep would fail; the installer and
 # deploy.sh run `uv sync` in the user's environment instead.
-ExecStart=/home/akhil/.local/bin/uv run --no-sync fastapi run
+ExecStart=/home/akhil/.local/bin/uv run --no-sync uvicorn financial_dashboard.main:create_app --factory --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=5s
 TimeoutStopSec=90s

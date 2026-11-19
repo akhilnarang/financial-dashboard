@@ -19,7 +19,8 @@ dependencies = [
     "bank-statement-parser",
     "cas-parser",
     "cc-parser",
-    "fastapi[standard-no-fastapi-cloud-cli]>=0.135,<1",
+    "fastapi>=0.135,<1",
+    "python-multipart>=0.0.18,<1",
     "cryptography>=49.0.0,<51",
     "python-telegram-bot>=22.7,<23",
     "python-dateutil>=2.9.0.post0",
@@ -30,9 +31,6 @@ dependencies = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.fastapi]
-entrypoint = "financial_dashboard.main:create_app"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
