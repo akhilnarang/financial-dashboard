@@ -69,6 +69,7 @@ Once running:
 - **Accounts** represent bank accounts, savings accounts, or credit cards. Each has a bank, label, type, and optional account number (last-4 or full number).
 - **Cards** are physical cards linked to an account. An account can have multiple cards (primary + addon cards). Each card has a `card_mask` (e.g. `XX1111`).
 - **Addon card support**: Multiple cards can be linked to a single credit card account (e.g. primary + spouse addon). The linker resolves transactions to the correct card and parent account.
+- **Family add-on cards**: The rules set the `family` category on spends, refunds and cashback of a family add-on card. Mark the card as a family add-on in the card form when the issuer gives the add-on its own mask. When the issuer prints the primary mask for all holders, put the holder names in the `categorization.family_card_holders` setting. A manual category stays. To set old rows, run `uv run python scripts/categorize_backfill.py --family --rules-only`.
 
 ### Transaction-to-Account Linking (`services/linker.py`)
 Every transaction is auto-linked to an Account (and optionally a Card) using a four-level lookup cascade:
@@ -543,6 +544,7 @@ erDiagram
         string card_mask
         string label
         bool is_primary
+        bool is_family
         bool active
     }
 

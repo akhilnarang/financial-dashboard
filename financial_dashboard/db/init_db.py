@@ -875,6 +875,14 @@ async def init_db(engine, *, paisa_enabled: bool = True) -> None:
                     "NOT NULL DEFAULT 0"
                 )
             )
+        try:
+            await conn.execute(text("SELECT is_family FROM cards LIMIT 0"))
+        except Exception:
+            await conn.execute(
+                text(
+                    "ALTER TABLE cards ADD COLUMN is_family BOOLEAN NOT NULL DEFAULT 0"
+                )
+            )
         await conn.execute(
             text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_fetch_rule_auto_managed "

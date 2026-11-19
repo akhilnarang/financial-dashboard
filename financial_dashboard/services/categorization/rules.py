@@ -20,6 +20,7 @@ from financial_dashboard.services.categorization.polarity import (
 from financial_dashboard.services.categorization.slugs import (
     CREDIT_CARD_ACCOUNT_TYPE,
     CREDIT_CARD_PAYMENT_SLUG,
+    FAMILY_SLUG,
     REFUND_SLUG,
 )
 from financial_dashboard.services.settings import get_self_identifier_tokens
@@ -149,6 +150,16 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
     cp_norm = normalize_counterparty(fields.get("counterparty"))
     channel = (fields.get("channel") or "").lower()
     direction = (fields.get("direction") or "").lower()
+    email_type = (fields.get("email_type") or "").lower()
+
+    # A credit on a family card can also be a bill payment, so only a refund
+    # or a cashback goes with the family spend.
+    if fields.get("family_card") and (
+        direction == "debit"
+        or "cc_refund" in email_type
+        or _has_marker(text_norm, (*CARD_REFUND_MARKERS, "cashback"))
+    ):
+        return RuleResult(FAMILY_SLUG, 1.0)
 
     # Fixed-deposit legs. The statement/SMS parser labels the counterparty
     # "<Bank> FD" for an FD booking or maturity. A debit is money INTO the
@@ -172,7 +183,6 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
     # Structural email_type signals: parsers tag card payoffs/refunds even when
     # there's no counterparty/narration. Spend alerts lack these tokens (so are
     # excluded); generic cc_credit is ambiguous and left to the rules/LLM below.
-    email_type = (fields.get("email_type") or "").lower()
     if "cc_refund" in email_type or email_type.endswith("refund_screenshot"):
         return RuleResult(REFUND_SLUG, 0.9)
     if (

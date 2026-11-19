@@ -63,7 +63,6 @@ from financial_dashboard.schemas.cashflow import (
 )
 from financial_dashboard.services.cashflow.buckets import (
     BUCKET_BY_SLUG,
-    FAMILY_SLUG,
     TRANSFERS_IN_SLUG,
     bucket_for_slug,
     internal_slugs_for_scope,
@@ -75,6 +74,7 @@ from financial_dashboard.services.cashflow.scope import (
     Scope,
 )
 from financial_dashboard.services.categorization.slugs import (
+    FAMILY_SLUG,
     UNKNOWN_SLUG,
     USER_CATEGORY_BUCKETS,
 )

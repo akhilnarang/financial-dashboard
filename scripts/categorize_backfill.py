@@ -3,15 +3,26 @@
 Runs the rule sweep until no untouched rows remain. The rule pass seeds the
 few-shot examples. Then runs the LLM sweep until it stops making progress.
 
+With --family, rows on family add-on cards go back to the rule pass first, so
+the family rule sets them. A manual category stays.
+
 Usage:
-    uv run python scripts/categorize_backfill.py [--rules-only] [--batch-size N]
+    uv run python scripts/categorize_backfill.py [--rules-only] [--family]
+        [--batch-size N]
 """
 
 import argparse
 import asyncio
 from collections.abc import Awaitable, Callable
 
-from financial_dashboard.db import init_db
+from sqlalchemy import select
+
+from financial_dashboard.db import async_session, init_db
+from financial_dashboard.db.models import Transaction
+from financial_dashboard.services.categorization.family import (
+    load_family_cards,
+    requeue_family_spend,
+)
 from financial_dashboard.services.categorization.sweep import (
     run_llm_sweep,
     run_rule_sweep,
@@ -32,12 +43,35 @@ async def _main() -> None:
     )
     parser.add_argument("--rules-only", action="store_true", help="Skip the LLM sweep")
     parser.add_argument(
+        "--family",
+        action="store_true",
+        help="Send rows on family add-on cards back to the rule pass first",
+    )
+    parser.add_argument(
         "--batch-size", type=int, default=100, help="LLM batch size (default 100)"
     )
     args = parser.parse_args()
 
     await init_db()
     await load_all_settings()
+
+    if args.family:
+        async with async_session() as session:
+            family = await load_family_cards(session)
+            rows = await session.scalars(
+                select(Transaction).where(
+                    Transaction.card_id.is_not(None)
+                    | Transaction.card_mask.is_not(None)
+                    | Transaction.card_holder.is_not(None)
+                )
+            )
+            requeued = [
+                txn.id
+                for txn in rows.all()
+                if await requeue_family_spend(session, family, txn)
+            ]
+            await session.commit()
+        print(f"Family pass sent {len(requeued)} rows back to the rule pass.")
 
     # Each processed row leaves the untouched set, so this loop ends.
     rules = await _drain(run_rule_sweep, max(args.batch_size, 500))

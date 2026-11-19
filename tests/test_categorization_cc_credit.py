@@ -12,7 +12,8 @@ from decimal import Decimal
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from financial_dashboard.db.models import Account, Transaction
+from financial_dashboard.db.models import Account, Card, Transaction
+from financial_dashboard.services import settings as settings_mod
 from financial_dashboard.services.categorization import engine as eng
 from financial_dashboard.services.categorization import llm
 from financial_dashboard.services.categorization.polarity import resolve_direction
@@ -105,3 +106,97 @@ async def test_engine_bank_credit_unexplained_still_repayment(
 
     await eng.categorize_one(session, txn, use_llm=True)
     assert txn.category == "repayment"
+
+
+async def _family_account(session: AsyncSession, client, monkeypatch) -> Account:
+    """Seed a card account with a primary card and an add-on flagged by the form."""
+    monkeypatch.setitem(
+        settings_mod._cache, "categorization.family_card_holders", "Jane Roe, Sam Roe"
+    )
+    account = Account(bank="testbank", label="Card", type="credit_card")
+    session.add(account)
+    await session.flush()
+    primary = Card(account_id=account.id, card_mask="XXXX1111", label="Alex Doe")
+    addon = Card(account_id=account.id, card_mask="XXXX2222", label="Kid")
+    session.add_all([primary, addon])
+    await session.commit()
+    response = await client.post(
+        f"/accounts/{account.id}/cards/{addon.id}/edit",
+        data={"label": "Kid", "is_family": "1"},
+    )
+    assert response.status_code == 303
+    return account
+
+
+@pytest.mark.parametrize(
+    ("card_mask", "holder", "direction", "raw", "expected"),
+    [
+        # An alert names the add-on by its own mask only.
+        ("XX2222", None, "debit", "AMAZON", "family"),
+        # The issuer prints the primary mask, and only the holder differs.
+        ("XX1111", "JANE  ROE", "credit", "REFUND AMAZON", "family"),
+        ("XX1111", "Alex Doe", "debit", "AMAZON", None),
+    ],
+)
+async def test_family_addon_card_rows_are_family(
+    session: AsyncSession,
+    client,
+    monkeypatch,
+    card_mask,
+    holder,
+    direction,
+    raw,
+    expected,
+):
+    account = await _family_account(session, client, monkeypatch)
+    txn = Transaction(
+        bank="testbank",
+        email_type="cc_txn",
+        direction=direction,
+        amount=Decimal("100"),
+        raw_description=raw,
+        account_id=account.id,
+        card_mask=card_mask,
+        card_holder=holder,
+    )
+    session.add(txn)
+    await session.flush()
+
+    await eng.categorize_one(session, txn, use_llm=False)
+
+    assert txn.category == expected
+    if expected:
+        assert (txn.category_method, txn.category_confidence) == ("rule", 1.0)
+
+
+async def test_enrichment_requeues_a_family_row_but_keeps_a_manual_category(
+    session: AsyncSession, client, monkeypatch
+):
+    account = await _family_account(session, client, monkeypatch)
+    rows = [
+        Transaction(
+            bank="testbank",
+            email_type="cc_txn",
+            direction="debit",
+            amount=Decimal("100"),
+            raw_description="AMAZON",
+            account_id=account.id,
+            card_mask="XX1111",
+            card_holder="Jane Roe",
+            category="shopping",
+            category_method=method,
+        )
+        for method in ("llm", "manual")
+    ]
+    session.add_all(rows)
+    await session.flush()
+
+    for txn in rows:
+        await eng.requeue_after_enrichment(session, txn)
+        if txn.category_method is None:
+            await eng.categorize_one(session, txn, use_llm=False)
+
+    assert [(t.category, t.category_method) for t in rows] == [
+        ("family", "rule"),
+        ("shopping", "manual"),
+    ]
