@@ -146,6 +146,7 @@ from financial_dashboard.services.screenshot_transactions import (
     apply_corrections,
     direction_unclear,
     direction_word,
+    is_self_transfer,
     orient_read,
     owner_side,
     review_screenshot,
@@ -3075,7 +3076,8 @@ async def _screenshot_reply_result(
 
     The screenshot is read again with the reply. A value that the new read
     loses keeps the previous value, and a typed correction still replaces it.
-    A "self transfer" reply keeps the direction of the read.
+    A "self transfer" reply keeps the direction of the read, and marks the
+    draft as a self transfer.
 
     Args:
         session: The turn session.
@@ -3132,7 +3134,7 @@ async def _screenshot_reply_result(
             )
         except OSError, ValueError, httpx.HTTPError, OpenAIError:
             logger.exception("Screenshot reply %s was not read", interaction_id)
-    said = direction_word(user_text)
+    said = word = direction_word(user_text)
     if said == "self":
         said = corrected.direction
     if said is not None:
@@ -3163,8 +3165,14 @@ async def _screenshot_reply_result(
         notes=notes,
         direction_settled=settled,
         owner_direction=said,
+        self_transfer=word == "self"
+        or (
+            word is None
+            and (draft.self_transfer or is_self_transfer(corrected, tokens))
+        ),
     )
-    if corrected == draft.read and not is_new:
+    reviewed = review.action.read if review.action is not None else corrected
+    if reviewed == draft.read and not is_new:
         review = review._replace(
             text=f"I found no new value in your reply.\n{review.text}"
         )
@@ -3301,6 +3309,9 @@ async def _process_screenshot_interaction(
                             not_duplicates=[],
                             notes=[caption] if caption else [],
                             direction_settled=not direction_unclear(
+                                read, get_self_identifier_tokens()
+                            ),
+                            self_transfer=is_self_transfer(
                                 read, get_self_identifier_tokens()
                             ),
                         ),

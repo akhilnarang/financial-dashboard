@@ -121,6 +121,13 @@ class ScreenshotCheck(NamedTuple):
     duplicate: Transaction | None
 
 
+class SelfTransferLeg(NamedTuple):
+    """The read oriented to the leg to record, and the leg already stored."""
+
+    read: ScreenshotTransaction
+    recorded: Transaction | None
+
+
 class ScreenshotReview(NamedTuple):
     """The reply to a screenshot, and the action a Yes applies, if any."""
 
@@ -184,6 +191,19 @@ def owner_side(
             return "payee"
         case _:
             return None
+
+
+def is_self_transfer(read: ScreenshotTransaction, self_tokens: tuple[str, ...]) -> bool:
+    """Tell if both receipt blocks are the owner.
+
+    Args:
+        read: The read from the vision model.
+        self_tokens: The owner's names and VPAs.
+
+    Returns:
+        True when the From and To blocks both match the owner.
+    """
+    return _is_owner(read.payer, self_tokens) and _is_owner(read.payee, self_tokens)
 
 
 def direction_unclear(
@@ -275,6 +295,46 @@ def orient_read(
     if not last4 or last4.group(1) in other_bank:
         updates["account_hint"] = own.bank_text if own else None
     return ScreenshotTransaction.model_validate(read.model_dump() | updates)
+
+
+async def _self_transfer_leg(
+    session: AsyncSession, read: ScreenshotTransaction
+) -> SelfTransferLeg:
+    """Orient a self transfer read to the leg that no live row holds yet.
+
+    A self transfer has a debit leg on the sending account and a credit leg
+    on the receiving account. Both legs carry the same UTR. Often an alert
+    records one leg and no source records the other. When live rows with the
+    UTR hold exactly one direction, the read turns to the other leg. Else the
+    read stays, and the duplicate check finds any stored leg.
+
+    Args:
+        session: The turn session.
+        read: The fields read off the screenshot.
+
+    Returns:
+        The oriented read, and the stored leg when the read turned.
+    """
+    if (utr := read.utr if reference_form(read.utr) is not None else None) is None:
+        return SelfTransferLeg(read, None)
+    rows = (
+        await session.scalars(
+            select(Transaction)
+            .where(
+                func.upper(Transaction.reference_number) == utr,
+                Transaction.voided.is_(False),
+            )
+            .order_by(Transaction.id)
+        )
+    ).all()
+    if len({row.direction for row in rows}) != 1:
+        return SelfTransferLeg(read, None)
+    recorded = rows[0]
+    missing = "credit" if recorded.direction == "debit" else "debit"
+    turned = orient_read(read, (), side="payee" if missing == "credit" else "payer")
+    if turned.direction != missing:
+        return SelfTransferLeg(read, None)
+    return SelfTransferLeg(turned, recorded)
 
 
 def _named_accounts(hint: str, accounts: list[Account]) -> list[Account]:
@@ -631,13 +691,14 @@ async def review_screenshot(
     notes: list[str],
     direction_settled: bool,
     owner_direction: Literal["credit", "debit"] | None = None,
+    self_transfer: bool = False,
 ) -> ScreenshotReview:
     """Check one screenshot read and word the question for the owner.
 
     A screenshot that does not show a success or a reversal is refused. A
     duplicate offers to attach the screenshot to the stored row. A read with
     a missing field names each field and asks for it. Otherwise the question
-    asks to save.
+    asks to save. A self transfer with one leg stored records the other leg.
 
     Args:
         session: The turn session.
@@ -647,6 +708,8 @@ async def review_screenshot(
         notes: The owner's caption and replies, oldest first.
         direction_settled: False when the owner must say received or paid.
         owner_direction: What the owner said, kept for the next read.
+        self_transfer: True when the money moved between the owner's own
+            accounts.
 
     Returns:
         The reply text, and the action that a Yes applies. The action is
@@ -661,14 +724,30 @@ async def review_screenshot(
             "I saved nothing.",
             None,
         )
+    recorded = None
+    if self_transfer:
+        read, recorded = await _self_transfer_leg(session, read)
     target, missing, duplicate = await _check(session, read, not_duplicates)
     if not direction_settled:
         missing.append("received or paid")
+        duplicate = None
+    if recorded is not None and duplicate is not None and duplicate.id == recorded.id:
         duplicate = None
     lines = [
         _headline(read),
         _detail_line(read, target),
     ]
+    if recorded is not None and duplicate is None:
+        lines.append(
+            f"Self transfer: the {recorded.direction} is already #{recorded.id}. "
+            f"I will record the {read.direction}."
+            + (
+                ""
+                if target.account is not None
+                else " Which account "
+                + ("received it?" if read.direction == "credit" else "sent it?")
+            )
+        )
     if (
         duplicate is not None
         and read.utr
@@ -734,6 +813,7 @@ async def review_screenshot(
             notes=notes,
             direction_settled=direction_settled,
             owner_direction=owner_direction,
+            self_transfer=self_transfer,
         ),
     )
 

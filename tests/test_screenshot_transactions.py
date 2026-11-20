@@ -944,6 +944,71 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert row is not None
     assert (row.voided, row.attachment_path) == (False, "shot.png")
 
+    # A self transfer whose debit leg is stored records the missing credit
+    # leg on the account that the owner names. A new read of the screen as
+    # a debit does not undo that.
+    settings_service._cache["categorization.self_identifiers"] = "JANE DOE"
+    async with shot.maker() as s:
+        debit = Transaction(
+            bank="hdfc",
+            account_id=3,
+            email_type="hdfc_upi_alert",
+            direction="debit",
+            amount=Decimal("600.00"),
+            transaction_date=paid_at.date(),
+            reference_number="410987654321",
+            source="sms",
+        )
+        s.add(debit)
+        await s.commit()
+    own_screen = second.model_copy(
+        update={
+            "utr": "410987654321",
+            "amount": Decimal("600.00"),
+            "counterparty": "JANE DOE",
+            "vpa": None,
+            "account_hint": "HDFC 5555",
+            "payer": UpiParty(name="JANE DOE", bank_text="HDFC XXXXXX5555"),
+            "payee": UpiParty(name="JANE DOE"),
+        }
+    )
+    leg = await _send(shot, monkeypatch, own_screen)
+    assert "received ₹600.00 from JANE DOE" in leg.text
+    assert (
+        f"Self transfer: the debit is already #{debit.id}. I will record the "
+        "credit. Which account received it?"
+    ) in leg.text
+    assert "account (last 4 digits or bank)" in leg.text
+    assert "Attach" not in leg.text
+
+    async def screen_again(
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        notes: Sequence[str] = (),
+        current: ScreenshotTransaction | None = None,
+    ) -> ScreenshotTransaction:
+        return own_screen
+
+    monkeypatch.setattr(openai_provider, "read_screenshot", screen_again)
+    named = await _reply(shot, leg.conversation_id, "account 4321")
+    assert "received ₹600.00 from JANE DOE" in named.text
+    assert "Save this as a provisional transaction?" in named.text
+    assert (await _yes(shot, leg.conversation_id)).startswith("Saved #")
+    legs = [r for r in await _rows(shot) if r.reference_number == "410987654321"]
+    assert [
+        (r.id, r.account_id, r.direction, r.amount, r.attachment_path) for r in legs
+    ] == [
+        (debit.id, 3, "debit", Decimal("600.00"), None),
+        (legs[1].id, 1, "credit", Decimal("600.00"), "shot.png"),
+    ]
+    # With both legs stored, the same screenshot only attaches to its leg.
+    both_legs = await _send(shot, monkeypatch, own_screen)
+    assert f"This is already recorded as #{debit.id}." in both_legs.text
+
 
 @pytest.mark.parametrize(
     "case",
