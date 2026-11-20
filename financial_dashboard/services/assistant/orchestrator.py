@@ -142,10 +142,13 @@ from financial_dashboard.services.categorization.decision_lifecycle import (
 from financial_dashboard.services.categorization.normalize import normalize_text
 from financial_dashboard.services.categorization.slugs import MANUAL_ONLY_SLUGS
 from financial_dashboard.services.screenshot_transactions import (
+    ACCOUNT_FIELD,
     ScreenshotReview,
     apply_corrections,
+    bare_account_hint,
     direction_unclear,
     direction_word,
+    is_self_transfer,
     orient_read,
     owner_side,
     review_screenshot,
@@ -162,6 +165,7 @@ TURN_TIMEOUT_SECONDS = 180
 # Each candidate row gets a button, so the question stays short.
 MAX_FOUND_CANDIDATES = 3
 _CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
+_REREAD_KEPT_FIELDS = ("counterparty", "vpa", "utr", "amount", "occurred_at")
 _SECRET_TRACEBACK_RE = re.compile(
     r"(https?://api\.telegram\.org/(?:file/)?bot)[^/\s'\"]+|(Bearer\s+)[^\s'\"]+|(\bsk-[A-Za-z0-9_-]{8,})"
 )
@@ -3072,6 +3076,13 @@ async def _screenshot_reply_result(
 ) -> OrchestrationResult:
     """Apply a user reply to a pending screenshot draft and build the result.
 
+    The screenshot is read again with the reply. A value that the new read
+    loses keeps the previous value, and a typed correction still replaces it.
+    A "self transfer" reply keeps the direction of the read, and marks the
+    draft as a self transfer until a "received" or "paid" reply. Without
+    such a reply, the receipt blocks of each read decide. While the account is missing, a reply of only
+    a bank or an account label names the account.
+
     Args:
         session: The turn session.
         draft: The stored pending screenshot confirmation.
@@ -3110,6 +3121,13 @@ async def _screenshot_reply_result(
                 notes=notes,
                 current=draft.read,
             )
+            lost = {
+                field: value
+                for field in _REREAD_KEPT_FIELDS
+                if (value := getattr(draft.read, field)) is not None
+                and getattr(reread, field) is None
+            }
+            reread = ScreenshotTransaction.model_validate(reread.model_dump() | lost)
             oriented = orient_read(reread, tokens)
             corrected = (
                 reread
@@ -3120,7 +3138,10 @@ async def _screenshot_reply_result(
             )
         except OSError, ValueError, httpx.HTTPError, OpenAIError:
             logger.exception("Screenshot reply %s was not read", interaction_id)
-    if said := direction_word(user_text):
+    said = word = direction_word(user_text)
+    if said == "self":
+        said = corrected.direction
+    if said is not None:
         corrected = orient_read(
             corrected, tokens, side="payee" if said == "credit" else "payer"
         )
@@ -3131,6 +3152,10 @@ async def _screenshot_reply_result(
             )
         )
     corrected = apply_corrections(corrected, user_text)
+    if ACCOUNT_FIELD in draft.missing and (
+        hint := await bare_account_hint(session, user_text)
+    ):
+        corrected = corrected.model_copy(update={"account_hint": hint})
     settled = (
         said is not None
         or owner_side(corrected, tokens) is not None
@@ -3148,8 +3173,33 @@ async def _screenshot_reply_result(
         notes=notes,
         direction_settled=settled,
         owner_direction=said,
+        self_transfer=word == "self"
+        or (
+            word is None
+            and (
+                is_self_transfer(corrected, tokens)
+                if draft.owner_direction is None
+                else draft.self_transfer
+            )
+        ),
     )
-    if corrected == draft.read and not is_new:
+    before = (
+        draft.read,
+        draft.direction_settled,
+        draft.owner_direction,
+        draft.self_transfer,
+    )
+    after = (
+        (
+            review.action.read,
+            review.action.direction_settled,
+            review.action.owner_direction,
+            review.action.self_transfer,
+        )
+        if review.action is not None
+        else (corrected, *before[1:])
+    )
+    if after == before and not is_new:
         review = review._replace(
             text=f"I found no new value in your reply.\n{review.text}"
         )
@@ -3286,6 +3336,9 @@ async def _process_screenshot_interaction(
                             not_duplicates=[],
                             notes=[caption] if caption else [],
                             direction_settled=not direction_unclear(
+                                read, get_self_identifier_tokens()
+                            ),
+                            self_transfer=is_self_transfer(
                                 read, get_self_identifier_tokens()
                             ),
                         ),

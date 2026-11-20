@@ -452,7 +452,8 @@ class ScreenshotTransactionConfirmation(StrictModel):
     ``direction_settled`` is False while the receipt blocks do not show which
     side is the owner and the owner has not said received or paid. A Yes
     never saves while it is False. ``owner_direction`` is what the owner said,
-    and each new read keeps it.
+    and each new read keeps it. ``self_transfer`` is True when the money moved
+    between the owner's own accounts, so each review records the missing leg.
     """
 
     kind: Literal["screenshot_transaction"]
@@ -466,6 +467,7 @@ class ScreenshotTransactionConfirmation(StrictModel):
     notes: list[StrictStr] = Field(default_factory=list, max_length=20)
     direction_settled: StrictBool = True
     owner_direction: Literal["credit", "debit"] | None = None
+    self_transfer: StrictBool = False
 
 
 ConfirmationAction: TypeAlias = Annotated[

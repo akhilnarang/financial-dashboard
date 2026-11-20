@@ -21,6 +21,7 @@ from financial_dashboard.db.models import (
     Account,
     AuditInteraction,
     Card,
+    Category,
     Setting,
     TelegramConversation,
     TelegramOutboundDelivery,
@@ -112,6 +113,7 @@ async def shot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIterator
         s.add_all(
             [
                 Setting(key="telegram.chat_id", value=str(CHAT)),
+                Category(slug="self_transfer", active=True),
                 Account(
                     id=1,
                     bank="sbi",
@@ -784,13 +786,16 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert "Save this as a provisional transaction?" in proposed.text
     assert "from ALEX S SMITH" in proposed.text
 
-    # A reread that matches the owner on both blocks asks again.
+    # A reread that shows the owner on both blocks is a self transfer. The
+    # direction of the read holds, and the owner is not asked.
     both = current.model_copy(
         update={"utr": UTR, "payer": UpiParty(name="JANE DOE", vpa="test0000@upi")}
     )
     create.return_value.choices[0].message.content = both.model_dump_json()
-    reasked = await _reply(shot, asked.conversation_id, "ok")
-    assert "Did you receive or pay this?" in reasked.text
+    own = await _reply(shot, asked.conversation_id, "ok")
+    assert "received ₹1,234.00 from" in own.text
+    assert "Did you receive or pay this?" not in own.text
+    assert "Save this as a provisional transaction?" in own.text
 
     # A reread that flips the receipt back to the owner's payment is
     # oriented again by the receipt blocks.
@@ -809,6 +814,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         row.raw_description,
         row.transaction_date,
         row.transaction_time,
+        row.category,
     ) == (
         1,
         "credit",
@@ -818,11 +824,12 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         "test0000@upi",
         paid_at.date(),
         datetime.time(18, 16),
+        None,
     )
 
-    # A token on both sides decides nothing: Yes waits for received or paid,
-    # and the answer holds when a later reread says debit.
-    settings_service._cache["categorization.self_identifiers"] = "DOE, SMITH"
+    # When neither block is the owner, Yes waits for received or paid, and
+    # the answer holds when a later reread says debit.
+    settings_service._cache["categorization.self_identifiers"] = "CHRIS TEST"
     async with shot.maker() as s:
         s.add(
             Account(
@@ -863,7 +870,14 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         blocks = {"payer": second.payer, "payee": second.payee}
         match notes[-1]:
             case "utr 210987654321":
-                return current.model_copy(update={"payer": None, "payee": None})
+                return current.model_copy(
+                    update={
+                        "payer": None,
+                        "payee": None,
+                        "counterparty": None,
+                        "vpa": None,
+                    }
+                )
             case "name Paid Ventures":
                 return current.model_copy(
                     update=blocks | {"direction": "debit", "account_hint": "HDFC Bank"}
@@ -875,9 +889,11 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     with pytest.raises(MutationRejected, match="received or paid"):
         await _yes(shot, unclear.conversation_id)
     assert len(await _rows(shot)) == 1
-    # A reread without the blocks does not settle the open question.
+    # A reread without the blocks does not settle the open question, and the
+    # name it drops stays.
     still = await _reply(shot, unclear.conversation_id, "utr 210987654321")
     assert "Did you receive or pay this?" in still.text
+    assert "paid ₹777.00 to JANE DOE (jane@testyes)" in still.text
     answered = await _reply(shot, unclear.conversation_id, "received")
     assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in answered.text
     # The owner's block shows no bank, so the sender's bank never stays.
@@ -921,6 +937,128 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         row = await s.get(Transaction, voided.id)
     assert row is not None
     assert (row.voided, row.attachment_path) == (True, None)
+    # An answer that changes only the open question is a new value.
+    paid = await _reply(shot, held.conversation_id, "paid")
+    assert "I found no new value" not in paid.text
+    assert f"This is recorded as #{voided.id}, which is voided." in paid.text
+    # A "self transfer" reply keeps the direction of the read, so the
+    # screenshot goes to the stored row.
+    own = await _reply(shot, held.conversation_id, "Self transfer")
+    assert "Did you receive or pay this?" not in own.text
+    assert f"This is recorded as #{voided.id}, which is voided." in own.text
+    await _yes(shot, held.conversation_id)
+    async with shot.maker() as s:
+        row = await s.get(Transaction, voided.id)
+    assert row is not None
+    assert (row.voided, row.attachment_path) == (False, "shot.png")
+
+    # A self transfer whose debit leg is stored records the missing credit
+    # leg on the account that the owner names, never on the debit's account.
+    # A new read of the screen as a debit does not undo that.
+    settings_service._cache["categorization.self_identifiers"] = "JANE DOE"
+    async with shot.maker() as s:
+        debit = Transaction(
+            bank="hdfc",
+            account_id=3,
+            email_type="hdfc_upi_alert",
+            direction="debit",
+            amount=Decimal("600.00"),
+            transaction_date=paid_at.date(),
+            reference_number="410987654321",
+            source="sms",
+        )
+        s.add(debit)
+        await s.commit()
+    own_screen = second.model_copy(
+        update={
+            "utr": "410987654321",
+            "amount": Decimal("600.00"),
+            "counterparty": "JANE DOE",
+            "vpa": None,
+            "account_hint": "HDFC 5555",
+            "payer": UpiParty(name="JANE DOE", bank_text="HDFC"),
+            "payee": UpiParty(name="JANE DOE"),
+        }
+    )
+    leg = await _send(shot, monkeypatch, own_screen)
+    assert "received ₹600.00 from JANE DOE" in leg.text
+    assert (
+        f"Self transfer: the debit is already #{debit.id}. I will record the "
+        "credit. Which account received it?"
+    ) in leg.text
+    assert "account (last 4 digits or bank)" in leg.text
+    assert "Attach" not in leg.text
+
+    async def screen_again(
+        *,
+        image: bytes,
+        media_type: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        notes: Sequence[str] = (),
+        current: ScreenshotTransaction | None = None,
+    ) -> ScreenshotTransaction:
+        return own_screen
+
+    monkeypatch.setattr(openai_provider, "read_screenshot", screen_again)
+    # A reply that only contains a bank name does not name an account.
+    card = await _reply(shot, leg.conversation_id, "SBI card")
+    assert "Which account received it?" in card.text
+    named = await _reply(shot, leg.conversation_id, "SBI Bank")
+    assert "received ₹600.00 from JANE DOE" in named.text
+    assert "Save this as a provisional transaction?" in named.text
+    assert (await _yes(shot, leg.conversation_id)).startswith("Saved #")
+    legs = [r for r in await _rows(shot) if r.reference_number == "410987654321"]
+    assert [
+        (r.id, r.account_id, r.direction, r.amount, r.attachment_path, r.category)
+        for r in legs
+    ] == [
+        (debit.id, 3, "debit", Decimal("600.00"), None, None),
+        (legs[1].id, 1, "credit", Decimal("600.00"), "shot.png", "self_transfer"),
+    ]
+    # With both legs stored, the same screenshot only attaches to its leg.
+    both_legs = await _send(shot, monkeypatch, own_screen)
+    assert f"This is already recorded as #{debit.id}." in both_legs.text
+
+    # A UPI narration's IFSC names the receiving account, so the credit leg
+    # needs no question. Its branch digits are not account digits.
+    async with shot.maker() as s:
+        s.add_all(
+            [
+                Account(
+                    id=4,
+                    bank="axis",
+                    label="Axis savings",
+                    type="bank_account",
+                    account_number="XXXXXX1111",
+                ),
+                Transaction(
+                    bank="hdfc",
+                    account_id=3,
+                    email_type="hdfc_upi_alert",
+                    direction="debit",
+                    amount=Decimal("700.00"),
+                    transaction_date=paid_at.date(),
+                    reference_number="510987654321",
+                    source="sms",
+                ),
+            ]
+        )
+        await s.commit()
+    coded = own_screen.model_copy(
+        update={
+            "utr": "510987654321",
+            "amount": Decimal("700.00"),
+            "payee": UpiParty(name="JANE DOE", bank_text="UTIB0004321"),
+        }
+    )
+    known = await _send(shot, monkeypatch, coded)
+    assert "I will record the credit on Axis savings." in known.text
+    assert "Save this as a provisional transaction?" in known.text
+    # A bare bank reply names the account only while the account is missing.
+    kept = await _reply(shot, known.conversation_id, "SBI")
+    assert "I will record the credit on Axis savings." in kept.text
 
 
 @pytest.mark.parametrize(

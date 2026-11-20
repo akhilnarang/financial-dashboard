@@ -41,7 +41,11 @@ from financial_dashboard.services.assistant.contracts import (
     UpiParty,
 )
 from financial_dashboard.services.assistant.mutations import MutationRejected
+from financial_dashboard.services.categorization.manual import (
+    assign_category_no_commit,
+)
 from financial_dashboard.services.settings import (
+    get_self_identifier_tokens,
     get_telegram_chat_id,
     is_telegram_assistant_enabled,
     is_telegram_configured,
@@ -56,6 +60,8 @@ from financial_dashboard.services.transactions import set_transaction_voided_no_
 logger = logging.getLogger(__name__)
 
 FLAG_AGE = datetime.timedelta(days=60)
+
+ACCOUNT_FIELD = "account (last 4 digits or bank)"
 
 DUPLICATE_WINDOW = datetime.timedelta(days=1)
 
@@ -77,10 +83,32 @@ _BANK_NAMES = {
     "bankofbaroda": "bob",
     "unionbankofindia": "uboi",
 }
+_IFSC_CODE = re.compile(r"\b([A-Z]{4})\b")
+_FULL_IFSC = re.compile(r"\b(?!XXXX)([A-Z]{4})0[A-Z0-9]{6}\b")
+_IFSC_BANKS = frozendict(
+    {
+        "AUBL": "au",
+        "BARB": "bob",
+        "FDRL": "federal",
+        "HDFC": "hdfc",
+        "ICIC": "icici",
+        "IDFB": "idfc",
+        "INDB": "indusind",
+        "KKBK": "kotak",
+        "NESF": "slice",
+        "SBIN": "sbi",
+        "UBIN": "uboi",
+        "UTIB": "axis",
+        "YESB": "yesbank",
+    }
+)
 _KEYED_AMOUNT = re.compile(
     r"(?:(?:is|was)\s+)?(?:₹|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d{1,2})?)"
     r"\s*(?:rupees|rs\.?|inr|/-)?\.?",
     re.IGNORECASE,
+)
+_SELF_WORDS = frozenset(
+    {"self", "self transfer", "self-transfer", "own account", "transfer to self"}
 )
 _RUPEES = re.compile(
     r"(?:₹|\brs\.?|\binr)\s*(\d[\d,]*(?:\.\d{1,2})?)(?![.,]?\d)", re.IGNORECASE
@@ -116,6 +144,13 @@ class ScreenshotCheck(NamedTuple):
     target: ScreenshotTarget
     missing: list[str]
     duplicate: Transaction | None
+
+
+class SelfTransferLeg(NamedTuple):
+    """The read oriented to the leg to record, and the leg already stored."""
+
+    read: ScreenshotTransaction
+    recorded: Transaction | None
 
 
 class ScreenshotReview(NamedTuple):
@@ -161,20 +196,39 @@ def owner_side(
 ) -> Literal["payer", "payee"] | None:
     """Return the receipt block that is the owner.
 
+    When both blocks are the owner, the receipt shows a transfer between the
+    owner's own accounts. Then the direction of the read names the side: the
+    payer for a debit, the payee for a credit.
+
     Args:
         read: The read from the vision model.
         self_tokens: The owner's names and VPAs.
 
     Returns:
-        The payer or the payee. None when both blocks match or neither does.
+        The payer or the payee. None when neither block matches.
     """
-    payer, payee = (
-        _is_owner(read.payer, self_tokens),
-        _is_owner(read.payee, self_tokens),
-    )
-    if payer == payee:
-        return None
-    return "payer" if payer else "payee"
+    match _is_owner(read.payer, self_tokens), _is_owner(read.payee, self_tokens):
+        case True, True:
+            return "payer" if read.direction == "debit" else "payee"
+        case True, False:
+            return "payer"
+        case False, True:
+            return "payee"
+        case _:
+            return None
+
+
+def is_self_transfer(read: ScreenshotTransaction, self_tokens: tuple[str, ...]) -> bool:
+    """Tell if both receipt blocks are the owner.
+
+    Args:
+        read: The read from the vision model.
+        self_tokens: The owner's names and VPAs.
+
+    Returns:
+        True when the From and To blocks both match the owner.
+    """
+    return _is_owner(read.payer, self_tokens) and _is_owner(read.payee, self_tokens)
 
 
 def direction_unclear(
@@ -187,29 +241,30 @@ def direction_unclear(
         self_tokens: The owner's names and VPAs.
 
     Returns:
-        True when both receipt blocks show a party and neither or both of
-        them is the owner. A screen without both blocks keeps the model's
-        direction.
+        True when both receipt blocks show a party and neither of them is
+        the owner. A screen without both blocks keeps the model's direction.
     """
     both = all(p is not None and (p.name or p.vpa) for p in (read.payer, read.payee))
     return both and owner_side(read, self_tokens) is None
 
 
-def direction_word(text: str) -> Literal["credit", "debit"] | None:
+def direction_word(text: str) -> Literal["credit", "debit", "self"] | None:
     """Return the direction that the owner's reply names.
 
     Only a reply part that is the word itself counts, such as "received",
     or a "direction credit" part. A forwarded "Sent you money" and a value
-    such as "name Credit Suisse" do not count.
+    such as "name Credit Suisse" do not count. A reply such as "self
+    transfer" says that both sides are the owner.
 
     Args:
         text: The owner's reply.
 
     Returns:
-        Credit for received or credit. Debit for paid or debit. None when no
-        part names one, or the parts disagree.
+        Credit for received or credit. Debit for paid or debit. Self for a
+        transfer between the owner's own accounts. None when no part names
+        one, or the parts disagree.
     """
-    found: set[str] = set()
+    found: set[Literal["credit", "debit", "self"]] = set()
     for part in re.split(r"[;\n,]", text.lower()):
         key, _, value = part.strip().rstrip(".!").partition(" ")
         word = value.strip() if key == "direction" else part.strip().rstrip(".!")
@@ -217,9 +272,11 @@ def direction_word(text: str) -> Literal["credit", "debit"] | None:
             found.add("credit")
         elif word in ("paid", "debit"):
             found.add("debit")
+        elif word in _SELF_WORDS:
+            found.add("self")
     if len(found) != 1:
         return None
-    return "credit" if "credit" in found else "debit"
+    return found.pop()
 
 
 def orient_read(
@@ -229,8 +286,9 @@ def orient_read(
 ) -> ScreenshotTransaction:
     """Set the direction and the other party of a read from its receipt blocks.
 
-    When exactly one of the From and To blocks is the owner, the read takes
-    the direction, and the other party's name and VPA when shown. A hint that
+    When the owner's block is known, the read takes the direction, and the
+    other party's name and VPA when shown. For a transfer between the owner's
+    own accounts, the other party is the owner's other account. A hint that
     ends in last 4 digits that the other party's block does not show stays.
     Else the owner's bank text, or none, replaces the hint, because a bank
     name alone can be the other party's bank. With none, the review asks for
@@ -264,6 +322,96 @@ def orient_read(
     return ScreenshotTransaction.model_validate(read.model_dump() | updates)
 
 
+async def _self_transfer_leg(
+    session: AsyncSession, read: ScreenshotTransaction
+) -> SelfTransferLeg:
+    """Orient a self transfer read to the leg that no live row holds yet.
+
+    A self transfer has a debit leg on the sending account and a credit leg
+    on the receiving account. Both legs carry the same UTR. Often an alert
+    records one leg and no source records the other. When live rows with the
+    UTR hold exactly one direction, the read turns to the other leg. Else the
+    read stays, and the duplicate check finds any stored leg. The new leg
+    never takes the account of the stored leg. Then the hint becomes the
+    bank of the owner's block on the new leg, else none, and the review
+    asks for the account.
+
+    Args:
+        session: The turn session.
+        read: The fields read off the screenshot.
+
+    Returns:
+        The oriented read, and the stored leg when the read turned.
+    """
+    if (utr := read.utr if reference_form(read.utr) is not None else None) is None:
+        return SelfTransferLeg(read, None)
+    rows = (
+        await session.scalars(
+            select(Transaction)
+            .where(
+                func.upper(Transaction.reference_number) == utr,
+                Transaction.voided.is_(False),
+            )
+            .order_by(Transaction.id)
+        )
+    ).all()
+    if len({row.direction for row in rows}) != 1:
+        return SelfTransferLeg(read, None)
+    recorded = rows[0]
+    missing = "credit" if recorded.direction == "debit" else "debit"
+    turned = orient_read(read, (), side="payee" if missing == "credit" else "payer")
+    if turned.direction != missing:
+        return SelfTransferLeg(read, None)
+    own = turned.payee if missing == "credit" else turned.payer
+    for hint in (turned.account_hint, own.bank_text if own else None):
+        candidate = turned.model_copy(update={"account_hint": hint})
+        target = await _resolve_target(session, candidate)
+        if target.account is None or target.account.id != recorded.account_id:
+            return SelfTransferLeg(candidate, recorded)
+    return SelfTransferLeg(turned.model_copy(update={"account_hint": None}), recorded)
+
+
+async def bare_account_hint(session: AsyncSession, text: str) -> str | None:
+    """Return the account hint that a reply of only a bank or account names.
+
+    The whole reply must be a bank key, with or without the word "bank", a
+    full bank name, a 4-letter IFSC bank code or an account label, such as
+    "SBI", "HDFC Bank", "SBIN" or "Axis savings".
+    A part of a word never counts, so a name such as "Paul" never names the
+    "au" bank.
+
+    Args:
+        session: The turn session.
+        text: The owner's reply.
+
+    Returns:
+        The label and last 4 digits of the one active bank account that the
+        reply names. None when the reply names no account or several.
+    """
+    reply = text.strip().rstrip(".!")
+    if not (normalized := _normalize_hint(reply)):
+        return None
+    keys = {
+        _IFSC_BANKS.get(reply.upper(), normalized),
+        normalized.removesuffix("bank"),
+    }
+    accounts = await session.scalars(
+        select(Account).where(Account.type == "bank_account", Account.active.is_(True))
+    )
+    matched = [
+        account
+        for account in accounts
+        if _normalize_hint(account.bank) in keys
+        or normalized == _normalize_hint(account.label)
+    ]
+    if len(matched) != 1:
+        return None
+    account = matched[0]
+    if last4 := mask_last4(account.account_number):
+        return f"{account.label} {last4}"
+    return account.label
+
+
 def _named_accounts(hint: str, accounts: list[Account]) -> list[Account]:
     """Return the accounts whose bank key or label appears in a hint.
 
@@ -273,11 +421,22 @@ def _named_accounts(hint: str, accounts: list[Account]) -> list[Account]:
 
     Returns:
         Each account whose bank key or label is in the hint. A hint with a
-        full bank name, such as "State Bank of India", selects only the
-        accounts with that exact bank key.
+        4-letter IFSC bank code, such as "SBIN", or a full bank
+        name, such as "State Bank of India", selects only the accounts with
+        that exact bank key.
     """
     raw = _NON_ALPHANUMERIC.sub("", hint.lower())
-    if key := next((k for name, k in _BANK_NAMES.items() if name in raw), None):
+    codes = {
+        _IFSC_BANKS[code]
+        for code in _IFSC_CODE.findall(hint.upper())
+        if code in _IFSC_BANKS
+    }
+    key = (
+        codes.pop()
+        if len(codes) == 1
+        else next((k for name, k in _BANK_NAMES.items() if name in raw), None)
+    )
+    if key:
         return [account for account in accounts if _normalize_hint(account.bank) == key]
     if not (normalized := _normalize_hint(hint)):
         return []
@@ -377,7 +536,8 @@ async def _resolve_target(
     new row is saved. Else the bank name or the
     account label must name one active bank account. A card read resolves by
     the card digits, else by the bank name or the account label. An ambiguous
-    name lists its choices.
+    name lists its choices. A full IFSC code counts as its 4-letter bank
+    code, so its branch digits never match an account.
 
     Args:
         session: The turn session.
@@ -387,7 +547,7 @@ async def _resolve_target(
         The account and card of the read. A field is None when it does not
         resolve to one row.
     """
-    hint = read.account_hint or ""
+    hint = _FULL_IFSC.sub(r"\1", read.account_hint or "")
     if read.channel == "card":
         return await _resolve_credit_card_target(session, hint)
     accounts = list(
@@ -547,7 +707,7 @@ async def _check(
         # a new row only on a bank account.
         checks.append(
             (
-                "account (last 4 digits or bank)",
+                ACCOUNT_FIELD,
                 target.account is not None and target.card is None,
             )
         )
@@ -618,13 +778,14 @@ async def review_screenshot(
     notes: list[str],
     direction_settled: bool,
     owner_direction: Literal["credit", "debit"] | None = None,
+    self_transfer: bool = False,
 ) -> ScreenshotReview:
     """Check one screenshot read and word the question for the owner.
 
     A screenshot that does not show a success or a reversal is refused. A
     duplicate offers to attach the screenshot to the stored row. A read with
     a missing field names each field and asks for it. Otherwise the question
-    asks to save.
+    asks to save. A self transfer with one leg stored records the other leg.
 
     Args:
         session: The turn session.
@@ -634,6 +795,8 @@ async def review_screenshot(
         notes: The owner's caption and replies, oldest first.
         direction_settled: False when the owner must say received or paid.
         owner_direction: What the owner said, kept for the next read.
+        self_transfer: True when the money moved between the owner's own
+            accounts.
 
     Returns:
         The reply text, and the action that a Yes applies. The action is
@@ -648,14 +811,30 @@ async def review_screenshot(
             "I saved nothing.",
             None,
         )
+    recorded = None
+    if self_transfer:
+        read, recorded = await _self_transfer_leg(session, read)
     target, missing, duplicate = await _check(session, read, not_duplicates)
     if not direction_settled:
         missing.append("received or paid")
+        duplicate = None
+    if recorded is not None and duplicate is not None and duplicate.id == recorded.id:
         duplicate = None
     lines = [
         _headline(read),
         _detail_line(read, target),
     ]
+    if recorded is not None and duplicate is None:
+        lines.append(
+            f"Self transfer: the {recorded.direction} is already #{recorded.id}. "
+            f"I will record the {read.direction}"
+            + (
+                f" on {target.account.label}."
+                if target.account is not None
+                else ". Which account "
+                + ("received it?" if read.direction == "credit" else "sent it?")
+            )
+        )
     if (
         duplicate is not None
         and read.utr
@@ -721,6 +900,7 @@ async def review_screenshot(
             notes=notes,
             direction_settled=direction_settled,
             owner_direction=owner_direction,
+            self_transfer=self_transfer,
         ),
     )
 
@@ -891,6 +1071,10 @@ async def save_screenshot_transaction(
     )
     session.add(txn)
     await session.flush()
+    if action.self_transfer or is_self_transfer(read, get_self_identifier_tokens()):
+        await assign_category_no_commit(
+            session, txn.id, "self_transfer", actor="screenshot"
+        )
     await attach_downloaded_attachment(
         session, txn.id, stored, interaction_id=interaction_id
     )
