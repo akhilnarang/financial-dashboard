@@ -784,13 +784,16 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert "Save this as a provisional transaction?" in proposed.text
     assert "from ALEX S SMITH" in proposed.text
 
-    # A reread that matches the owner on both blocks asks again.
+    # A reread that shows the owner on both blocks is a self transfer. The
+    # direction of the read holds, and the owner is not asked.
     both = current.model_copy(
         update={"utr": UTR, "payer": UpiParty(name="JANE DOE", vpa="test0000@upi")}
     )
     create.return_value.choices[0].message.content = both.model_dump_json()
-    reasked = await _reply(shot, asked.conversation_id, "ok")
-    assert "Did you receive or pay this?" in reasked.text
+    own = await _reply(shot, asked.conversation_id, "ok")
+    assert "received ₹1,234.00 from" in own.text
+    assert "Did you receive or pay this?" not in own.text
+    assert "Save this as a provisional transaction?" in own.text
 
     # A reread that flips the receipt back to the owner's payment is
     # oriented again by the receipt blocks.
@@ -820,9 +823,9 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         datetime.time(18, 16),
     )
 
-    # A token on both sides decides nothing: Yes waits for received or paid,
-    # and the answer holds when a later reread says debit.
-    settings_service._cache["categorization.self_identifiers"] = "DOE, SMITH"
+    # When neither block is the owner, Yes waits for received or paid, and
+    # the answer holds when a later reread says debit.
+    settings_service._cache["categorization.self_identifiers"] = "CHRIS TEST"
     async with shot.maker() as s:
         s.add(
             Account(
@@ -863,7 +866,14 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         blocks = {"payer": second.payer, "payee": second.payee}
         match notes[-1]:
             case "utr 210987654321":
-                return current.model_copy(update={"payer": None, "payee": None})
+                return current.model_copy(
+                    update={
+                        "payer": None,
+                        "payee": None,
+                        "counterparty": None,
+                        "vpa": None,
+                    }
+                )
             case "name Paid Ventures":
                 return current.model_copy(
                     update=blocks | {"direction": "debit", "account_hint": "HDFC Bank"}
@@ -875,9 +885,11 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     with pytest.raises(MutationRejected, match="received or paid"):
         await _yes(shot, unclear.conversation_id)
     assert len(await _rows(shot)) == 1
-    # A reread without the blocks does not settle the open question.
+    # A reread without the blocks does not settle the open question, and the
+    # name it drops stays.
     still = await _reply(shot, unclear.conversation_id, "utr 210987654321")
     assert "Did you receive or pay this?" in still.text
+    assert "paid ₹777.00 to JANE DOE (jane@testyes)" in still.text
     answered = await _reply(shot, unclear.conversation_id, "received")
     assert "received ₹777.00 from ALEX SMITH (test0000@upi)" in answered.text
     # The owner's block shows no bank, so the sender's bank never stays.
@@ -921,6 +933,16 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         row = await s.get(Transaction, voided.id)
     assert row is not None
     assert (row.voided, row.attachment_path) == (True, None)
+    # A "self transfer" reply keeps the direction of the read, so the
+    # screenshot goes to the stored row.
+    own = await _reply(shot, held.conversation_id, "Self transfer")
+    assert "Did you receive or pay this?" not in own.text
+    assert f"This is recorded as #{voided.id}, which is voided." in own.text
+    await _yes(shot, held.conversation_id)
+    async with shot.maker() as s:
+        row = await s.get(Transaction, voided.id)
+    assert row is not None
+    assert (row.voided, row.attachment_path) == (False, "shot.png")
 
 
 @pytest.mark.parametrize(

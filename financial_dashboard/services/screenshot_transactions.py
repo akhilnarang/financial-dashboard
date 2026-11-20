@@ -82,6 +82,9 @@ _KEYED_AMOUNT = re.compile(
     r"\s*(?:rupees|rs\.?|inr|/-)?\.?",
     re.IGNORECASE,
 )
+_SELF_WORDS = frozenset(
+    {"self", "self transfer", "self-transfer", "own account", "transfer to self"}
+)
 _RUPEES = re.compile(
     r"(?:₹|\brs\.?|\binr)\s*(\d[\d,]*(?:\.\d{1,2})?)(?![.,]?\d)", re.IGNORECASE
 )
@@ -161,20 +164,26 @@ def owner_side(
 ) -> Literal["payer", "payee"] | None:
     """Return the receipt block that is the owner.
 
+    When both blocks are the owner, the receipt shows a transfer between the
+    owner's own accounts. Then the direction of the read names the side: the
+    payer for a debit, the payee for a credit.
+
     Args:
         read: The read from the vision model.
         self_tokens: The owner's names and VPAs.
 
     Returns:
-        The payer or the payee. None when both blocks match or neither does.
+        The payer or the payee. None when neither block matches.
     """
-    payer, payee = (
-        _is_owner(read.payer, self_tokens),
-        _is_owner(read.payee, self_tokens),
-    )
-    if payer == payee:
-        return None
-    return "payer" if payer else "payee"
+    match _is_owner(read.payer, self_tokens), _is_owner(read.payee, self_tokens):
+        case True, True:
+            return "payer" if read.direction == "debit" else "payee"
+        case True, False:
+            return "payer"
+        case False, True:
+            return "payee"
+        case _:
+            return None
 
 
 def direction_unclear(
@@ -187,29 +196,30 @@ def direction_unclear(
         self_tokens: The owner's names and VPAs.
 
     Returns:
-        True when both receipt blocks show a party and neither or both of
-        them is the owner. A screen without both blocks keeps the model's
-        direction.
+        True when both receipt blocks show a party and neither of them is
+        the owner. A screen without both blocks keeps the model's direction.
     """
     both = all(p is not None and (p.name or p.vpa) for p in (read.payer, read.payee))
     return both and owner_side(read, self_tokens) is None
 
 
-def direction_word(text: str) -> Literal["credit", "debit"] | None:
+def direction_word(text: str) -> Literal["credit", "debit", "self"] | None:
     """Return the direction that the owner's reply names.
 
     Only a reply part that is the word itself counts, such as "received",
     or a "direction credit" part. A forwarded "Sent you money" and a value
-    such as "name Credit Suisse" do not count.
+    such as "name Credit Suisse" do not count. A reply such as "self
+    transfer" says that both sides are the owner.
 
     Args:
         text: The owner's reply.
 
     Returns:
-        Credit for received or credit. Debit for paid or debit. None when no
-        part names one, or the parts disagree.
+        Credit for received or credit. Debit for paid or debit. Self for a
+        transfer between the owner's own accounts. None when no part names
+        one, or the parts disagree.
     """
-    found: set[str] = set()
+    found: set[Literal["credit", "debit", "self"]] = set()
     for part in re.split(r"[;\n,]", text.lower()):
         key, _, value = part.strip().rstrip(".!").partition(" ")
         word = value.strip() if key == "direction" else part.strip().rstrip(".!")
@@ -217,9 +227,11 @@ def direction_word(text: str) -> Literal["credit", "debit"] | None:
             found.add("credit")
         elif word in ("paid", "debit"):
             found.add("debit")
+        elif word in _SELF_WORDS:
+            found.add("self")
     if len(found) != 1:
         return None
-    return "credit" if "credit" in found else "debit"
+    return found.pop()
 
 
 def orient_read(
@@ -229,8 +241,9 @@ def orient_read(
 ) -> ScreenshotTransaction:
     """Set the direction and the other party of a read from its receipt blocks.
 
-    When exactly one of the From and To blocks is the owner, the read takes
-    the direction, and the other party's name and VPA when shown. A hint that
+    When the owner's block is known, the read takes the direction, and the
+    other party's name and VPA when shown. For a transfer between the owner's
+    own accounts, the other party is the owner's other account. A hint that
     ends in last 4 digits that the other party's block does not show stays.
     Else the owner's bank text, or none, replaces the hint, because a bank
     name alone can be the other party's bank. With none, the review asks for

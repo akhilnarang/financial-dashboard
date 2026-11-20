@@ -162,6 +162,7 @@ TURN_TIMEOUT_SECONDS = 180
 # Each candidate row gets a button, so the question stays short.
 MAX_FOUND_CANDIDATES = 3
 _CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
+_REREAD_KEPT_FIELDS = ("counterparty", "vpa", "utr", "amount", "occurred_at")
 _SECRET_TRACEBACK_RE = re.compile(
     r"(https?://api\.telegram\.org/(?:file/)?bot)[^/\s'\"]+|(Bearer\s+)[^\s'\"]+|(\bsk-[A-Za-z0-9_-]{8,})"
 )
@@ -3072,6 +3073,10 @@ async def _screenshot_reply_result(
 ) -> OrchestrationResult:
     """Apply a user reply to a pending screenshot draft and build the result.
 
+    The screenshot is read again with the reply. A value that the new read
+    loses keeps the previous value, and a typed correction still replaces it.
+    A "self transfer" reply keeps the direction of the read.
+
     Args:
         session: The turn session.
         draft: The stored pending screenshot confirmation.
@@ -3110,6 +3115,13 @@ async def _screenshot_reply_result(
                 notes=notes,
                 current=draft.read,
             )
+            lost = {
+                field: value
+                for field in _REREAD_KEPT_FIELDS
+                if (value := getattr(draft.read, field)) is not None
+                and getattr(reread, field) is None
+            }
+            reread = ScreenshotTransaction.model_validate(reread.model_dump() | lost)
             oriented = orient_read(reread, tokens)
             corrected = (
                 reread
@@ -3120,7 +3132,10 @@ async def _screenshot_reply_result(
             )
         except OSError, ValueError, httpx.HTTPError, OpenAIError:
             logger.exception("Screenshot reply %s was not read", interaction_id)
-    if said := direction_word(user_text):
+    said = direction_word(user_text)
+    if said == "self":
+        said = corrected.direction
+    if said is not None:
         corrected = orient_read(
             corrected, tokens, side="payee" if said == "credit" else "payer"
         )
