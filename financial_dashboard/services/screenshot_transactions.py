@@ -78,7 +78,7 @@ _BANK_NAMES = {
     "unionbankofindia": "uboi",
 }
 _IFSC_CODE = re.compile(r"\b([A-Z]{4})\b")
-_FULL_IFSC = re.compile(r"\b(?!XXXX)([A-Za-z]{4})0[A-Za-z0-9]{6}\b")
+_FULL_IFSC = re.compile(r"\b(?!XXXX)([A-Z]{4})0[A-Z0-9]{6}\b")
 _IFSC_BANKS = frozendict(
     {
         "AUBL": "au",
