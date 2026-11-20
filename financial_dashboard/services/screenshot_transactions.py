@@ -77,6 +77,24 @@ _BANK_NAMES = {
     "bankofbaroda": "bob",
     "unionbankofindia": "uboi",
 }
+_IFSC_CODE = re.compile(r"\b([A-Z]{4})(?:0[A-Z0-9]{6})?\b")
+_IFSC_BANKS = frozendict(
+    {
+        "AUBL": "au",
+        "BARB": "bob",
+        "FDRL": "federal",
+        "HDFC": "hdfc",
+        "ICIC": "icici",
+        "IDFB": "idfc",
+        "INDB": "indusind",
+        "KKBK": "kotak",
+        "NESF": "slice",
+        "SBIN": "sbi",
+        "UBIN": "uboi",
+        "UTIB": "axis",
+        "YESB": "yesbank",
+    }
+)
 _KEYED_AMOUNT = re.compile(
     r"(?:(?:is|was)\s+)?(?:₹|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d{1,2})?)"
     r"\s*(?:rupees|rs\.?|inr|/-)?\.?",
@@ -306,7 +324,10 @@ async def _self_transfer_leg(
     on the receiving account. Both legs carry the same UTR. Often an alert
     records one leg and no source records the other. When live rows with the
     UTR hold exactly one direction, the read turns to the other leg. Else the
-    read stays, and the duplicate check finds any stored leg.
+    read stays, and the duplicate check finds any stored leg. The new leg
+    never takes the account of the stored leg. Then the hint becomes the
+    bank of the owner's block on the new leg, else none, and the review
+    asks for the account.
 
     Args:
         session: The turn session.
@@ -334,7 +355,13 @@ async def _self_transfer_leg(
     turned = orient_read(read, (), side="payee" if missing == "credit" else "payer")
     if turned.direction != missing:
         return SelfTransferLeg(read, None)
-    return SelfTransferLeg(turned, recorded)
+    own = turned.payee if missing == "credit" else turned.payer
+    for hint in (turned.account_hint, own.bank_text if own else None):
+        candidate = turned.model_copy(update={"account_hint": hint})
+        target = await _resolve_target(session, candidate)
+        if target.account is None or target.account.id != recorded.account_id:
+            return SelfTransferLeg(candidate, recorded)
+    return SelfTransferLeg(turned.model_copy(update={"account_hint": None}), recorded)
 
 
 def _named_accounts(hint: str, accounts: list[Account]) -> list[Account]:
@@ -345,12 +372,23 @@ def _named_accounts(hint: str, accounts: list[Account]) -> list[Account]:
         accounts: The accounts to choose from.
 
     Returns:
-        Each account whose bank key or label is in the hint. A hint with a
-        full bank name, such as "State Bank of India", selects only the
-        accounts with that exact bank key.
+        Each account whose bank key or label is in the hint. A hint with an
+        IFSC code or its 4-letter bank prefix, such as "SBIN", or a full bank
+        name, such as "State Bank of India", selects only the accounts with
+        that exact bank key.
     """
     raw = _NON_ALPHANUMERIC.sub("", hint.lower())
-    if key := next((k for name, k in _BANK_NAMES.items() if name in raw), None):
+    codes = {
+        _IFSC_BANKS[code]
+        for code in _IFSC_CODE.findall(hint.upper())
+        if code in _IFSC_BANKS
+    }
+    key = (
+        codes.pop()
+        if len(codes) == 1
+        else next((k for name, k in _BANK_NAMES.items() if name in raw), None)
+    )
+    if key:
         return [account for account in accounts if _normalize_hint(account.bank) == key]
     if not (normalized := _normalize_hint(hint)):
         return []
@@ -740,11 +778,11 @@ async def review_screenshot(
     if recorded is not None and duplicate is None:
         lines.append(
             f"Self transfer: the {recorded.direction} is already #{recorded.id}. "
-            f"I will record the {read.direction}."
+            f"I will record the {read.direction}"
             + (
-                ""
+                f" on {target.account.label}."
                 if target.account is not None
-                else " Which account "
+                else ". Which account "
                 + ("received it?" if read.direction == "credit" else "sent it?")
             )
         )

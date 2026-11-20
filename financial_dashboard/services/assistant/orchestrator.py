@@ -3168,7 +3168,13 @@ async def _screenshot_reply_result(
         self_transfer=word == "self"
         or (
             word is None
-            and (draft.self_transfer or is_self_transfer(corrected, tokens))
+            and (
+                draft.self_transfer
+                or (
+                    draft.owner_direction is None
+                    and is_self_transfer(corrected, tokens)
+                )
+            )
         ),
     )
     reviewed = review.action.read if review.action is not None else corrected

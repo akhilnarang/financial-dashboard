@@ -945,8 +945,8 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     assert (row.voided, row.attachment_path) == (False, "shot.png")
 
     # A self transfer whose debit leg is stored records the missing credit
-    # leg on the account that the owner names. A new read of the screen as
-    # a debit does not undo that.
+    # leg on the account that the owner names, never on the debit's account.
+    # A new read of the screen as a debit does not undo that.
     settings_service._cache["categorization.self_identifiers"] = "JANE DOE"
     async with shot.maker() as s:
         debit = Transaction(
@@ -968,7 +968,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
             "counterparty": "JANE DOE",
             "vpa": None,
             "account_hint": "HDFC 5555",
-            "payer": UpiParty(name="JANE DOE", bank_text="HDFC XXXXXX5555"),
+            "payer": UpiParty(name="JANE DOE", bank_text="HDFC"),
             "payee": UpiParty(name="JANE DOE"),
         }
     )
@@ -1008,6 +1008,42 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     # With both legs stored, the same screenshot only attaches to its leg.
     both_legs = await _send(shot, monkeypatch, own_screen)
     assert f"This is already recorded as #{debit.id}." in both_legs.text
+
+    # A UPI narration's bank code names the receiving account, so the credit
+    # leg needs no question.
+    async with shot.maker() as s:
+        s.add_all(
+            [
+                Account(
+                    id=4,
+                    bank="axis",
+                    label="Axis savings",
+                    type="bank_account",
+                    account_number="XXXXXX1111",
+                ),
+                Transaction(
+                    bank="hdfc",
+                    account_id=3,
+                    email_type="hdfc_upi_alert",
+                    direction="debit",
+                    amount=Decimal("700.00"),
+                    transaction_date=paid_at.date(),
+                    reference_number="510987654321",
+                    source="sms",
+                ),
+            ]
+        )
+        await s.commit()
+    coded = own_screen.model_copy(
+        update={
+            "utr": "510987654321",
+            "amount": Decimal("700.00"),
+            "payee": UpiParty(name="JANE DOE", bank_text="UTIB"),
+        }
+    )
+    known = await _send(shot, monkeypatch, coded)
+    assert "I will record the credit on Axis savings." in known.text
+    assert "Save this as a provisional transaction?" in known.text
 
 
 @pytest.mark.parametrize(
