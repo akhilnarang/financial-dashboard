@@ -1009,8 +1009,8 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     both_legs = await _send(shot, monkeypatch, own_screen)
     assert f"This is already recorded as #{debit.id}." in both_legs.text
 
-    # A UPI narration's bank code names the receiving account, so the credit
-    # leg needs no question.
+    # A UPI narration's IFSC names the receiving account, so the credit leg
+    # needs no question. Its branch digits are not account digits.
     async with shot.maker() as s:
         s.add_all(
             [
@@ -1038,7 +1038,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         update={
             "utr": "510987654321",
             "amount": Decimal("700.00"),
-            "payee": UpiParty(name="JANE DOE", bank_text="UTIB"),
+            "payee": UpiParty(name="JANE DOE", bank_text="UTIB0004321"),
         }
     )
     known = await _send(shot, monkeypatch, coded)

@@ -77,7 +77,8 @@ _BANK_NAMES = {
     "bankofbaroda": "bob",
     "unionbankofindia": "uboi",
 }
-_IFSC_CODE = re.compile(r"\b([A-Z]{4})(?:0[A-Z0-9]{6})?\b")
+_IFSC_CODE = re.compile(r"\b([A-Z]{4})\b")
+_FULL_IFSC = re.compile(r"\b(?!XXXX)([A-Za-z]{4})0[A-Za-z0-9]{6}\b")
 _IFSC_BANKS = frozendict(
     {
         "AUBL": "au",
@@ -372,8 +373,8 @@ def _named_accounts(hint: str, accounts: list[Account]) -> list[Account]:
         accounts: The accounts to choose from.
 
     Returns:
-        Each account whose bank key or label is in the hint. A hint with an
-        IFSC code or its 4-letter bank prefix, such as "SBIN", or a full bank
+        Each account whose bank key or label is in the hint. A hint with a
+        4-letter IFSC bank code, such as "SBIN", or a full bank
         name, such as "State Bank of India", selects only the accounts with
         that exact bank key.
     """
@@ -488,7 +489,8 @@ async def _resolve_target(
     new row is saved. Else the bank name or the
     account label must name one active bank account. A card read resolves by
     the card digits, else by the bank name or the account label. An ambiguous
-    name lists its choices.
+    name lists its choices. A full IFSC code counts as its 4-letter bank
+    code, so its branch digits never match an account.
 
     Args:
         session: The turn session.
@@ -498,7 +500,7 @@ async def _resolve_target(
         The account and card of the read. A field is None when it does not
         resolve to one row.
     """
-    hint = read.account_hint or ""
+    hint = _FULL_IFSC.sub(r"\1", read.account_hint or "")
     if read.channel == "card":
         return await _resolve_credit_card_target(session, hint)
     accounts = list(
