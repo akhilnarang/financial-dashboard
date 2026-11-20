@@ -142,8 +142,10 @@ from financial_dashboard.services.categorization.decision_lifecycle import (
 from financial_dashboard.services.categorization.normalize import normalize_text
 from financial_dashboard.services.categorization.slugs import MANUAL_ONLY_SLUGS
 from financial_dashboard.services.screenshot_transactions import (
+    ACCOUNT_FIELD,
     ScreenshotReview,
     apply_corrections,
+    bare_account_hint,
     direction_unclear,
     direction_word,
     is_self_transfer,
@@ -3077,7 +3079,9 @@ async def _screenshot_reply_result(
     The screenshot is read again with the reply. A value that the new read
     loses keeps the previous value, and a typed correction still replaces it.
     A "self transfer" reply keeps the direction of the read, and marks the
-    draft as a self transfer.
+    draft as a self transfer until a "received" or "paid" reply. Without
+    such a reply, the receipt blocks of each read decide. While the account is missing, a reply of only
+    a bank or an account label names the account.
 
     Args:
         session: The turn session.
@@ -3148,6 +3152,10 @@ async def _screenshot_reply_result(
             )
         )
     corrected = apply_corrections(corrected, user_text)
+    if ACCOUNT_FIELD in draft.missing and (
+        hint := await bare_account_hint(session, user_text)
+    ):
+        corrected = corrected.model_copy(update={"account_hint": hint})
     settled = (
         said is not None
         or owner_side(corrected, tokens) is not None
@@ -3169,16 +3177,29 @@ async def _screenshot_reply_result(
         or (
             word is None
             and (
-                draft.self_transfer
-                or (
-                    draft.owner_direction is None
-                    and is_self_transfer(corrected, tokens)
-                )
+                is_self_transfer(corrected, tokens)
+                if draft.owner_direction is None
+                else draft.self_transfer
             )
         ),
     )
-    reviewed = review.action.read if review.action is not None else corrected
-    if reviewed == draft.read and not is_new:
+    before = (
+        draft.read,
+        draft.direction_settled,
+        draft.owner_direction,
+        draft.self_transfer,
+    )
+    after = (
+        (
+            review.action.read,
+            review.action.direction_settled,
+            review.action.owner_direction,
+            review.action.self_transfer,
+        )
+        if review.action is not None
+        else (corrected, *before[1:])
+    )
+    if after == before and not is_new:
         review = review._replace(
             text=f"I found no new value in your reply.\n{review.text}"
         )

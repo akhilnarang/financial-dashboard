@@ -21,6 +21,7 @@ from financial_dashboard.db.models import (
     Account,
     AuditInteraction,
     Card,
+    Category,
     Setting,
     TelegramConversation,
     TelegramOutboundDelivery,
@@ -112,6 +113,7 @@ async def shot(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIterator
         s.add_all(
             [
                 Setting(key="telegram.chat_id", value=str(CHAT)),
+                Category(slug="self_transfer", active=True),
                 Account(
                     id=1,
                     bank="sbi",
@@ -812,6 +814,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         row.raw_description,
         row.transaction_date,
         row.transaction_time,
+        row.category,
     ) == (
         1,
         "credit",
@@ -821,6 +824,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         "test0000@upi",
         paid_at.date(),
         datetime.time(18, 16),
+        None,
     )
 
     # When neither block is the owner, Yes waits for received or paid, and
@@ -933,6 +937,10 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         row = await s.get(Transaction, voided.id)
     assert row is not None
     assert (row.voided, row.attachment_path) == (True, None)
+    # An answer that changes only the open question is a new value.
+    paid = await _reply(shot, held.conversation_id, "paid")
+    assert "I found no new value" not in paid.text
+    assert f"This is recorded as #{voided.id}, which is voided." in paid.text
     # A "self transfer" reply keeps the direction of the read, so the
     # screenshot goes to the stored row.
     own = await _reply(shot, held.conversation_id, "Self transfer")
@@ -994,16 +1002,20 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
         return own_screen
 
     monkeypatch.setattr(openai_provider, "read_screenshot", screen_again)
-    named = await _reply(shot, leg.conversation_id, "account 4321")
+    # A reply that only contains a bank name does not name an account.
+    card = await _reply(shot, leg.conversation_id, "SBI card")
+    assert "Which account received it?" in card.text
+    named = await _reply(shot, leg.conversation_id, "SBI")
     assert "received ₹600.00 from JANE DOE" in named.text
     assert "Save this as a provisional transaction?" in named.text
     assert (await _yes(shot, leg.conversation_id)).startswith("Saved #")
     legs = [r for r in await _rows(shot) if r.reference_number == "410987654321"]
     assert [
-        (r.id, r.account_id, r.direction, r.amount, r.attachment_path) for r in legs
+        (r.id, r.account_id, r.direction, r.amount, r.attachment_path, r.category)
+        for r in legs
     ] == [
-        (debit.id, 3, "debit", Decimal("600.00"), None),
-        (legs[1].id, 1, "credit", Decimal("600.00"), "shot.png"),
+        (debit.id, 3, "debit", Decimal("600.00"), None, None),
+        (legs[1].id, 1, "credit", Decimal("600.00"), "shot.png", "self_transfer"),
     ]
     # With both legs stored, the same screenshot only attaches to its leg.
     both_legs = await _send(shot, monkeypatch, own_screen)
@@ -1044,6 +1056,9 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     known = await _send(shot, monkeypatch, coded)
     assert "I will record the credit on Axis savings." in known.text
     assert "Save this as a provisional transaction?" in known.text
+    # A bare bank reply names the account only while the account is missing.
+    kept = await _reply(shot, known.conversation_id, "SBI")
+    assert "I will record the credit on Axis savings." in kept.text
 
 
 @pytest.mark.parametrize(

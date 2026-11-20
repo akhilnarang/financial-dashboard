@@ -41,7 +41,11 @@ from financial_dashboard.services.assistant.contracts import (
     UpiParty,
 )
 from financial_dashboard.services.assistant.mutations import MutationRejected
+from financial_dashboard.services.categorization.manual import (
+    assign_category_no_commit,
+)
 from financial_dashboard.services.settings import (
+    get_self_identifier_tokens,
     get_telegram_chat_id,
     is_telegram_assistant_enabled,
     is_telegram_configured,
@@ -56,6 +60,8 @@ from financial_dashboard.services.transactions import set_transaction_voided_no_
 logger = logging.getLogger(__name__)
 
 FLAG_AGE = datetime.timedelta(days=60)
+
+ACCOUNT_FIELD = "account (last 4 digits or bank)"
 
 DUPLICATE_WINDOW = datetime.timedelta(days=1)
 
@@ -365,6 +371,43 @@ async def _self_transfer_leg(
     return SelfTransferLeg(turned.model_copy(update={"account_hint": None}), recorded)
 
 
+async def bare_account_hint(session: AsyncSession, text: str) -> str | None:
+    """Return the account hint that a reply of only a bank or account names.
+
+    The whole reply must be a bank key, a full bank name, a 4-letter IFSC
+    bank code or an account label, such as "SBI", "SBIN" or "Axis savings".
+    A part of a word never counts, so a name such as "Paul" never names the
+    "au" bank.
+
+    Args:
+        session: The turn session.
+        text: The owner's reply.
+
+    Returns:
+        The label and last 4 digits of the one active bank account that the
+        reply names. None when the reply names no account or several.
+    """
+    reply = text.strip().rstrip(".!")
+    if not (normalized := _normalize_hint(reply)):
+        return None
+    key = _IFSC_BANKS.get(reply.upper(), normalized)
+    accounts = await session.scalars(
+        select(Account).where(Account.type == "bank_account", Account.active.is_(True))
+    )
+    matched = [
+        account
+        for account in accounts
+        if key == _normalize_hint(account.bank)
+        or normalized == _normalize_hint(account.label)
+    ]
+    if len(matched) != 1:
+        return None
+    account = matched[0]
+    if last4 := mask_last4(account.account_number):
+        return f"{account.label} {last4}"
+    return account.label
+
+
 def _named_accounts(hint: str, accounts: list[Account]) -> list[Account]:
     """Return the accounts whose bank key or label appears in a hint.
 
@@ -660,7 +703,7 @@ async def _check(
         # a new row only on a bank account.
         checks.append(
             (
-                "account (last 4 digits or bank)",
+                ACCOUNT_FIELD,
                 target.account is not None and target.card is None,
             )
         )
@@ -1024,6 +1067,10 @@ async def save_screenshot_transaction(
     )
     session.add(txn)
     await session.flush()
+    if action.self_transfer or is_self_transfer(read, get_self_identifier_tokens()):
+        await assign_category_no_commit(
+            session, txn.id, "self_transfer", actor="screenshot"
+        )
     await attach_downloaded_attachment(
         session, txn.id, stored, interaction_id=interaction_id
     )
