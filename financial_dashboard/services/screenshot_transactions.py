@@ -374,8 +374,9 @@ async def _self_transfer_leg(
 async def bare_account_hint(session: AsyncSession, text: str) -> str | None:
     """Return the account hint that a reply of only a bank or account names.
 
-    The whole reply must be a bank key, a full bank name, a 4-letter IFSC
-    bank code or an account label, such as "SBI", "SBIN" or "Axis savings".
+    The whole reply must be a bank key, with or without the word "bank", a
+    full bank name, a 4-letter IFSC bank code or an account label, such as
+    "SBI", "HDFC Bank", "SBIN" or "Axis savings".
     A part of a word never counts, so a name such as "Paul" never names the
     "au" bank.
 
@@ -390,14 +391,17 @@ async def bare_account_hint(session: AsyncSession, text: str) -> str | None:
     reply = text.strip().rstrip(".!")
     if not (normalized := _normalize_hint(reply)):
         return None
-    key = _IFSC_BANKS.get(reply.upper(), normalized)
+    keys = {
+        _IFSC_BANKS.get(reply.upper(), normalized),
+        normalized.removesuffix("bank"),
+    }
     accounts = await session.scalars(
         select(Account).where(Account.type == "bank_account", Account.active.is_(True))
     )
     matched = [
         account
         for account in accounts
-        if key == _normalize_hint(account.bank)
+        if _normalize_hint(account.bank) in keys
         or normalized == _normalize_hint(account.label)
     ]
     if len(matched) != 1:

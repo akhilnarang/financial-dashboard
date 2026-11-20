@@ -1005,7 +1005,7 @@ async def test_payee_receipt_saves_a_credit_on_the_named_bank(
     # A reply that only contains a bank name does not name an account.
     card = await _reply(shot, leg.conversation_id, "SBI card")
     assert "Which account received it?" in card.text
-    named = await _reply(shot, leg.conversation_id, "SBI")
+    named = await _reply(shot, leg.conversation_id, "SBI Bank")
     assert "received ₹600.00 from JANE DOE" in named.text
     assert "Save this as a provisional transaction?" in named.text
     assert (await _yes(shot, leg.conversation_id)).startswith("Saved #")
