@@ -9,6 +9,7 @@ import asyncio
 import html
 import logging
 import re
+import time
 from collections.abc import Iterable
 from decimal import Decimal
 from typing import Literal, NamedTuple, TypedDict
@@ -68,9 +69,34 @@ class SettlementPrompt(TypedDict):
     candidates: list[PromptCandidate]
 
 
+class _SendPacer:
+    """Start bot sends at least one interval apart, first come first served.
+
+    The lock queues callers in arrival order. The holder sleeps until one
+    interval has passed since the last send started, so a burst drains as a
+    queue.
+    """
+
+    def __init__(self, interval_s: float) -> None:
+        self._interval_s = interval_s
+        self._lock = asyncio.Lock()
+        self._last_start = float("-inf")
+
+    async def wait_turn(self) -> None:
+        """Wait in line, then until one interval after the last start."""
+        async with self._lock:
+            while (now := time.monotonic()) < (
+                ready := self._last_start + self._interval_s
+            ):
+                await asyncio.sleep(ready - now)
+            self._last_start = now
+
+
 logger = logging.getLogger(__name__)
 
 tg_app: Application | None = None
+
+_send_pacer = _SendPacer(interval_s=1.0)
 
 _SMS_DUPLICATE_HEADER = re.compile(
     r"^\s*⚠️\s+(?:<b>)?[^<\n]+?(?:</b>)?\s+"
@@ -219,6 +245,7 @@ async def _send_with_retry(
 ):
     """Send a message with retries on transient network errors.
 
+    - Sends start at most once per second, in the order callers ask.
     - Retries up to `attempts` total tries on `telegram.error.NetworkError`
       (which includes `TimedOut`), with exponential backoff (1s, 2s, 4s, ...).
     - On `RetryAfter`, sleeps the bot's recommended duration plus a small
@@ -228,6 +255,7 @@ async def _send_with_retry(
     """
     network_attempt = 0
     while True:
+        await _send_pacer.wait_turn()
         try:
             kwargs = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
             if reply_markup is not None:
@@ -974,11 +1002,11 @@ async def send_sms_duplicate_disambiguation_prompt(payload: dict, chat_id: int) 
     else:
         lines.append("Possible duplicate. Resolve it on the web.")
     # TODO: Persist duplicate prompts in a transactional outbox before dispatch.
-    await app.bot.send_message(
+    await _send_with_retry(
+        app,
         chat_id=chat_id,
         text="\n".join(lines),
         reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-        parse_mode="HTML",
     )
 
 
@@ -1178,11 +1206,11 @@ async def send_settlement_prompt(payload: SettlementPrompt, chat_id: int) -> Non
     lines.append("The statement row is in the ledger as its own purchase.")
     lines.append("Merge folds it into the stored row, which takes the billed amount.")
 
-    await tg_app.bot.send_message(
+    await _send_with_retry(
+        tg_app,
         chat_id=chat_id,
         text="\n".join(lines),
         reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="HTML",
     )
 
 
@@ -1268,11 +1296,11 @@ async def send_disambiguation_prompt(payload: dict, chat_id: int) -> None:
     buttons.append(
         [InlineKeyboardButton("Skip", callback_data=f"cc_pay_pick:{txn_id}:skip")]
     )
-    await app.bot.send_message(
+    await _send_with_retry(
+        app,
         chat_id=chat_id,
         text=text,
         reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="HTML",
     )
 
 
