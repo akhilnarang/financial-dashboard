@@ -1,5 +1,6 @@
 """Tests for Telegram notifications, prompts, callbacks, and send retries."""
 
+import asyncio
 from contextlib import contextmanager
 from datetime import date, time
 from decimal import Decimal
@@ -15,8 +16,10 @@ from financial_dashboard.db import TelegramMessageContext
 from financial_dashboard.services.sms_duplicate_resolution import (
     SmsDuplicateResolutionResult,
 )
+from financial_dashboard.services import telegram
 from financial_dashboard.services.telegram import (
     _handle_callback,
+    _SendPacer,
     _parse_sms_duplicate_callback,
     _send_with_retry,
     send_bulk_summary,
@@ -151,6 +154,37 @@ def _mock_app(send_side_effect):
 
 
 @pytest.mark.anyio
+async def test_concurrent_sends_start_one_second_apart_with_retries(monkeypatch):
+    clock = [0.0]
+    real_sleep = asyncio.sleep
+
+    async def advancing_sleep(delay):
+        clock[0] += delay
+        await real_sleep(0)
+
+    monkeypatch.setattr("asyncio.sleep", advancing_sleep)
+    monkeypatch.setattr(telegram, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(telegram, "_send_pacer", _SendPacer(interval_s=1.0))
+    starts = []
+
+    async def send_message(**kwargs):
+        starts.append((clock[0], kwargs["text"]))
+        if kwargs["text"] == "b" and sum(t == "b" for _, t in starts) == 1:
+            raise TimedOut()
+
+    app = MagicMock()
+    app.bot.send_message = send_message
+    await asyncio.gather(
+        *(_send_with_retry(app, chat_id=1, text=t) for t in ("a", "b", "c"))
+    )
+
+    times = [t for t, _ in starts]
+    assert [t for _, t in starts][:3] == ["a", "b", "c"]
+    assert sorted(t for _, t in starts) == ["a", "b", "b", "c"]
+    assert all(later - earlier >= 1.0 for earlier, later in zip(times, times[1:]))
+
+
+@pytest.mark.anyio
 async def test_send_retry_after_does_not_consume_attempts(monkeypatch):
     sleep_mock = AsyncMock()
     monkeypatch.setattr("asyncio.sleep", sleep_mock)
@@ -234,7 +268,7 @@ async def test_sms_duplicate_prompt_offers_only_safe_actions():
             },
             chat_id=12345,
         )
-        assert fake_app.bot.send_message.await_args.kwargs["reply_markup"] is None
+        assert fake_app.bot.send_message.await_args.kwargs.get("reply_markup") is None
 
 
 def test_sms_duplicate_callback_parser_contract():

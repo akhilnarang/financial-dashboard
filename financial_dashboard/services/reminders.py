@@ -294,8 +294,8 @@ async def _send_reminder_notification(upload, due, amount_due, days_until_due, c
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Mark as Paid", callback_data=f"paid:{upload.id}")]]
         )
-        await app.bot.send_message(
-            chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard
+        await telegram_service._send_with_retry(
+            app, chat_id=chat_id, text=text, reply_markup=keyboard
         )
     except Exception as e:
         logger.warning("Failed to send reminder for statement #%s: %s", upload.id, e)
@@ -647,6 +647,6 @@ async def _send_payment_received_notification(
             ]
 
         text = "\n".join(lines)
-        await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        await telegram_service._send_with_retry(app, chat_id=chat_id, text=text)
     except Exception as e:
         logger.warning("Failed to send payment-received notification: %s", e)

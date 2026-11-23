@@ -39,6 +39,15 @@ def anyio_backend():
 
 
 @pytest.fixture(autouse=True)
+def _unpaced_telegram_sends(monkeypatch):
+    """Give each test a fresh pacer with no interval. A shared pacer would
+    carry slots from one test into the next and make sends sleep."""
+    from financial_dashboard.services import telegram
+
+    monkeypatch.setattr(telegram, "_send_pacer", telegram._SendPacer(interval_s=0.0))
+
+
+@pytest.fixture(autouse=True)
 def _restore_settings_cache():
     """Snapshot/restore the global settings._cache and the user-category slug
     caches around each test so tests that mutate them (e.g. CAS feature tests)
