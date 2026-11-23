@@ -121,7 +121,7 @@ dependencies = [
 [[package]]
 name = "cc-parser"
 version = "0.1.0"
-source = { git = "https://github.com/akhilnarang/cc-parser#8944e9228041bd66fd6c04f1278ac0fdbbbeb0db" }
+source = { git = "https://github.com/akhilnarang/cc-parser#a8698c628d79b852213656d0cafc7fb8b7ea6deb" }
 dependencies = [
     { name = "pdfplumber" },
     { name = "pydantic" },
