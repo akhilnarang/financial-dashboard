@@ -9,7 +9,7 @@ and cashflow exclusion state.
 
 import datetime
 import re
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from collections.abc import Iterable
 from typing import Any, NamedTuple, cast
 
@@ -32,8 +32,10 @@ from financial_dashboard.services.categorization.normalize import (
     redact_names,
     redact_pii,
 )
+from financial_dashboard.services.assistant.contracts import ShowTransactions
 from financial_dashboard.services.categorization.vocabulary import get_active_slugs
 from financial_dashboard.services.settings import get_redact_name_tokens
+from financial_dashboard.services.transaction_filters import TransactionFilters
 
 MAX_CONTEXT_ROWS = 20
 MAX_FIELD_LENGTH = 2_000
@@ -308,6 +310,61 @@ async def _category_slug(session: AsyncSession, category: str) -> str:
         if wanted in (slug, slug.replace("_", " "), label_for_slug(slug).lower()):
             return slug
     return category
+
+
+async def report_filters(
+    session: AsyncSession, call: ShowTransactions
+) -> TransactionFilters | None:
+    """Turn the filters of a transaction report into the page's filters.
+
+    A bank filter that names accounts or cards becomes their ids, so the
+    report and the page that its link opens list the same rows. A search is
+    plain text here: the model names an account in the bank filter.
+
+    Args:
+        session: The open database session.
+        call: The report call.
+
+    Returns:
+        The filters, or None when a date or the amount is not valid.
+    """
+    try:
+        date_from = (
+            datetime.date.fromisoformat(call.date_from) if call.date_from else None
+        )
+        date_to = datetime.date.fromisoformat(call.date_to) if call.date_to else None
+        amount = Decimal(call.amount) if call.amount else None
+    except ValueError, InvalidOperation:
+        return None
+    if (amount is not None and not amount.is_finite()) or (
+        date_from and date_to and date_from > date_to
+    ):
+        return None
+    account_ids = (call.account_id,) if call.account_id else ()
+    card_ids = (call.card_id,) if call.card_id else ()
+    bank = call.bank
+    if bank and not account_ids and not card_ids:
+        named = await _named_ids(session, bank, loose=True)
+        if named.account_ids or named.card_ids:
+            account_ids, card_ids = tuple(named.account_ids), tuple(named.card_ids)
+            bank = None
+    return TransactionFilters(
+        bank=bank,
+        account_ids=account_ids,
+        card_ids=card_ids,
+        direction=call.direction,
+        date_from=date_from,
+        date_to=date_to,
+        category=await _category_slug(session, call.category)
+        if call.category
+        else None,
+        excluded=call.excluded,
+        q=call.search,
+        amount=amount,
+        source=call.source,
+        review_status=call.review_status,
+        reference=call.reference,
+    )
 
 
 async def list_accounts(session: AsyncSession) -> list[AssistantAccount]:

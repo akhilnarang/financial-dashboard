@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import null, select
 
-from financial_dashboard.db.models import Transaction
+from financial_dashboard.db.models import Card, Transaction
 from tests.conftest import MISSING_ACCOUNT_ID, ensure_account
 
 pytestmark = pytest.mark.anyio
@@ -361,3 +361,48 @@ async def test_paging_and_sorting_keep_every_drill_filter(client, session):
     for listing in (page_two.text, by_amount.text):
         for decoy in ("999.00", "998.00", "997.00", "996.00"):
             assert decoy not in _transaction_rows_html(listing)
+
+
+async def test_listed_accounts_and_cards_select_their_rows(client, session):
+    """The assistant's report links here with several ids, so the page must list
+    the rows on any listed account or card, and a card narrows its account."""
+    savings = await ensure_account(session, 501, "bank_account")
+    credit = await ensure_account(session, 502, "credit_card")
+    session.add_all(
+        [
+            Card(id=601, account_id=credit, card_mask="XXXX0001", label="Primary"),
+            Card(id=602, account_id=credit, card_mask="XXXX0002", label="Add-on"),
+        ]
+    )
+    await session.flush()
+    for account_id, card_id, counterparty in (
+        (savings, None, "SAMPLE GROCER"),
+        (credit, 601, "SAMPLE CAFE"),
+        (credit, 602, "SAMPLE FOODS"),
+    ):
+        session.add(
+            Transaction(
+                bank="hdfc",
+                email_type="x",
+                direction="debit",
+                amount=Decimal("100"),
+                counterparty=counterparty,
+                account_id=account_id,
+                card_id=card_id,
+                transaction_date=DATED,
+            )
+        )
+    await session.flush()
+
+    both = await client.get(f"/transactions?account_id={savings}&account_id={credit}")
+    card_of_account = await client.get(f"/transactions?account_id={credit}&card_id=601")
+    card_and_other_account = await client.get(
+        f"/transactions?account_id={savings}&card_id=601"
+    )
+    # q finds text in a row, as the assistant's search does.
+    by_text = await client.get("/transactions?q=sample%20foods")
+
+    assert _count_rows(both.text) == 3
+    assert _count_rows(card_of_account.text) == 1
+    assert _count_rows(card_and_other_account.text) == 2
+    assert _count_rows(by_text.text) == 1

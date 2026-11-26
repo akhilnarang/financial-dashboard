@@ -19,7 +19,10 @@ from financial_dashboard.core.dates import IST
 from financial_dashboard.core.links import page_link
 from financial_dashboard.core.templating import format_inr_exact
 from financial_dashboard.db.models import Account, StatementUpload, Transaction
-from financial_dashboard.services.cashflow.buckets import INVESTMENT_BUCKET
+from financial_dashboard.services.cashflow.buckets import (
+    INVESTMENT_BUCKET,
+    label_for_slug,
+)
 from financial_dashboard.services.cashflow.report import (
     INCLUDED,
     INR_OR_NULL,
@@ -38,10 +41,20 @@ from financial_dashboard.services.assistant.contracts import (
     GetInvestmentFlows,
     GetNetworth,
     ReportCall,
+    ShowTransactions,
+)
+from financial_dashboard.services.assistant.transaction_reads import report_filters
+from financial_dashboard.services.transaction_filters import (
+    TransactionFilters,
+    ordered,
+    transaction_totals,
+    transactions_path,
 )
 
 # Telegram allows 4,096 characters. The Ref footer needs some of them.
 MAX_REPORT_CHARS = 3800
+# The link to the page lists the rest.
+MAX_SHOWN_ROWS = 20
 
 _GROUP_LABELS = {
     "bank_balance": "Bank balances",
@@ -92,6 +105,17 @@ async def render_report(session: AsyncSession, call: ReportCall) -> Answer | Err
             text = await _networth(session, base_url)
         case GetCardDues():
             text = await _card_dues(session, base_url)
+        case ShowTransactions():
+            if (filters := await report_filters(session, call)) is None:
+                return Error(
+                    outcome="error",
+                    message=(
+                        "I couldn't use those filters. Please check the dates and "
+                        "the amount."
+                    ),
+                    code="invalid_filters",
+                )
+            text = await _transactions(session, filters, call, base_url)
     return Answer(outcome="answer", text=text)
 
 
@@ -236,6 +260,77 @@ async def _investment_flows(
         ),
     ]
     return _fit(head, body, tail)
+
+
+async def _transactions(
+    session: AsyncSession,
+    filters: TransactionFilters,
+    call: ShowTransactions,
+    base_url: str,
+) -> str:
+    """Render the filtered rows and their totals, as /transactions lists them.
+
+    The rows, the totals and the link all come from the same filters, so the
+    page that the link opens shows the same rows in the same order.
+    """
+    stmt = select(Transaction).where(*filters.clauses())
+    count, totals = await transaction_totals(session, stmt)
+    rows = (
+        await session.scalars(
+            ordered(stmt, call.sort, call.order).limit(MAX_SHOWN_ROWS)
+        )
+    ).all()
+    heading = "Transactions"
+    if filters.date_from and filters.date_to:
+        heading += f", {_period(filters.date_from, filters.date_to)}"
+    summary = (
+        f"{count} row{'' if count == 1 else 's'} · Debits: {_money(totals.debits)}"
+        f" · Credits: {_money(totals.credits)}"
+    )
+    if totals.foreign_count:
+        summary += f" · {totals.foreign_count} not in rupees, left out of the sums"
+    head = [f"<b>{html.escape(heading)}</b>", summary]
+    if not rows:
+        head.append("No transactions match these filters.")
+    body = [_transaction_line(row, base_url) for row in rows]
+    tail = [
+        *([f"Showing the first {len(rows)}."] if count > len(rows) else []),
+        "",
+        page_link(
+            "Open these on the dashboard",
+            transactions_path(filters, call.sort, call.order),
+            base_url,
+        ),
+    ]
+    return _fit(head, body, tail)
+
+
+def _transaction_line(row: Transaction, base_url: str) -> str:
+    """Render one transaction as a report line: id, date, amount, payee, category."""
+    sign = "−" if row.direction == "debit" else "+"
+    currency = (row.currency or "INR").strip().upper() or "INR"
+    amount = (
+        _money(row.amount)
+        if currency == "INR"
+        else html.escape(f"{currency} {row.amount}")
+    )
+    parts = [
+        f"{row.transaction_date:%d %b}" if row.transaction_date else "no date",
+        f"{sign}{amount}",
+        html.escape((row.counterparty or "").strip() or "(no counterparty)"),
+        html.escape(label_for_slug(row.category)),
+    ]
+    flags = [
+        flag
+        for flag, on in (
+            ("voided", row.voided),
+            ("excluded", row.exclude_from_cashflow),
+        )
+        if on
+    ]
+    line = f"• {page_link(f'#{row.id}', f'/transactions/{row.id}', base_url)} "
+    line += " · ".join(parts)
+    return line + (f" ({', '.join(flags)})" if flags else "")
 
 
 async def _holdings(session: AsyncSession, call: GetHoldings, base_url: str) -> str:

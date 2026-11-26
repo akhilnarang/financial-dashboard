@@ -98,9 +98,9 @@ class ApplyTransactionChanges(StrictModel):
     merchant_rule: MerchantRuleRequest | None = None
 
 
-class ListTransactions(StrictModel):
-    name: Literal["list_transactions"]
-    transaction_ids: list[StrictInt] | None = Field(default=None, max_length=20)
+class TransactionFilterFields(StrictModel):
+    """The transaction filters that a read and the transaction report share."""
+
     account_id: StrictInt | None = Field(default=None, gt=0)
     card_id: StrictInt | None = Field(default=None, gt=0)
     date_from: StrictStr | None = Field(default=None, max_length=30)
@@ -114,7 +114,20 @@ class ListTransactions(StrictModel):
     reference: StrictStr | None = Field(default=None, max_length=200)
     search: StrictStr | None = Field(default=None, max_length=200)
     excluded: StrictBool | None = None
+
+
+class ListTransactions(TransactionFilterFields):
+    name: Literal["list_transactions"]
+    transaction_ids: list[StrictInt] | None = Field(default=None, max_length=20)
     limit: StrictInt = Field(default=20, ge=1, le=20)
+
+
+class ShowTransactions(TransactionFilterFields):
+    """Ask the server to send the filtered rows, with a link to their page."""
+
+    name: Literal["show_transactions"]
+    sort: Literal["amount", "bank", "category", "counterparty", "date"] = "date"
+    order: Literal["asc", "desc"] = "desc"
 
 
 class GetCashflowSummary(StrictModel):
@@ -249,7 +262,12 @@ AssistantWriteCall = (
 AssistantWrite: TypeAlias = Annotated[AssistantWriteCall, Field(discriminator="name")]
 ReadCall = ListTransactions | ListAccounts | ListReceivables
 ReportCall = (
-    GetCashflowSummary | GetInvestmentFlows | GetHoldings | GetNetworth | GetCardDues
+    GetCashflowSummary
+    | GetInvestmentFlows
+    | GetHoldings
+    | GetNetworth
+    | GetCardDues
+    | ShowTransactions
 )
 
 ToolCall: TypeAlias = Annotated[
@@ -260,6 +278,7 @@ ToolCall: TypeAlias = Annotated[
     | GetHoldings
     | GetNetworth
     | GetCardDues
+    | ShowTransactions
     | ApplyTransactionChanges
     | ListReceivables
     | CreateReceivable

@@ -248,6 +248,27 @@ async def test_cashflow_summary_sends_server_figures_without_a_second_model_step
         ({"name": "get_holdings", "search": "example"}, ("Example Fund: ₹550.00",)),
         ({"name": "get_networth"}, ("Net worth: ₹1,000.00",)),
         ({"name": "get_card_dues"}, ("₹1,234.50 due 2026-12-01",)),
+        (
+            {
+                "name": "show_transactions",
+                "bank": "testbank",
+                "date_from": "2026-05-01",
+                "date_to": "2026-05-31",
+            },
+            (
+                "1 row · Debits: ₹400.00",
+                "01 May · −₹400.00 · SAMPLE AMC",
+                # The link opens the same rows on the transactions page.
+                'href="http://dash/transactions?bank=testbank&amp;'
+                "date_from=2026-05-01&amp;date_to=2026-05-31&amp;"
+                'sort=date&amp;order=desc"',
+            ),
+        ),
+        # An account name becomes its id, so the link opens that account's rows.
+        (
+            {"name": "show_transactions", "bank": "Savings", "category": "investment"},
+            ("−₹400.00 · SAMPLE AMC", "/transactions?account_id="),
+        ),
     ],
 )
 async def test_reports_send_server_figures(session, monkeypatch, call, expected):
