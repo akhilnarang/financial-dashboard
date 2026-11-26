@@ -634,6 +634,18 @@ AssistantResponse: TypeAlias = Annotated[
 _RESPONSE_ADAPTER = TypeAdapter(AssistantResponse)
 
 
+class AssistantResponseEnvelope(StrictModel):
+    """The object root of every model reply.
+
+    Strict provider APIs need an object at the root, not a union.
+
+    Attributes:
+        response: The outcome of the step.
+    """
+
+    response: AssistantResponse
+
+
 def _openai_strict_schema(value: object) -> object:
     """Make every object field required, using nullable unions for optionals.
 
@@ -659,18 +671,6 @@ def _openai_strict_schema(value: object) -> object:
         result["additionalProperties"] = False
         result["required"] = list(properties)
     return result
-
-
-class AssistantResponseEnvelope(StrictModel):
-    """The object root of every model reply.
-
-    Strict provider APIs need an object at the root, not a union.
-
-    Attributes:
-        response: The outcome of the step.
-    """
-
-    response: AssistantResponse
 
 
 _FULL_RESPONSE_SCHEMA = cast(
