@@ -110,13 +110,14 @@ async def test_orchestrator_caps_tool_rounds_and_renews_lease(session):
     provider = FakeProvider(
         [
             RequestPacks(outcome="request_packs", packs=["receivables"]),
+            ToolCalls(outcome="tool_calls", calls=[{"name": "list_receivables"}]),
             *[
                 ToolCalls(
                     outcome="tool_calls",
                     calls=[{"name": "list_transactions", "transaction_ids": [txn.id]}],
                 )
             ]
-            * 3,
+            * 2,
         ]
     )
     renewals = 0
@@ -140,6 +141,12 @@ async def test_orchestrator_caps_tool_rounds_and_renews_lease(session):
     first, *later = provider.contexts
     assert sent_tools(first) == EDIT_TOOLS
     assert all("list_receivables" in sent_tools(context) for context in later)
+    # The read of the fetched pack ran like a core read.
+    assert [result.tool for result in provider.context.tool_results] == [
+        "list_receivables",
+        "list_transactions",
+        "list_transactions",
+    ]
     assert all(
         rule in build_prompt(context)
         for context in provider.contexts

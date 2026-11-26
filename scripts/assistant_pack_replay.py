@@ -44,7 +44,7 @@ class ReplayTurn(NamedTuple):
         has_target: Whether the turn had a trusted transaction target.
         user_texts: The user message, then the earlier user turns.
         tools: The tool names that the model called.
-        calls: The number of model calls of the turn.
+        calls: The number of model calls of the turn, without pack requests.
     """
 
     trigger: str
@@ -98,23 +98,24 @@ def read_turns(lines: Iterable[str]) -> Iterator[ReplayTurn]:
         row = json.loads(line)
         outputs = row["model_output"]
         conversation = row["conversation_id"]
+        earlier = prior[conversation] if conversation is not None else []
         if row["trigger"] in TEXT_TRIGGERS and isinstance(outputs, list) and outputs:
             yield ReplayTurn(
                 trigger=row["trigger"],
                 has_target=row["transaction_id"] is not None,
-                user_texts=[
-                    row["user_text"] or "",
-                    *prior[conversation][-HISTORY_TURNS:],
-                ],
+                user_texts=[row["user_text"] or "", *earlier[-HISTORY_TURNS:]],
                 tools={
                     call["name"]
                     for output in outputs
                     for call in output["payload"].get("calls", [])
                 },
-                calls=len(outputs),
+                calls=sum(
+                    output["payload"].get("outcome") != "request_packs"
+                    for output in outputs
+                ),
             )
         if row["assistant_text"] is not None and row["user_text"]:
-            prior[conversation].append(row["user_text"])
+            earlier.append(row["user_text"])
 
 
 def score(turn: ReplayTurn, *, use_history: bool) -> TurnScore:

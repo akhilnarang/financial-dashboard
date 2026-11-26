@@ -167,6 +167,29 @@ _NON_MUTATING_START = re.compile(
 )
 
 
+class IntentSignals(NamedTuple):
+    """The fixed signals in a user message that pick the tool packs.
+
+    Attributes:
+        edit: The message asks to change, void or merge a transaction.
+        receivables: The message is about money that a person owes.
+        reports: The message asks for figures or a list of rows.
+        categories: The message can ask for a new category.
+    """
+
+    edit: bool
+    receivables: bool
+    reports: bool
+    categories: bool
+
+
+class InstructionParts(NamedTuple):
+    text: str
+    note_payload: str | None
+    note_requires_category: bool
+    note_shorthand: bool
+
+
 def _find_closing_quote(text: str, start: int, closing: str) -> int | None:
     """Find a quoted note terminator without treating contractions as quotes."""
     index = start + 1
@@ -212,29 +235,6 @@ def has_ambiguous_intent(text: str) -> bool:
 def has_non_mutating_intent(text: str) -> bool:
     """Return whether the turn begins as a read or preservation request."""
     return bool(_NON_MUTATING_START.search(normalize_text(text).strip()))
-
-
-class IntentSignals(NamedTuple):
-    """The fixed signals in a user message that pick the tool packs.
-
-    Attributes:
-        edit: The message asks to change, void or merge a transaction.
-        receivables: The message is about money that a person owes.
-        reports: The message asks for figures or a list of rows.
-        categories: The message can ask for a new category.
-    """
-
-    edit: bool
-    receivables: bool
-    reports: bool
-    categories: bool
-
-
-class InstructionParts(NamedTuple):
-    text: str
-    note_payload: str | None
-    note_requires_category: bool
-    note_shorthand: bool
 
 
 def _safe_shorthand_note(payload: str) -> bool:
