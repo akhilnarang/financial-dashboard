@@ -6,6 +6,9 @@ import json
 from typing import NamedTuple
 
 from financial_dashboard.services.assistant.context import ToolResult
+from financial_dashboard.services.assistant.transaction_reads import (
+    AssistantTransaction,
+)
 
 PROMPT_VERSION = "telegram-assistant-v14"
 
@@ -13,11 +16,31 @@ PROMPT_VERSION = "telegram-assistant-v14"
 class PromptContext(NamedTuple):
     user_message: str
     history: Sequence[Mapping[str, str]] = ()
-    transaction: Mapping[str, object] | None = None
+    transaction: AssistantTransaction | None = None
     tool_results: Sequence[ToolResult] = ()
     categories: Sequence[str] = ()
     fitting_categories: Sequence[str] = ()
     today: datetime.date | None = None
+
+    def data_size(self) -> int:
+        """Count the characters of the data that the prompt quotes.
+
+        The context limit counts this data and not the fixed instructions.
+        """
+        data = {
+            "user_message": self.user_message,
+            "history": list(self.history),
+            "transaction": self.transaction.model_dump(mode="json")
+            if self.transaction
+            else None,
+            "tool_results": [
+                result.model_dump(mode="json") for result in self.tool_results
+            ],
+            "categories": list(self.categories),
+            "fitting_categories": list(self.fitting_categories),
+            "today": str(self.today),
+        }
+        return len(json.dumps(data, ensure_ascii=False))
 
 
 def _quoted(value: object, limit: int = 2000) -> str:
@@ -157,7 +180,8 @@ def build_prompt(context: PromptContext) -> str:
     if context.transaction is not None:
         lines.extend(["", "=== TRUSTED TRANSACTION TARGET (quoted data) ==="])
         lines.extend(
-            f"{key}: {_quoted(value)}" for key, value in context.transaction.items()
+            f"{key}: {_quoted(value)}"
+            for key, value in context.transaction.model_dump(mode="json").items()
         )
         lines.append("=== END TRUSTED TRANSACTION TARGET ===")
     if context.categories:
@@ -187,5 +211,5 @@ def build_prompt(context: PromptContext) -> str:
         for result in context.tool_results:
             # The orchestrator bounds the complete context before dispatch.
             # Keep each returned record intact instead of silently cutting a page.
-            lines.append(json.dumps(result.as_json(), ensure_ascii=False, default=str))
+            lines.append(result.model_dump_json(exclude_none=True))
     return "\n".join(lines)

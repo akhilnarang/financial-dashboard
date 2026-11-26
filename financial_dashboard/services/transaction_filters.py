@@ -160,42 +160,42 @@ class TransactionFilters(BaseModel):
             and_(on_account, Transaction.account_id.not_in(narrowed)),
         )
 
-    def query(self) -> dict[str, str | list[str]]:
-        """Return the URL query of the transactions page for these filters.
+    def query(self) -> list[tuple[str, str]]:
+        """Return the URL query pairs of the transactions page for these filters.
 
         Returns:
-            The parameters in the order the page shows them. A blank
-            counterparty stays, because it narrows the rows.
+            The pairs in the order the page shows them. Each listed id is its
+            own pair. A blank counterparty stays, because it narrows the rows.
         """
-        values: dict[str, str | list[str] | None] = {
-            "bank": self.bank,
-            "account_id": [str(value) for value in self.account_ids] or None,
-            "card_id": [str(value) for value in self.card_ids] or None,
-            "direction": self.direction,
-            "date_from": self.date_from.isoformat() if self.date_from else None,
-            "date_to": self.date_to.isoformat() if self.date_to else None,
-            "category": self.category,
-            "counterparty": self.counterparty,
-            "card_holder": self.card_holder,
-            "uncategorized": _flag(self.uncategorized),
-            "category_null": _flag(self.category_null),
-            "internal": _flag(self.internal),
-            "non_inr": _three_way(self.non_inr),
-            "undated": _flag(self.undated),
-            "excluded": _three_way(self.excluded),
-            "provisional": _flag(self.provisional),
-            "scope": self.scope,
-            "q": self.q,
-            "amount": None if self.amount is None else str(self.amount),
-            "source": self.source,
-            "review_status": self.review_status,
-            "reference": self.reference,
-        }
-        return {
-            key: value
-            for key, value in values.items()
+        pairs: list[tuple[str, str | None]] = [
+            ("bank", self.bank),
+            *(("account_id", str(value)) for value in self.account_ids),
+            *(("card_id", str(value)) for value in self.card_ids),
+            ("direction", self.direction),
+            ("date_from", self.date_from.isoformat() if self.date_from else None),
+            ("date_to", self.date_to.isoformat() if self.date_to else None),
+            ("category", self.category),
+            ("counterparty", self.counterparty),
+            ("card_holder", self.card_holder),
+            ("uncategorized", _flag(self.uncategorized)),
+            ("category_null", _flag(self.category_null)),
+            ("internal", _flag(self.internal)),
+            ("non_inr", _three_way(self.non_inr)),
+            ("undated", _flag(self.undated)),
+            ("excluded", _three_way(self.excluded)),
+            ("provisional", _flag(self.provisional)),
+            ("scope", self.scope),
+            ("q", self.q),
+            ("amount", None if self.amount is None else str(self.amount)),
+            ("source", self.source),
+            ("review_status", self.review_status),
+            ("reference", self.reference),
+        ]
+        return [
+            (key, value)
+            for key, value in pairs
             if value is not None and (value != "" or key == "counterparty")
-        }
+        ]
 
 
 def _flag(value: bool) -> str | None:
@@ -221,8 +221,7 @@ def transactions_path(
     Returns:
         The path and query, such as ``/transactions?account_id=1&sort=date``.
     """
-    query = {**filters.query(), "sort": sort, "order": order}
-    return f"/transactions?{urlencode(query, doseq=True)}"
+    return f"/transactions?{urlencode([*filters.query(), ('sort', sort), ('order', order)])}"
 
 
 def ordered(stmt: Select, sort: SortKey, order: SortOrder) -> Select:

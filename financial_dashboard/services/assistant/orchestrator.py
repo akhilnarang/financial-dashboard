@@ -43,9 +43,7 @@ from financial_dashboard.db.models import (
 from financial_dashboard.services.assistant.context import (
     MAX_CONTEXT_CHARS,
     bounded_history,
-    context_size,
     ToolResult,
-    tool_items,
 )
 from financial_dashboard.services.assistant.contracts import (
     Answer,
@@ -609,13 +607,13 @@ async def run_turn(
         prompt_context = PromptContext(
             user_message=user_message,
             history=bounded_history(history),
-            transaction=target._asdict() if target is not None else None,
+            transaction=target,
             tool_results=tool_results,
             categories=active_categories,
             fitting_categories=fitting_categories,
             today=datetime.datetime.now(IST).date(),
         )
-        if context_size(prompt_context._asdict()) > MAX_CONTEXT_CHARS:
+        if prompt_context.data_size() > MAX_CONTEXT_CHARS:
             return completed(
                 Error(
                     outcome="error",
@@ -882,13 +880,14 @@ async def run_turn(
                         rows = await _read_transactions(session, call)
                         pending_rows.update((row.id, row) for row in rows)
                         result = ToolResult(
-                            call.name,
-                            tool_items(rows),
-                            None if rows else EMPTY_LIST_HINT,
+                            tool=call.name,
+                            items=rows,
+                            hint=None if rows else EMPTY_LIST_HINT,
                         )
                     else:
-                        read = await _dispatch_read(session, call)
-                        result = ToolResult(call.name, tool_items(read))
+                        result = ToolResult(
+                            tool=call.name, items=await _dispatch_read(session, call)
+                        )
                     pending_tool_results.append(result)
                 if confirm_found:
                     try:

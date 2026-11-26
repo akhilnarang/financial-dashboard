@@ -9,6 +9,7 @@ from financial_dashboard.services.assistant.contracts import (
 )
 from financial_dashboard.services.assistant.context import ToolResult
 from financial_dashboard.services.assistant.prompt import PromptContext
+from financial_dashboard.services.assistant.transaction_reads import AssistantAccount
 from financial_dashboard.services.assistant.provider import (
     GeminiProvider,
     ProviderFailure,
@@ -54,14 +55,21 @@ async def test_gemini_attempts_full_schema_then_records_json_fallback():
     provider.client = type(
         "Client", (), {"aio": type("Aio", (), {"models": Models()})()}
     )()
-    items: list[dict[str, object]] = [
-        {"id": index, "note": "synthetic transaction context " * 6}
+    accounts = [
+        AssistantAccount(
+            id=index,
+            bank="samplebank",
+            label="synthetic account context " * 6,
+            type="bank_account",
+            active=True,
+            cards=[],
+        )
         for index in range(20)
     ]
     result = await provider.complete(
         PromptContext(
-            "show transactions",
-            tool_results=[ToolResult("list_transactions", items)],
+            "show accounts",
+            tool_results=[ToolResult(tool="list_accounts", items=accounts)],
         )
     )
     assert result.output_mode == "validated_json_object"
@@ -72,8 +80,8 @@ async def test_gemini_attempts_full_schema_then_records_json_fallback():
         "=== TOOL RESULTS (quoted data) ===\n", 1
     )[1]
     assert json.loads(supplied_results) == {
-        "tool": "list_transactions",
-        "result": {"items": items},
+        "tool": "list_accounts",
+        "items": [account.model_dump(mode="json") for account in accounts],
     }
 
 

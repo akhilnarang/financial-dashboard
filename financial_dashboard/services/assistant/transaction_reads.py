@@ -11,10 +11,10 @@ import datetime
 import re
 from decimal import Decimal, InvalidOperation
 from collections.abc import Iterable
-from typing import Any, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, cast
 
 from sqlalchemy import ColumnElement, Select, and_, func, literal, or_, select
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.references import reference_form
@@ -55,8 +55,10 @@ _REDACTED_REF = "[redacted-ref]"
 _MASK_LABEL = re.compile(r"\[redacted-[a-z]+\]")
 
 
-class AssistantTransaction(NamedTuple):
+class AssistantTransaction(BaseModel):
     """Redacted transaction projection safe to place in a model context."""
+
+    model_config = ConfigDict(frozen=True)
 
     id: int
     bank: str
@@ -79,6 +81,21 @@ class AssistantTransaction(NamedTuple):
     review_status: str | None
     review_reason: str | None
     review_gate_reason: str | None
+
+
+class LabelCandidate(NamedTuple):
+    """An account or a card that a name can point to, with its label."""
+
+    kind: Literal["account", "card"]
+    id: int
+    label: str
+
+
+class LabelRank(NamedTuple):
+    """How closely a label fits a name. A higher rank fits better."""
+
+    covered: int
+    whole: bool
 
 
 class NamedIds(NamedTuple):
@@ -204,10 +221,10 @@ def _name_words(text: str) -> frozenset[str]:
     return frozenset(_NAME_WORD.findall(text)) - GENERIC_NAME_WORDS
 
 
-def _closest_labels[T](
-    words: frozenset[str], labels: Iterable[tuple[T, str | None]], *, loose: bool
-) -> list[T]:
-    """Return the keys whose labels the name words point to most closely.
+def _closest_labels(
+    words: frozenset[str], candidates: Iterable[LabelCandidate], *, loose: bool
+) -> list[LabelCandidate]:
+    """Return the candidates whose labels the name words point to most closely.
 
     A label points when the name holds all its words. A label of one word
     stands for a single merchant or bank name, such as "Swiggy", so only a
@@ -220,26 +237,26 @@ def _closest_labels[T](
 
     Args:
         words: The name words from ``_name_words``.
-        labels: The key and the label of each account or card.
+        candidates: The accounts and cards with their labels.
         loose: Also match a label that holds every word of the name.
 
     Returns:
-        The keys of the closest labels.
+        The closest candidates.
     """
-    ranked: list[tuple[tuple[int, bool], T]] = []
-    for key, label in labels:
-        if not (label_words := _name_words(label or "")):
+    ranked: list[tuple[LabelRank, LabelCandidate]] = []
+    for candidate in candidates:
+        if not (label_words := _name_words(candidate.label)):
             continue
         if label_words <= words and (
             len(label_words) > 1 or (loose and label_words == words)
         ):
-            ranked.append(((len(label_words), True), key))
+            ranked.append((LabelRank(covered=len(label_words), whole=True), candidate))
         elif loose and words <= label_words:
-            ranked.append(((len(words), False), key))
+            ranked.append((LabelRank(covered=len(words), whole=False), candidate))
     if not ranked:
         return []
     best = max(rank for rank, _ in ranked)
-    return [key for rank, key in ranked if rank == best]
+    return [candidate for rank, candidate in ranked if rank == best]
 
 
 async def _named_ids(session: AsyncSession, text: str, *, loose: bool) -> NamedIds:
@@ -265,27 +282,31 @@ async def _named_ids(session: AsyncSession, text: str, *, loose: bool) -> NamedI
     """
     if not (words := _name_words(text)):
         return NamedIds(account_ids=[], card_ids=[])
-    accounts = [
-        (row.id, row.label)
+    account_labels: dict[int, str] = {
+        row.id: row.label
         for row in await session.execute(select(Account.id, Account.label))
-    ]
-    labels: list[tuple[tuple[str, int], str | None]] = [
-        (("account", account_id), label) for account_id, label in accounts
+    }
+    candidates = [
+        LabelCandidate(kind="account", id=account_id, label=label)
+        for account_id, label in account_labels.items()
     ]
     if loose:
-        account_labels = dict(accounts)
         for row in await session.execute(select(Card.id, Card.account_id, Card.label)):
-            account_label = account_labels.get(row.account_id) or ""
+            account_label = account_labels.get(row.account_id, "")
             # A card is named by its own label and its account's label, as in
             # "Pat's Sample Gold". The name must hold a word that only the
             # card's label has. If not, a card labelled "Sample Debit" would
             # stand for its "Sample Savings" account when the user names it.
             if words & (_name_words(row.label or "") - _name_words(account_label)):
-                labels.append((("card", row.id), f"{row.label} {account_label}"))
-    closest = _closest_labels(words, labels, loose=loose)
+                candidates.append(
+                    LabelCandidate(
+                        kind="card", id=row.id, label=f"{row.label} {account_label}"
+                    )
+                )
+    closest = _closest_labels(words, candidates, loose=loose)
     return NamedIds(
-        account_ids=[row_id for kind, row_id in closest if kind == "account"],
-        card_ids=[row_id for kind, row_id in closest if kind == "card"],
+        account_ids=[match.id for match in closest if match.kind == "account"],
+        card_ids=[match.id for match in closest if match.kind == "card"],
     )
 
 

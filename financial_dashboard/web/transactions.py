@@ -205,6 +205,17 @@ def _ids(values: list[str] | None) -> tuple[int, ...]:
     return tuple(int(value) for value in values or () if value.strip().isdigit())
 
 
+def _three_way(value: str | None) -> bool | None:
+    """Read a "1" or "0" filter. Any other value, or none, does not filter."""
+    match value:
+        case "1":
+            return True
+        case "0":
+            return False
+        case _:
+            return None
+
+
 def _amount(value: str | None) -> Decimal | None:
     """Return the amount in the query value, or None when there is none or it is bad."""
     try:
@@ -376,9 +387,9 @@ async def transaction_list(
         uncategorized=uncategorized == "1",
         category_null=category_null == "1",
         internal=internal == "1",
-        non_inr={"1": True, "0": False}.get(non_inr or ""),
+        non_inr=_three_way(non_inr),
         undated=undated == "1",
-        excluded={"1": True, "0": False}.get(excluded or ""),
+        excluded=_three_way(excluded),
         provisional=provisional == "1",
         scope=scope,
         q=q or None,
@@ -498,23 +509,23 @@ async def transaction_list(
     # The shared filters keep a blank counterparty, because it narrows the rows:
     # dropping it would widen page 2 to every row.
     query = page_filters.query()
-    retained_filters = {
-        k: v for k, v in query.items() if k not in {"date_from", "date_to"}
-    }
-    base_qs = urlencode(query, doseq=True)
+    retained_filters = [
+        (key, value) for key, value in query if key not in {"date_from", "date_to"}
+    ]
+    base_qs = urlencode(query)
     date_presets = []
     for preset in _date_presets(date.today()):
-        preset_query = {
-            **retained_filters,
-            "date_from": preset["date_from"],
-            "date_to": preset["date_to"],
-            "sort": sort,
-            "order": order,
-        }
+        preset_query = [
+            *retained_filters,
+            ("date_from", preset["date_from"]),
+            ("date_to", preset["date_to"]),
+            ("sort", sort),
+            ("order", order),
+        ]
         date_presets.append(
             {
                 **preset,
-                "href": f"/transactions?{urlencode(preset_query, doseq=True)}",
+                "href": f"/transactions?{urlencode(preset_query)}",
                 "active": (
                     date_from == preset["date_from"] and date_to == preset["date_to"]
                 ),

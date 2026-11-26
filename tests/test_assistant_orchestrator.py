@@ -133,7 +133,7 @@ async def test_an_empty_read_tells_the_model_how_to_find_the_names(session):
 
     assert result.response.outcome == "answer"
     empty, accounts = (
-        entry.as_json()["result"] for entry in provider.context.tool_results
+        entry.model_dump(mode="json") for entry in provider.context.tool_results
     )
     # The model learns that no row exists, or how to find the right name.
     assert empty["items"] == []
@@ -766,7 +766,7 @@ async def test_receivable_write_waits_for_a_yes(session, tool, message):
         )
 
     proposed, _ = await state()
-    listed = provider.context.tool_results[0].as_json()["result"]["items"]
+    listed = provider.context.tool_results[0].model_dump(mode="json")["items"]
     assert [(item["id"], item["person"]) for item in listed] == [(rid, "Friend A")]
     # A listed receivable is not a transaction the reply shows.
     assert result.transaction_ids == ()
