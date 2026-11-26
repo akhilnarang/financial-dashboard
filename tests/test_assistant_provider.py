@@ -3,11 +3,9 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from financial_dashboard.services.assistant.contracts import (
-    parse_response,
-    response_json_schema,
-)
+from financial_dashboard.services.assistant.contracts import parse_response
 from financial_dashboard.services.assistant.context import ToolResult
+from financial_dashboard.services.assistant.packs import pack_response_schema
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.transaction_reads import (
     AssistantAccount,
@@ -74,10 +72,15 @@ async def test_gemini_attempts_full_schema_then_records_json_fallback():
         PromptContext(
             "show accounts",
             tool_results=[ToolResult(tool="list_accounts", items=accounts)],
+            packs=frozenset({"reports"}),
         )
     )
     assert result.output_mode == "validated_json_object"
-    assert calls[0]["config"].response_json_schema == response_json_schema()
+    schema = calls[0]["config"].response_json_schema
+    assert schema == pack_response_schema(frozenset({"reports"}))
+    # The schema holds the tools of the loaded packs only.
+    assert "get_networth" in json.dumps(schema)
+    assert "create_receivable" not in json.dumps(schema)
     assert calls[0]["config"].response_schema is None
     assert calls[1]["config"].response_json_schema is None
     supplied_results = calls[1]["contents"].split(

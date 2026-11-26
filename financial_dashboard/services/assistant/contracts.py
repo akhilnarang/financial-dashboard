@@ -7,7 +7,10 @@ untrusted input and is never interpreted as prose or partially recovered.
 
 import datetime
 import re
+from collections.abc import Sequence
 from decimal import Decimal
+from functools import reduce
+from operator import or_
 from typing import Annotated, Literal, TypeAlias, cast
 
 from pydantic import (
@@ -16,6 +19,7 @@ from pydantic import (
     Field,
     TypeAdapter,
     WithJsonSchema,
+    create_model,
     field_validator,
     model_validator,
 )
@@ -23,6 +27,9 @@ from pydantic.types import StrictBool, StrictFloat, StrictInt, StrictStr
 
 from financial_dashboard.core.dates import IST
 from financial_dashboard.services.categorization.slugs import UserCategoryBucket
+
+
+PackName: TypeAlias = Literal["edit", "receivables", "reports", "categories"]
 
 
 class StrictModel(BaseModel):
@@ -607,16 +614,26 @@ class Error(StrictModel):
     )
 
 
+class RequestPacks(StrictModel):
+    """Ask the server to load tool packs that this step does not have.
+
+    The next step has the tools and the rules of these packs.
+
+    Attributes:
+        outcome: The outcome name.
+        packs: The packs to load.
+    """
+
+    outcome: Literal["request_packs"]
+    packs: list[PackName] = Field(min_length=1, max_length=4)
+
+
 AssistantResponse: TypeAlias = Annotated[
-    Answer | Clarification | CategoryProposal | ToolCalls | Error,
+    Answer | Clarification | CategoryProposal | ToolCalls | Error | RequestPacks,
     Field(discriminator="outcome"),
 ]
 
 _RESPONSE_ADAPTER = TypeAdapter(AssistantResponse)
-
-
-class AssistantResponseEnvelope(StrictModel):
-    response: AssistantResponse
 
 
 def _openai_strict_schema(value: object) -> object:
@@ -646,12 +663,56 @@ def _openai_strict_schema(value: object) -> object:
     return result
 
 
-def response_json_schema() -> dict[str, object]:
-    """Return an object-root schema accepted by strict provider APIs."""
-    return cast(
-        dict[str, object],
-        _openai_strict_schema(AssistantResponseEnvelope.model_json_schema()),
+def response_json_schema(
+    tools: Sequence[type[StrictModel]], requestable: Sequence[PackName]
+) -> dict[str, object]:
+    """Return the strict provider schema of one step, for the given tools only.
+
+    Args:
+        tools: The tool calls that the step can make, two or more.
+        requestable: The packs that the step can ask for. With none, the
+            schema has no ``request_packs`` outcome.
+
+    Returns:
+        An object-root schema that strict provider APIs accept.
+    """
+    calls = create_model(
+        "ToolCalls",
+        __base__=ToolCalls,
+        __doc__=ToolCalls.__doc__,
+        calls=(
+            list[Annotated[reduce(or_, tools), Field(discriminator="name")]],  # ty: ignore[invalid-type-form]
+            Field(min_length=1, max_length=4),
+        ),
     )
+    outcomes: list[type[StrictModel]] = [
+        Answer,
+        Clarification,
+        CategoryProposal,
+        calls,
+        Error,
+    ]
+    if requestable:
+        outcomes.append(
+            create_model(
+                "RequestPacks",
+                __base__=RequestPacks,
+                __doc__=RequestPacks.__doc__,
+                packs=(
+                    list[Literal[tuple(requestable)]],  # ty: ignore[invalid-type-form]
+                    Field(min_length=1, max_length=len(requestable)),
+                ),
+            )
+        )
+    envelope = create_model(
+        "AssistantResponseEnvelope",
+        __base__=StrictModel,
+        response=(
+            Annotated[reduce(or_, outcomes), Field(discriminator="outcome")],  # ty: ignore[invalid-type-form]
+            ...,
+        ),
+    )
+    return cast(dict[str, object], _openai_strict_schema(envelope.model_json_schema()))
 
 
 def screenshot_json_schema() -> dict[str, object]:

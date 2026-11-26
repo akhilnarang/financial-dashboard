@@ -70,6 +70,8 @@ from financial_dashboard.services.assistant.contracts import (
     UpdateReceivable,
     VoidTransaction,
     MerchantRuleConfirmation,
+    PackName,
+    RequestPacks,
     ScreenshotTransaction,
     ScreenshotTransactionConfirmation,
     SetTextValue,
@@ -103,6 +105,7 @@ from financial_dashboard.services.assistant.mutations import (
     unnamed_category,
     unrequested_exclusion,
 )
+from financial_dashboard.services.assistant.packs import choose_packs, loaded_tool_names
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.reports import render_report
 from financial_dashboard.services.assistant.assistant_writes import (
@@ -601,6 +604,10 @@ async def run_turn(
         if target is not None
         else ()
     )
+    packs: frozenset[PackName] = choose_packs(
+        [user_message, *(turn["text"] for turn in history if turn["role"] == "user")],
+        has_target=target is not None,
+    )
     while calls_used < 4:
         if calls_used and renew_lease is not None and not await renew_lease():
             raise ProcessingLeaseLost
@@ -612,6 +619,7 @@ async def run_turn(
             categories=active_categories,
             fitting_categories=fitting_categories,
             today=datetime.datetime.now(IST).date(),
+            packs=packs,
         )
         if prompt_context.data_size() > MAX_CONTEXT_CHARS:
             return completed(
@@ -627,7 +635,11 @@ async def run_turn(
             last_result = result
             prompt_records.append(result.prompt)
             output_records.append(
-                {"payload": dict(result.raw_payload), "latency_ms": result.latency_ms}
+                {
+                    "payload": dict(result.raw_payload),
+                    "latency_ms": result.latency_ms,
+                    "packs": sorted(packs),
+                }
             )
             response = parse_response(result.response.model_dump())
         except (ProviderFailure, ValueError, TypeError) as exc:
@@ -639,6 +651,30 @@ async def run_turn(
                 ),
                 error_detail=_format_exception_detail(exc),
             )
+        match response:
+            case RequestPacks() if not set(response.packs) <= packs:
+                packs = packs | set(response.packs)
+                continue
+            case RequestPacks():
+                return completed(
+                    Error(
+                        outcome="error",
+                        message="I couldn't safely interpret that request. Please rephrase it.",
+                        code="invalid_model_output",
+                    ),
+                    error_detail="request_packs named only loaded packs",
+                )
+            case ToolCalls() if unloaded := sorted(
+                {call.name for call in response.calls} - loaded_tool_names(packs)
+            ):
+                return completed(
+                    Error(
+                        outcome="error",
+                        message="I couldn't safely interpret that request. Please rephrase it.",
+                        code="invalid_model_output",
+                    ),
+                    error_detail=f"tool not loaded: {', '.join(unloaded)}",
+                )
         writes_target = (
             isinstance(response, CategoryProposal)
             or isinstance(response, Clarification)
