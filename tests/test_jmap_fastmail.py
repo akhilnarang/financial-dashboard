@@ -2,10 +2,10 @@
 
 import io
 import json
-
-import pytest
 from urllib.parse import unquote, urlsplit
 from urllib.request import Request
+
+import pytest
 
 from financial_dashboard.db import FetchRule
 from financial_dashboard.integrations.email import jmap_fastmail
