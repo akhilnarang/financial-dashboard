@@ -28,7 +28,7 @@ class PromptContext(NamedTuple):
         The context limit counts this data and not the fixed instructions.
 
         Returns:
-            The length of the data as compact JSON.
+            The length of the data as JSON.
         """
         data = {
             "user_message": self.user_message,
@@ -214,5 +214,10 @@ def build_prompt(context: PromptContext) -> str:
         for result in context.tool_results:
             # The orchestrator bounds the complete context before dispatch.
             # Keep each returned record intact instead of silently cutting a page.
-            lines.append(result.model_dump_json(exclude_none=True))
+            # Only a missing hint is left out. A null row field stays.
+            lines.append(
+                result.model_dump_json(
+                    exclude={"hint"} if result.hint is None else None
+                )
+            )
     return "\n".join(lines)

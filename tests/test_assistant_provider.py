@@ -9,7 +9,10 @@ from financial_dashboard.services.assistant.contracts import (
 )
 from financial_dashboard.services.assistant.context import ToolResult
 from financial_dashboard.services.assistant.prompt import PromptContext
-from financial_dashboard.services.assistant.transaction_reads import AssistantAccount
+from financial_dashboard.services.assistant.transaction_reads import (
+    AssistantAccount,
+    AssistantCard,
+)
 from financial_dashboard.services.assistant.provider import (
     GeminiProvider,
     ProviderFailure,
@@ -62,7 +65,8 @@ async def test_gemini_attempts_full_schema_then_records_json_fallback():
             label="synthetic account context " * 6,
             type="bank_account",
             active=True,
-            cards=[],
+            # A null field in a row stays in what the model sees.
+            cards=[AssistantCard(id=index, label=None, active=True, is_primary=True)],
         )
         for index in range(20)
     ]
