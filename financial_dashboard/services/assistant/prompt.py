@@ -26,6 +26,9 @@ class PromptContext(NamedTuple):
         """Count the characters of the data that the prompt quotes.
 
         The context limit counts this data and not the fixed instructions.
+
+        Returns:
+            The length of the data as compact JSON.
         """
         data = {
             "user_message": self.user_message,

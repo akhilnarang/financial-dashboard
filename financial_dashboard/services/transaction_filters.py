@@ -47,6 +47,13 @@ class TransactionTotals(NamedTuple):
     A foreign-currency row is a card alert that no statement converted to
     rupees yet, so the sums leave it out and count it. A voided row moved no
     money.
+
+    Attributes:
+        count: The number of filtered rows.
+        credits: The sum of the INR credits.
+        debits: The sum of the INR debits.
+        net: Credits minus debits.
+        foreign_count: The live rows not in rupees, which the sums leave out.
     """
 
     count: int
@@ -59,8 +66,36 @@ class TransactionTotals(NamedTuple):
 class TransactionFilters(BaseModel):
     """The filters of the transactions page, as its URL query names them.
 
-    ``counterparty`` set to a blank text selects the rows with no counterparty.
-    ``non_inr`` and ``excluded`` are three-way: ``None`` does not filter.
+    The page, its links and the assistant's transaction report use this one
+    model, so a report and the page that its link opens list the same rows.
+    Every field is optional, and an empty model selects every row.
+
+    Attributes:
+        bank: The bank, matched without case.
+        account_ids: Rows on any of these accounts.
+        card_ids: Rows with any of these cards. A listed card narrows its own
+            listed account to that card.
+        direction: ``debit`` or ``credit``.
+        date_from: The first date.
+        date_to: The last date.
+        category: The category slug.
+        counterparty: The exact counterparty. A blank text selects the rows
+            with no counterparty.
+        card_holder: The cardholder that the card statement names.
+        uncategorized: Only rows outside the known category buckets.
+        category_null: Only rows with no category.
+        internal: Only internal-movement rows for the scope.
+        non_inr: True for foreign rows, False for rupee rows, None for both.
+        undated: Only live rows with no date.
+        excluded: True for rows out of the cashflow, False for rows in it,
+            None for both.
+        provisional: Only screenshot rows that no bank source confirms yet.
+        scope: The account perimeter of a cashflow figure.
+        q: Text to find in the row's text fields.
+        amount: The exact amount.
+        source: The exact row source.
+        review_status: The category review status.
+        reference: A payment reference.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -147,6 +182,9 @@ class TransactionFilters(BaseModel):
 
         A listed card narrows its own account to that card, so choosing an
         account and then one of its cards lists that card's rows.
+
+        Returns:
+            One clause for the listed accounts and cards.
         """
         on_card = Transaction.card_id.in_(self.card_ids)
         if not self.account_ids:
@@ -199,12 +237,26 @@ class TransactionFilters(BaseModel):
 
 
 def _flag(value: bool) -> str | None:
-    """Return the "1" that an on/off filter takes in the URL, or no parameter."""
+    """Return the "1" that an on/off filter takes in the URL.
+
+    Args:
+        value: The filter.
+
+    Returns:
+        "1" when the filter is on, or None for no parameter.
+    """
     return "1" if value else None
 
 
 def _three_way(value: bool | None) -> str | None:
-    """Return the "1" or "0" that a three-way filter takes in the URL."""
+    """Return the "1" or "0" that a three-way filter takes in the URL.
+
+    Args:
+        value: True, False, or None for no filter.
+
+    Returns:
+        "1", "0", or None for no parameter.
+    """
     return None if value is None else _flag(value) or "0"
 
 

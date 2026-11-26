@@ -99,7 +99,26 @@ class ApplyTransactionChanges(StrictModel):
 
 
 class TransactionFilterFields(StrictModel):
-    """The transaction filters that a read and the transaction report share."""
+    """The transaction filters that a read and the transaction report share.
+
+    Every field is optional. The model gives dates and the amount as text, and
+    the server checks them.
+
+    Attributes:
+        account_id: One account, by id.
+        card_id: One card, by id.
+        date_from: The first date, as YYYY-MM-DD.
+        date_to: The last date, as YYYY-MM-DD.
+        direction: ``debit`` or ``credit``.
+        amount: The exact amount, as text.
+        bank: A bank, or the name of an account or a card.
+        source: The row source, such as ``sms``.
+        category: A category slug, or the label that the user sees.
+        review_status: The category review status.
+        reference: A payment reference, such as a UTR.
+        search: Text to find in the row, such as a merchant.
+        excluded: True for rows out of the cashflow, False for rows in it.
+    """
 
     account_id: StrictInt | None = Field(default=None, gt=0)
     card_id: StrictInt | None = Field(default=None, gt=0)
@@ -117,13 +136,30 @@ class TransactionFilterFields(StrictModel):
 
 
 class ListTransactions(TransactionFilterFields):
+    """Ask for transaction rows that the model reads, to find or explain them.
+
+    Attributes:
+        name: The tool name.
+        transaction_ids: Read these rows by id.
+        limit: The most rows to return.
+    """
+
     name: Literal["list_transactions"]
     transaction_ids: list[StrictInt] | None = Field(default=None, max_length=20)
     limit: StrictInt = Field(default=20, ge=1, le=20)
 
 
 class ShowTransactions(TransactionFilterFields):
-    """Ask the server to send the filtered rows, with a link to their page."""
+    """Ask the server to send the filtered rows, with a link to their page.
+
+    The rows, the totals and the link go to the user. The model does not see
+    them.
+
+    Attributes:
+        name: The tool name.
+        sort: The column to sort by, as the transactions page names it.
+        order: The sort order.
+    """
 
     name: Literal["show_transactions"]
     sort: Literal["amount", "bank", "category", "counterparty", "date"] = "date"
@@ -181,7 +217,11 @@ class GetCardDues(StrictModel):
 
 
 class ListAccounts(StrictModel):
-    """Ask for the user's accounts and cards, with their ids and names."""
+    """Ask for the user's accounts and cards, with their ids and names.
+
+    Attributes:
+        name: The tool name.
+    """
 
     name: Literal["list_accounts"]
 
@@ -580,7 +620,12 @@ class AssistantResponseEnvelope(StrictModel):
 
 
 def _openai_strict_schema(value: object) -> object:
-    """Make every object field required, using nullable unions for optionals."""
+    """Make every object field required, using nullable unions for optionals.
+
+    A model's description drops the Attributes section of its docstring. That
+    section is for the reader of the code, and the schema goes with every
+    model call.
+    """
     if isinstance(value, list):
         return [_openai_strict_schema(item) for item in value]
     if not isinstance(value, dict):
@@ -588,6 +633,9 @@ def _openai_strict_schema(value: object) -> object:
     result: dict[str, object] = {}
     for key, item in value.items():
         if key in {"default", "discriminator"}:
+            continue
+        if key == "description" and isinstance(item, str):
+            result[key] = item.split("\n\nAttributes:", 1)[0]
             continue
         output_key = "anyOf" if key == "oneOf" else key
         result[output_key] = _openai_strict_schema(item)

@@ -56,7 +56,15 @@ _MASK_LABEL = re.compile(r"\[redacted-[a-z]+\]")
 
 
 class AssistantTransaction(BaseModel):
-    """Redacted transaction projection safe to place in a model context."""
+    """Redacted transaction projection safe to place in a model context.
+
+    Only these fields reach the model. Names and numbers in the text fields
+    are masked before the projection is built.
+
+    Attributes:
+        review_gate_reason: Why the categoriser asked the user about the row,
+            from the latest active review decision, or None.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -84,7 +92,14 @@ class AssistantTransaction(BaseModel):
 
 
 class LabelCandidate(NamedTuple):
-    """An account or a card that a name can point to, with its label."""
+    """An account or a card that a name can point to, with its label.
+
+    Attributes:
+        kind: ``account`` or ``card``.
+        id: The account id or the card id.
+        label: The label to match. A card's label also holds its account's
+            label, so a name can give both.
+    """
 
     kind: Literal["account", "card"]
     id: int
@@ -92,21 +107,40 @@ class LabelCandidate(NamedTuple):
 
 
 class LabelRank(NamedTuple):
-    """How closely a label fits a name. A higher rank fits better."""
+    """How closely a label fits a name. A higher rank fits better.
+
+    Tuples compare field by field, so more covered words win first.
+
+    Attributes:
+        covered: How many words of the name the label covers.
+        whole: True when the name holds every word of the label. It wins a tie.
+    """
 
     covered: int
     whole: bool
 
 
 class NamedIds(NamedTuple):
-    """The accounts and cards that a name points to."""
+    """The accounts and cards that a name points to.
+
+    Attributes:
+        account_ids: The ids of the accounts.
+        card_ids: The ids of the cards.
+    """
 
     account_ids: list[int]
     card_ids: list[int]
 
 
 class AssistantCard(BaseModel):
-    """One card of an account, as the model sees it."""
+    """One card of an account, as the model sees it.
+
+    Attributes:
+        id: The card id, for the ``card_id`` filter.
+        label: The card label, with configured names masked.
+        active: False for a card that the user no longer uses.
+        is_primary: True for the user's own card, False for an add-on.
+    """
 
     id: int
     label: str | None
@@ -115,7 +149,16 @@ class AssistantCard(BaseModel):
 
 
 class AssistantAccount(BaseModel):
-    """One account and its cards, as the model sees them."""
+    """One account and its cards, as the model sees them.
+
+    Attributes:
+        id: The account id, for the ``account_id`` filter.
+        bank: The bank, as the rows store it.
+        label: The account label, with configured names masked.
+        type: The account type, such as ``credit_card``.
+        active: False for an account that the user closed.
+        cards: The cards of the account.
+    """
 
     id: int
     bank: str
@@ -215,7 +258,13 @@ def _name_words(text: str) -> frozenset[str]:
     """Return the words that tell one account or card from another.
 
     Case, a possessive "'s", punctuation and generic words such as "card" do
-    not count. "+" stays, because some card names end in it.
+    not count.
+
+    Args:
+        text: A name or a label.
+
+    Returns:
+        The words, in lower case.
     """
     text = _POSSESSIVE.sub("", text.lower().replace("a/c", " "))
     return frozenset(_NAME_WORD.findall(text)) - GENERIC_NAME_WORDS
@@ -311,7 +360,15 @@ async def _named_ids(session: AsyncSession, text: str, *, loose: bool) -> NamedI
 
 
 def _named_clause(column: ColumnElement[bool], named: NamedIds) -> ColumnElement[bool]:
-    """Widen a filter to the rows of the accounts and cards that a name points to."""
+    """Widen a filter to the rows of the accounts and cards that a name points to.
+
+    Args:
+        column: The filter on the row's own fields.
+        named: The accounts and cards that the name points to.
+
+    Returns:
+        A clause that matches either.
+    """
     return or_(
         column,
         Transaction.account_id.in_(named.account_ids),
@@ -323,8 +380,15 @@ async def _category_slug(session: AsyncSession, category: str) -> str:
     """Return the slug of the category that the model names.
 
     The model can give the label that the user sees, such as "Card bills",
-    in place of the slug. A name that fits no active category stays as it is,
-    so the filter matches no row.
+    in place of the slug.
+
+    Args:
+        session: The open database session.
+        category: A slug, a slug with spaces, or a label.
+
+    Returns:
+        The slug of the active category that fits. A name that fits no active
+        category stays as it is, so the filter matches no row.
     """
     wanted = category.strip().lower()
     for slug in await get_active_slugs(session):
@@ -449,7 +513,15 @@ async def get_transaction(
     session: AsyncSession,
     transaction_id: int,
 ) -> AssistantTransaction | None:
-    """Read exactly one transaction by trusted database ID."""
+    """Read exactly one transaction by trusted database ID.
+
+    Args:
+        session: The open database session.
+        transaction_id: The id of the row.
+
+    Returns:
+        The redacted row, or None when no row has this id.
+    """
     rows = await list_transactions(session, transaction_ids=[transaction_id])
     return rows[0] if rows else None
 
@@ -474,7 +546,37 @@ async def list_transactions(
     review_status: str | None = None,
     reference: str | None = None,
 ) -> list[AssistantTransaction]:
-    """Return a bounded, stable page of allowlisted transaction projections."""
+    """Return a bounded, stable page of allowlisted transaction projections.
+
+    A bank filter also matches the accounts and cards that it names, and a
+    search also matches an account whose whole label it holds. A category may
+    be a label. Each row carries its review gate reason.
+
+    Args:
+        session: The open database session.
+        limit: The most rows to return, at most ``MAX_CONTEXT_ROWS``.
+        offset: The rows to skip.
+        account_id: One account, by id.
+        card_id: One card, by id.
+        date_from: The first date.
+        date_to: The last date.
+        direction: ``debit`` or ``credit``.
+        category: A category slug or label.
+        search: Text to find in the row.
+        excluded: True for rows out of the cashflow, False for rows in it.
+        transaction_ids: Read these rows by id.
+        amount: The exact amount.
+        bank: A bank, or the name of an account or a card.
+        source: The row source.
+        review_status: The category review status.
+        reference: A payment reference.
+
+    Returns:
+        The newest rows first.
+
+    Raises:
+        ValueError: The limit is not positive or the offset is negative.
+    """
     if limit < 1 or offset < 0:
         raise ValueError("limit must be positive and offset cannot be negative")
     limit = min(limit, MAX_CONTEXT_ROWS)

@@ -201,12 +201,26 @@ def _date_presets(today: date) -> list[dict[str, str]]:
 
 
 def _ids(values: list[str] | None) -> tuple[int, ...]:
-    """Return the ids among the query values. A value that is not a number is ignored."""
+    """Return the ids among the query values.
+
+    Args:
+        values: The repeated query values, or None.
+
+    Returns:
+        The ids in order. A value that is not a number is left out.
+    """
     return tuple(int(value) for value in values or () if value.strip().isdigit())
 
 
 def _three_way(value: str | None) -> bool | None:
-    """Read a "1" or "0" filter. Any other value, or none, does not filter."""
+    """Read a "1" or "0" filter from the query.
+
+    Args:
+        value: The query value, or None.
+
+    Returns:
+        True for "1", False for "0", and None for any other value or none.
+    """
     match value:
         case "1":
             return True
@@ -217,7 +231,14 @@ def _three_way(value: str | None) -> bool | None:
 
 
 def _amount(value: str | None) -> Decimal | None:
-    """Return the amount in the query value, or None when there is none or it is bad."""
+    """Return the amount in the query value.
+
+    Args:
+        value: The query value, or None.
+
+    Returns:
+        The amount, or None when there is none or it is not a finite number.
+    """
     try:
         amount = Decimal(value) if value and value.strip() else None
     except InvalidOperation:

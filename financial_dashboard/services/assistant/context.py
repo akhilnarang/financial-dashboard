@@ -20,7 +20,15 @@ MAX_CONTEXT_CHARS = 18_000
 
 
 class ToolResult(BaseModel):
-    """The result of one read, as the model sees it."""
+    """The result of one read, as the model sees it.
+
+    The prompt quotes it as JSON. The model never sees the database rows.
+
+    Attributes:
+        tool: The name of the read tool, such as ``list_transactions``.
+        items: The rows that the read returns, already redacted.
+        hint: What to do next when the read found nothing, or None.
+    """
 
     model_config = ConfigDict(frozen=True)
 

@@ -127,8 +127,16 @@ def _fit(
 ) -> str:
     """Join the lines and drop the last rows that do not fit in one message.
 
-    ``hidden`` counts rows that the caller left out before, so the "and more"
-    line counts them too.
+    Args:
+        head: The lines that always stay at the top.
+        rows: The lines that can drop, last first.
+        tail: The lines that always stay at the bottom.
+        hidden: The rows that the caller left out before. The "and more"
+            line counts them too.
+
+    Returns:
+        The message text, at most ``MAX_REPORT_CHARS`` long when the rows can
+        drop far enough.
     """
     kept = list(rows)
     while True:
@@ -279,8 +287,17 @@ async def _transactions(
 ) -> str:
     """Render the filtered rows and their totals, as /transactions lists them.
 
-    The rows, the totals and the link all come from the same filters, so the
+    The rows, the totals and the link all come from the same filters. So the
     page that the link opens shows the same rows in the same order.
+
+    Args:
+        session: The turn session.
+        filters: The filters of the report.
+        call: The report call, for the sort column and order.
+        base_url: The dashboard base URL for the links. Empty means no links.
+
+    Returns:
+        The report as Telegram HTML.
     """
     stmt = select(Transaction).where(*filters.clauses())
     totals = await transaction_totals(session, stmt)
@@ -315,7 +332,18 @@ async def _transactions(
 
 
 def _transaction_line(row: Transaction, base_url: str) -> str:
-    """Render one transaction as a report line: id, date, amount, payee, category."""
+    """Render one transaction as a report line.
+
+    The line holds the id, the date, the signed amount, the payee and the
+    category. A voided or excluded row says so.
+
+    Args:
+        row: The transaction.
+        base_url: The dashboard base URL for the id link. Empty means no link.
+
+    Returns:
+        One line of Telegram HTML.
+    """
     sign = "−" if row.direction == "debit" else "+"
     currency = (row.currency or "INR").strip().upper() or "INR"
     amount = (
