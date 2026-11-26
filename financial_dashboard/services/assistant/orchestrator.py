@@ -105,7 +105,7 @@ from financial_dashboard.services.assistant.mutations import (
     unnamed_category,
     unrequested_exclusion,
 )
-from financial_dashboard.services.assistant.packs import choose_packs, loaded_tool_names
+from financial_dashboard.services.assistant.packs import choose_packs, pack_refusal
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.reports import render_report
 from financial_dashboard.services.assistant.assistant_writes import (
@@ -171,6 +171,11 @@ EMPTY_LIST_HINT = (
     "such rows: answer that. If a name did not fit, list_accounts gives the "
     "account and card names with the ids for account_id and card_id, and "
     "the category filter takes a slug from ACTIVE CATEGORY SLUGS."
+)
+INVALID_OUTPUT = Error(
+    outcome="error",
+    message="I couldn't safely interpret that request. Please rephrase it.",
+    code="invalid_model_output",
 )
 _CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
 _REREAD_KEPT_FIELDS = ("counterparty", "vpa", "utr", "amount", "occurred_at")
@@ -643,38 +648,12 @@ async def run_turn(
             )
             response = parse_response(result.response.model_dump())
         except (ProviderFailure, ValueError, TypeError) as exc:
-            return completed(
-                Error(
-                    outcome="error",
-                    message="I couldn't safely interpret that request. Please rephrase it.",
-                    code="invalid_model_output",
-                ),
-                error_detail=_format_exception_detail(exc),
-            )
-        match response:
-            case RequestPacks() if not set(response.packs) <= packs:
-                packs = packs | set(response.packs)
-                continue
-            case RequestPacks():
-                return completed(
-                    Error(
-                        outcome="error",
-                        message="I couldn't safely interpret that request. Please rephrase it.",
-                        code="invalid_model_output",
-                    ),
-                    error_detail="request_packs named only loaded packs",
-                )
-            case ToolCalls() if unloaded := sorted(
-                {call.name for call in response.calls} - loaded_tool_names(packs)
-            ):
-                return completed(
-                    Error(
-                        outcome="error",
-                        message="I couldn't safely interpret that request. Please rephrase it.",
-                        code="invalid_model_output",
-                    ),
-                    error_detail=f"tool not loaded: {', '.join(unloaded)}",
-                )
+            return completed(INVALID_OUTPUT, error_detail=_format_exception_detail(exc))
+        if (refusal := pack_refusal(response, packs)) is not None:
+            return completed(INVALID_OUTPUT, error_detail=refusal)
+        if isinstance(response, RequestPacks):
+            packs |= set(response.packs)
+            continue
         writes_target = (
             isinstance(response, CategoryProposal)
             or isinstance(response, Clarification)

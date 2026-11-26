@@ -5,13 +5,12 @@ tools below.  Pydantic validation is deliberately strict: provider output is
 untrusted input and is never interpreted as prose or partially recovered.
 """
 
+import copy
 import datetime
 import re
 from collections.abc import Sequence
 from decimal import Decimal
-from functools import reduce
-from operator import or_
-from typing import Annotated, Literal, TypeAlias, cast
+from typing import Annotated, Any, Literal, TypeAlias, cast
 
 from pydantic import (
     BaseModel,
@@ -19,7 +18,6 @@ from pydantic import (
     Field,
     TypeAdapter,
     WithJsonSchema,
-    create_model,
     field_validator,
     model_validator,
 )
@@ -663,56 +661,92 @@ def _openai_strict_schema(value: object) -> object:
     return result
 
 
+class AssistantResponseEnvelope(StrictModel):
+    """The object root of every model reply.
+
+    Strict provider APIs need an object at the root, not a union.
+
+    Attributes:
+        response: The outcome of the step.
+    """
+
+    response: AssistantResponse
+
+
+_FULL_RESPONSE_SCHEMA = cast(
+    dict[str, Any],
+    _openai_strict_schema(AssistantResponseEnvelope.model_json_schema()),
+)
+# The docstring is for the reader of the code. The model does not need it.
+_FULL_RESPONSE_SCHEMA.pop("description")
+
+
 def response_json_schema(
-    tools: Sequence[type[StrictModel]], requestable: Sequence[PackName]
+    tool_names: frozenset[str], requestable: Sequence[PackName]
 ) -> dict[str, object]:
     """Return the strict provider schema of one step, for the given tools only.
 
+    The full schema drops the tools that the step cannot call, and the
+    definitions that nothing then uses.
+
     Args:
-        tools: The tool calls that the step can make, two or more.
+        tool_names: The names of the tools that the step can call.
         requestable: The packs that the step can ask for. With none, the
             schema has no ``request_packs`` outcome.
 
     Returns:
         An object-root schema that strict provider APIs accept.
     """
-    calls = create_model(
-        "ToolCalls",
-        __base__=ToolCalls,
-        __doc__=ToolCalls.__doc__,
-        calls=(
-            list[Annotated[reduce(or_, tools), Field(discriminator="name")]],  # ty: ignore[invalid-type-form]
-            Field(min_length=1, max_length=4),
-        ),
-    )
-    outcomes: list[type[StrictModel]] = [
-        Answer,
-        Clarification,
-        CategoryProposal,
-        calls,
-        Error,
+    schema = copy.deepcopy(_FULL_RESPONSE_SCHEMA)
+    defs = schema["$defs"]
+    calls = defs["ToolCalls"]["properties"]["calls"]["items"]
+    calls["anyOf"] = [
+        ref
+        for ref in calls["anyOf"]
+        if defs[_ref_name(ref)]["properties"]["name"]["const"] in tool_names
     ]
+    outcomes = schema["properties"]["response"]
     if requestable:
-        outcomes.append(
-            create_model(
-                "RequestPacks",
-                __base__=RequestPacks,
-                __doc__=RequestPacks.__doc__,
-                packs=(
-                    list[Literal[tuple(requestable)]],  # ty: ignore[invalid-type-form]
-                    Field(min_length=1, max_length=len(requestable)),
-                ),
-            )
-        )
-    envelope = create_model(
-        "AssistantResponseEnvelope",
-        __base__=StrictModel,
-        response=(
-            Annotated[reduce(or_, outcomes), Field(discriminator="outcome")],  # ty: ignore[invalid-type-form]
-            ...,
-        ),
-    )
-    return cast(dict[str, object], _openai_strict_schema(envelope.model_json_schema()))
+        packs = defs["RequestPacks"]["properties"]["packs"]
+        packs["items"]["enum"] = list(requestable)
+        packs["maxItems"] = len(requestable)
+    else:
+        outcomes["anyOf"] = [
+            ref for ref in outcomes["anyOf"] if _ref_name(ref) != "RequestPacks"
+        ]
+    used = _used_defs(schema, defs)
+    schema["$defs"] = {name: body for name, body in defs.items() if name in used}
+    return schema
+
+
+def _ref_name(ref: dict[str, str]) -> str:
+    """Return the definition name of a ``{"$ref": "#/$defs/Name"}`` entry."""
+    return ref["$ref"].rsplit("/", 1)[1]
+
+
+def _used_defs(schema: dict[str, Any], defs: dict[str, Any]) -> set[str]:
+    """Name the definitions that the schema root reaches through its refs.
+
+    Args:
+        schema: The schema root.
+        defs: The definitions that the refs point to.
+
+    Returns:
+        The names of the reached definitions.
+    """
+    used: set[str] = set()
+    pending: list[object] = [{k: v for k, v in schema.items() if k != "$defs"}]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, list):
+            pending.extend(node)
+        elif isinstance(node, dict):
+            ref = node.get("$ref")
+            if isinstance(ref, str) and (name := _ref_name(node)) not in used:
+                used.add(name)
+                pending.append(defs[name])
+            pending.extend(node.values())
+    return used
 
 
 def screenshot_json_schema() -> dict[str, object]:

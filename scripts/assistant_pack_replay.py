@@ -24,15 +24,14 @@ from financial_dashboard.services.assistant.packs import (
     PACKS,
     choose_packs,
     pack_response_schema,
+    tool_name,
 )
 from financial_dashboard.services.assistant.prompt import PromptContext, build_prompt
 
 TEXT_TRIGGERS = frozenset({"ask", "reply"})
 HISTORY_TURNS = 12
 TOOL_PACK: dict[str, PackName] = {
-    tool.model_json_schema()["properties"]["name"]["const"]: name
-    for name, pack in PACKS.items()
-    for tool in pack.tools
+    tool_name(tool): name for name, pack in PACKS.items() for tool in pack.tools
 }
 
 
