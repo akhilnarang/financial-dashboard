@@ -342,7 +342,7 @@ async def report_filters(
         return None
     account_ids = (call.account_id,) if call.account_id else ()
     card_ids = (call.card_id,) if call.card_id else ()
-    bank = call.bank
+    bank = call.bank or None
     if bank and not account_ids and not card_ids:
         named = await _named_ids(session, bank, loose=True)
         if named.account_ids or named.card_ids:
@@ -359,11 +359,11 @@ async def report_filters(
         if call.category
         else None,
         excluded=call.excluded,
-        q=call.search,
+        q=call.search or None,
         amount=amount,
-        source=call.source,
-        review_status=call.review_status,
-        reference=call.reference,
+        source=call.source or None,
+        review_status=call.review_status or None,
+        reference=call.reference or None,
     )
 
 

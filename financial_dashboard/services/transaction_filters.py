@@ -42,13 +42,14 @@ SORT_COLUMNS = {
 
 
 class TransactionTotals(NamedTuple):
-    """INR amounts of the filtered rows.
+    """The count and the INR amounts of the filtered rows.
 
     A foreign-currency row is a card alert that no statement converted to
     rupees yet, so the sums leave it out and count it. A voided row moved no
     money.
     """
 
+    count: int
     credits: Decimal
     debits: Decimal
     net: Decimal
@@ -241,9 +242,7 @@ def ordered(stmt: Select, sort: SortKey, order: SortOrder) -> Select:
     return stmt.order_by(column.desc().nullslast(), Transaction.id.desc())
 
 
-async def transaction_totals(
-    session: AsyncSession, stmt: Select
-) -> tuple[int, TransactionTotals]:
+async def transaction_totals(session: AsyncSession, stmt: Select) -> TransactionTotals:
     """Count the filtered rows and sum their INR credits and debits.
 
     Args:
@@ -284,6 +283,10 @@ async def transaction_totals(
     count, credits, debits, foreign = row
     credits = Decimal(str(credits or 0))
     debits = Decimal(str(debits or 0))
-    return count, TransactionTotals(
-        credits=credits, debits=debits, net=credits - debits, foreign_count=foreign
+    return TransactionTotals(
+        count=count,
+        credits=credits,
+        debits=debits,
+        net=credits - debits,
+        foreign_count=foreign,
     )

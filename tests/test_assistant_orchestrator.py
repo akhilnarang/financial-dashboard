@@ -254,6 +254,8 @@ async def test_cashflow_summary_sends_server_figures_without_a_second_model_step
                 "bank": "testbank",
                 "date_from": "2026-05-01",
                 "date_to": "2026-05-31",
+                # A blank filter is no filter, in the rows and in the link.
+                "source": "",
             },
             (
                 "1 row · Debits: ₹400.00",
@@ -370,6 +372,16 @@ async def test_reports_send_server_figures(session, monkeypatch, call, expected)
                 {"name": "list_accounts"},
             ],
             "mixed_report",
+        ),
+        (
+            [
+                {
+                    "name": "show_transactions",
+                    "date_from": "2026-11-12",
+                    "date_to": "2026-04-01",
+                }
+            ],
+            "invalid_filters",
         ),
     ],
 )

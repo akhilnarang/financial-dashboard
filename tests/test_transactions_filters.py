@@ -368,6 +368,7 @@ async def test_listed_accounts_and_cards_select_their_rows(client, session):
     the rows on any listed account or card, and a card narrows its account."""
     savings = await ensure_account(session, 501, "bank_account")
     credit = await ensure_account(session, 502, "credit_card")
+    other = await ensure_account(session, 503, "bank_account")
     session.add_all(
         [
             Card(id=601, account_id=credit, card_mask="XXXX0001", label="Primary"),
@@ -379,6 +380,7 @@ async def test_listed_accounts_and_cards_select_their_rows(client, session):
         (savings, None, "SAMPLE GROCER"),
         (credit, 601, "SAMPLE CAFE"),
         (credit, 602, "SAMPLE FOODS"),
+        (other, None, "SAMPLE DECOY"),
     ):
         session.add(
             Transaction(
@@ -401,8 +403,17 @@ async def test_listed_accounts_and_cards_select_their_rows(client, session):
     )
     # q finds text in a row, as the assistant's search does.
     by_text = await client.get("/transactions?q=sample%20foods")
+    # A corrected date keeps every listed id.
+    corrected = await client.get(
+        f"/transactions?account_id={savings}&account_id={credit}&date_to=2026-06-31",
+        follow_redirects=True,
+    )
 
     assert _count_rows(both.text) == 3
+    assert "SAMPLE DECOY" not in _transaction_rows_html(both.text)
+    assert _count_rows(corrected.text) == 3
     assert _count_rows(card_of_account.text) == 1
     assert _count_rows(card_and_other_account.text) == 2
+    assert "SAMPLE GROCER" in _transaction_rows_html(card_and_other_account.text)
     assert _count_rows(by_text.text) == 1
+    assert "SAMPLE FOODS" in _transaction_rows_html(by_text.text)

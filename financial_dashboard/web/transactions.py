@@ -351,8 +351,11 @@ async def transaction_list(
         ):
             corrections[key] = normalized
     if corrections:
-        query = dict(request.query_params)
-        query.update(corrections)
+        # multi_items keeps a repeated account_id or card_id.
+        query = [
+            (key, corrections.get(key, value))
+            for key, value in request.query_params.multi_items()
+        ]
         return RedirectResponse(
             url=f"/transactions?{urlencode(query)}",
             status_code=307,
@@ -385,7 +388,8 @@ async def transaction_list(
         reference=reference or None,
     )
     stmt = select(Transaction).where(*page_filters.clauses())
-    total_count, totals = await transaction_totals(session, stmt)
+    totals = await transaction_totals(session, stmt)
+    total_count = totals.count
 
     if sort not in SORT_COLUMNS:
         sort = "date"

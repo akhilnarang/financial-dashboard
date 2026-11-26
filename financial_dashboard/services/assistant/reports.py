@@ -119,11 +119,20 @@ async def render_report(session: AsyncSession, call: ReportCall) -> Answer | Err
     return Answer(outcome="answer", text=text)
 
 
-def _fit(head: Sequence[str], rows: Sequence[str], tail: Sequence[str] = ()) -> str:
-    """Join the lines and drop the last rows that do not fit in one message."""
+def _fit(
+    head: Sequence[str],
+    rows: Sequence[str],
+    tail: Sequence[str] = (),
+    hidden: int = 0,
+) -> str:
+    """Join the lines and drop the last rows that do not fit in one message.
+
+    ``hidden`` counts rows that the caller left out before, so the "and more"
+    line counts them too.
+    """
     kept = list(rows)
     while True:
-        more = len(rows) - len(kept)
+        more = len(rows) - len(kept) + hidden
         lines = [*head, *kept]
         if more:
             lines.append(f"… and {more} more")
@@ -274,7 +283,8 @@ async def _transactions(
     page that the link opens shows the same rows in the same order.
     """
     stmt = select(Transaction).where(*filters.clauses())
-    count, totals = await transaction_totals(session, stmt)
+    totals = await transaction_totals(session, stmt)
+    count = totals.count
     rows = (
         await session.scalars(
             ordered(stmt, call.sort, call.order).limit(MAX_SHOWN_ROWS)
@@ -294,7 +304,6 @@ async def _transactions(
         head.append("No transactions match these filters.")
     body = [_transaction_line(row, base_url) for row in rows]
     tail = [
-        *([f"Showing the first {len(rows)}."] if count > len(rows) else []),
         "",
         page_link(
             "Open these on the dashboard",
@@ -302,7 +311,7 @@ async def _transactions(
             base_url,
         ),
     ]
-    return _fit(head, body, tail)
+    return _fit(head, body, tail, hidden=count - len(rows))
 
 
 def _transaction_line(row: Transaction, base_url: str) -> str:
