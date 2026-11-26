@@ -2,6 +2,8 @@
 
 import io
 import json
+
+import pytest
 from urllib.parse import unquote, urlsplit
 from urllib.request import Request
 
@@ -14,6 +16,7 @@ DOWNLOAD_URL = (
     "https://dl.example/jmap/download/{accountId}/{blobId}/{name}?type={type}"
 )
 REFUSED_SENDER = "alerts@refused.example"
+FAILING_SENDER = "alerts@failing.example"
 SEEN_IDS = {f"e-seen-{n}" for n in range(5)}
 EMAILS = {
     "e-new": "alerts@new.example",
@@ -69,9 +72,13 @@ class _FakeFastmail:
         match name:
             case "Email/query" if args["filter"].get("from") == REFUSED_SENDER:
                 return "error", {"type": "unsupportedFilter"}
+            case "Email/query" if args["filter"].get("from") == FAILING_SENDER:
+                return name, {"ids": [FAILING_SENDER]}
             case "Email/query":
                 ids = [i for i, s in EMAILS.items() if s == args["filter"].get("from")]
                 return name, {"ids": ids[args["position"] :][: args["limit"]]}
+            case "Email/get" if FAILING_SENDER in args["ids"]:
+                return "error", {"type": "serverFail", "description": None}
             case "Email/get":
                 assert len(args["ids"]) <= 4
                 return name, {
@@ -83,7 +90,7 @@ class _FakeFastmail:
                             "subject": "Alert",
                             "mailboxIds": {"inbox": True},
                         }
-                        for i in args["ids"]
+                        for i in reversed(args["ids"])
                     ]
                 }
             case "Mailbox/query":
@@ -94,13 +101,16 @@ class _FakeFastmail:
                 raise AssertionError(f"unexpected JMAP method {name}")
 
 
-def test_fetch_source_keeps_backfill_pending_for_rules_that_fail(monkeypatch):
+def test_fetch_source_keeps_backfill_pending_for_rules_that_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Only a rule whose search finished completes its backfill.
 
     A JMAP method error or a missing folder must not read as "no mail". A
     rule whose matches are all stored already still completes its backfill,
-    and its pages stay within the server's maxObjectsInGet. Other rules
-    keep running.
+    and its pages stay within the server's maxObjectsInGet. The fetch
+    limit keeps the newest email, whatever order Email/get answers in.
+    Other rules keep running.
     """
     monkeypatch.setattr(jmap_fastmail, "urlopen", _FakeFastmail())
     rules = [
@@ -113,7 +123,7 @@ def test_fetch_source_keeps_backfill_pending_for_rules_that_fail(monkeypatch):
     result = jmap_fastmail._fetch_fastmail_source_sync(
         rules,
         token="tok",
-        fetch_limit=0,
+        fetch_limit=1,
         source_id=7,
         existing_remote_ids={"e-old"} | SEEN_IDS,
     )
@@ -126,3 +136,29 @@ def test_fetch_source_keeps_backfill_pending_for_rules_that_fail(monkeypatch):
         4: [],
     }
     assert result.backfill_ready_rule_ids == {1, 2}
+
+
+def test_fetch_source_fails_on_a_server_level_method_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-level JMAP error fails the whole source.
+
+    The error comes inside an HTTP 200 answer. It must not read as an empty
+    page, and the other rules must not mark the sync as good.
+    """
+    monkeypatch.setattr(jmap_fastmail, "urlopen", _FakeFastmail())
+    rules = [
+        FetchRule(id=1, bank="new", sender="alerts@new.example"),
+        FetchRule(id=2, bank="failing", sender=FAILING_SENDER),
+    ]
+
+    result = jmap_fastmail._fetch_fastmail_source_sync(
+        rules,
+        token="tok",
+        fetch_limit=0,
+        source_id=7,
+        existing_remote_ids=set(),
+    )
+
+    assert result.fetch_ok is False
+    assert result.backfill_ready_rule_ids == set()

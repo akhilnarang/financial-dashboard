@@ -33,10 +33,17 @@ REGULAR_SYNC_MARGIN_DAYS = 2
 EMAIL_PROPERTIES = ["id", "blobId", "receivedAt", "from", "subject", "mailboxIds"]
 BLOB_TYPE = "application/octet-stream"
 BLOB_NAME = "email.eml"
+RULE_SCOPED_METHOD_ERRORS = frozenset(
+    {"invalidArguments", "unsupportedFilter", "unsupportedSort", "anchorNotFound"}
+)
 
 
 class JmapError(Exception):
-    """Raised when the JMAP server refuses a call or a rule cannot be searched."""
+    """Raised when the JMAP server refuses a call. It fails the whole source."""
+
+
+class JmapRuleError(JmapError):
+    """Raised when one rule cannot be searched. The other rules still run."""
 
 
 class _Candidate(NamedTuple):
@@ -45,7 +52,7 @@ class _Candidate(NamedTuple):
 
 
 class _RuleFilter(NamedTuple):
-    jmap_filter: dict
+    jmap_filter: dict[str, str]
     mailbox_id: str | None
 
 
@@ -129,7 +136,8 @@ def _jmap_request(token: str, url: str, body: dict | None = None) -> dict:
 
 def _require_https(url: str, field: str) -> str:
     """Refuse a session URL that would send the token in clear text."""
-    if urlsplit(url).scheme != "https":
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.netloc:
         raise JmapError(f"JMAP session {field} is not https: {url}")
     return url
 
@@ -163,7 +171,9 @@ def open_jmap_session(token: str) -> JmapSession:
 def _method_args(responses: list[list], index: int, name: str) -> dict:
     """Return the arguments of one method response.
 
-    An error response must not read as an empty result.
+    An error response must not read as an empty result. An error that
+    the rule's own arguments cause fails only that rule. Any other error,
+    such as ``serverFail`` or ``accountNotFound``, fails the whole source.
 
     Args:
         responses: The ``methodResponses`` list.
@@ -174,13 +184,16 @@ def _method_args(responses: list[list], index: int, name: str) -> dict:
         The response arguments.
 
     Raises:
-        JmapError: The server answered with an error or another method.
+        JmapRuleError: The rule's arguments caused the error.
+        JmapError: The server answered with another error or another method.
     """
     response_name, args, _call_id = responses[index]
     if response_name == "error":
-        raise JmapError(
-            f"{name} failed: {args.get('type')} {args.get('description', '')}".strip()
-        )
+        error_type = args.get("type")
+        message = f"{name} failed: {error_type} {args.get('description') or ''}"
+        if error_type in RULE_SCOPED_METHOD_ERRORS:
+            raise JmapRuleError(message.strip())
+        raise JmapError(message.strip())
     if response_name != name:
         raise JmapError(f"{name} answered as {response_name}")
     return args
@@ -241,21 +254,33 @@ def _rule_filter(
     """Build the Email/query filter for one rule.
 
     Raises:
-        JmapError: The rule's folder does not exist or the lookup failed.
+        JmapRuleError: The rule's folder does not exist.
+        JmapError: The folder lookup failed.
     """
-    jmap_filter: dict = {"after": after}
+    jmap_filter = {"after": after}
     mailbox_id = None
     if rule.folder:
         if rule.folder not in mailbox_cache:
             mailbox_cache[rule.folder] = _resolve_mailbox_id(session, rule.folder)
         if (mailbox_id := mailbox_cache[rule.folder]) is None:
-            raise JmapError(f"folder not found: {rule.folder}")
+            raise JmapRuleError(f"folder not found: {rule.folder}")
         jmap_filter["inMailbox"] = mailbox_id
     if rule.sender:
         jmap_filter["from"] = rule.sender
     if rule.subject:
         jmap_filter["subject"] = rule.subject
     return _RuleFilter(jmap_filter, mailbox_id)
+
+
+def _email_matches(em: dict, rule: FetchRule, mailbox_id: str | None) -> bool:
+    """Check one Email/get entry against the rule's folder and local filters."""
+    if mailbox_id and mailbox_id not in em.get("mailboxIds", {}):
+        return False
+    return _matches_rule_filters(
+        rule,
+        sender=_format_jmap_from_field(em.get("from")),
+        subject=em.get("subject", ""),
+    )
 
 
 def _rule_candidates(
@@ -266,8 +291,13 @@ def _rule_candidates(
 ) -> list[_Candidate]:
     """Page through the emails that match one rule, newest first.
 
+    Email/get may answer in any order, so the query's id order sets the
+    order. A server may lower the page limit, so its answered limit ends
+    the paging.
+
     Raises:
-        JmapError: A query or get call failed.
+        JmapRuleError: The rule's arguments caused an error.
+        JmapError: A query or get call failed for another reason.
     """
     page_size = max(fetch_limit, MIN_PAGE_SIZE)
     if session.max_objects_in_get:
@@ -303,23 +333,16 @@ def _rule_candidates(
                 ],
             ]
         )
-        query_ids = _method_args(responses, 0, "Email/query")["ids"]
-        emails = _method_args(responses, 1, "Email/get")["list"]
-        for em in emails:
+        query = _method_args(responses, 0, "Email/query")
+        by_id = {em["id"]: em for em in _method_args(responses, 1, "Email/get")["list"]}
+        for email_id in query["ids"]:
             if fetch_limit > 0 and len(candidates) >= fetch_limit:
                 break
-            if rule_filter.mailbox_id and rule_filter.mailbox_id not in em.get(
-                "mailboxIds", {}
-            ):
-                continue
-            if _matches_rule_filters(
-                rule,
-                sender=_format_jmap_from_field(em.get("from")),
-                subject=em.get("subject", ""),
-            ):
-                candidates.append(_Candidate(em["id"], em["blobId"]))
-        position += len(query_ids)
-        if len(query_ids) < page_size:
+            em = by_id.get(email_id)
+            if em and _email_matches(em, rule, rule_filter.mailbox_id):
+                candidates.append(_Candidate(email_id, em["blobId"]))
+        position += len(query["ids"])
+        if len(query["ids"]) < query.get("limit", page_size):
             break
     return candidates
 
@@ -336,7 +359,8 @@ def _fetch_fastmail_source_sync(
     """Fetch emails from Fastmail via JMAP for all rules on one source.
 
     A rule that cannot be searched is skipped and keeps its backfill
-    pending. A session, transport or download error fails the whole source.
+    pending. A session, transport, download or server-level JMAP error
+    fails the whole source.
 
     Args:
         rules: The enabled rules of the source.
@@ -369,7 +393,7 @@ def _fetch_fastmail_source_sync(
                     session, rule, _after_date(rule, last_synced_at), mailbox_cache
                 )
                 candidates = _rule_candidates(session, rule, rule_filter, fetch_limit)
-            except JmapError as e:
+            except JmapRuleError as e:
                 logger.error(
                     "Fastmail rule %s skipped for source %s: %s", rule.id, source_id, e
                 )
