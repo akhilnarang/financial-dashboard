@@ -13,6 +13,7 @@ from financial_dashboard.db.models import (
     Account,
     BalanceSnapshot,
     BankStatementUpload,
+    Card,
     CasUpload,
     Email,
     Category,
@@ -82,7 +83,7 @@ async def test_orchestrator_caps_tool_rounds_and_renews_lease(session):
         [
             ToolCalls(
                 outcome="tool_calls",
-                calls=[{"name": "get_transaction", "transaction_id": txn.id}],
+                calls=[{"name": "list_transactions", "transaction_ids": [txn.id]}],
             )
         ]
         * 4
@@ -104,6 +105,57 @@ async def test_orchestrator_caps_tool_rounds_and_renews_lease(session):
     assert result.response.outcome == "error"
     assert provider.calls == 4
     assert renewals == 3
+
+
+@pytest.mark.anyio
+async def test_an_empty_read_tells_the_model_how_to_find_the_names(session):
+    from financial_dashboard.services import settings as settings_service
+
+    settings_service._cache["categorization.hidden_identifiers"] = "Holder"
+    account = Account(bank="samplebank", label="Sample Gold", type="credit_card")
+    session.add(account)
+    await session.flush()
+    card = Card(account_id=account.id, card_mask="XXXX0000", label="Pat Holder")
+    session.add(card)
+    await session.flush()
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[{"name": "list_transactions", "bank": "Platinum"}],
+            ),
+            ToolCalls(outcome="tool_calls", calls=[{"name": "list_accounts"}]),
+            Answer(outcome="answer", text="No rows."),
+        ]
+    )
+
+    result = await run_turn(session, provider, user_message="spends on my Platinum")
+
+    assert result.response.outcome == "answer"
+    empty, accounts = (
+        entry.model_dump(mode="json") for entry in provider.context.tool_results
+    )
+    # The model learns that no row exists, or how to find the right name.
+    assert empty["items"] == []
+    assert "list_accounts" in empty["hint"]
+    assert accounts["items"] == [
+        {
+            "id": account.id,
+            "bank": "samplebank",
+            "label": "Sample Gold",
+            "type": "credit_card",
+            "active": True,
+            # A configured name is masked in a card label.
+            "cards": [
+                {
+                    "id": card.id,
+                    "label": "[redacted-name]",
+                    "active": True,
+                    "is_primary": False,
+                }
+            ],
+        }
+    ]
 
 
 @pytest.mark.anyio
@@ -198,6 +250,29 @@ async def test_cashflow_summary_sends_server_figures_without_a_second_model_step
         ({"name": "get_holdings", "search": "example"}, ("Example Fund: ₹550.00",)),
         ({"name": "get_networth"}, ("Net worth: ₹1,000.00",)),
         ({"name": "get_card_dues"}, ("₹1,234.50 due 2026-12-01",)),
+        (
+            {
+                "name": "show_transactions",
+                "bank": "testbank",
+                "date_from": "2026-05-01",
+                "date_to": "2026-05-31",
+                # A blank filter is no filter, in the rows and in the link.
+                "source": "",
+            },
+            (
+                "1 row · Debits: ₹400.00",
+                "01 May · −₹400.00 · SAMPLE AMC",
+                # The link opens the same rows on the transactions page.
+                'href="http://dash/transactions?bank=testbank&amp;'
+                "date_from=2026-05-01&amp;date_to=2026-05-31&amp;"
+                'sort=date&amp;order=desc"',
+            ),
+        ),
+        # An account name becomes its id, so the link opens that account's rows.
+        (
+            {"name": "show_transactions", "bank": "Savings", "category": "investment"},
+            ("−₹400.00 · SAMPLE AMC", "/transactions?account_id="),
+        ),
     ],
 )
 async def test_reports_send_server_figures(session, monkeypatch, call, expected):
@@ -296,9 +371,19 @@ async def test_reports_send_server_figures(session, monkeypatch, call, expected)
                     "date_from": "2026-04-01",
                     "date_to": "2026-11-12",
                 },
-                {"name": "list_categories"},
+                {"name": "list_accounts"},
             ],
             "mixed_report",
+        ),
+        (
+            [
+                {
+                    "name": "show_transactions",
+                    "date_from": "2026-11-12",
+                    "date_to": "2026-04-01",
+                }
+            ],
+            "invalid_filters",
         ),
     ],
 )
@@ -681,7 +766,7 @@ async def test_receivable_write_waits_for_a_yes(session, tool, message):
         )
 
     proposed, _ = await state()
-    listed = provider.context.tool_results[0]["result"]["items"]
+    listed = provider.context.tool_results[0].model_dump(mode="json")["items"]
     assert [(item["id"], item["person"]) for item in listed] == [(rid, "Friend A")]
     # A listed receivable is not a transaction the reply shows.
     assert result.transaction_ids == ()

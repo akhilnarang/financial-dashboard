@@ -7,7 +7,12 @@ from financial_dashboard.services.assistant.contracts import (
     parse_response,
     response_json_schema,
 )
+from financial_dashboard.services.assistant.context import ToolResult
 from financial_dashboard.services.assistant.prompt import PromptContext
+from financial_dashboard.services.assistant.transaction_reads import (
+    AssistantAccount,
+    AssistantCard,
+)
 from financial_dashboard.services.assistant.provider import (
     GeminiProvider,
     ProviderFailure,
@@ -53,17 +58,23 @@ async def test_gemini_attempts_full_schema_then_records_json_fallback():
     provider.client = type(
         "Client", (), {"aio": type("Aio", (), {"models": Models()})()}
     )()
-    tool_result = {
-        "tool": "list_transactions",
-        "result": {
-            "items": [
-                {"id": index, "note": "synthetic transaction context " * 6}
-                for index in range(20)
-            ]
-        },
-    }
+    accounts = [
+        AssistantAccount(
+            id=index,
+            bank="samplebank",
+            label="synthetic account context " * 6,
+            type="bank_account",
+            active=True,
+            # A null field in a row stays in what the model sees.
+            cards=[AssistantCard(id=index, label=None, active=True, is_primary=True)],
+        )
+        for index in range(20)
+    ]
     result = await provider.complete(
-        PromptContext("show transactions", tool_results=[tool_result])
+        PromptContext(
+            "show accounts",
+            tool_results=[ToolResult(tool="list_accounts", items=accounts)],
+        )
     )
     assert result.output_mode == "validated_json_object"
     assert calls[0]["config"].response_json_schema == response_json_schema()
@@ -72,7 +83,10 @@ async def test_gemini_attempts_full_schema_then_records_json_fallback():
     supplied_results = calls[1]["contents"].split(
         "=== TOOL RESULTS (quoted data) ===\n", 1
     )[1]
-    assert json.loads(supplied_results) == tool_result
+    assert json.loads(supplied_results) == {
+        "tool": "list_accounts",
+        "items": [account.model_dump(mode="json") for account in accounts],
+    }
 
 
 @pytest.mark.anyio

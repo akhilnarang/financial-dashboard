@@ -5,13 +5,13 @@ import json
 import logging
 import re
 from datetime import date, timedelta
-from decimal import Decimal
-from typing import Annotated, NamedTuple, TypedDict
+from decimal import Decimal, InvalidOperation
+from typing import Annotated, NamedTuple, cast
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Query, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
-from sqlalchemy import case, func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -27,19 +27,14 @@ from financial_dashboard.db import (
 )
 from financial_dashboard.db.models import Category
 from financial_dashboard.exceptions import UnprocessableEntityException
-from financial_dashboard.services.cashflow.buckets import internal_slugs_for_scope
-from financial_dashboard.services.cashflow.report import (
-    BLANK_CATEGORY,
-    BLANK_COUNTERPARTY,
-    EXCLUDED,
-    INCLUDED,
-    INR_OR_NULL,
-    NON_INR,
-    NOT_VOIDED,
-    UNCATEGORIZED,
-    is_blank_counterparty,
+from financial_dashboard.services.cashflow.scope import Scope
+from financial_dashboard.services.transaction_filters import (
+    SORT_COLUMNS,
+    SortKey,
+    TransactionFilters,
+    ordered,
+    transaction_totals,
 )
-from financial_dashboard.services.cashflow.scope import Scope, scope_predicate
 from financial_dashboard.web.transaction_display import category_label
 
 logging.basicConfig(
@@ -84,30 +79,6 @@ class LoadedTransaction(NamedTuple):
     account: Account | None
     sms: SmsMessage | None
 
-
-class TransactionTotal(TypedDict):
-    """INR amounts of the filtered rows.
-
-    Attributes:
-        credits: Sum of filtered INR credit transactions.
-        debits: Sum of filtered INR debit transactions.
-        net: Credits minus debits.
-        foreign_count: Number of filtered non-INR rows, which the sums omit.
-    """
-
-    credits: Decimal
-    debits: Decimal
-    net: Decimal
-    foreign_count: int
-
-
-SORT_COLUMNS = {
-    "amount": Transaction.amount,
-    "bank": Transaction.bank,
-    "category": Transaction.category,
-    "counterparty": Transaction.counterparty,
-    "date": Transaction.transaction_date,
-}
 
 # Display labels for the categorization pipeline's category_method column, so a
 # transaction's provenance reads as a word rather than the internal state-machine
@@ -229,12 +200,62 @@ def _date_presets(today: date) -> list[dict[str, str]]:
     ]
 
 
+def _ids(values: list[str] | None) -> tuple[int, ...]:
+    """Return the ids among the query values.
+
+    Args:
+        values: The repeated query values, or None.
+
+    Returns:
+        The ids in order. A value that is not a number is left out.
+    """
+    return tuple(int(value) for value in values or () if value.strip().isdigit())
+
+
+def _three_way(value: str | None) -> bool | None:
+    """Read a "1" or "0" filter from the query.
+
+    Args:
+        value: The query value, or None.
+
+    Returns:
+        True for "1", False for "0", and None for any other value or none.
+    """
+    match value:
+        case "1":
+            return True
+        case "0":
+            return False
+        case _:
+            return None
+
+
+def _amount(value: str | None) -> Decimal | None:
+    """Return the amount in the query value.
+
+    Args:
+        value: The query value, or None.
+
+    Returns:
+        The amount, or None when there is none or it is not a finite number.
+    """
+    try:
+        amount = Decimal(value) if value and value.strip() else None
+    except InvalidOperation:
+        return None
+    return amount if amount is not None and amount.is_finite() else None
+
+
 @router.get("/transactions", response_class=HTMLResponse)
 async def transaction_list(
     request: FastAPIRequest,
     bank: Annotated[str | None, Query(description="Filter by bank name")] = None,
-    account_id: Annotated[str | None, Query(description="Filter by account ID")] = None,
-    card_id: Annotated[str | None, Query(description="Filter by card ID")] = None,
+    account_id: Annotated[
+        list[str] | None, Query(description="Filter by account ID; repeat for several")
+    ] = None,
+    card_id: Annotated[
+        list[str] | None, Query(description="Filter by card ID; repeat for several")
+    ] = None,
     direction: Annotated[
         str | None, Query(description="Filter by direction: debit or credit")
     ] = None,
@@ -293,6 +314,17 @@ async def transaction_list(
             "of those names); omit for every account"
         ),
     ] = None,
+    q: Annotated[
+        str | None, Query(description="Text to find in the row's text fields")
+    ] = None,
+    amount: Annotated[str | None, Query(description="Exact amount")] = None,
+    source: Annotated[str | None, Query(description="Row source, such as sms")] = None,
+    review_status: Annotated[
+        str | None, Query(description="Category review status")
+    ] = None,
+    reference: Annotated[
+        str | None, Query(description="Payment reference, such as a UTR")
+    ] = None,
     sort: Annotated[str, Query(description="Sort column")] = "date",
     order: Annotated[str, Query(description="Sort order: asc or desc")] = "desc",
     page: Annotated[int, Query(ge=1, description="Page number (1-indexed)")] = 1,
@@ -303,8 +335,8 @@ async def transaction_list(
     Args:
         request: Current request used to render the template and preserve queries.
         bank: Optional exact bank-name filter.
-        account_id: Optional account ID filter supplied as a query string.
-        card_id: Optional card ID filter supplied as a query string.
+        account_id: Optional account IDs, supplied as query strings.
+        card_id: Optional card IDs, supplied as query strings.
         direction: Optional transaction direction, normally ``debit`` or ``credit``.
         date_from: Optional inclusive lower date bound in ISO ``YYYY-MM-DD`` form.
         date_to: Optional inclusive upper date bound in ISO ``YYYY-MM-DD`` form.
@@ -322,6 +354,11 @@ async def transaction_list(
         provisional: ``"1"`` selects screenshot rows that no bank source
             confirms yet.
         scope: Optional account perimeter used by cash-flow drill-down links.
+        q: Optional text to find in the row's text fields.
+        amount: Optional exact amount.
+        source: Optional exact row source.
+        review_status: Optional exact category review status.
+        reference: Optional payment reference.
         sort: Requested sort key; invalid values fall back to transaction date.
         order: Sort direction; invalid values fall back to descending.
         page: One-indexed result page.
@@ -346,8 +383,11 @@ async def transaction_list(
         ):
             corrections[key] = normalized
     if corrections:
-        query = dict(request.query_params)
-        query.update(corrections)
+        # multi_items keeps a repeated account_id or card_id.
+        query = [
+            (key, corrections.get(key, value))
+            for key, value in request.query_params.multi_items()
+        ]
         return RedirectResponse(
             url=f"/transactions?{urlencode(query)}",
             status_code=307,
@@ -355,146 +395,39 @@ async def transaction_list(
     date_from = normalized_date_from.query_value
     date_to = normalized_date_to.query_value
 
-    stmt = select(Transaction)
-
-    if bank:
-        stmt = stmt.where(Transaction.bank == bank)
-    if account_id:
-        try:
-            stmt = stmt.where(Transaction.account_id == int(account_id))
-        except ValueError:
-            pass
-    if card_id:
-        try:
-            stmt = stmt.where(Transaction.card_id == int(card_id))
-        except ValueError:
-            pass
-    if direction:
-        stmt = stmt.where(Transaction.direction == direction)
-    if normalized_date_from.parsed_date is not None:
-        stmt = stmt.where(
-            Transaction.transaction_date >= normalized_date_from.parsed_date
-        )
-    if normalized_date_to.parsed_date is not None:
-        stmt = stmt.where(
-            Transaction.transaction_date <= normalized_date_to.parsed_date
-        )
-    if category:
-        stmt = stmt.where(Transaction.category == category)
-    if counterparty is not None:
-        if is_blank_counterparty(counterparty):
-            # A blank counterparty is a filter, not an absent one: it selects the
-            # rows that carry no counterparty at all, whether that is stored as
-            # NULL, as an empty string, or as whitespace. Both the test for the
-            # incoming value and the clause it produces come from the report, so
-            # this lists exactly the rows the report's "(no counterparty)" line
-            # counted — no spelling of blank can fall between the two.
-            stmt = stmt.where(BLANK_COUNTERPARTY)
-        else:
-            stmt = stmt.where(Transaction.counterparty == counterparty)
-    if card_holder:
-        stmt = stmt.where(Transaction.card_holder == card_holder)
-    if uncategorized == "1":
-        # No currency clause: a non-INR row with no category is still uncategorized.
-        stmt = stmt.where(UNCATEGORIZED)
-    if category_null == "1":
-        # Strictly the rows carrying no category at all — NULL or blank, which are
-        # the same absence and are counted as one line by the report. This is
-        # narrower than `uncategorized`, which also takes in the 'unknown' sentinel
-        # and slugs the bucket map does not know: a report line that counts only
-        # the category-less rows needs a filter that lists only those rows, or its
-        # link would return more rows than the line it sits on says it has.
-        stmt = stmt.where(BLANK_CATEGORY)
-    if internal == "1":
-        # Which slugs are internal is a question the account scope answers, so the
-        # set is asked for under the scope this listing is drawn over rather than
-        # fixed here. Over the bank a card bill is money leaving it — expense, and
-        # counted as such by the report — so listing it as internal would hand the
-        # internal footnote a link to rows its own count excludes. Over every
-        # account the same slug is internal churn again, and the unscoped filter
-        # keeps saying so.
-        stmt = stmt.where(
-            Transaction.category.in_(tuple(internal_slugs_for_scope(scope)))
-        )
-    if non_inr == "1":
-        stmt = stmt.where(NON_INR)
-    elif non_inr == "0":
-        # The complement, and the exact population the rupee buckets of the
-        # cashflow report sum: a NULL currency is a rupee row that predates the
-        # column's default. Without this value a bucket's drill-through would
-        # list foreign rows its own total left out.
-        stmt = stmt.where(INR_OR_NULL)
-    if undated == "1":
-        stmt = stmt.where(Transaction.transaction_date.is_(None), NOT_VOIDED)
-    if excluded == "1":
-        # The rows the Excluded footnote counts. `is_(True)` selects the flagged
-        # rows alone. A legacy NULL is an unflagged row and stays out.
-        stmt = stmt.where(EXCLUDED)
-    elif excluded == "0":
-        # The rows still in the cashflow. The report's figures sum these. Every
-        # headline drill carries this value, so a tile links to the rows it counted.
-        stmt = stmt.where(INCLUDED)
-    if provisional == "1":
-        # A bank match appends its source, so a bare "screenshot" is unconfirmed.
-        stmt = stmt.where(Transaction.source == "screenshot", NOT_VOIDED)
-    account_scope = scope_predicate(scope)
-    if account_scope is not None:
-        # The report's own predicate, imported rather than restated: a cash-basis
-        # figure counts one account perimeter, and the rows behind its link have to
-        # be that same perimeter. A second spelling of "the bank" here is a second
-        # thing to drift, which is the bug class the currency clause already hit.
-        stmt = stmt.where(account_scope)
-
-    filtered = stmt.subquery()
-    count_stmt = select(func.count()).select_from(filtered)
-    total_count = (await session.execute(count_stmt)).scalar() or 0
-
-    # Totals are INR only. A foreign-currency row is a card alert that no
-    # statement converted to rupees yet. A voided row moved no money.
-    live = filtered.c.voided.is_not(True)
-    is_inr = (
-        func.coalesce(
-            func.nullif(func.upper(func.trim(filtered.c.currency)), ""), "INR"
-        )
-        == "INR"
-    ) & live
-    totals_row = (
-        await session.execute(
-            select(
-                func.sum(
-                    case(
-                        (is_inr & (filtered.c.direction == "credit"), filtered.c.amount)
-                    )
-                ).label("credits"),
-                func.sum(
-                    case(
-                        (is_inr & (filtered.c.direction == "debit"), filtered.c.amount)
-                    )
-                ).label("debits"),
-                func.count()
-                .filter(live & ~is_inr & filtered.c.direction.in_(("credit", "debit")))
-                .label("foreign"),
-            )
-        )
-    ).one()
-    credits = Decimal(str(totals_row.credits or 0))
-    debits = Decimal(str(totals_row.debits or 0))
-    transaction_totals: TransactionTotal = {
-        "credits": credits,
-        "debits": debits,
-        "net": credits - debits,
-        "foreign_count": totals_row.foreign,
-    }
+    page_filters = TransactionFilters(
+        bank=bank or None,
+        account_ids=_ids(account_id),
+        card_ids=_ids(card_id),
+        direction=direction or None,
+        date_from=normalized_date_from.parsed_date,
+        date_to=normalized_date_to.parsed_date,
+        category=category or None,
+        counterparty=counterparty,
+        card_holder=card_holder or None,
+        uncategorized=uncategorized == "1",
+        category_null=category_null == "1",
+        internal=internal == "1",
+        non_inr=_three_way(non_inr),
+        undated=undated == "1",
+        excluded=_three_way(excluded),
+        provisional=provisional == "1",
+        scope=scope,
+        q=q or None,
+        amount=_amount(amount),
+        source=source or None,
+        review_status=review_status or None,
+        reference=reference or None,
+    )
+    stmt = select(Transaction).where(*page_filters.clauses())
+    totals = await transaction_totals(session, stmt)
+    total_count = totals.count
 
     if sort not in SORT_COLUMNS:
         sort = "date"
-    sort_col = SORT_COLUMNS[sort]
     if order not in ("asc", "desc"):
         order = "desc"
-    if order == "asc":
-        stmt = stmt.order_by(sort_col.asc().nullslast(), Transaction.id.asc())
-    else:
-        stmt = stmt.order_by(sort_col.desc().nullslast(), Transaction.id.desc())
+    stmt = ordered(stmt, cast(SortKey, sort), order)
 
     total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
     if page < 1:
@@ -571,8 +504,8 @@ async def transaction_list(
     # Build base query string for pagination/sort links
     form_filters = {
         "bank": bank,
-        "account_id": account_id,
-        "card_id": card_id,
+        "account_id": account_id[0] if account_id else None,
+        "card_id": card_id[0] if card_id else None,
         "direction": direction,
         "date_from": date_from,
         "date_to": date_to,
@@ -594,25 +527,22 @@ async def transaction_list(
         "scope": scope,
     }
     filters = {**form_filters, **drill_filters}
-    # Drill params are kept whenever they are present, empty string included: a
-    # blank counterparty narrows the result set, so dropping it on truthiness
-    # would silently widen page 2 to every row.
-    retained_filters = {
-        k: v for k, v in form_filters.items() if v and k not in {"date_from", "date_to"}
-    } | {k: v for k, v in drill_filters.items() if v is not None}
-    base_qs = urlencode(
-        {k: v for k, v in form_filters.items() if v}
-        | {k: v for k, v in drill_filters.items() if v is not None}
-    )
+    # The shared filters keep a blank counterparty, because it narrows the rows:
+    # dropping it would widen page 2 to every row.
+    query = page_filters.query()
+    retained_filters = [
+        (key, value) for key, value in query if key not in {"date_from", "date_to"}
+    ]
+    base_qs = urlencode(query)
     date_presets = []
     for preset in _date_presets(date.today()):
-        preset_query = {
-            **retained_filters,
-            "date_from": preset["date_from"],
-            "date_to": preset["date_to"],
-            "sort": sort,
-            "order": order,
-        }
+        preset_query = [
+            *retained_filters,
+            ("date_from", preset["date_from"]),
+            ("date_to", preset["date_to"]),
+            ("sort", sort),
+            ("order", order),
+        ]
         date_presets.append(
             {
                 **preset,
@@ -657,7 +587,7 @@ async def transaction_list(
             "total_count": total_count,
             "total_pages": total_pages,
             "page_size": PAGE_SIZE,
-            "transaction_totals": transaction_totals,
+            "transaction_totals": totals,
             "date_from_display": _date_display(date_from),
             "date_to_display": _date_display(date_to),
             "date_presets": date_presets,

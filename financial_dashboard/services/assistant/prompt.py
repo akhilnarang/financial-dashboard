@@ -5,17 +5,45 @@ import datetime
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v13"
+from financial_dashboard.services.assistant.context import ToolResult
+from financial_dashboard.services.assistant.transaction_reads import (
+    AssistantTransaction,
+)
+
+PROMPT_VERSION = "telegram-assistant-v14"
 
 
 class PromptContext(NamedTuple):
     user_message: str
     history: Sequence[Mapping[str, str]] = ()
-    transaction: Mapping[str, object] | None = None
-    tool_results: Sequence[Mapping[str, object]] = ()
+    transaction: AssistantTransaction | None = None
+    tool_results: Sequence[ToolResult] = ()
     categories: Sequence[str] = ()
     fitting_categories: Sequence[str] = ()
     today: datetime.date | None = None
+
+    def data_size(self) -> int:
+        """Count the characters of the data that the prompt quotes.
+
+        The context limit counts this data and not the fixed instructions.
+
+        Returns:
+            The length of the data as JSON.
+        """
+        data = {
+            "user_message": self.user_message,
+            "history": list(self.history),
+            "transaction": self.transaction.model_dump(mode="json")
+            if self.transaction
+            else None,
+            "tool_results": [
+                result.model_dump(mode="json") for result in self.tool_results
+            ],
+            "categories": list(self.categories),
+            "fitting_categories": list(self.fitting_categories),
+            "today": str(self.today),
+        }
+        return len(json.dumps(data, ensure_ascii=False))
 
 
 def _quoted(value: object, limit: int = 2000) -> str:
@@ -45,9 +73,12 @@ def build_prompt(context: PromptContext) -> str:
         '- {"outcome":"tool_calls","calls":[READ|APPLY|RECEIVABLE WRITE, ...],'
         '"explanation":"..."}',
         '- {"outcome":"error","message":"...","code":"..."}',
-        "READ is get_transaction(transaction_id), list_categories(), or",
-        "list_transactions with optional transaction_ids/account_id/date_from/date_to/",
-        "direction/amount/bank/source/category/review_status/reference/search/excluded/limit.",
+        "READ is list_accounts() or list_transactions with",
+        "optional transaction_ids/account_id/card_id/date_from/date_to/direction/",
+        "amount/bank/source/category/review_status/reference/search/excluded/limit.",
+        "To read rows by id, give transaction_ids. list_accounts gives each account and its",
+        "cards with their ids. For the rows of an account or a card that the user",
+        "names, find its id with list_accounts, then filter by account_id or card_id.",
         'APPLY is {"name":"apply_transaction_changes","transaction_id":1,',
         '"changes":{optional note/category/exclude_from_cashflow patches},',
         'optional "merchant_rule":{"category":"...","intent_evidence":"..."}}.',
@@ -131,6 +162,13 @@ def build_prompt(context: PromptContext) -> str:
         "latest balance of every account. Use it for account balances.",
         '- {"name":"get_card_dues"}: the latest bill, due date and payment',
         "status of each credit card.",
+        '- {"name":"show_transactions", the list_transactions filters except',
+        'transaction_ids and limit, "sort":"date|amount|bank|category|counterparty",',
+        '"order":"desc|asc"}: the matching rows, their count and totals, and a',
+        "link to the same list on the dashboard. Use it when the user asks to",
+        "see, list or show transactions. Put an account or card name in bank.",
+        "search finds text in a row, such as a merchant. Use list_transactions",
+        "only to find rows to change.",
         "A financial year (FY) runs from 1 April to 31 March. For a period that",
         "has not ended, such as the current FY or this month, use today as",
         "date_to. Never calculate or estimate totals, averages or breakdowns",
@@ -145,7 +183,8 @@ def build_prompt(context: PromptContext) -> str:
     if context.transaction is not None:
         lines.extend(["", "=== TRUSTED TRANSACTION TARGET (quoted data) ==="])
         lines.extend(
-            f"{key}: {_quoted(value)}" for key, value in context.transaction.items()
+            f"{key}: {_quoted(value)}"
+            for key, value in context.transaction.model_dump(mode="json").items()
         )
         lines.append("=== END TRUSTED TRANSACTION TARGET ===")
     if context.categories:
@@ -175,5 +214,10 @@ def build_prompt(context: PromptContext) -> str:
         for result in context.tool_results:
             # The orchestrator bounds the complete context before dispatch.
             # Keep each returned record intact instead of silently cutting a page.
-            lines.append(json.dumps(result, ensure_ascii=False, default=str))
+            # Only a missing hint is left out. A null row field stays.
+            lines.append(
+                result.model_dump_json(
+                    exclude={"hint"} if result.hint is None else None
+                )
+            )
     return "\n".join(lines)

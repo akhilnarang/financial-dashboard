@@ -1,10 +1,14 @@
 """Bounded application context supplied to assistant model calls."""
 
-import json
 from collections.abc import Mapping, Sequence
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
+from financial_dashboard.schemas.receivables import ReceivableRead
+from financial_dashboard.services.assistant.transaction_reads import (
+    AssistantAccount,
+    AssistantTransaction,
+)
 from financial_dashboard.services.categorization.normalize import (
     redact_names,
     redact_pii,
@@ -13,6 +17,24 @@ from financial_dashboard.services.settings import get_redact_name_tokens
 
 MAX_HISTORY_TURNS = 12
 MAX_CONTEXT_CHARS = 18_000
+
+
+class ToolResult(BaseModel):
+    """The result of one read, as the model sees it.
+
+    The prompt quotes it as JSON. The model never sees the database rows.
+
+    Attributes:
+        tool: The name of the read tool, such as ``list_transactions``.
+        items: The rows that the read returns, already redacted.
+        hint: What to do next when the read found nothing, or None.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    tool: str
+    items: list[AssistantTransaction] | list[AssistantAccount] | list[ReceivableRead]
+    hint: str | None = None
 
 
 def bounded_history(history: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
@@ -28,29 +50,3 @@ def bounded_history(history: Sequence[Mapping[str, str]]) -> list[dict[str, str]
             }
         )
     return result
-
-
-def serialize_tool_result(value: object) -> dict[str, object]:
-    asdict = getattr(value, "_asdict", None)
-    if callable(asdict):
-        return dict(asdict())
-    if isinstance(value, Mapping):
-        return dict(value)
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        return {
-            "items": [
-                dict(item._asdict())
-                if hasattr(item, "_asdict")
-                else item.model_dump(mode="json")
-                if isinstance(item, BaseModel)
-                else dict(item)
-                if isinstance(item, Mapping)
-                else str(item)[:1000]
-                for item in value
-            ]
-        }
-    return {"value": str(value)[:4000]}
-
-
-def context_size(context: Mapping[str, object]) -> int:
-    return len(json.dumps(context, default=str, ensure_ascii=False))
