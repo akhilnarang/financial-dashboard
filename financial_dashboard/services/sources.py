@@ -2,17 +2,13 @@
 
 import asyncio
 import imaplib
-import json
-from urllib.request import Request, urlopen
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.crypto import decrypt_credentials
 from financial_dashboard.db import EmailSource
-from financial_dashboard.integrations.email.base import (
-    JMAP_SESSION_URL,
-    NETWORK_TIMEOUT_SECONDS,
-)
+from financial_dashboard.integrations.email.base import NETWORK_TIMEOUT_SECONDS
+from financial_dashboard.integrations.email.jmap_fastmail import open_jmap_session
 from financial_dashboard.schemas.sources import SourceTestResponse
 
 
@@ -24,14 +20,8 @@ def _test_gmail(user: str, password: str) -> str:
 
 
 def _test_fastmail(token: str) -> str:
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    req = Request(JMAP_SESSION_URL, headers=headers)
-    with urlopen(req, timeout=NETWORK_TIMEOUT_SECONDS) as resp:
-        data = json.loads(resp.read())
-    acct = data.get("primaryAccounts", {}).get("urn:ietf:params:jmap:mail")
-    if not acct:
-        raise ValueError("JMAP session returned but no mail account found")
-    return f"Fastmail JMAP session OK (account: {acct})"
+    session = open_jmap_session(token)
+    return f"Fastmail JMAP session OK (account: {session.account_id})"
 
 
 class SourceNotFoundError(Exception):
