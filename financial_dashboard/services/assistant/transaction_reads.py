@@ -244,8 +244,9 @@ async def _named_ids(session: AsyncSession, text: str, *, loose: bool) -> NamedI
     """Return the accounts and cards that a name from the model points to.
 
     The model often knows an account or a card only by the name that the user
-    gives, and not by its id. Accounts and cards compete for the name. When
-    the name points to a card and to its account, it means the card.
+    gives, and not by its id. Accounts and cards compete for the name. A card
+    that the name points to always covers more of it than its own account,
+    so the name then means the card.
 
     Args:
         session: The open database session.
@@ -269,7 +270,6 @@ async def _named_ids(session: AsyncSession, text: str, *, loose: bool) -> NamedI
     labels: list[tuple[tuple[str, int], str | None]] = [
         (("account", account_id), label) for account_id, label in accounts
     ]
-    card_account: dict[int, int] = {}
     if loose:
         account_labels = dict(accounts)
         for row in await session.execute(select(Card.id, Card.account_id, Card.label)):
@@ -279,18 +279,11 @@ async def _named_ids(session: AsyncSession, text: str, *, loose: bool) -> NamedI
             # card's label has. If not, a card labelled "Sample Debit" would
             # stand for its "Sample Savings" account when the user names it.
             if words & (_name_words(row.label or "") - _name_words(account_label)):
-                card_account[row.id] = row.account_id
                 labels.append((("card", row.id), f"{row.label} {account_label}"))
     closest = _closest_labels(words, labels, loose=loose)
-    card_ids = [row_id for kind, row_id in closest if kind == "card"]
-    narrowed = {card_account[card_id] for card_id in card_ids}
     return NamedIds(
-        account_ids=[
-            row_id
-            for kind, row_id in closest
-            if kind == "account" and row_id not in narrowed
-        ],
-        card_ids=card_ids,
+        account_ids=[row_id for kind, row_id in closest if kind == "account"],
+        card_ids=[row_id for kind, row_id in closest if kind == "card"],
     )
 
 
