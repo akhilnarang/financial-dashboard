@@ -346,7 +346,7 @@ async def test_reports_send_server_figures(session, monkeypatch, call, expected)
                     "date_from": "2026-04-01",
                     "date_to": "2026-11-12",
                 },
-                {"name": "list_categories"},
+                {"name": "list_accounts"},
             ],
             "mixed_report",
         ),

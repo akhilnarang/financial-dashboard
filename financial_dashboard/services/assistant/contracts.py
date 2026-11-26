@@ -167,10 +167,6 @@ class GetCardDues(StrictModel):
     name: Literal["get_card_dues"]
 
 
-class ListCategories(StrictModel):
-    name: Literal["list_categories"]
-
-
 class ListAccounts(StrictModel):
     """Ask for the user's accounts and cards, with their ids and names."""
 
@@ -251,14 +247,13 @@ AssistantWriteCall = (
     | MergeTransactions
 )
 AssistantWrite: TypeAlias = Annotated[AssistantWriteCall, Field(discriminator="name")]
-ReadCall = ListTransactions | ListCategories | ListAccounts | ListReceivables
+ReadCall = ListTransactions | ListAccounts | ListReceivables
 ReportCall = (
     GetCashflowSummary | GetInvestmentFlows | GetHoldings | GetNetworth | GetCardDues
 )
 
 ToolCall: TypeAlias = Annotated[
     ListTransactions
-    | ListCategories
     | ListAccounts
     | GetCashflowSummary
     | GetInvestmentFlows

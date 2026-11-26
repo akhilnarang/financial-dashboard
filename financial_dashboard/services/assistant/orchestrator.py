@@ -61,7 +61,6 @@ from financial_dashboard.services.assistant.contracts import (
     Error,
     ToolCalls,
     ListAccounts,
-    ListCategories,
     ListReceivables,
     ListTransactions,
     AddPersonIdentifier,
@@ -170,7 +169,7 @@ EMPTY_LIST_HINT = (
     "No row matched every filter. If the filters fit the request, there are no "
     "such rows: answer that. If a name did not fit, list_accounts gives the "
     "account and card names with the ids for account_id and card_id, and "
-    "list_categories gives the category slugs."
+    "the category filter takes a slug from ACTIVE CATEGORY SLUGS."
 )
 _CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
 _REREAD_KEPT_FIELDS = ("counterparty", "vpa", "utr", "amount", "occurred_at")
@@ -407,12 +406,7 @@ async def current_confirmation_state_hash(
 
 async def _dispatch_read(
     session: AsyncSession, call: ReadCall
-) -> (
-    list[str]
-    | list[AssistantTransaction]
-    | list[AssistantAccount]
-    | list[ReceivableRead]
-):
+) -> list[AssistantTransaction] | list[AssistantAccount] | list[ReceivableRead]:
     """Run one read tool call.
 
     Args:
@@ -427,8 +421,6 @@ async def _dispatch_read(
             unknown.
     """
     match call:
-        case ListCategories():
-            return await get_active_slugs(session)
         case ListAccounts():
             return await list_accounts(session)
         case ListReceivables():

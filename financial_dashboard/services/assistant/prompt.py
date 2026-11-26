@@ -45,7 +45,7 @@ def build_prompt(context: PromptContext) -> str:
         '- {"outcome":"tool_calls","calls":[READ|APPLY|RECEIVABLE WRITE, ...],'
         '"explanation":"..."}',
         '- {"outcome":"error","message":"...","code":"..."}',
-        "READ is list_categories(), list_accounts(), or list_transactions with",
+        "READ is list_accounts() or list_transactions with",
         "optional transaction_ids/account_id/card_id/date_from/date_to/direction/",
         "amount/bank/source/category/review_status/reference/search/excluded/limit.",
         "To read rows by id, give transaction_ids. list_accounts gives each account and its",
