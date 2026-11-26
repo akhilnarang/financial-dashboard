@@ -44,7 +44,8 @@ from financial_dashboard.services.assistant.context import (
     MAX_CONTEXT_CHARS,
     bounded_history,
     context_size,
-    serialize_tool_result,
+    ToolResult,
+    tool_items,
 )
 from financial_dashboard.services.assistant.contracts import (
     Answer,
@@ -71,7 +72,6 @@ from financial_dashboard.services.assistant.contracts import (
     UpdateReceivable,
     VoidTransaction,
     MerchantRuleConfirmation,
-    ReadCall,
     ScreenshotTransaction,
     ScreenshotTransactionConfirmation,
     SetTextValue,
@@ -405,20 +405,16 @@ async def current_confirmation_state_hash(
 
 
 async def _dispatch_read(
-    session: AsyncSession, call: ReadCall
-) -> list[AssistantTransaction] | list[AssistantAccount] | list[ReceivableRead]:
-    """Run one read tool call.
+    session: AsyncSession, call: ListAccounts | ListReceivables
+) -> list[AssistantAccount] | list[ReceivableRead]:
+    """Run one read tool call other than list_transactions.
 
     Args:
         session: The turn session.
         call: The read call that the model asked for.
 
     Returns:
-        The rows or values that the call reads.
-
-    Raises:
-        MutationRejected: A transaction filter is not valid, or the tool is
-            unknown.
+        The rows that the call reads.
     """
     match call:
         case ListAccounts():
@@ -434,42 +430,52 @@ async def _dispatch_read(
                 if (call.kind is None or read.kind == call.kind)
                 and person in normalize_person(read.person)
             ]
-        case ListTransactions():
-            try:
-                date_from = (
-                    datetime.date.fromisoformat(call.date_from)
-                    if call.date_from
-                    else None
-                )
-                date_to = (
-                    datetime.date.fromisoformat(call.date_to) if call.date_to else None
-                )
-                amount = Decimal(call.amount) if call.amount else None
-            except (ValueError, InvalidOperation) as exc:
-                raise MutationRejected("invalid transaction filter") from exc
-            if amount is not None and not amount.is_finite():
-                raise MutationRejected("invalid transaction filter")
-            return await list_transactions(
-                session,
-                limit=call.limit,
-                offset=0,
-                account_id=call.account_id,
-                card_id=call.card_id,
-                date_from=date_from,
-                date_to=date_to,
-                direction=call.direction,
-                category=call.category,
-                search=call.search,
-                excluded=call.excluded,
-                transaction_ids=call.transaction_ids,
-                amount=amount,
-                bank=call.bank,
-                source=call.source,
-                review_status=call.review_status,
-                reference=call.reference,
-            )
-        case _:
-            raise MutationRejected("unsupported tool")
+
+
+async def _read_transactions(
+    session: AsyncSession, call: ListTransactions
+) -> list[AssistantTransaction]:
+    """Run one list_transactions call.
+
+    Args:
+        session: The turn session.
+        call: The read call that the model asked for.
+
+    Returns:
+        The rows that match the filters.
+
+    Raises:
+        MutationRejected: A date or the amount is not valid.
+    """
+    try:
+        date_from = (
+            datetime.date.fromisoformat(call.date_from) if call.date_from else None
+        )
+        date_to = datetime.date.fromisoformat(call.date_to) if call.date_to else None
+        amount = Decimal(call.amount) if call.amount else None
+    except (ValueError, InvalidOperation) as exc:
+        raise MutationRejected("invalid transaction filter") from exc
+    if amount is not None and not amount.is_finite():
+        raise MutationRejected("invalid transaction filter")
+    return await list_transactions(
+        session,
+        limit=call.limit,
+        offset=0,
+        account_id=call.account_id,
+        card_id=call.card_id,
+        date_from=date_from,
+        date_to=date_to,
+        direction=call.direction,
+        category=call.category,
+        search=call.search,
+        excluded=call.excluded,
+        transaction_ids=call.transaction_ids,
+        amount=amount,
+        bank=call.bank,
+        source=call.source,
+        review_status=call.review_status,
+        reference=call.reference,
+    )
 
 
 async def _persist_pending(
@@ -554,7 +560,7 @@ async def run_turn(
                 code="target_not_found",
             )
         )
-    tool_results: list[dict[str, object]] = []
+    tool_results: list[ToolResult] = []
     calls_used = 0
     mutation: MutationResult | None = None
     read_rows: dict[int, AssistantTransaction] = {}
@@ -603,7 +609,7 @@ async def run_turn(
         prompt_context = PromptContext(
             user_message=user_message,
             history=bounded_history(history),
-            transaction=serialize_tool_result(target) if target is not None else None,
+            transaction=target._asdict() if target is not None else None,
             tool_results=tool_results,
             categories=active_categories,
             fitting_categories=fitting_categories,
@@ -860,7 +866,7 @@ async def run_turn(
                         code="ambiguous_target",
                     )
                 )
-            pending_tool_results: list[dict[str, object]] = []
+            pending_tool_results: list[ToolResult] = []
             pending_rows: dict[int, AssistantTransaction] = {}
             unfit_guess: str | None = None
             try:
@@ -872,16 +878,18 @@ async def run_turn(
                         ApplyTransactionChanges | AssistantWriteCall | ReportCall,
                     ):
                         continue
-                    tool_result = await _dispatch_read(session, call)
-                    pending_rows.update(
-                        (row.id, row)
-                        for row in tool_result
-                        if isinstance(row, AssistantTransaction)
-                    )
-                    result = serialize_tool_result(tool_result)
-                    if isinstance(call, ListTransactions) and not tool_result:
-                        result["hint"] = EMPTY_LIST_HINT
-                    pending_tool_results.append({"tool": call.name, "result": result})
+                    if isinstance(call, ListTransactions):
+                        rows = await _read_transactions(session, call)
+                        pending_rows.update((row.id, row) for row in rows)
+                        result = ToolResult(
+                            call.name,
+                            tool_items(rows),
+                            None if rows else EMPTY_LIST_HINT,
+                        )
+                    else:
+                        read = await _dispatch_read(session, call)
+                        result = ToolResult(call.name, tool_items(read))
+                    pending_tool_results.append(result)
                 if confirm_found:
                     try:
                         found_question = await _confirm_found_changes(

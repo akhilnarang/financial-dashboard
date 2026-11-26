@@ -260,7 +260,6 @@ AssistantWriteCall = (
     | MergeTransactions
 )
 AssistantWrite: TypeAlias = Annotated[AssistantWriteCall, Field(discriminator="name")]
-ReadCall = ListTransactions | ListAccounts | ListReceivables
 ReportCall = (
     GetCashflowSummary
     | GetInvestmentFlows

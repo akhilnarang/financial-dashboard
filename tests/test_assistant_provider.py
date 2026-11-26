@@ -7,6 +7,7 @@ from financial_dashboard.services.assistant.contracts import (
     parse_response,
     response_json_schema,
 )
+from financial_dashboard.services.assistant.context import ToolResult
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.provider import (
     GeminiProvider,
@@ -53,17 +54,15 @@ async def test_gemini_attempts_full_schema_then_records_json_fallback():
     provider.client = type(
         "Client", (), {"aio": type("Aio", (), {"models": Models()})()}
     )()
-    tool_result = {
-        "tool": "list_transactions",
-        "result": {
-            "items": [
-                {"id": index, "note": "synthetic transaction context " * 6}
-                for index in range(20)
-            ]
-        },
-    }
+    items: list[dict[str, object]] = [
+        {"id": index, "note": "synthetic transaction context " * 6}
+        for index in range(20)
+    ]
     result = await provider.complete(
-        PromptContext("show transactions", tool_results=[tool_result])
+        PromptContext(
+            "show transactions",
+            tool_results=[ToolResult("list_transactions", items)],
+        )
     )
     assert result.output_mode == "validated_json_object"
     assert calls[0]["config"].response_json_schema == response_json_schema()
@@ -72,7 +71,10 @@ async def test_gemini_attempts_full_schema_then_records_json_fallback():
     supplied_results = calls[1]["contents"].split(
         "=== TOOL RESULTS (quoted data) ===\n", 1
     )[1]
-    assert json.loads(supplied_results) == tool_result
+    assert json.loads(supplied_results) == {
+        "tool": "list_transactions",
+        "result": {"items": items},
+    }
 
 
 @pytest.mark.anyio

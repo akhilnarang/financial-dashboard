@@ -5,6 +5,8 @@ import datetime
 import json
 from typing import NamedTuple
 
+from financial_dashboard.services.assistant.context import ToolResult
+
 PROMPT_VERSION = "telegram-assistant-v14"
 
 
@@ -12,7 +14,7 @@ class PromptContext(NamedTuple):
     user_message: str
     history: Sequence[Mapping[str, str]] = ()
     transaction: Mapping[str, object] | None = None
-    tool_results: Sequence[Mapping[str, object]] = ()
+    tool_results: Sequence[ToolResult] = ()
     categories: Sequence[str] = ()
     fitting_categories: Sequence[str] = ()
     today: datetime.date | None = None
@@ -185,5 +187,5 @@ def build_prompt(context: PromptContext) -> str:
         for result in context.tool_results:
             # The orchestrator bounds the complete context before dispatch.
             # Keep each returned record intact instead of silently cutting a page.
-            lines.append(json.dumps(result, ensure_ascii=False, default=str))
+            lines.append(json.dumps(result.as_json(), ensure_ascii=False, default=str))
     return "\n".join(lines)
