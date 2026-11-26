@@ -10,20 +10,29 @@ and cashflow exclusion state.
 import datetime
 import re
 from decimal import Decimal
+from collections.abc import Iterable
 from typing import Any, NamedTuple, cast
 
 from sqlalchemy import ColumnElement, Select, and_, func, literal, or_, select
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from financial_dashboard.core.references import reference_form
-from financial_dashboard.db.models import CategoryReviewDecision, Transaction
+from financial_dashboard.db.models import (
+    Account,
+    Card,
+    CategoryReviewDecision,
+    Transaction,
+)
 from financial_dashboard.services.transaction_reads import (
     build_transaction_filter_clauses,
 )
+from financial_dashboard.services.cashflow.buckets import label_for_slug
 from financial_dashboard.services.categorization.normalize import (
     redact_names,
     redact_pii,
 )
+from financial_dashboard.services.categorization.vocabulary import get_active_slugs
 from financial_dashboard.services.settings import get_redact_name_tokens
 
 MAX_CONTEXT_ROWS = 20
@@ -31,6 +40,14 @@ MAX_FIELD_LENGTH = 2_000
 # A shorter stored counterparty, such as "UPI", would match too many searches.
 MIN_PREFIX_COUNTERPARTY = 4
 MAX_SEARCH_WORDS = 8
+# These words do not tell one account or card from another, such as "CC" in
+# "Sample Bank Gold CC". A card that the user holds has the label "self" or
+# "Primary".
+GENERIC_NAME_WORDS = frozenset(
+    {"account", "acct", "bank", "card", "cc", "credit", "debit", "primary", "self"}
+)
+_POSSESSIVE = re.compile(r"['’]s\b")
+_NAME_WORD = re.compile(r"[a-z0-9+]+")
 
 _REDACTED_REF = "[redacted-ref]"
 _MASK_LABEL = re.compile(r"\[redacted-[a-z]+\]")
@@ -60,6 +77,33 @@ class AssistantTransaction(NamedTuple):
     review_status: str | None
     review_reason: str | None
     review_gate_reason: str | None
+
+
+class NamedIds(NamedTuple):
+    """The accounts and cards that a name points to."""
+
+    account_ids: list[int]
+    card_ids: list[int]
+
+
+class AssistantCard(BaseModel):
+    """One card of an account, as the model sees it."""
+
+    id: int
+    label: str | None
+    active: bool
+    is_primary: bool
+
+
+class AssistantAccount(BaseModel):
+    """One account and its cards, as the model sees them."""
+
+    id: int
+    bank: str
+    label: str
+    type: str
+    active: bool
+    cards: list[AssistantCard]
 
 
 def _bounded(value: str | None) -> str | None:
@@ -148,6 +192,163 @@ def _search_clause(search: str) -> ColumnElement[bool]:
     )
 
 
+def _name_words(text: str) -> frozenset[str]:
+    """Return the words that tell one account or card from another.
+
+    Case, a possessive "'s", punctuation and generic words such as "card" do
+    not count. "+" stays, because some card names end in it.
+    """
+    text = _POSSESSIVE.sub("", text.lower().replace("a/c", " "))
+    return frozenset(_NAME_WORD.findall(text)) - GENERIC_NAME_WORDS
+
+
+def _closest_labels[T](
+    words: frozenset[str], labels: Iterable[tuple[T, str | None]], *, loose: bool
+) -> list[T]:
+    """Return the keys whose labels the name words point to most closely.
+
+    A label points when the name holds all its words. A label of one word
+    stands for a single merchant or bank name, such as "Swiggy", so only a
+    loose name that is exactly that word points to it. A loose name also
+    points to a label that holds all the name's words. The labels that cover
+    the most words of the name win, and a label that the name holds whole
+    wins a tie. So "Sample Gold" points to "Sample Gold" and not to "Sample",
+    and "Pat Sample" points to the card "Pat Holder Sample" and not to the
+    account "Sample".
+
+    Args:
+        words: The name words from ``_name_words``.
+        labels: The key and the label of each account or card.
+        loose: Also match a label that holds every word of the name.
+
+    Returns:
+        The keys of the closest labels.
+    """
+    ranked: list[tuple[tuple[int, bool], T]] = []
+    for key, label in labels:
+        if not (label_words := _name_words(label or "")):
+            continue
+        if label_words <= words and (
+            len(label_words) > 1 or (loose and label_words == words)
+        ):
+            ranked.append(((len(label_words), True), key))
+        elif loose and words <= label_words:
+            ranked.append(((len(words), False), key))
+    if not ranked:
+        return []
+    best = max(rank for rank, _ in ranked)
+    return [key for rank, key in ranked if rank == best]
+
+
+async def _named_ids(session: AsyncSession, text: str, *, loose: bool) -> NamedIds:
+    """Return the accounts and cards that a name from the model points to.
+
+    The model often knows an account or a card only by the name that the user
+    gives, and not by its id. Accounts and cards compete for the name. When
+    the name points to a card and to its account, it means the card.
+
+    Args:
+        session: The open database session.
+        text: The name from the model, from a bank or search filter.
+        loose: The name comes from the bank filter. It also points to an
+            account or a card when the label holds every word of the name,
+            such as "Gold" for "Sample Bank Gold". It also points to cards. A
+            search is not loose: a merchant word such as "Swiggy" must not
+            match a card named after it, and a person that the user paid must
+            not match that person's add-on card.
+
+    Returns:
+        The ids of the accounts and cards that the name points to.
+    """
+    if not (words := _name_words(text)):
+        return NamedIds(account_ids=[], card_ids=[])
+    accounts = [
+        (row.id, row.label)
+        for row in await session.execute(select(Account.id, Account.label))
+    ]
+    labels: list[tuple[tuple[str, int], str | None]] = [
+        (("account", account_id), label) for account_id, label in accounts
+    ]
+    card_account: dict[int, int] = {}
+    if loose:
+        account_labels = dict(accounts)
+        for row in await session.execute(select(Card.id, Card.account_id, Card.label)):
+            account_label = account_labels.get(row.account_id) or ""
+            # A card is named by its own label and its account's label, as in
+            # "Pat's Sample Gold". The name must hold a word that only the
+            # card's label has. If not, a card labelled "Sample Debit" would
+            # stand for its "Sample Savings" account when the user names it.
+            if words & (_name_words(row.label or "") - _name_words(account_label)):
+                card_account[row.id] = row.account_id
+                labels.append((("card", row.id), f"{row.label} {account_label}"))
+    closest = _closest_labels(words, labels, loose=loose)
+    card_ids = [row_id for kind, row_id in closest if kind == "card"]
+    narrowed = {card_account[card_id] for card_id in card_ids}
+    return NamedIds(
+        account_ids=[
+            row_id
+            for kind, row_id in closest
+            if kind == "account" and row_id not in narrowed
+        ],
+        card_ids=card_ids,
+    )
+
+
+def _named_clause(column: ColumnElement[bool], named: NamedIds) -> ColumnElement[bool]:
+    """Widen a filter to the rows of the accounts and cards that a name points to."""
+    return or_(
+        column,
+        Transaction.account_id.in_(named.account_ids),
+        Transaction.card_id.in_(named.card_ids),
+    )
+
+
+async def _category_slug(session: AsyncSession, category: str) -> str:
+    """Return the slug of the category that the model names.
+
+    The model can give the label that the user sees, such as "Card bills",
+    in place of the slug. A name that fits no active category stays as it is,
+    so the filter matches no row.
+    """
+    wanted = category.strip().lower()
+    for slug in await get_active_slugs(session):
+        if wanted in (slug, slug.replace("_", " "), label_for_slug(slug).lower()):
+            return slug
+    return category
+
+
+async def list_accounts(session: AsyncSession) -> list[AssistantAccount]:
+    """Return every account and its cards, with the ids and names.
+
+    Args:
+        session: The open database session.
+
+    Returns:
+        The accounts in id order. Configured names are masked in the labels.
+    """
+    name_tokens = get_redact_name_tokens()
+    accounts = await session.scalars(select(Account).order_by(Account.id))
+    return [
+        AssistantAccount(
+            id=account.id,
+            bank=account.bank,
+            label=_redacted(account.label, name_tokens) or "",
+            type=account.type,
+            active=account.active is not False,
+            cards=[
+                AssistantCard(
+                    id=card.id,
+                    label=_redacted(card.label, name_tokens),
+                    active=card.active is not False,
+                    is_primary=bool(card.is_primary),
+                )
+                for card in account.cards
+            ],
+        )
+        for account in accounts
+    ]
+
+
 def _statement(**filters: object) -> Select:
     return select(
         Transaction.id,
@@ -204,6 +405,7 @@ async def list_transactions(
     limit: int = MAX_CONTEXT_ROWS,
     offset: int = 0,
     account_id: int | None = None,
+    card_id: int | None = None,
     date_from: datetime.date | None = None,
     date_to: datetime.date | None = None,
     direction: str | None = None,
@@ -221,9 +423,27 @@ async def list_transactions(
     if limit < 1 or offset < 0:
         raise ValueError("limit must be positive and offset cannot be negative")
     limit = min(limit, MAX_CONTEXT_ROWS)
+    clauses: list[ColumnElement[bool]] = []
+    if search and search.strip():
+        clauses.append(
+            _named_clause(
+                _search_clause(search),
+                await _named_ids(session, search, loose=False),
+            )
+        )
+    if bank is not None:
+        clauses.append(
+            _named_clause(
+                func.lower(Transaction.bank) == bank.strip().lower(),
+                await _named_ids(session, bank, loose=True),
+            )
+        )
+    if category is not None:
+        category = await _category_slug(session, category)
     result = await session.execute(
         _statement(
             account_id=account_id,
+            card_id=card_id,
             date_from=date_from,
             date_to=date_to,
             direction=direction,
@@ -231,12 +451,11 @@ async def list_transactions(
             excluded=excluded,
             transaction_ids=transaction_ids,
             amount=amount,
-            bank=bank,
             source=source,
             review_status=review_status,
             reference=reference,
         )
-        .where(*([_search_clause(search)] if search and search.strip() else []))
+        .where(*clauses)
         .order_by(
             Transaction.transaction_date.desc().nullslast(), Transaction.id.desc()
         )

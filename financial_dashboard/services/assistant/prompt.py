@@ -5,7 +5,7 @@ import datetime
 import json
 from typing import NamedTuple
 
-PROMPT_VERSION = "telegram-assistant-v13"
+PROMPT_VERSION = "telegram-assistant-v14"
 
 
 class PromptContext(NamedTuple):
@@ -45,9 +45,12 @@ def build_prompt(context: PromptContext) -> str:
         '- {"outcome":"tool_calls","calls":[READ|APPLY|RECEIVABLE WRITE, ...],'
         '"explanation":"..."}',
         '- {"outcome":"error","message":"...","code":"..."}',
-        "READ is get_transaction(transaction_id), list_categories(), or",
-        "list_transactions with optional transaction_ids/account_id/date_from/date_to/",
-        "direction/amount/bank/source/category/review_status/reference/search/excluded/limit.",
+        "READ is get_transaction(transaction_id), list_categories(), list_accounts(),",
+        "or list_transactions with optional transaction_ids/account_id/card_id/",
+        "date_from/date_to/direction/amount/bank/source/category/review_status/",
+        "reference/search/excluded/limit. list_accounts gives each account and its",
+        "cards with their ids. For the rows of an account or a card that the user",
+        "names, find its id with list_accounts, then filter by account_id or card_id.",
         'APPLY is {"name":"apply_transaction_changes","transaction_id":1,',
         '"changes":{optional note/category/exclude_from_cashflow patches},',
         'optional "merchant_rule":{"category":"...","intent_evidence":"..."}}.',

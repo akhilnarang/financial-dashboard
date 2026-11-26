@@ -61,6 +61,7 @@ from financial_dashboard.services.assistant.contracts import (
     Error,
     ToolCalls,
     GetTransaction,
+    ListAccounts,
     ListCategories,
     ListReceivables,
     ListTransactions,
@@ -121,8 +122,10 @@ from financial_dashboard.services.assistant.provider import (
     ProviderFailure,
 )
 from financial_dashboard.services.assistant.transaction_reads import (
+    AssistantAccount,
     AssistantTransaction,
     get_transaction,
+    list_accounts,
     list_transactions,
 )
 from financial_dashboard.services.categorization.polarity import resolve_direction
@@ -164,6 +167,12 @@ TURN_TIMEOUT_SECONDS = 180
 
 # Each candidate row gets a button, so the question stays short.
 MAX_FOUND_CANDIDATES = 3
+EMPTY_LIST_HINT = (
+    "No row matched every filter. If the filters fit the request, there are no "
+    "such rows: answer that. If a name did not fit, list_accounts gives the "
+    "account and card names with the ids for account_id and card_id, and "
+    "list_categories gives the category slugs."
+)
 _CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
 _REREAD_KEPT_FIELDS = ("counterparty", "vpa", "utr", "amount", "occurred_at")
 _SECRET_TRACEBACK_RE = re.compile(
@@ -404,6 +413,7 @@ async def _dispatch_read(
     | None
     | list[str]
     | list[AssistantTransaction]
+    | list[AssistantAccount]
     | list[ReceivableRead]
 ):
     """Run one read tool call.
@@ -424,6 +434,8 @@ async def _dispatch_read(
             return await get_transaction(session, call.transaction_id)
         case ListCategories():
             return await get_active_slugs(session)
+        case ListAccounts():
+            return await list_accounts(session)
         case ListReceivables():
             status = ReceivableStatus(call.status) if call.status else None
             person = normalize_person(call.person or "")
@@ -455,6 +467,7 @@ async def _dispatch_read(
                 limit=call.limit,
                 offset=0,
                 account_id=call.account_id,
+                card_id=call.card_id,
                 date_from=date_from,
                 date_to=date_to,
                 direction=call.direction,
@@ -882,12 +895,10 @@ async def run_turn(
                                 for row in tool_result
                                 if isinstance(row, AssistantTransaction)
                             )
-                    pending_tool_results.append(
-                        {
-                            "tool": call.name,
-                            "result": serialize_tool_result(tool_result),
-                        }
-                    )
+                    result = serialize_tool_result(tool_result)
+                    if isinstance(call, ListTransactions) and not tool_result:
+                        result["hint"] = EMPTY_LIST_HINT
+                    pending_tool_results.append({"tool": call.name, "result": result})
                 if confirm_found:
                     try:
                         found_question = await _confirm_found_changes(

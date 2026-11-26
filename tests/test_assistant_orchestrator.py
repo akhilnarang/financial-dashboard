@@ -13,6 +13,7 @@ from financial_dashboard.db.models import (
     Account,
     BalanceSnapshot,
     BankStatementUpload,
+    Card,
     CasUpload,
     Email,
     Category,
@@ -104,6 +105,55 @@ async def test_orchestrator_caps_tool_rounds_and_renews_lease(session):
     assert result.response.outcome == "error"
     assert provider.calls == 4
     assert renewals == 3
+
+
+@pytest.mark.anyio
+async def test_an_empty_read_tells_the_model_how_to_find_the_names(session):
+    from financial_dashboard.services import settings as settings_service
+
+    settings_service._cache["categorization.hidden_identifiers"] = "Holder"
+    account = Account(bank="samplebank", label="Sample Gold", type="credit_card")
+    session.add(account)
+    await session.flush()
+    card = Card(account_id=account.id, card_mask="XXXX0000", label="Pat Holder")
+    session.add(card)
+    await session.flush()
+    provider = FakeProvider(
+        [
+            ToolCalls(
+                outcome="tool_calls",
+                calls=[{"name": "list_transactions", "bank": "Platinum"}],
+            ),
+            ToolCalls(outcome="tool_calls", calls=[{"name": "list_accounts"}]),
+            Answer(outcome="answer", text="No rows."),
+        ]
+    )
+
+    result = await run_turn(session, provider, user_message="spends on my Platinum")
+
+    assert result.response.outcome == "answer"
+    empty, accounts = (entry["result"] for entry in provider.context.tool_results)
+    # The model learns that no row exists, or how to find the right name.
+    assert empty["items"] == []
+    assert "list_accounts" in empty["hint"]
+    assert accounts["items"] == [
+        {
+            "id": account.id,
+            "bank": "samplebank",
+            "label": "Sample Gold",
+            "type": "credit_card",
+            "active": True,
+            # A configured name is masked in a card label.
+            "cards": [
+                {
+                    "id": card.id,
+                    "label": "[redacted-name]",
+                    "active": True,
+                    "is_primary": False,
+                }
+            ],
+        }
+    ]
 
 
 @pytest.mark.anyio

@@ -107,6 +107,7 @@ class ListTransactions(StrictModel):
     name: Literal["list_transactions"]
     transaction_ids: list[StrictInt] | None = Field(default=None, max_length=20)
     account_id: StrictInt | None = Field(default=None, gt=0)
+    card_id: StrictInt | None = Field(default=None, gt=0)
     date_from: StrictStr | None = Field(default=None, max_length=30)
     date_to: StrictStr | None = Field(default=None, max_length=30)
     direction: Literal["debit", "credit"] | None = None
@@ -173,6 +174,12 @@ class GetCardDues(StrictModel):
 
 class ListCategories(StrictModel):
     name: Literal["list_categories"]
+
+
+class ListAccounts(StrictModel):
+    """Ask for the user's accounts and cards, with their ids and names."""
+
+    name: Literal["list_accounts"]
 
 
 ReceivableKindName: TypeAlias = Literal["receivable", "payable"]
@@ -249,7 +256,9 @@ AssistantWriteCall = (
     | MergeTransactions
 )
 AssistantWrite: TypeAlias = Annotated[AssistantWriteCall, Field(discriminator="name")]
-ReadCall = GetTransaction | ListTransactions | ListCategories | ListReceivables
+ReadCall = (
+    GetTransaction | ListTransactions | ListCategories | ListAccounts | ListReceivables
+)
 ReportCall = (
     GetCashflowSummary | GetInvestmentFlows | GetHoldings | GetNetworth | GetCardDues
 )
@@ -258,6 +267,7 @@ ToolCall: TypeAlias = Annotated[
     GetTransaction
     | ListTransactions
     | ListCategories
+    | ListAccounts
     | GetCashflowSummary
     | GetInvestmentFlows
     | GetHoldings
