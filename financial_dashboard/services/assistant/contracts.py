@@ -98,11 +98,6 @@ class ApplyTransactionChanges(StrictModel):
     merchant_rule: MerchantRuleRequest | None = None
 
 
-class GetTransaction(StrictModel):
-    name: Literal["get_transaction"]
-    transaction_id: StrictInt = Field(gt=0)
-
-
 class ListTransactions(StrictModel):
     name: Literal["list_transactions"]
     transaction_ids: list[StrictInt] | None = Field(default=None, max_length=20)
@@ -256,16 +251,13 @@ AssistantWriteCall = (
     | MergeTransactions
 )
 AssistantWrite: TypeAlias = Annotated[AssistantWriteCall, Field(discriminator="name")]
-ReadCall = (
-    GetTransaction | ListTransactions | ListCategories | ListAccounts | ListReceivables
-)
+ReadCall = ListTransactions | ListCategories | ListAccounts | ListReceivables
 ReportCall = (
     GetCashflowSummary | GetInvestmentFlows | GetHoldings | GetNetworth | GetCardDues
 )
 
 ToolCall: TypeAlias = Annotated[
-    GetTransaction
-    | ListTransactions
+    ListTransactions
     | ListCategories
     | ListAccounts
     | GetCashflowSummary

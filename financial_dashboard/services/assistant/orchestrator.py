@@ -60,7 +60,6 @@ from financial_dashboard.services.assistant.contracts import (
     Clarification,
     Error,
     ToolCalls,
-    GetTransaction,
     ListAccounts,
     ListCategories,
     ListReceivables,
@@ -430,8 +429,6 @@ async def _dispatch_read(
             unknown.
     """
     match call:
-        case GetTransaction():
-            return await get_transaction(session, call.transaction_id)
         case ListCategories():
             return await get_active_slugs(session)
         case ListAccounts():

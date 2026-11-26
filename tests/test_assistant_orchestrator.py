@@ -83,7 +83,7 @@ async def test_orchestrator_caps_tool_rounds_and_renews_lease(session):
         [
             ToolCalls(
                 outcome="tool_calls",
-                calls=[{"name": "get_transaction", "transaction_id": txn.id}],
+                calls=[{"name": "list_transactions", "transaction_ids": [txn.id]}],
             )
         ]
         * 4

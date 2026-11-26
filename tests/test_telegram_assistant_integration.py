@@ -954,7 +954,7 @@ async def test_tool_round_renews_lease_after_pending_confirmation_dismissal(
     provider = SequenceProvider(
         ToolCalls(
             outcome="tool_calls",
-            calls=[{"name": "get_transaction", "transaction_id": transaction_id}],
+            calls=[{"name": "list_transactions", "transaction_ids": [transaction_id]}],
         ),
         Answer(outcome="answer", text="Found it."),
     )

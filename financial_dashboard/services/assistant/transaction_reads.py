@@ -379,24 +379,8 @@ async def get_transaction(
     transaction_id: int,
 ) -> AssistantTransaction | None:
     """Read exactly one transaction by trusted database ID."""
-    result = await session.execute(_statement(transaction_id=transaction_id))
-    row = result.one_or_none()
-    if row is None:
-        return None
-    gate_reason = await session.scalar(
-        select(CategoryReviewDecision.gate_reason)
-        .where(
-            CategoryReviewDecision.transaction_id == transaction_id,
-            CategoryReviewDecision.status == "active",
-        )
-        .order_by(CategoryReviewDecision.id.desc())
-        .limit(1)
-    )
-    return _projection(
-        row,
-        name_tokens=get_redact_name_tokens(),
-        review_gate_reason=gate_reason,
-    )
+    rows = await list_transactions(session, transaction_ids=[transaction_id])
+    return rows[0] if rows else None
 
 
 async def list_transactions(
@@ -462,5 +446,26 @@ async def list_transactions(
         .offset(offset)
         .limit(limit)
     )
+    rows = list(result)
+    # A later active decision replaces an earlier one in the dict.
+    gate_reasons = {
+        row.transaction_id: row.gate_reason
+        for row in await session.execute(
+            select(
+                CategoryReviewDecision.transaction_id,
+                CategoryReviewDecision.gate_reason,
+            )
+            .where(
+                CategoryReviewDecision.transaction_id.in_([row.id for row in rows]),
+                CategoryReviewDecision.status == "active",
+            )
+            .order_by(CategoryReviewDecision.id)
+        )
+    }
     name_tokens = get_redact_name_tokens()
-    return [_projection(row, name_tokens=name_tokens) for row in result]
+    return [
+        _projection(
+            row, name_tokens=name_tokens, review_gate_reason=gate_reasons.get(row.id)
+        )
+        for row in rows
+    ]
