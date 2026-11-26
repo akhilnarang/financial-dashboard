@@ -439,7 +439,8 @@ async def list_transactions(
         .offset(offset)
         .limit(limit)
     )
-    rows = list(result)
+    if not (rows := list(result)):
+        return []
     # A later active decision replaces an earlier one in the dict.
     gate_reasons = {
         row.transaction_id: row.gate_reason

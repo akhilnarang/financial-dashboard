@@ -408,9 +408,7 @@ async def current_confirmation_state_hash(
 async def _dispatch_read(
     session: AsyncSession, call: ReadCall
 ) -> (
-    AssistantTransaction
-    | None
-    | list[str]
+    list[str]
     | list[AssistantTransaction]
     | list[AssistantAccount]
     | list[ReceivableRead]
@@ -883,15 +881,11 @@ async def run_turn(
                     ):
                         continue
                     tool_result = await _dispatch_read(session, call)
-                    match tool_result:
-                        case AssistantTransaction():
-                            pending_rows[tool_result.id] = tool_result
-                        case list():
-                            pending_rows.update(
-                                (row.id, row)
-                                for row in tool_result
-                                if isinstance(row, AssistantTransaction)
-                            )
+                    pending_rows.update(
+                        (row.id, row)
+                        for row in tool_result
+                        if isinstance(row, AssistantTransaction)
+                    )
                     result = serialize_tool_result(tool_result)
                     if isinstance(call, ListTransactions) and not tool_result:
                         result["hint"] = EMPTY_LIST_HINT
