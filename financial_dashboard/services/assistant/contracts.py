@@ -16,6 +16,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     TypeAdapter,
     WithJsonSchema,
     field_validator,
@@ -28,9 +29,6 @@ from financial_dashboard.services.categorization.slugs import UserCategoryBucket
 
 
 PackName: TypeAlias = Literal["edit", "receivables", "reports", "categories"]
-type JsonValue = (
-    str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
-)
 # A JSON schema. The keys are the keywords that the strict schema code reads or
 # writes. A schema can also hold other keywords, such as title or minLength.
 JsonSchema = TypedDict(
