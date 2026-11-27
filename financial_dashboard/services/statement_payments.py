@@ -64,6 +64,10 @@ STATEMENT_PAYMENT_MARKERS = (
     "autopay",
 )
 STATEMENT_PAYMENT_PREFIXES = ("payment ", "credit card payment")
+# An SMS stored twice, such as when the forwarder sends a backlog again, keeps
+# its text and nearly its time. A real second payment changes the text,
+# because the notice carries the new available limit.
+COPY_SECONDS = 60
 
 
 class Provisional(NamedTuple):
@@ -204,9 +208,7 @@ async def _pending_payments(
         .all()
     )
 
-    provisionals: list[Provisional] = []
-    # Credits that a provisional settled by hand already pays for.
-    reserved: set[int] = set()
+    found: list[Provisional] = []
     for sms in rows:
         parsed = _parse_provisional_cc_payment(sms)
         if parsed is None:
@@ -222,6 +224,12 @@ async def _pending_payments(
         # here. Confirm the parsed card belongs to this account's card set.
         if not _card_belongs_to_account(txn_data.get("card_mask"), account):
             continue
+        found.append(Provisional(sms, txn_data))
+
+    provisionals: list[Provisional] = []
+    # Credits that a provisional settled by hand already pays for.
+    reserved: set[int] = set()
+    for sms, txn_data in _without_copies(found):
         if sms.transaction_id is not None:
             reserved.add(sms.transaction_id)
             continue
@@ -250,6 +258,30 @@ async def _pending_payments(
             )
         )
     return pending
+
+
+def _without_copies(found: list[Provisional]) -> list[Provisional]:
+    """Keep one SMS of each message that the database holds more than once.
+
+    A copy has the same text, received within ``COPY_SECONDS``. The settled
+    one of a group is kept, so its copies do not show as unpaid.
+
+    Args:
+        found: The provisional SMS of the window.
+
+    Returns:
+        One provisional per message.
+    """
+    kept: list[Provisional] = []
+    for item in sorted(found, key=lambda item: item.sms.transaction_id is None):
+        if not any(
+            other.sms.body == item.sms.body
+            and abs((other.sms.received_at - item.sms.received_at).total_seconds())
+            <= COPY_SECONDS
+            for other in kept
+        ):
+            kept.append(item)
+    return kept
 
 
 async def _unpaired_provisionals(

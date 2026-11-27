@@ -67,11 +67,11 @@ async def _seed_open_statement(maker, *, total="50,000.00", due="25/08/2026"):
         return upload.id, acc_id
 
 
-async def _add_provisional_sms(maker, *, day=7, hour=6, minute=0):
+async def _add_provisional_sms(maker, *, day=7, hour=6, minute=0, sender="AD-HDFCBK"):
     async with maker() as session:
         sms = SmsMessage(
             bank="hdfc",
-            sender="AD-HDFCBK",
+            sender=sender,
             body=_PROVISIONAL_BODY.format(day=day),
             received_at=datetime.datetime(
                 2026, 8, day, hour, minute, tzinfo=datetime.UTC
@@ -254,6 +254,9 @@ async def test_settled_provisional_keeps_its_own_credit(maker):
         link_ctx = await build_link_context(session)
         await process_sms_row(session, sms, link_ctx, settle_provisional=True)
 
+    # The same SMS stored again under another operator prefix is the same
+    # payment, not a third one.
+    await _add_provisional_sms(maker, day=7, minute=7, sender="VM-HDFCBK")
     # The credit that the first settle made does not pay the second.
     assert [row.sms_id for row in await _pending(maker, upload_id)] == [second]
 
