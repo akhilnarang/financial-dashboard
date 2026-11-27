@@ -171,19 +171,46 @@ async def _add_settled_credit(maker, acc_id, *, amount, day=8):
 
 
 @pytest.mark.anyio
-async def test_two_provisionals_one_settled_keeps_both_pending(maker):
-    """An amount-only settled row does not hide either provisional."""
+async def test_each_payment_credit_hides_one_provisional(maker):
+    """A provisional pairs once with a later payment credit of its amount."""
     upload_id, acc_id = await _seed_open_statement(maker)
+    # Dated before the window: it pays the previous bill and shows there.
+    await _add_provisional_sms(maker, day=5)
     await _add_provisional_sms(maker, day=7, minute=7)
     await _add_provisional_sms(maker, day=7, minute=11)
     await _add_settled_credit(maker, acc_id, amount="30000.00", day=8)
 
-    upload = await _get_upload(maker, upload_id)
-    async with maker() as session:
-        view = await build_payments_view(session, upload)
+    async def pending():
+        upload = await _get_upload(maker, upload_id)
+        async with maker() as session:
+            return (await build_payments_view(session, upload)).pending
 
-    assert len(view.settled) == 1
-    assert len(view.pending) == 2
+    # Two payments and one settlement leave one payment pending.
+    assert [row.date for row in await pending()] == ["2026-08-07"]
+
+    async def add_statement_credit(narration):
+        async with maker() as session:
+            session.add(
+                Transaction(
+                    account_id=acc_id,
+                    bank="hdfc",
+                    email_type="cc_statement",
+                    direction="credit",
+                    amount=Decimal("30000.00"),
+                    transaction_date=datetime.date(2026, 8, 9),
+                    counterparty=narration,
+                    raw_description=narration,
+                    category="credit_card_payment",
+                )
+            )
+            await session.commit()
+
+    # HDFC often sends no settlement SMS, so the statement line settles it.
+    # A refund of the same amount is not a payment, even with that category.
+    await add_statement_credit("AMAZON REFUND GURGAON")
+    assert len(await pending()) == 1
+    await add_statement_credit("BPPY CC PAYMENT DP0000000000 (Ref# 1)")
+    assert await pending() == []
 
 
 @pytest.mark.anyio
