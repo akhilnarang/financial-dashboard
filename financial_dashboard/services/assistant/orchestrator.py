@@ -756,7 +756,8 @@ async def run_turn(
                                 "question": _confirmation_question(
                                     pending,
                                     stored.counterparty if stored else None,
-                                )
+                                ),
+                                "transaction_ids": [],
                             }
                         )
                         await _persist_pending(
@@ -2306,7 +2307,7 @@ async def _queue_result(
                     separators=(",", ":"),
                 )
         delivery_ids.append(delivery.id)
-    # Each row of the answer gets its own card. A reply then targets a row
+    # Each row of the reply gets its own card. A reply then targets a row
     # that the user can see. A found-row question shows its rows already.
     if (
         transaction_id is None
