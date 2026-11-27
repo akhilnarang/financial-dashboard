@@ -59,14 +59,12 @@ STATEMENT_PAYMENT_MARKERS = (
     "netbanking transfer",
     "net banking",
     "tele transfer credit",
-    "payzapp",
     "repayment",
     "autopay",
 )
-STATEMENT_PAYMENT_PREFIXES = ("payment ", "credit card payment")
 # An SMS stored twice, such as when the forwarder sends a backlog again, keeps
-# its text and nearly its time. A real second payment changes the text,
-# because the notice carries the new available limit.
+# its text and nearly its time. Two real payments of one amount within a
+# minute are rare, and the usual notice also differs by its available limit.
 COPY_SECONDS = 60
 
 
@@ -159,11 +157,12 @@ async def _pending_payments(
 ) -> list[PendingPayment]:
     """Provisional bill-payment SMS for this card, not yet in the ledger.
 
-    Fetches the account's unlinked SMS in the cycle window, then re-parses each
-    body. Keeps only the ones the parser calls a provisional credit that the
-    classifier reads as a CC bill-payment. Re-parsing is required: the parser's
-    ledger role is not stored on the SMS row. The candidate set is small (one
-    card's unlinked SMS in one cycle), so parsing on page load is cheap.
+    Fetches the bank's SMS around the cycle window, then re-parses each body.
+    Keeps only the ones the parser calls a provisional credit that the
+    classifier reads as a CC bill-payment for this card. Re-parsing is
+    required: the parser's ledger role is not stored on the SMS row. The
+    candidate set is small (one bank's SMS in about one cycle), so parsing on
+    page load is cheap.
 
     A provisional whose payment is already in the ledger must not show as
     pending. That row is a settlement SMS or email, or, when the bank sends no
@@ -191,8 +190,12 @@ async def _pending_payments(
         SmsMessage.received_at >= lower,
     ]
     if window.end is not None:
+        # A credit can pair up to SETTLE_DAYS after the window. A provisional
+        # settled by hand in that time must reserve its credit, so fetch it too.
         upper = datetime.combine(
-            window.end + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
+            window.end + timedelta(days=SETTLE_DAYS + 1),
+            datetime.min.time(),
+            tzinfo=timezone.utc,
         )
         conditions.append(SmsMessage.received_at < upper)
 
@@ -226,12 +229,14 @@ async def _pending_payments(
             continue
         found.append(Provisional(sms, txn_data))
 
+    # Credits that a provisional settled by hand already pays for. Collect them
+    # before copies drop out: both copies of one SMS can be settled.
+    reserved = {
+        item.sms.transaction_id for item in found if item.sms.transaction_id is not None
+    }
     provisionals: list[Provisional] = []
-    # Credits that a provisional settled by hand already pays for.
-    reserved: set[int] = set()
     for sms, txn_data in _without_copies(found):
         if sms.transaction_id is not None:
-            reserved.add(sms.transaction_id)
             continue
         txn_date = txn_data.get("transaction_date")
         if txn_date is not None and (
@@ -276,7 +281,11 @@ def _without_copies(found: list[Provisional]) -> list[Provisional]:
     for item in sorted(found, key=lambda item: item.sms.transaction_id is None):
         if not any(
             other.sms.body == item.sms.body
-            and abs((other.sms.received_at - item.sms.received_at).total_seconds())
+            and abs(
+                (
+                    _utc(other.sms.received_at) - _utc(item.sms.received_at)
+                ).total_seconds()
+            )
             <= COPY_SECONDS
             for other in kept
         ):
@@ -309,7 +318,7 @@ async def _unpaired_provisionals(
         provisionals,
         key=lambda item: (
             item.data.get("transaction_date") or date.max,
-            item.sms.received_at,
+            _utc(item.sms.received_at),
             item.sms.id,
         ),
     )
@@ -370,9 +379,16 @@ def _is_payment_credit(row: Transaction) -> bool:
     text = normalize_text(row.raw_description or row.counterparty)
     if has_marker(text, (*CARD_REFUND_MARKERS, "cashback")):
         return False
-    return has_marker(
-        text, (*CARD_BILL_PAYMENT_MARKERS, *STATEMENT_PAYMENT_MARKERS)
-    ) or text.startswith(STATEMENT_PAYMENT_PREFIXES)
+    return (
+        has_marker(text, (*CARD_BILL_PAYMENT_MARKERS, *STATEMENT_PAYMENT_MARKERS))
+        or text.split(" ", 1)[0] == "payment"
+        or text.startswith("credit card payment")
+    )
+
+
+def _utc(moment: datetime) -> datetime:
+    """Read a stored time as UTC. SQLite returns it without a zone."""
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
 def _parse_provisional_cc_payment(sms: SmsMessage):
@@ -381,9 +397,7 @@ def _parse_provisional_cc_payment(sms: SmsMessage):
     Side-effect free. Swallows parser errors: a body that no longer parses is
     simply not a pending payment.
     """
-    received_at = sms.received_at
-    if received_at is not None and received_at.tzinfo is None:
-        received_at = received_at.replace(tzinfo=timezone.utc)
+    received_at = _utc(sms.received_at) if sms.received_at is not None else None
     try:
         parsed = parse_sms(
             sms.bank, sms.body, sender=sms.sender, received_at=received_at

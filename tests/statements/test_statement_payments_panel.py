@@ -152,24 +152,6 @@ async def test_settle_promotes_provisional_to_real_credit(maker):
     assert view.pending == []
 
 
-async def _add_settled_credit(maker, acc_id, *, amount, day=8):
-    """A real bank-settled CC-payment credit already in the ledger."""
-    async with maker() as session:
-        txn = Transaction(
-            account_id=acc_id,
-            bank="hdfc",
-            email_type="hdfc_cc_payment_received_alert",
-            direction="credit",
-            amount=Decimal(str(amount)),
-            transaction_date=datetime.date(2026, 8, day),
-            counterparty="Payment",
-            reference_number="REF123",
-        )
-        session.add(txn)
-        await session.commit()
-        return txn.id
-
-
 async def _add_credit(
     maker, acc_id, *, day, narration=None, voided=False, amount="30000.00"
 ):
@@ -192,6 +174,14 @@ async def _add_credit(
             )
         )
         await session.commit()
+
+
+async def _settle(maker, sms_id):
+    """Settle one provisional SMS by hand, as the page's Settle button does."""
+    async with maker() as session, session.begin():
+        sms = await session.get(SmsMessage, sms_id)
+        link_ctx = await build_link_context(session)
+        await process_sms_row(session, sms, link_ctx, settle_provisional=True)
 
 
 async def _pending(maker, upload_id):
@@ -224,12 +214,13 @@ async def test_each_payment_credit_hides_one_provisional(maker):
     assert await pending_dates() == ["2026-08-07", "2026-08-12"]
 
     # None of these pays one: a credit 4 days after the 7 Aug payments and
-    # before the 12 Aug one, a voided one, another card's, and a refund that
-    # names PayZapp.
+    # before the 12 Aug one, a voided one, another card's, a refund that names
+    # PayZapp, and a payment gateway's refund.
     await _add_credit(maker, acc_id, day=11)
     await _add_credit(maker, acc_id, day=9, voided=True)
     await _add_credit(maker, other_acc, day=9)
     await _add_credit(maker, acc_id, day=9, narration="PAYZAPP REFUND MUMBAI")
+    await _add_credit(maker, acc_id, day=9, narration="RAZORPAY PAYMENTS BANGALORE")
     assert await pending_dates() == ["2026-08-07", "2026-08-12"]
 
     # HDFC often sends no settlement SMS, so the statement line settles it.
@@ -237,6 +228,12 @@ async def test_each_payment_credit_hides_one_provisional(maker):
         maker, acc_id, day=10, narration="CREDIT CARD PAYMENTNet Banking (Ref# 1)"
     )
     assert await pending_dates() == ["2026-08-12"]
+
+    # A next-bill payment settled by hand pays only itself, even when its
+    # credit falls within three days of an unpaid payment of this bill.
+    await _add_provisional_sms(maker, day=25)
+    await _settle(maker, await _add_provisional_sms(maker, day=27))
+    assert await pending_dates() == ["2026-08-12", "2026-08-25"]
 
 
 @pytest.mark.anyio
@@ -247,16 +244,13 @@ async def test_settled_provisional_keeps_its_own_credit(maker):
     )
 
     upload_id, acc_id = await _seed_open_statement(maker)
+    # The same SMS stored twice, under two operator prefixes. The copy comes
+    # first, so the settled one must win however the rows are ordered.
+    await _add_provisional_sms(maker, day=7, minute=7, sender="VM-HDFCBK")
     first = await _add_provisional_sms(maker, day=7, minute=7)
     second = await _add_provisional_sms(maker, day=7, minute=11)
-    async with maker() as session, session.begin():
-        sms = await session.get(SmsMessage, first)
-        link_ctx = await build_link_context(session)
-        await process_sms_row(session, sms, link_ctx, settle_provisional=True)
+    await _settle(maker, first)
 
-    # The same SMS stored again under another operator prefix is the same
-    # payment, not a third one.
-    await _add_provisional_sms(maker, day=7, minute=7, sender="VM-HDFCBK")
     # The credit that the first settle made does not pay the second.
     assert [row.sms_id for row in await _pending(maker, upload_id)] == [second]
 

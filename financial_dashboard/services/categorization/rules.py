@@ -108,6 +108,15 @@ DIVIDEND_MARKERS: tuple[str, ...] = (
 
 
 def has_marker(text_norm: str, markers: tuple[str, ...]) -> bool:
+    """Say whether a whole-word marker occurs in normalized text.
+
+    Args:
+        text_norm: Text already passed through ``normalize_text``.
+        markers: Lowercase markers, words separated by single spaces.
+
+    Returns:
+        True when a marker occurs with word boundaries on both sides.
+    """
     padded = f" {text_norm} "
     return any(f" {marker} " in padded for marker in markers)
 
