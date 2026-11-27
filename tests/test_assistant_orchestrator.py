@@ -245,11 +245,14 @@ async def test_answer_cards_only_the_rows_it_tells_about(session, reply):
 
     # The read returned both rows, but only the rows that the reply tells
     # about get a card. An id that no read returned gets no card either.
-    assert result.transaction_ids == {
-        "answer": (food.id,),
-        "clarification": (bill.id,),
-        "error": (),
-    }[reply]
+    assert (
+        result.transaction_ids
+        == {
+            "answer": (food.id,),
+            "clarification": (bill.id,),
+            "error": (),
+        }[reply]
+    )
 
 
 @pytest.mark.anyio
