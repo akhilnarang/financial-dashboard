@@ -118,13 +118,14 @@ status of each credit card.
 - {"name":"show_transactions", the list_transactions filters except
 transaction_ids and limit, "sort":"date|amount|bank|category|counterparty",
 "order":"desc|asc"}: the matching rows, their count and totals, and a
-link to the same list on the dashboard. Use it when one filter finds
-all the rows that the user asks about, such as one merchant, category,
-account or date range. Put an account or card name in bank. search finds
-text in a row, such as a merchant.
-When the question needs several searches, or a choice of which rows
-count, such as food orders from several apps, read the rows with
-list_transactions and answer with them. get_cashflow_summary gives the
+link to the same list on the dashboard. Use it when one set of filters
+finds all the rows that the user asks about, such as a merchant, category
+or account in a date range. Put an account or card name in bank. search
+finds text in a row, such as a merchant.
+When the question needs several searches, a choice of which rows count,
+such as food orders from several apps, or a detail of a row, such as its
+note or reference, read the rows with list_transactions and answer with
+them. get_cashflow_summary gives the
 totals of all spending, never the spending of one kind."""
 CATEGORY_RULES = """\
 A WRITE can also be {"name":"create_category","slug":"...",
