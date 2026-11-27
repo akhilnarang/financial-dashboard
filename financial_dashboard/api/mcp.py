@@ -10,6 +10,7 @@ from pydantic import JsonValue
 from financial_dashboard.config import settings
 from financial_dashboard.core.deps import AsyncSessionDep
 from financial_dashboard.services.mcp import (
+    INVALID_REQUEST,
     PARSE_ERROR,
     PROTOCOL_VERSIONS,
     JsonRpcResponse,
@@ -56,7 +57,7 @@ async def mcp(request: Request, session: AsyncSessionDep) -> Response:
     """Answer one JSON-RPC message.
 
     A request gets a JSON reply. A notification or a client response gets 202
-    with no body.
+    with no body. A body that is not one valid JSON-RPC message gets 400.
     """
     try:
         message = json.loads(await request.body())
@@ -66,7 +67,9 @@ async def mcp(request: Request, session: AsyncSessionDep) -> Response:
     reply = await handle_message(session, message)
     if reply is None:
         return Response(status_code=202)
-    return JSONResponse(_reply_body(reply))
+    # A message that is not valid JSON-RPC is refused at the HTTP level too.
+    invalid = reply.error is not None and reply.error.code == INVALID_REQUEST
+    return JSONResponse(_reply_body(reply), 400 if invalid else 200)
 
 
 @router.get("/mcp", dependencies=[Depends(verify_mcp_request)])
@@ -82,5 +85,9 @@ async def mcp_end_session() -> Response:
 
 
 def _reply_body(reply: JsonRpcResponse) -> dict[str, JsonValue]:
-    """Serialize a reply. JSON-RPC requires the id, even when it is null."""
-    return {"id": None, **reply.model_dump(mode="json", exclude_none=True)}
+    """Serialize a reply, keeping the null fields of the rows.
+
+    The output schema requires every row field, null or not. Only the unset
+    protocol fields, such as ``error`` on a result, are left out.
+    """
+    return reply.model_dump(mode="json")

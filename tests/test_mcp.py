@@ -1,7 +1,9 @@
+import json
+
 import pytest
 
 from financial_dashboard.config import settings
-from financial_dashboard.db import Transaction
+from financial_dashboard.db import Receivable, Transaction
 from financial_dashboard.services import settings as settings_service
 
 TOKEN = "test-mcp-token"
@@ -47,7 +49,7 @@ async def test_mcp_client_reads_rows_and_reports(
         )
         for amount, counterparty in ((250, "FOOD APP"), (9000, "PAT HOLDER RENT"))
     )
-    session.add_all([food, rent])
+    session.add_all([food, rent, Receivable(person="Pat Holder", amount=500)])
     await session.flush()
 
     started = (await rpc(client, "initialize", {"protocolVersion": "2025-06-18"}))[
@@ -83,6 +85,18 @@ async def test_mcp_client_reads_rows_and_reports(
     )["result"]
     assert read["isError"] is False
     assert [row["id"] for row in read["structuredContent"]["items"]] == [food.id]
+    # The row has null fields. A client checks the result against the output
+    # schema, so every required field must be there, null or not.
+    output_defs = tools["list_transactions"]["outputSchema"]["$defs"]
+    required = set(output_defs["AssistantTransaction"]["required"])
+    assert required <= read["structuredContent"]["items"][0].keys()
+
+    owed = (
+        await rpc(client, "tools/call", {"name": "list_receivables", "arguments": None})
+    )["result"]
+    assert [item["person"] for item in owed["structuredContent"]["items"]] == [
+        "[redacted-name]"
+    ]
 
     # A report is text for the user; through MCP it reaches a model, so a
     # configured name is hidden there too.
@@ -95,6 +109,8 @@ async def test_mcp_client_reads_rows_and_reports(
     )["result"]
     assert "[redacted-name]" in report["content"][0]["text"]
     assert "HOLDER" not in report["content"][0]["text"].upper()
+    # A link query could carry a name past the redaction, so there are none.
+    assert "<" not in report["content"][0]["text"]
 
     # Bad arguments are a tool error that the model can fix, not a protocol error.
     bad = (
@@ -106,6 +122,16 @@ async def test_mcp_client_reads_rows_and_reports(
     )["result"]
     assert bad["isError"] is True
     assert (await rpc(client, "resources/list"))["error"]["code"] == -32601
+    # A request id is never null, and a body must be one JSON-RPC object.
+    for body in ({"jsonrpc": "2.0", "id": None, "method": "ping"}, [], "{"):
+        refused = await client.post(
+            "/api/mcp",
+            headers={**AUTH, "Content-Type": "application/json"},
+            content=body if isinstance(body, str) else json.dumps(body),
+        )
+        assert refused.status_code == 400
+    stream = await client.get("/api/mcp", headers=AUTH)
+    assert (stream.status_code, stream.headers["allow"]) == (405, "POST")
 
 
 @pytest.mark.anyio

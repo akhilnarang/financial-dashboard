@@ -7,6 +7,8 @@ stream. The tools are the assistant's reads and reports, built from the same
 contracts, so an MCP client and the Telegram assistant see the same data.
 """
 
+import html
+import re
 from typing import Annotated, Literal, TypeAlias
 
 from pydantic import (
@@ -18,8 +20,10 @@ from pydantic import (
     ValidationError,
 )
 from pydantic.alias_generators import to_camel
+from pydantic.types import StrictInt, StrictStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from financial_dashboard.schemas.receivables import ReceivableRead
 from financial_dashboard.services.assistant.context import ToolResult
 from financial_dashboard.services.assistant.contracts import (
     Answer,
@@ -49,7 +53,8 @@ from financial_dashboard.services.categorization.vocabulary import get_active_sl
 from financial_dashboard.services.settings import get_redact_name_tokens
 
 # The newest version first. A client that asks for another gets the newest.
-PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
+# 2025-03-26 is left out: it allows batches, which this server does not take.
+PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18")
 SERVER_NAME = "financial-dashboard"
 SERVER_VERSION = "0.1.0"
 INSTRUCTIONS = """\
@@ -71,6 +76,9 @@ PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
+# An Indian PAN, which a CAS snapshot label can hold.
+PAN = re.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b")
+HTML_TAG = re.compile(r"<[^>]+>")
 READ_TOOLS = (ListTransactions, ListAccounts, ListReceivables)
 REPORT_TOOLS = (
     ShowTransactions,
@@ -167,7 +175,9 @@ class McpTool(McpModel):
     name: str
     description: str
     input_schema: dict[str, JsonValue]
-    output_schema: dict[str, JsonValue] | None = None
+    output_schema: dict[str, JsonValue] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     annotations: ToolAnnotations = ToolAnnotations()
 
 
@@ -194,7 +204,9 @@ class CallToolResult(McpModel):
     """
 
     content: list[TextContent]
-    structured_content: ToolResult | None = None
+    structured_content: ToolResult | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     is_error: bool = False
 
 
@@ -250,9 +262,9 @@ class JsonRpcRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     jsonrpc: Literal["2.0"]
-    id: int | str | None = None
+    id: StrictInt | StrictStr | None = None
     method: str
-    params: dict[str, JsonValue] = {}
+    params: dict[str, JsonValue] | None = None
 
 
 class CallToolParams(BaseModel):
@@ -266,7 +278,7 @@ class CallToolParams(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     name: str
-    arguments: dict[str, JsonValue] = {}
+    arguments: dict[str, JsonValue] | None = None
 
 
 class JsonRpcError(BaseModel):
@@ -288,8 +300,12 @@ class JsonRpcResponse(BaseModel):
 
     jsonrpc: Literal["2.0"] = "2.0"
     id: int | str | None
-    result: InitializeResult | ToolList | CallToolResult | EmptyResult | None = None
-    error: JsonRpcError | None = None
+    result: InitializeResult | ToolList | CallToolResult | EmptyResult | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    error: JsonRpcError | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 async def handle_message(
@@ -307,17 +323,33 @@ async def handle_message(
     """
     if not isinstance(message, dict):
         return error_response(None, INVALID_REQUEST, "send one JSON-RPC object")
+    request_id = message.get("id")
+    valid_id = isinstance(request_id, str) or (
+        isinstance(request_id, int) and not isinstance(request_id, bool)
+    )
+    reply_id = request_id if valid_id else None
     if "method" not in message:
-        return None
+        # A client response. This server sends no requests, so it drops it.
+        is_response = message.get("jsonrpc") == "2.0" and (
+            "result" in message or "error" in message
+        )
+        if is_response and valid_id:
+            return None
+        return error_response(reply_id, INVALID_REQUEST, "invalid JSON-RPC message")
+    if "id" in message and not valid_id:
+        return error_response(
+            None, INVALID_REQUEST, "the id must be a string or number"
+        )
     try:
         request = JsonRpcRequest.model_validate(message)
     except ValidationError:
-        return error_response(None, INVALID_REQUEST, "invalid JSON-RPC request")
+        return error_response(reply_id, INVALID_REQUEST, "invalid JSON-RPC request")
     if request.id is None:
         return None
+    params = request.params or {}
     match request.method:
         case "initialize":
-            asked = request.params.get("protocolVersion")
+            asked = params.get("protocolVersion")
             version = asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0]
             slugs = ", ".join(await get_active_slugs(session))
             result = InitializeResult(
@@ -330,14 +362,16 @@ async def handle_message(
             result = ToolList(tools=[_tool(name) for name in TOOL_MODELS])
         case "tools/call":
             try:
-                params = CallToolParams.model_validate(request.params)
+                call_params = CallToolParams.model_validate(params)
             except ValidationError:
                 return error_response(request.id, INVALID_PARAMS, "invalid params")
-            if params.name not in TOOL_MODELS:
+            if call_params.name not in TOOL_MODELS:
                 return error_response(
-                    request.id, INVALID_PARAMS, f"unknown tool: {params.name}"
+                    request.id, INVALID_PARAMS, f"unknown tool: {call_params.name}"
                 )
-            result = await call_tool(session, params.name, params.arguments)
+            result = await call_tool(
+                session, call_params.name, call_params.arguments or {}
+            )
         case _:
             return error_response(
                 request.id, METHOD_NOT_FOUND, f"method not found: {request.method}"
@@ -376,6 +410,8 @@ async def call_tool(
     Returns:
         The tool result: the redacted rows of a read, or the text of a report.
     """
+    if "name" in arguments:
+        return _tool_error("invalid arguments: name is the tool, not an argument")
     try:
         call = CALL_ADAPTER.validate_python({**arguments, "name": name})
     except ValidationError as exc:
@@ -384,6 +420,7 @@ async def call_tool(
             for error in exc.errors(include_url=False)
         )
         return _tool_error(f"invalid arguments: {problems}")
+    tokens = get_redact_name_tokens()
     match call:
         case ListTransactions():
             try:
@@ -393,23 +430,47 @@ async def call_tool(
             read = ToolResult(
                 tool=name, items=rows, hint=None if rows else EMPTY_LIST_HINT
             )
-        case ListAccounts() | ListReceivables():
+        case ListAccounts():
             read = ToolResult(tool=name, items=await dispatch_read(session, call))
-        case _:
-            match await render_report(session, call):
-                case Answer(text=text):
-                    tokens = get_redact_name_tokens()
-                    return CallToolResult(
-                        content=[
-                            TextContent(text=redact_names(redact_pii(text), tokens))
-                        ]
+        case ListReceivables():
+            receivables = await dispatch_read(session, call)
+            read = ToolResult(
+                tool=name,
+                items=[
+                    item.model_copy(
+                        update={
+                            "person": _redact(item.person, tokens),
+                            "note": item.note and _redact(item.note, tokens),
+                        }
                     )
+                    for item in receivables
+                    if isinstance(item, ReceivableRead)
+                ],
+            )
+        case _:
+            # No links: a link query can hold a name that redaction cannot see.
+            match await render_report(session, call, base_url=""):
+                case Answer(text=text):
+                    plain = "\n".join(
+                        _redact(html.unescape(HTML_TAG.sub("", line)), tokens)
+                        for line in text.splitlines()
+                    )
+                    return CallToolResult(content=[TextContent(text=plain)])
                 case error:
                     return _tool_error(error.message)
     return CallToolResult(
-        content=[TextContent(text=read.model_dump_json(exclude_none=True))],
+        content=[TextContent(text=read.model_dump_json())],
         structured_content=read,
     )
+
+
+def _redact(text: str, tokens: tuple[str, ...]) -> str:
+    """Hide configured names, long numbers, phone numbers and PANs in one line.
+
+    Redact one line at a time: the name rule joins nearby markers, and across
+    lines it would merge two report rows into one.
+    """
+    return PAN.sub("[redacted-pan]", redact_names(redact_pii(text), tokens))
 
 
 def _tool(name: str) -> McpTool:
