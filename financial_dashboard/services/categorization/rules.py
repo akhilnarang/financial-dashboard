@@ -107,7 +107,7 @@ DIVIDEND_MARKERS: tuple[str, ...] = (
 )
 
 
-def _has_marker(text_norm: str, markers: tuple[str, ...]) -> bool:
+def has_marker(text_norm: str, markers: tuple[str, ...]) -> bool:
     padded = f" {text_norm} "
     return any(f" {marker} " in padded for marker in markers)
 
@@ -157,7 +157,7 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
     if fields.get("family_card") and (
         direction == "debit"
         or "cc_refund" in email_type
-        or _has_marker(text_norm, (*CARD_REFUND_MARKERS, "cashback"))
+        or has_marker(text_norm, (*CARD_REFUND_MARKERS, "cashback"))
     ):
         return RuleResult(FAMILY_SLUG, 1.0)
 
@@ -200,7 +200,7 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
     # (which has no evidence to offer), so the guard still flips a no-evidence
     # credit fees_charges to 'repayment' / a card bill. Direction-gated to
     # credit because the markers themselves describe a credit event.
-    if direction == "credit" and _has_marker(text_norm, FEE_REVERSAL_MARKERS):
+    if direction == "credit" and has_marker(text_norm, FEE_REVERSAL_MARKERS):
         return RuleResult("fees_charges", 0.9)
 
     # A credit on a credit card is money returning TO the card — the account
@@ -212,10 +212,10 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
         direction == "credit" and fields.get("account_type") == CREDIT_CARD_ACCOUNT_TYPE
     )
     if is_card_credit:
-        if _has_marker(text_norm, CARD_REFUND_MARKERS):
+        if has_marker(text_norm, CARD_REFUND_MARKERS):
             return RuleResult(REFUND_SLUG, 0.9)
         # A leading "Payment/..." is the bank's own label for a card bill payment.
-        if _has_marker(text_norm, CARD_BILL_PAYMENT_MARKERS) or text_norm.startswith(
+        if has_marker(text_norm, CARD_BILL_PAYMENT_MARKERS) or text_norm.startswith(
             "payment "
         ):
             return RuleResult(CREDIT_CARD_PAYMENT_SLUG, 0.95)
@@ -227,7 +227,7 @@ def match_rules(fields: dict, config: RuleConfig) -> RuleResult | None:
     if (
         direction == "credit"
         and not is_card_credit
-        and _has_marker(text_norm, DIVIDEND_MARKERS)
+        and has_marker(text_norm, DIVIDEND_MARKERS)
     ):
         return RuleResult("other_income", 0.9)
 

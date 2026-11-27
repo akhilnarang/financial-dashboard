@@ -170,78 +170,100 @@ async def _add_settled_credit(maker, acc_id, *, amount, day=8):
         return txn.id
 
 
-@pytest.mark.anyio
-async def test_each_payment_credit_hides_one_provisional(maker):
-    """A provisional pairs once with a later payment credit of its amount."""
-    upload_id, acc_id = await _seed_open_statement(maker)
-    # Dated before the window: it pays the previous bill and shows there.
-    await _add_provisional_sms(maker, day=5)
-    await _add_provisional_sms(maker, day=7, minute=7)
-    await _add_provisional_sms(maker, day=7, minute=11)
-    await _add_settled_credit(maker, acc_id, amount="30000.00", day=8)
-
-    async def pending():
-        upload = await _get_upload(maker, upload_id)
-        async with maker() as session:
-            return (await build_payments_view(session, upload)).pending
-
-    # Two payments and one settlement leave one payment pending.
-    assert [row.date for row in await pending()] == ["2026-08-07"]
-
-    async def add_statement_credit(narration):
-        async with maker() as session:
-            session.add(
-                Transaction(
-                    account_id=acc_id,
-                    bank="hdfc",
-                    email_type="cc_statement",
-                    direction="credit",
-                    amount=Decimal("30000.00"),
-                    transaction_date=datetime.date(2026, 8, 9),
-                    counterparty=narration,
-                    raw_description=narration,
-                    category="credit_card_payment",
-                )
-            )
-            await session.commit()
-
-    # HDFC often sends no settlement SMS, so the statement line settles it.
-    # A refund of the same amount is not a payment, even with that category.
-    await add_statement_credit("AMAZON REFUND GURGAON")
-    assert len(await pending()) == 1
-    await add_statement_credit("BPPY CC PAYMENT DP0000000000 (Ref# 1)")
-    assert await pending() == []
-
-
-@pytest.mark.anyio
-async def test_confident_settled_match_hides_provisional(maker):
-    """Equal authoritative balance and identity hide the settled provisional."""
-    upload_id, acc_id = await _seed_open_statement(maker)
-    await _add_provisional_sms(maker, day=7, hour=6, minute=0)
+async def _add_credit(
+    maker, acc_id, *, day, narration=None, voided=False, amount="30000.00"
+):
+    """A credit of the statement card: a payment alert, or a statement line."""
     async with maker() as session:
         session.add(
             Transaction(
                 account_id=acc_id,
                 bank="hdfc",
-                email_type="hdfc_cc_payment_received_alert",
+                email_type=(
+                    "cc_statement" if narration else "hdfc_cc_payment_received_alert"
+                ),
                 direction="credit",
-                amount=Decimal("30000.00"),
-                currency="INR",
-                transaction_date=datetime.date(2026, 8, 7),
-                transaction_time=datetime.time(11, 30),
-                card_mask="1234",
-                balance=Decimal("100000.00"),
-                source="email",
+                amount=Decimal(amount),
+                transaction_date=datetime.date(2026, 8, day),
+                counterparty=narration,
+                raw_description=narration,
+                category="credit_card_payment",
+                voided=voided,
             )
         )
         await session.commit()
 
+
+async def _pending(maker, upload_id):
     upload = await _get_upload(maker, upload_id)
     async with maker() as session:
-        view = await build_payments_view(session, upload)
+        return (await build_payments_view(session, upload)).pending
 
-    assert len(view.settled) == 1
-    assert view.pending == []
+
+@pytest.mark.anyio
+async def test_each_payment_credit_hides_one_provisional(maker):
+    """A provisional pairs once with a payment credit 0 to 3 days later."""
+    upload_id, acc_id = await _seed_open_statement(maker)
+    # The next statement closes this window at 26 Aug.
+    await _seed_second_statement(
+        maker, acc_id, created_at=datetime.datetime(2026, 9, 5, tzinfo=datetime.UTC)
+    )
+    # Dated outside the window: they pay another bill and show there.
+    await _add_provisional_sms(maker, day=5)
+    await _add_provisional_sms(maker, day=26)
+    await _add_provisional_sms(maker, day=7, minute=7)
+    await _add_provisional_sms(maker, day=7, minute=11)
+    await _add_provisional_sms(maker, day=12)
+    other_acc = await h.add_cc_account(maker, cards=["XXXX5678"])
+
+    async def pending_dates():
+        return [row.date for row in await _pending(maker, upload_id)]
+
+    await _add_credit(maker, acc_id, day=8)
+    # Two payments and one settlement leave one payment pending.
+    assert await pending_dates() == ["2026-08-07", "2026-08-12"]
+
+    # None of these pays one: a credit 4 days after the 7 Aug payments and
+    # before the 12 Aug one, a voided one, another card's, and a refund that
+    # names PayZapp.
+    await _add_credit(maker, acc_id, day=11)
+    await _add_credit(maker, acc_id, day=9, voided=True)
+    await _add_credit(maker, other_acc, day=9)
+    await _add_credit(maker, acc_id, day=9, narration="PAYZAPP REFUND MUMBAI")
+    assert await pending_dates() == ["2026-08-07", "2026-08-12"]
+
+    # HDFC often sends no settlement SMS, so the statement line settles it.
+    await _add_credit(
+        maker, acc_id, day=10, narration="CREDIT CARD PAYMENTNet Banking (Ref# 1)"
+    )
+    assert await pending_dates() == ["2026-08-12"]
+
+
+@pytest.mark.anyio
+async def test_settled_provisional_keeps_its_own_credit(maker):
+    """A provisional settled by hand pays only itself, and a paid one is final."""
+    from financial_dashboard.services.statement_payments import (
+        is_settleable_provisional,
+    )
+
+    upload_id, acc_id = await _seed_open_statement(maker)
+    first = await _add_provisional_sms(maker, day=7, minute=7)
+    second = await _add_provisional_sms(maker, day=7, minute=11)
+    async with maker() as session, session.begin():
+        sms = await session.get(SmsMessage, first)
+        link_ctx = await build_link_context(session)
+        await process_sms_row(session, sms, link_ctx, settle_provisional=True)
+
+    # The credit that the first settle made does not pay the second.
+    assert [row.sms_id for row in await _pending(maker, upload_id)] == [second]
+
+    # A statement line pays the second. A page opened before it arrived must
+    # not settle the second into a duplicate credit.
+    await _add_credit(maker, acc_id, day=8, narration="BPPY CC PAYMENT DP0 (Ref# 1)")
+    upload = await _get_upload(maker, upload_id)
+    async with maker() as session:
+        sms = await session.get(SmsMessage, second)
+        assert await is_settleable_provisional(session, sms, upload) is False
 
 
 async def _seed_second_statement(maker, acc_id, *, created_at, total="50,000.00"):

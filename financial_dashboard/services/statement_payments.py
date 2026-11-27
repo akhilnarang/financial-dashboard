@@ -15,9 +15,9 @@ self-healing: no staging table to clean up.
 """
 
 import logging
-import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from typing import NamedTuple
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import func, select
@@ -40,19 +40,37 @@ from financial_dashboard.services.cc_disambiguation import (
     is_cc_payment_received_email,
 )
 from financial_dashboard.services.sms_pipeline import parsed_sms_to_txn_data
+from financial_dashboard.services.categorization.normalize import normalize_text
+from financial_dashboard.services.categorization.rules import (
+    CARD_BILL_PAYMENT_MARKERS,
+    CARD_REFUND_MARKERS,
+    has_marker,
+)
 from financial_dashboard.services.statements.cc import parse_cc_amount
 
 logger = logging.getLogger(__name__)
 
 # A payment on a later statement can post a few days after its provisional SMS.
 SETTLE_DAYS = 3
-# A statement credit that is a bill payment, by its narration. Refunds and
-# cashback are credits too, so a narration check keeps them from hiding a
-# provisional that has the same amount. A narration can run words together,
-# as in "PAYMENTNet Banking", so only the start of a word is checked.
-PAYMENT_NARRATION = re.compile(
-    r"\b(PAYMENT|PAYZAPP|BPPY|NETBANKING|TELE TRANSFER)", re.IGNORECASE
+# Statement narrations of a card bill payment that the categorizer's markers
+# do not cover. HDFC can run words together, as in "CREDIT CARD PAYMENTNet
+# Banking", so a line start counts too.
+STATEMENT_PAYMENT_MARKERS = (
+    "netbanking transfer",
+    "net banking",
+    "tele transfer credit",
+    "payzapp",
+    "repayment",
+    "autopay",
 )
+STATEMENT_PAYMENT_PREFIXES = ("payment ", "credit card payment")
+
+
+class Provisional(NamedTuple):
+    """A provisional bill-payment SMS with its parsed data."""
+
+    sms: SmsMessage
+    data: dict
 
 
 @dataclass(frozen=True)
@@ -148,8 +166,10 @@ async def _pending_payments(
     settlement message, a payment line of a later statement. It is a separate
     row, so the provisional stays unlinked. Each provisional pairs with one
     such credit of the same amount, dated the same day or up to
-    ``SETTLE_DAYS`` later, and each credit pairs once. A provisional dated
-    before the window pays the previous bill, so it shows on that bill.
+    ``SETTLE_DAYS`` later, and each credit pairs once. A provisional settled
+    by hand links to its own credit, which then pays no other provisional. A
+    provisional dated outside the window pays another bill, so it shows on
+    that bill.
     """
     account = await session.get(Account, upload.account_id)
     if account is None:
@@ -157,18 +177,13 @@ async def _pending_payments(
 
     # ``received_at`` is UTC; the cycle bounds are calendar dates whose real
     # day is IST. A payment near IST-midnight is stored on the adjacent UTC
-    # date, so a tight UTC-midnight window would drop it. Pad the window by a
-    # day on each edge to cover the ~5.5h skew. Over-inclusion is safe: a
-    # provisional pulled in from an adjacent cycle still needs a transaction
-    # identity match, a matching card, and ``transaction_id IS NULL``;
-    # the worst case is showing a genuinely-unsettled neighbour payment, which
-    # settling attributes to the correct cycle anyway.
+    # date, so the fetch is padded by a day on each edge. The provisional's
+    # own date, from its body, then decides its cycle.
     lower = datetime.combine(
         window.start - timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
     )
     conditions = [
         func.lower(SmsMessage.bank) == account.bank.lower(),
-        SmsMessage.transaction_id.is_(None),
         SmsMessage.received_at >= lower,
     ]
     if window.end is not None:
@@ -182,14 +197,16 @@ async def _pending_payments(
             await session.execute(
                 select(SmsMessage)
                 .where(*conditions)
-                .order_by(SmsMessage.received_at.asc())
+                .order_by(SmsMessage.received_at.asc(), SmsMessage.id.asc())
             )
         )
         .scalars()
         .all()
     )
 
-    provisionals = []
+    provisionals: list[Provisional] = []
+    # Credits that a provisional settled by hand already pays for.
+    reserved: set[int] = set()
     for sms in rows:
         parsed = _parse_provisional_cc_payment(sms)
         if parsed is None:
@@ -205,12 +222,20 @@ async def _pending_payments(
         # here. Confirm the parsed card belongs to this account's card set.
         if not _card_belongs_to_account(txn_data.get("card_mask"), account):
             continue
-        txn_date = txn_data.get("transaction_date")
-        if txn_date is not None and txn_date < window.start:
+        if sms.transaction_id is not None:
+            reserved.add(sms.transaction_id)
             continue
-        provisionals.append((sms, txn_data))
+        txn_date = txn_data.get("transaction_date")
+        if txn_date is not None and (
+            txn_date < window.start
+            or (window.end is not None and txn_date >= window.end)
+        ):
+            continue
+        provisionals.append(Provisional(sms, txn_data))
 
-    unpaired = await _unpaired_provisionals(session, upload.account_id, provisionals)
+    unpaired = await _unpaired_provisionals(
+        session, upload.account_id, provisionals, reserved
+    )
     pending: list[PendingPayment] = []
     for sms, txn_data in unpaired:
         txn_date = txn_data.get("transaction_date")
@@ -230,8 +255,9 @@ async def _pending_payments(
 async def _unpaired_provisionals(
     session: AsyncSession,
     account_id: int,
-    provisionals: list[tuple[SmsMessage, dict]],
-) -> list[tuple[SmsMessage, dict]]:
+    provisionals: list[Provisional],
+    reserved: set[int],
+) -> list[Provisional]:
     """Drop each provisional that pairs with a payment credit in the ledger.
 
     Pairs in date order. A provisional takes the earliest unused credit of
@@ -241,7 +267,8 @@ async def _unpaired_provisionals(
     Args:
         session: The page session.
         account_id: The card account of the statement.
-        provisionals: The provisional SMS with their parsed data.
+        provisionals: The unlinked provisional SMS with their parsed data.
+        reserved: Credits that a provisional settled by hand pays for.
 
     Returns:
         The provisionals that no credit pairs with, in date order.
@@ -249,11 +276,12 @@ async def _unpaired_provisionals(
     dated = sorted(
         provisionals,
         key=lambda item: (
-            item[1].get("transaction_date") or date.max,
-            item[0].received_at,
+            item.data.get("transaction_date") or date.max,
+            item.sms.received_at,
+            item.sms.id,
         ),
     )
-    dates = [d for _, data in dated if (d := data.get("transaction_date"))]
+    dates = [d for item in dated if (d := item.data.get("transaction_date"))]
     if not dates:
         return dated
     credits = list(
@@ -272,16 +300,18 @@ async def _unpaired_provisionals(
             )
         ).all()
     )
-    payments = [row for row in credits if _is_payment_credit(row)]
+    payments = [
+        row for row in credits if row.id not in reserved and _is_payment_credit(row)
+    ]
     unpaired = []
-    for sms, data in dated:
-        txn_date = data.get("transaction_date")
+    for item in dated:
+        txn_date = item.data.get("transaction_date")
         match = next(
             (
                 row
                 for row in payments
                 if txn_date is not None
-                and row.amount == data["amount"]
+                and row.amount == item.data["amount"]
                 and row.transaction_date is not None
                 and txn_date
                 <= row.transaction_date
@@ -290,7 +320,7 @@ async def _unpaired_provisionals(
             None,
         )
         if match is None:
-            unpaired.append((sms, data))
+            unpaired.append(item)
         else:
             payments.remove(match)
     return unpaired
@@ -300,12 +330,17 @@ def _is_payment_credit(row: Transaction) -> bool:
     """Say whether a credit row is a card bill payment, not a refund.
 
     An alert row says so by its type. A statement row says so only by its
-    narration, because its category can call a refund a card payment.
+    narration, because its category can call a refund a card payment. A
+    refund or cashback marker wins over a payment word.
     """
-    if row.email_type == "cc_statement":
-        narration = row.raw_description or row.counterparty or ""
-        return bool(PAYMENT_NARRATION.search(narration))
-    return is_cc_payment_received_email(row.email_type)
+    if row.email_type != "cc_statement":
+        return is_cc_payment_received_email(row.email_type)
+    text = normalize_text(row.raw_description or row.counterparty)
+    if has_marker(text, (*CARD_REFUND_MARKERS, "cashback")):
+        return False
+    return has_marker(
+        text, (*CARD_BILL_PAYMENT_MARKERS, *STATEMENT_PAYMENT_MARKERS)
+    ) or text.startswith(STATEMENT_PAYMENT_PREFIXES)
 
 
 def _parse_provisional_cc_payment(sms: SmsMessage):
@@ -367,14 +402,14 @@ def _card_belongs_to_account(
 async def is_settleable_provisional(
     session: AsyncSession, sms: SmsMessage, upload: StatementUpload
 ) -> bool:
-    """True if ``sms`` is a provisional CC bill-payment for ``upload``'s account.
+    """True if ``sms`` is a pending provisional CC bill-payment of ``upload``.
 
     The settle route accepts a raw SMS id from the form, so it must confirm the
     SMS really is a provisional CC-payment credit for this statement's card
     before promoting it. This rejects a restatement, a non-payment SMS, a
-    different card, or an arbitrary id. It does NOT re-check the cycle window:
-    settling a slightly out-of-window provisional the user can see is harmless
-    and the paid-amount recompute scopes the credit to the right cycle anyway.
+    different card, or an arbitrary id. The SMS must also still be pending: a
+    page opened before a settlement or statement credit arrived must not add
+    a second credit for a paid provisional.
     """
     if sms.transaction_id is not None:
         return False
@@ -391,7 +426,11 @@ async def is_settleable_provisional(
         return False
     if not is_cc_payment_received_email(txn_data.get("email_type")):
         return False
-    return _card_belongs_to_account(txn_data.get("card_mask"), account, strict=True)
+    if not _card_belongs_to_account(txn_data.get("card_mask"), account, strict=True):
+        return False
+    window = await cc_cycle_window(session, upload)
+    pending = await _pending_payments(session, upload, window)
+    return sms.id in {row.sms_id for row in pending}
 
 
 async def build_payments_view(
