@@ -9,11 +9,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from financial_dashboard.core.security import check_credentials, http_basic
 from financial_dashboard.db import async_session
 
+MCP_PATH = "/api/mcp"
+
 
 def verify_credentials(
     request: Request,
     credentials: Optional[HTTPBasicCredentials] = Depends(http_basic),
 ) -> None:
+    # The MCP endpoint checks its own bearer token. MCP clients send no Basic auth.
+    if request.url.path == MCP_PATH:
+        return
     check_credentials(credentials, request)
 
 

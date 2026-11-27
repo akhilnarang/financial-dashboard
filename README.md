@@ -41,6 +41,7 @@ Once running:
 | `POLL_FETCH_LIMIT_PER_RULE` | `50` | Max new emails fetched per rule per poll cycle |
 | `TELEGRAM_BOT_TOKEN` | (optional) | Telegram bot token for real-time transaction notifications |
 | `TELEGRAM_CHAT_ID` | (optional) | Telegram chat ID to send notifications to |
+| `MCP_TOKEN` | (empty) | Bearer token of the read-only MCP endpoint at `/api/mcp`. Empty turns the endpoint off. |
 
 ## Key Features
 
@@ -1121,6 +1122,7 @@ uv run python scripts/seed.py
 | `PATCH` | `/api/receivables/{id}` | Change `amount`, `note`, `status`, or `person` |
 | `POST`/`DELETE` | `/api/receivables/{id}/links[/{transaction_id}]` | Link a row with a `role`, or unlink it |
 | `GET`/`POST` | `/api/receivables/identifiers` | List person identifiers, or store one (`person`, `kind` = `counterparty`/`vpa`/`phone`, `value`) |
+| `POST` | `/api/mcp` | Read-only MCP server (stateless Streamable HTTP, one JSON-RPC message per POST). Needs `Authorization: Bearer $MCP_TOKEN` and no `Origin`; skips Basic auth. Tools: the assistant's reads (`list_transactions`, `list_accounts`, `list_receivables`) and reports (`show_transactions`, `get_cashflow_summary`, `get_investment_flows`, `get_holdings`, `get_networth`, `get_card_dues`) |
 
 The full Paisa JSON surface (`/accounts`, `/probe`, `/preview`, `/generate`, `/sync`) is documented in [Extensions → Routes](#routes).
 
