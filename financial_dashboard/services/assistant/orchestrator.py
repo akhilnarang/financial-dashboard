@@ -580,6 +580,13 @@ async def run_turn(
         decision_id: int | None = None,
         error_detail: str | None = None,
     ) -> OrchestrationResult:
+        # Only the rows that the reply tells about get a card, and only when a
+        # read of this turn returned them.
+        shown = (
+            response.transaction_ids
+            if isinstance(response, Answer | Clarification)
+            else []
+        )
         return OrchestrationResult(
             response,
             mutation_result,
@@ -598,15 +605,7 @@ async def run_turn(
                 for record in output_records
                 if isinstance(record.get("latency_ms"), int)
             ),
-            # Only the rows that an answer tells about get a card, and only
-            # when a read of this turn returned them.
-            tuple(
-                dict.fromkeys(
-                    row for row in response.transaction_ids if row in read_rows
-                )
-            )
-            if isinstance(response, Answer)
-            else (),
+            tuple(dict.fromkeys(row for row in shown if row in read_rows)),
             False,
             error_detail,
         )

@@ -377,9 +377,21 @@ class Answer(StrictModel):
 
 
 class Clarification(StrictModel):
+    """A question back to the user.
+
+    Attributes:
+        outcome: The outcome kind.
+        question: The question text.
+        pending_confirmation: The change that a yes confirms, or None.
+        transaction_ids: The rows that the question tells the user about.
+            The application sends a card for each row that a read of this
+            turn returned.
+    """
+
     outcome: Literal["clarification"]
     question: StrictStr = Field(min_length=1, max_length=1000)
     pending_confirmation: "PendingConfirmation | None" = None
+    transaction_ids: list[StrictInt] = Field(default_factory=list, max_length=20)
 
 
 class MerchantRuleConfirmation(StrictModel):

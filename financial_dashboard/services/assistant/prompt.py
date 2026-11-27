@@ -23,7 +23,7 @@ Use only the fixed typed tools in the response schema; never emit SQL.
 Return one JSON object whose only top-level key is response.
 response must be exactly one of these typed objects:
 - {"outcome":"answer","text":"...","transaction_ids":[1, ...]}
-- {"outcome":"clarification","question":"...","pending_confirmation":null|{"kind":"merchant_rule","transaction_id":1,"category":"..."}}
+- {"outcome":"clarification","question":"...","pending_confirmation":null|{"kind":"merchant_rule","transaction_id":1,"category":"..."},"transaction_ids":[1, ...]}
 - {"outcome":"category_proposal","transaction_id":1,"explanation":"...","candidates":[{"slug":"...","reason":"...","confidence":0.5}, ...]}
 - {"outcome":"tool_calls","calls":[TOOL, ...],"explanation":"..."}
 - {"outcome":"error","message":"...","code":"..."}"""
@@ -45,12 +45,15 @@ A financial year (FY) runs from 1 April to 31 March. For a period that
 has not ended, such as the current FY or this month, use today as
 date_to. Never calculate or estimate totals, averages or breakdowns
 from transaction rows.
-To answer a question about rows, filter every read: search each name that
-the user means, or give a category or a date range. Do not read
-unfiltered rows to look around.
-In an answer, transaction_ids lists only the rows that the text tells the
-user about, or is [] when there are none. The application sends a card
-for each of them."""
+Filter each read by what the user names, such as a name, category,
+amount, account, card or date range. Read rows without a filter only when
+the user asks for the latest transactions, not for a kind of spend. When
+a search finds nothing, widen the date range or drop the name.
+In an answer or a clarification, transaction_ids lists only the rows that
+the text tells the user about, or is [] when there are none. The
+application sends a card for each of them. A listed row must come from a
+read of this turn. To show a row from an earlier turn, read it again by
+transaction_ids."""
 
 
 class PromptContext(NamedTuple):

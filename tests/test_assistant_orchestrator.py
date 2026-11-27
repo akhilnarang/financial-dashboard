@@ -211,7 +211,7 @@ async def test_an_empty_read_tells_the_model_how_to_find_the_names(session):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("reply", ["answer", "clarification"])
+@pytest.mark.parametrize("reply", ["answer", "clarification", "error"])
 async def test_answer_cards_only_the_rows_it_tells_about(session, reply):
     food, bill = (
         Transaction(bank="test", email_type="test", direction="debit", amount=amount)
@@ -225,21 +225,31 @@ async def test_answer_cards_only_the_rows_it_tells_about(session, reply):
                 outcome="tool_calls",
                 calls=[{"name": "list_transactions", "direction": "debit"}],
             ),
-            Answer(
-                outcome="answer",
-                text="One food order.",
-                transaction_ids=[food.id, food.id, bill.id + 100],
-            )
-            if reply == "answer"
-            else Clarification(outcome="clarification", question="Which month?"),
+            {
+                "answer": Answer(
+                    outcome="answer",
+                    text="One food order.",
+                    transaction_ids=[food.id, food.id, bill.id + 100],
+                ),
+                "clarification": Clarification(
+                    outcome="clarification",
+                    question="Is this the bill?",
+                    transaction_ids=[bill.id],
+                ),
+                "error": Error(outcome="error", message="Failed.", code="failed"),
+            }[reply],
         ]
     )
 
     result = await run_turn(session, provider, user_message="my food orders")
 
-    # The read returned both rows, but the bill is not in the answer. An id
-    # that no read returned gets no card either. Another reply gets no card.
-    assert result.transaction_ids == ((food.id,) if reply == "answer" else ())
+    # The read returned both rows, but only the rows that the reply tells
+    # about get a card. An id that no read returned gets no card either.
+    assert result.transaction_ids == {
+        "answer": (food.id,),
+        "clarification": (bill.id,),
+        "error": (),
+    }[reply]
 
 
 @pytest.mark.anyio
