@@ -2,7 +2,7 @@
 
 from typing import Annotated, Optional
 
-from fastapi import Depends, Request
+from fastapi import Depends
 from fastapi.security import HTTPBasicCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,10 +11,9 @@ from financial_dashboard.db import async_session
 
 
 def verify_credentials(
-    request: Request,
     credentials: Optional[HTTPBasicCredentials] = Depends(http_basic),
 ) -> None:
-    check_credentials(credentials, request)
+    check_credentials(credentials)
 
 
 async def get_session():

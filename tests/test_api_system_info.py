@@ -24,25 +24,8 @@ class _FakeDistribution:
         return json.dumps(self._direct_url_payload)
 
 
-def _make_settings(
-    username: str = "",
-    password: str = "",
-    skip_cidrs: str = "",
-) -> Settings:
-    return Settings(
-        auth_username=username,
-        auth_password=SecretStr(password),
-        auth_skip_cidrs=skip_cidrs,
-    )
-
-
-@pytest.fixture(autouse=True)
-def _reset_trusted_cache():
-    security._get_trusted_networks.cache_clear()
-    try:
-        yield
-    finally:
-        security._get_trusted_networks.cache_clear()
+def _make_settings(username: str = "", password: str = "") -> Settings:
+    return Settings(auth_username=username, auth_password=SecretStr(password))
 
 
 async def test_system_info_success_shape_and_redaction(client, session, monkeypatch):
