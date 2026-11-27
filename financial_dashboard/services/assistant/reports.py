@@ -65,12 +65,16 @@ _GROUP_LABELS = {
 }
 
 
-async def render_report(session: AsyncSession, call: ReportCall) -> Answer | Error:
+async def render_report(
+    session: AsyncSession, call: ReportCall, base_url: str | None = None
+) -> Answer | Error:
     """Render the report that the model asked for.
 
     Args:
         session: The turn session.
         call: The report call with its inputs.
+        base_url: The dashboard base URL for the links. None uses the
+            configured URL, and empty means no links.
 
     Returns:
         The answer with the report as Telegram HTML, or an error for inputs
@@ -78,7 +82,8 @@ async def render_report(session: AsyncSession, call: ReportCall) -> Answer | Err
     """
     from financial_dashboard.services.settings import get_app_base_url
 
-    base_url = get_app_base_url()
+    if base_url is None:
+        base_url = get_app_base_url()
     match call:
         case GetCashflowSummary() | GetInvestmentFlows():
             try:

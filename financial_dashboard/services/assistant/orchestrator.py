@@ -13,7 +13,6 @@ import logging
 import re
 import traceback
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from decimal import Decimal, InvalidOperation
 from typing import NamedTuple, cast
 
 from sqlalchemy import select, update
@@ -27,7 +26,6 @@ from telegram import Document
 from financial_dashboard.core.links import page_link
 from financial_dashboard.core.dates import IST
 from financial_dashboard.core.templating import format_inr_exact
-from financial_dashboard.db.enums import ReceivableStatus
 from financial_dashboard.db.models import (
     Account,
     AuditAction,
@@ -59,8 +57,6 @@ from financial_dashboard.services.assistant.contracts import (
     Clarification,
     Error,
     ToolCalls,
-    ListAccounts,
-    ListReceivables,
     ListTransactions,
     AddPersonIdentifier,
     CreateCategory,
@@ -106,6 +102,10 @@ from financial_dashboard.services.assistant.mutations import (
     unrequested_exclusion,
 )
 from financial_dashboard.services.assistant.packs import choose_packs, pack_refusal
+from financial_dashboard.services.assistant.reads import (
+    dispatch_read,
+    read_transactions,
+)
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.reports import render_report
 from financial_dashboard.services.assistant.assistant_writes import (
@@ -113,19 +113,13 @@ from financial_dashboard.services.assistant.assistant_writes import (
     describe_assistant_write,
     assistant_write_state_hash,
 )
-from financial_dashboard.schemas.receivables import ReceivableRead
-from financial_dashboard.services.person_identifiers import normalize_person
-from financial_dashboard.services.receivables import list_receivables, receivable_read
 from financial_dashboard.services.assistant.provider import (
     AssistantProvider,
     ProviderFailure,
 )
 from financial_dashboard.services.assistant.transaction_reads import (
-    AssistantAccount,
     AssistantTransaction,
     get_transaction,
-    list_accounts,
-    list_transactions,
 )
 from financial_dashboard.services.categorization.polarity import resolve_direction
 from financial_dashboard.services.categorization.hashing import (
@@ -408,80 +402,6 @@ async def current_confirmation_state_hash(
         account = await session.get(Account, txn.account_id, populate_existing=True)
         account_type = account.type if account is not None else None
     return compute_transaction_confirmation_hash(txn, account_type)
-
-
-async def _dispatch_read(
-    session: AsyncSession, call: ListAccounts | ListReceivables
-) -> list[AssistantAccount] | list[ReceivableRead]:
-    """Run one read tool call other than list_transactions.
-
-    Args:
-        session: The turn session.
-        call: The read call that the model asked for.
-
-    Returns:
-        The rows that the call reads.
-    """
-    match call:
-        case ListAccounts():
-            return await list_accounts(session)
-        case ListReceivables():
-            status = ReceivableStatus(call.status) if call.status else None
-            person = normalize_person(call.person or "")
-            return [
-                read
-                for read in map(
-                    receivable_read, await list_receivables(session, status)
-                )
-                if (call.kind is None or read.kind == call.kind)
-                and person in normalize_person(read.person)
-            ]
-
-
-async def _read_transactions(
-    session: AsyncSession, call: ListTransactions
-) -> list[AssistantTransaction]:
-    """Run one list_transactions call.
-
-    Args:
-        session: The turn session.
-        call: The read call that the model asked for.
-
-    Returns:
-        The rows that match the filters.
-
-    Raises:
-        MutationRejected: A date or the amount is not valid.
-    """
-    try:
-        date_from = (
-            datetime.date.fromisoformat(call.date_from) if call.date_from else None
-        )
-        date_to = datetime.date.fromisoformat(call.date_to) if call.date_to else None
-        amount = Decimal(call.amount) if call.amount else None
-    except (ValueError, InvalidOperation) as exc:
-        raise MutationRejected("invalid transaction filter") from exc
-    if amount is not None and not amount.is_finite():
-        raise MutationRejected("invalid transaction filter")
-    return await list_transactions(
-        session,
-        limit=call.limit,
-        offset=0,
-        account_id=call.account_id,
-        card_id=call.card_id,
-        date_from=date_from,
-        date_to=date_to,
-        direction=call.direction,
-        category=call.category,
-        search=call.search,
-        excluded=call.excluded,
-        transaction_ids=call.transaction_ids,
-        amount=amount,
-        bank=call.bank,
-        source=call.source,
-        review_status=call.review_status,
-        reference=call.reference,
-    )
 
 
 async def _persist_pending(
@@ -900,7 +820,7 @@ async def run_turn(
                     ):
                         continue
                     if isinstance(call, ListTransactions):
-                        rows = await _read_transactions(session, call)
+                        rows = await read_transactions(session, call)
                         pending_rows.update((row.id, row) for row in rows)
                         result = ToolResult(
                             tool=call.name,
@@ -909,7 +829,7 @@ async def run_turn(
                         )
                     else:
                         result = ToolResult(
-                            tool=call.name, items=await _dispatch_read(session, call)
+                            tool=call.name, items=await dispatch_read(session, call)
                         )
                     pending_tool_results.append(result)
                 if confirm_found:
