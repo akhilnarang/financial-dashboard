@@ -95,6 +95,7 @@ async def test_transaction_attachment_route_uses_global_auth(
     session, tmp_path, monkeypatch
 ):
     monkeypatch.setattr(app_settings, "transaction_attachment_root", str(tmp_path))
+    monkeypatch.setattr(app_settings, "mcp_token", SecretStr("mcp-token"))
     (tmp_path / "receipt.pdf").write_bytes(b"%PDF-1.7\nreceipt")
     transaction = Transaction(
         bank="hdfc",
@@ -123,7 +124,14 @@ async def test_transaction_attachment_route_uses_global_auth(
                 f"/api/transactions/{transaction.id}/attachment",
                 headers=_basic_auth_header("admin", "pass"),
             )
+            # MCP clients send only their bearer token, never Basic auth.
+            mcp = await client.post(
+                "/api/mcp",
+                headers={"Authorization": "Bearer mcp-token"},
+                json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            )
 
     assert denied.status_code == 401
+    assert mcp.status_code == 200
     assert allowed.status_code == 200
     assert allowed.content.startswith(b"%PDF-")

@@ -1,11 +1,8 @@
 """HTTP Basic Auth for financial-dashboard."""
 
-import ipaddress
 import secrets
-from functools import lru_cache
 from typing import Optional
 
-from fastapi import Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from financial_dashboard.config import settings
@@ -14,40 +11,8 @@ from financial_dashboard.exceptions import UnauthorizedException
 http_basic = HTTPBasic(auto_error=False)
 
 
-@lru_cache
-def _get_trusted_networks() -> tuple[
-    ipaddress.IPv4Network | ipaddress.IPv6Network, ...
-]:
-    networks = []
-    for cidr in (s.strip() for s in settings.auth_skip_cidrs.split(",") if s.strip()):
-        try:
-            networks.append(ipaddress.ip_network(cidr, strict=False))
-        except ValueError:
-            raise SystemExit(f"Invalid CIDR in AUTH_SKIP_CIDRS: {cidr!r}")
-    return tuple(networks)
-
-
-def _is_trusted(client_host: str | None) -> bool:
-    if not client_host:
-        return False
-    trusted = _get_trusted_networks()
-    if not trusted:
-        return False
-    try:
-        addr = ipaddress.ip_address(client_host)
-    except ValueError:
-        return False
-    return any(addr in net for net in trusted)
-
-
-def check_credentials(
-    credentials: Optional[HTTPBasicCredentials],
-    request: Optional[Request] = None,
-) -> None:
+def check_credentials(credentials: Optional[HTTPBasicCredentials]) -> None:
     if not settings.auth_enabled:
-        return
-
-    if request and _is_trusted(request.client.host if request.client else None):
         return
 
     if credentials is None:

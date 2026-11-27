@@ -7,6 +7,7 @@ from .cas import router as cas_router
 from .cashflow import router as cashflow_router
 from .emails import router as emails_router
 from .extensions import get_router as get_extensions_router
+from .mcp import router as mcp_router
 from .merchant_rules import router as merchant_rules_router
 from .networth import router as networth_router
 from .polling import router as polling_router
@@ -25,6 +26,7 @@ def get_router(*, paisa_enabled: bool) -> APIRouter:
     router.include_router(cas_router)
     router.include_router(cashflow_router)
     router.include_router(emails_router)
+    router.include_router(mcp_router)
     router.include_router(get_extensions_router(paisa_enabled=paisa_enabled))
     router.include_router(merchant_rules_router)
     router.include_router(networth_router)

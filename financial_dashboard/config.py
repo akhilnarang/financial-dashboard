@@ -60,8 +60,8 @@ class Settings(BaseSettings):
     auth_username: str = ""
     auth_password: SecretStr = SecretStr("")
 
-    # comma-separated CIDRs to skip auth
-    auth_skip_cidrs: str = ""
+    # Bearer token of the MCP endpoint at /api/mcp. Empty turns the endpoint off.
+    mcp_token: SecretStr = SecretStr("")
 
     @model_validator(mode="after")
     def _validate_auth_pair(self):
