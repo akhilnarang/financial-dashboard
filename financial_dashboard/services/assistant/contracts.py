@@ -361,8 +361,19 @@ ToolCall: TypeAlias = Annotated[
 
 
 class Answer(StrictModel):
+    """A text reply to the user.
+
+    Attributes:
+        outcome: The outcome kind.
+        text: The reply text.
+        transaction_ids: The rows that the text tells the user about. The
+            application sends a card for each row that a read of this turn
+            returned.
+    """
+
     outcome: Literal["answer"]
     text: StrictStr = Field(min_length=1, max_length=4000)
+    transaction_ids: list[StrictInt] = Field(default_factory=list, max_length=20)
 
 
 class Clarification(StrictModel):

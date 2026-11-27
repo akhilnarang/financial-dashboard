@@ -598,7 +598,7 @@ async def run_turn(
                 for record in output_records
                 if isinstance(record.get("latency_ms"), int)
             ),
-            tuple(sorted(read_rows)),
+            _shown_rows(response, read_rows),
             False,
             error_detail,
         )
@@ -1430,6 +1430,29 @@ async def _save_proposal(
     session.add(decision)
     await session.flush()
     return SavedProposal(decision.id, response)
+
+
+def _shown_rows(
+    response: AssistantResponse, read_rows: Mapping[int, AssistantTransaction]
+) -> tuple[int, ...]:
+    """Give the rows that get a card after the reply.
+
+    An answer can read many rows and tell the user about only a few of them.
+    Only those rows get a card, and only when a read of this turn returned
+    them. Other replies keep every row that the reads returned.
+
+    Args:
+        response: The final response of the turn.
+        read_rows: The rows that the reads of this turn returned.
+
+    Returns:
+        The row ids, without duplicates.
+    """
+    match response:
+        case Answer(transaction_ids=shown):
+            return tuple(dict.fromkeys(row for row in shown if row in read_rows))
+        case _:
+            return tuple(sorted(read_rows))
 
 
 def _named_transaction_ids(text: str) -> set[int]:
