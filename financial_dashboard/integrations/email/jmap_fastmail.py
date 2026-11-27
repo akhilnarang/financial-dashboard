@@ -2,12 +2,15 @@
 
 import asyncio
 import datetime
-import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
+
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
 
 from financial_dashboard.core.crypto import decrypt_credentials
 from financial_dashboard.db import FetchRule
@@ -25,12 +28,25 @@ from financial_dashboard.services.rules import (
 
 logger = logging.getLogger(__name__)
 
+type JsonValue = (
+    str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
+)
+type JsonObject = dict[str, JsonValue]
+type JmapMethod = Literal["Mailbox/query", "Mailbox/get", "Email/query", "Email/get"]
+
 JMAP_CORE = "urn:ietf:params:jmap:core"
 JMAP_MAIL = "urn:ietf:params:jmap:mail"
 JMAP_USING = [JMAP_CORE, JMAP_MAIL]
 MIN_PAGE_SIZE = 50
 REGULAR_SYNC_MARGIN_DAYS = 2
-EMAIL_PROPERTIES = ["id", "blobId", "receivedAt", "from", "subject", "mailboxIds"]
+EMAIL_PROPERTIES: list[JsonValue] = [
+    "id",
+    "blobId",
+    "receivedAt",
+    "from",
+    "subject",
+    "mailboxIds",
+]
 BLOB_TYPE = "application/octet-stream"
 BLOB_NAME = "email.eml"
 RULE_SCOPED_METHOD_ERRORS = frozenset(
@@ -46,14 +62,78 @@ class JmapRuleError(JmapError):
     """Raised when one rule cannot be searched. The other rules still run."""
 
 
+class JmapCall(NamedTuple):
+    method: JmapMethod
+    args: JsonObject
+    call_id: str
+
+
+class JmapResponse(NamedTuple):
+    method: JmapMethod | Literal["error"]
+    args: JsonObject
+    call_id: str
+
+
 class _Candidate(NamedTuple):
     remote_id: str
     blob_id: str
 
 
 class _RuleFilter(NamedTuple):
-    jmap_filter: dict[str, str]
+    jmap_filter: JsonObject
     mailbox_id: str | None
+
+
+class _JmapModel(BaseModel):
+    model_config = ConfigDict(
+        alias_generator=to_camel, validate_by_name=True, serialize_by_alias=True
+    )
+
+
+class _RequestBody(_JmapModel):
+    using: list[str]
+    method_calls: list[JmapCall]
+
+
+class _ResponseBody(_JmapModel):
+    method_responses: list[JmapResponse]
+
+
+class _SessionResource(_JmapModel):
+    api_url: str
+    download_url: str
+    primary_accounts: dict[str, str] = {}
+    capabilities: dict[str, JsonObject] = {}
+
+
+class _CoreCapability(_JmapModel):
+    max_objects_in_get: int | None = None
+
+
+class _QueryResult(_JmapModel):
+    ids: list[str]
+    limit: int | None = None
+
+
+class _Mailbox(_JmapModel):
+    id: str
+    name: str
+
+
+class _MailboxGetResult(_JmapModel):
+    entries: list[_Mailbox] = Field(alias="list")
+
+
+class _Email(_JmapModel):
+    id: str
+    blob_id: str
+    sender: list[dict[str, str | None]] | None = Field(default=None, alias="from")
+    subject: str | None = None
+    mailbox_ids: dict[str, bool] = {}
+
+
+class _EmailGetResult(_JmapModel):
+    entries: list[_Email] = Field(alias="list")
 
 
 @dataclass(frozen=True)
@@ -74,17 +154,19 @@ class JmapSession:
     download_url: str
     max_objects_in_get: int | None
 
-    def call(self, method_calls: list[list]) -> list[list]:
+    def call(self, method_calls: Sequence[JmapCall]) -> list[JmapResponse]:
         """Send method calls in one request.
 
         Args:
-            method_calls: The JMAP invocations, as ``[name, args, call_id]``.
+            method_calls: The JMAP invocations.
 
         Returns:
-            The ``methodResponses`` list, in call order.
+            The method responses, in call order.
         """
-        body = {"using": JMAP_USING, "methodCalls": method_calls}
-        return _jmap_request(self.token, self.api_url, body)["methodResponses"]
+        body = _RequestBody(using=JMAP_USING, method_calls=list(method_calls))
+        return _jmap_request(
+            self.token, self.api_url, _ResponseBody, body
+        ).method_responses
 
     def blob_url(self, blob_id: str) -> str:
         """Fill the download URI template for one blob.
@@ -122,16 +204,22 @@ class JmapSession:
             return resp.read()
 
 
-def _jmap_request(token: str, url: str, body: dict | None = None) -> dict:
+def _jmap_request[T: BaseModel](
+    token: str, url: str, model: type[T], body: _RequestBody | None = None
+) -> T:
+    """Send one JMAP HTTP request and parse the answer with ``model``.
+
+    A GET fetches the session. A POST with ``body`` sends method calls.
+    """
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    if body:
-        req = Request(
-            url, data=json.dumps(body).encode(), headers=headers, method="POST"
-        )
-    else:
+    if body is None:
         req = Request(url, headers=headers)
+    else:
+        req = Request(
+            url, data=body.model_dump_json().encode(), headers=headers, method="POST"
+        )
     with urlopen(req, timeout=NETWORK_TIMEOUT_SECONDS) as resp:
-        return json.loads(resp.read())
+        return model.model_validate_json(resp.read())
 
 
 def _require_https(url: str, field: str) -> str:
@@ -154,61 +242,62 @@ def open_jmap_session(token: str) -> JmapSession:
     Raises:
         JmapError: The session has no mail account or a URL is not https.
     """
-    session = _jmap_request(token, JMAP_SESSION_URL)
-    account_id = session.get("primaryAccounts", {}).get(JMAP_MAIL)
-    if not account_id:
+    resource = _jmap_request(token, JMAP_SESSION_URL, _SessionResource)
+    if not (account_id := resource.primary_accounts.get(JMAP_MAIL)):
         raise JmapError("JMAP session returned but no mail account found")
-    core = session.get("capabilities", {}).get(JMAP_CORE, {})
+    core = _CoreCapability.model_validate(resource.capabilities.get(JMAP_CORE, {}))
     return JmapSession(
         token=token,
-        api_url=_require_https(session["apiUrl"], "apiUrl"),
+        api_url=_require_https(resource.api_url, "apiUrl"),
         account_id=account_id,
-        download_url=_require_https(session["downloadUrl"], "downloadUrl"),
-        max_objects_in_get=core.get("maxObjectsInGet"),
+        download_url=_require_https(resource.download_url, "downloadUrl"),
+        max_objects_in_get=core.max_objects_in_get,
     )
 
 
-def _method_args(responses: list[list], index: int, name: str) -> dict:
-    """Return the arguments of one method response.
+def _method_result[T: BaseModel](
+    response: JmapResponse, name: JmapMethod, model: type[T]
+) -> T:
+    """Parse the arguments of one method response.
 
     An error response must not read as an empty result. An error that
     the rule's own arguments cause fails only that rule. Any other error,
     such as ``serverFail`` or ``accountNotFound``, fails the whole source.
 
     Args:
-        responses: The ``methodResponses`` list.
-        index: The position of the call in the request.
+        response: The method response.
         name: The method name that the call used.
+        model: The model for the response arguments.
 
     Returns:
-        The response arguments.
+        The parsed response arguments.
 
     Raises:
         JmapRuleError: The rule's arguments caused the error.
         JmapError: The server answered with another error or another method.
     """
-    response_name, args, _call_id = responses[index]
-    if response_name == "error":
-        error_type = args.get("type")
-        message = f"{name} failed: {error_type} {args.get('description') or ''}"
+    if response.method == "error":
+        error_type = response.args.get("type")
+        description = response.args.get("description") or ""
+        message = f"{name} failed: {error_type} {description}"
         if error_type in RULE_SCOPED_METHOD_ERRORS:
             raise JmapRuleError(message.strip())
         raise JmapError(message.strip())
-    if response_name != name:
-        raise JmapError(f"{name} answered as {response_name}")
-    return args
+    if response.method != name:
+        raise JmapError(f"{name} answered as {response.method}")
+    return model.model_validate(response.args)
 
 
 def _resolve_mailbox_id(session: JmapSession, folder_name: str) -> str | None:
     """Find a mailbox id by name, exact match first, then case-insensitive."""
-    responses = session.call(
+    query, get = session.call(
         [
-            [
+            JmapCall(
                 "Mailbox/query",
                 {"accountId": session.account_id, "filter": {"name": folder_name}},
                 "0",
-            ],
-            [
+            ),
+            JmapCall(
                 "Mailbox/get",
                 {
                     "accountId": session.account_id,
@@ -216,17 +305,17 @@ def _resolve_mailbox_id(session: JmapSession, folder_name: str) -> str | None:
                     "properties": ["id", "name"],
                 },
                 "1",
-            ],
+            ),
         ]
     )
-    _method_args(responses, 0, "Mailbox/query")
-    mailboxes = _method_args(responses, 1, "Mailbox/get")["list"]
+    _method_result(query, "Mailbox/query", _QueryResult)
+    mailboxes = _method_result(get, "Mailbox/get", _MailboxGetResult).entries
     for mb in mailboxes:
-        if mb["name"] == folder_name:
-            return mb["id"]
+        if mb.name == folder_name:
+            return mb.id
     for mb in mailboxes:
-        if mb["name"].lower() == folder_name.lower():
-            return mb["id"]
+        if mb.name.lower() == folder_name.lower():
+            return mb.id
     return None
 
 
@@ -257,7 +346,7 @@ def _rule_filter(
         JmapRuleError: The rule's folder does not exist.
         JmapError: The folder lookup failed.
     """
-    jmap_filter = {"after": after}
+    jmap_filter: JsonObject = {"after": after}
     mailbox_id = None
     if rule.folder:
         if rule.folder not in mailbox_cache:
@@ -272,14 +361,14 @@ def _rule_filter(
     return _RuleFilter(jmap_filter, mailbox_id)
 
 
-def _email_matches(em: dict, rule: FetchRule, mailbox_id: str | None) -> bool:
+def _email_matches(em: _Email, rule: FetchRule, mailbox_id: str | None) -> bool:
     """Check one Email/get entry against the rule's folder and local filters."""
-    if mailbox_id and mailbox_id not in em.get("mailboxIds", {}):
+    if mailbox_id and mailbox_id not in em.mailbox_ids:
         return False
     return _matches_rule_filters(
         rule,
-        sender=_format_jmap_from_field(em.get("from")),
-        subject=em.get("subject", ""),
+        sender=_format_jmap_from_field(em.sender),
+        subject=em.subject or "",
     )
 
 
@@ -305,9 +394,9 @@ def _rule_candidates(
     candidates: list[_Candidate] = []
     position = 0
     while fetch_limit <= 0 or len(candidates) < fetch_limit:
-        responses = session.call(
+        query_response, get_response = session.call(
             [
-                [
+                JmapCall(
                     "Email/query",
                     {
                         "accountId": session.account_id,
@@ -317,8 +406,8 @@ def _rule_candidates(
                         "limit": page_size,
                     },
                     "0",
-                ],
-                [
+                ),
+                JmapCall(
                     "Email/get",
                     {
                         "accountId": session.account_id,
@@ -330,19 +419,20 @@ def _rule_candidates(
                         "properties": EMAIL_PROPERTIES,
                     },
                     "1",
-                ],
+                ),
             ]
         )
-        query = _method_args(responses, 0, "Email/query")
-        by_id = {em["id"]: em for em in _method_args(responses, 1, "Email/get")["list"]}
-        for email_id in query["ids"]:
+        query = _method_result(query_response, "Email/query", _QueryResult)
+        emails = _method_result(get_response, "Email/get", _EmailGetResult).entries
+        by_id = {em.id: em for em in emails}
+        for email_id in query.ids:
             if fetch_limit > 0 and len(candidates) >= fetch_limit:
                 break
             em = by_id.get(email_id)
             if em and _email_matches(em, rule, rule_filter.mailbox_id):
-                candidates.append(_Candidate(email_id, em["blobId"]))
-        position += len(query["ids"])
-        if len(query["ids"]) < query.get("limit", page_size):
+                candidates.append(_Candidate(email_id, em.blob_id))
+        position += len(query.ids)
+        if len(query.ids) < (query.limit or page_size):
             break
     return candidates
 
@@ -420,23 +510,23 @@ def _fetch_fastmail_single_sync(token: str, remote_id: str) -> bytes | None:
     """Fetch a single email from Fastmail by JMAP email ID."""
     try:
         session = open_jmap_session(token)
-        responses = session.call(
+        (response,) = session.call(
             [
-                [
+                JmapCall(
                     "Email/get",
                     {
                         "accountId": session.account_id,
                         "ids": [remote_id],
-                        "properties": ["blobId"],
+                        "properties": ["id", "blobId"],
                     },
                     "0",
-                ]
+                )
             ]
         )
-        emails = _method_args(responses, 0, "Email/get")["list"]
+        emails = _method_result(response, "Email/get", _EmailGetResult).entries
         if not emails:
             return None
-        return session.download(emails[0]["blobId"])
+        return session.download(emails[0].blob_id)
     except Exception as e:
         logger.error("Failed to fetch Fastmail message %s: %s", remote_id, e)
         return None
