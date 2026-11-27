@@ -9,7 +9,7 @@ from typing import Literal, NamedTuple
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from pydantic.alias_generators import to_camel
 
 from financial_dashboard.core.crypto import decrypt_credentials
@@ -28,9 +28,6 @@ from financial_dashboard.services.rules import (
 
 logger = logging.getLogger(__name__)
 
-type JsonValue = (
-    str | int | float | bool | None | list[JsonValue] | dict[str, JsonValue]
-)
 type JsonObject = dict[str, JsonValue]
 type JmapMethod = Literal["Mailbox/query", "Mailbox/get", "Email/query", "Email/get"]
 
