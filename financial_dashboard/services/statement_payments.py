@@ -8,9 +8,10 @@ The statement page shows three things for one CC cycle:
 
 A provisional CC-payment SMS is notify-only in the pipeline: it makes no
 Transaction row. So the pending set is not a stored table. It is derived live
-by re-parsing the account's unlinked SMS in the cycle window and keeping the
-ones the parser calls a provisional credit. Once a row settles it links to a
-Transaction and drops off the pending set on its own. This is deliberately
+by re-parsing the bank's SMS around the cycle window and keeping the
+provisional credits that no payment credit in the ledger pays yet. Once a
+settlement, a statement line or a manual settle records the payment, the
+provisional drops off the pending set on its own. This is deliberately
 self-healing: no staging table to clean up.
 """
 

@@ -214,12 +214,13 @@ async def test_each_payment_credit_hides_one_provisional(maker):
     assert await pending_dates() == ["2026-08-07", "2026-08-12"]
 
     # None of these pays one: a credit 4 days after the 7 Aug payments and
-    # before the 12 Aug one, a voided one, another card's, a refund that names
-    # PayZapp, and a payment gateway's refund.
+    # before the 12 Aug one, a voided one, another card's, a refund of a bill
+    # payment, a PayZapp merchant credit, and a payment gateway's refund.
     await _add_credit(maker, acc_id, day=11)
     await _add_credit(maker, acc_id, day=9, voided=True)
     await _add_credit(maker, other_acc, day=9)
-    await _add_credit(maker, acc_id, day=9, narration="PAYZAPP REFUND MUMBAI")
+    await _add_credit(maker, acc_id, day=9, narration="BILL PAYMENT REFUND")
+    await _add_credit(maker, acc_id, day=9, narration="PAYZAPP MUMBAI")
     await _add_credit(maker, acc_id, day=9, narration="RAZORPAY PAYMENTS BANGALORE")
     assert await pending_dates() == ["2026-08-07", "2026-08-12"]
 
