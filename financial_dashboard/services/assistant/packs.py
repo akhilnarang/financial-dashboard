@@ -30,6 +30,7 @@ from financial_dashboard.services.assistant.contracts import (
     ToolCalls,
     UpdateReceivable,
     VoidTransaction,
+    JsonSchema,
     response_json_schema,
 )
 from financial_dashboard.services.assistant.intent_policy import intent_signals
@@ -238,7 +239,7 @@ def tool_name(tool: type[StrictModel]) -> str:
     return get_args(tool.model_fields["name"].annotation)[0]
 
 
-def pack_response_schema(packs: frozenset[PackName]) -> dict[str, object]:
+def pack_response_schema(packs: frozenset[PackName]) -> JsonSchema:
     """Build the strict response schema of a step with these packs.
 
     Args:

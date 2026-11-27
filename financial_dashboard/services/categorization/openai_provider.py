@@ -325,7 +325,7 @@ async def read_screenshot(
             json_schema={
                 "name": "screenshot_transaction",
                 "strict": True,
-                "schema": screenshot_json_schema(),
+                "schema": dict(screenshot_json_schema()),
             },
         ),
         store=False,
