@@ -697,7 +697,8 @@ def _openai_strict_schema(schema: JsonSchema) -> JsonSchema:
     """Make every object field required, using nullable unions for optionals.
 
     Strict provider APIs accept no default and no discriminator, and they
-    take anyOf, not oneOf. A model's description drops the Attributes
+    take anyOf, not oneOf. The const property of a union branch, such as a
+    tool name, comes before the other properties. A model's description drops the Attributes
     section of its docstring. That section is for the reader of the code,
     and the schema goes with every model call.
 
@@ -723,9 +724,14 @@ def _openai_strict_schema(schema: JsonSchema) -> JsonSchema:
     if "description" in strict:
         strict["description"] = strict["description"].split("\n\nAttributes:", 1)[0]
     if "properties" in strict:
+        # A strict provider writes the properties in schema order. A tool name
+        # after the arguments makes that tool unreachable once the model has
+        # written "name" first, so a const property comes first.
+        properties = sorted(
+            strict["properties"].items(), key=lambda item: "const" not in item[1]
+        )
         strict["properties"] = {
-            name: _openai_strict_schema(body)
-            for name, body in strict["properties"].items()
+            name: _openai_strict_schema(body) for name, body in properties
         }
         strict["additionalProperties"] = False
         strict["required"] = list(strict["properties"])

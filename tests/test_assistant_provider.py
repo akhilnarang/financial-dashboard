@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from financial_dashboard.services.assistant.contracts import parse_response
 from financial_dashboard.services.assistant.context import ToolResult
-from financial_dashboard.services.assistant.packs import pack_response_schema
+from financial_dashboard.services.assistant.packs import ALL_PACKS, pack_response_schema
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.transaction_reads import (
     AssistantAccount,
@@ -34,6 +34,23 @@ def test_invalid_model_output_fails_closed():
     ):
         with pytest.raises(ValidationError):
             parse_response(payload)
+
+
+def test_every_tool_and_outcome_is_named_before_its_arguments():
+    # A strict provider writes the properties in schema order. When a tool
+    # name came after the arguments, the model could never choose that tool.
+    # With every pack loaded, the schema has no request_packs outcome.
+    defs = {
+        **pack_response_schema(frozenset())["$defs"],
+        **pack_response_schema(ALL_PACKS)["$defs"],
+    }
+    branches = {
+        name: list(body["properties"].values())
+        for name, body in defs.items()
+        if any("const" in field for field in body.get("properties", {}).values())
+    }
+    assert {"ListTransactions", "ShowTransactions", "RequestPacks"} <= branches.keys()
+    assert [name for name, fields in branches.items() if "const" not in fields[0]] == []
 
 
 @pytest.mark.anyio
