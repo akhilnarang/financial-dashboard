@@ -29,6 +29,7 @@ from financial_dashboard.db.models import (
 )
 from financial_dashboard.services.assistant.contracts import (
     Answer,
+    Clarification,
     CategoryProposal,
     Error,
     RequestPacks,
@@ -210,7 +211,8 @@ async def test_an_empty_read_tells_the_model_how_to_find_the_names(session):
 
 
 @pytest.mark.anyio
-async def test_answer_cards_only_the_rows_it_tells_about(session):
+@pytest.mark.parametrize("reply", ["answer", "clarification"])
+async def test_answer_cards_only_the_rows_it_tells_about(session, reply):
     food, bill = (
         Transaction(bank="test", email_type="test", direction="debit", amount=amount)
         for amount in (10, 20)
@@ -227,15 +229,17 @@ async def test_answer_cards_only_the_rows_it_tells_about(session):
                 outcome="answer",
                 text="One food order.",
                 transaction_ids=[food.id, food.id, bill.id + 100],
-            ),
+            )
+            if reply == "answer"
+            else Clarification(outcome="clarification", question="Which month?"),
         ]
     )
 
     result = await run_turn(session, provider, user_message="my food orders")
 
     # The read returned both rows, but the bill is not in the answer. An id
-    # that no read returned gets no card either.
-    assert result.transaction_ids == (food.id,)
+    # that no read returned gets no card either. Another reply gets no card.
+    assert result.transaction_ids == ((food.id,) if reply == "answer" else ())
 
 
 @pytest.mark.anyio

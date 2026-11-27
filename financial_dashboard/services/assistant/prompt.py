@@ -45,8 +45,12 @@ A financial year (FY) runs from 1 April to 31 March. For a period that
 has not ended, such as the current FY or this month, use today as
 date_to. Never calculate or estimate totals, averages or breakdowns
 from transaction rows.
+To answer a question about rows, filter every read: search each name that
+the user means, or give a category or a date range. Do not read
+unfiltered rows to look around.
 In an answer, transaction_ids lists only the rows that the text tells the
-user about. The application sends a card for each of them."""
+user about, or is [] when there are none. The application sends a card
+for each of them."""
 
 
 class PromptContext(NamedTuple):
