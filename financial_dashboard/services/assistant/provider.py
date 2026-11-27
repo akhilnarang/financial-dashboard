@@ -18,8 +18,8 @@ from google.genai import types
 from financial_dashboard.services.assistant.contracts import (
     AssistantResponse,
     parse_response,
-    response_json_schema,
 )
+from financial_dashboard.services.assistant.packs import pack_response_schema
 from financial_dashboard.services.assistant.prompt import (
     PROMPT_VERSION,
     PromptContext,
@@ -150,7 +150,7 @@ class OpenAICompatibleProvider:
                 "json_schema": {
                     "name": "assistant_response",
                     "strict": True,
-                    "schema": response_json_schema(),
+                    "schema": pack_response_schema(context.packs),
                 },
             },
             "temperature": omit if self.reasoning_effort else 0.0,
@@ -206,7 +206,7 @@ class GeminiProvider:
             # The native JSON Schema field accepts the full Pydantic schema.
             # ``response_schema`` first coerces through Gemini's reduced Schema
             # model and rejects valid JSON Schema keywords before HTTP dispatch.
-            "response_json_schema": response_json_schema(),
+            "response_json_schema": pack_response_schema(context.packs),
             "temperature": 0.0,
         }
         try:

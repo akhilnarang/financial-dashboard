@@ -5,15 +5,18 @@ tools below.  Pydantic validation is deliberately strict: provider output is
 untrusted input and is never interpreted as prose or partially recovered.
 """
 
+import copy
 import datetime
 import re
+from collections.abc import Sequence
 from decimal import Decimal
-from typing import Annotated, Literal, TypeAlias, cast
+from typing import Annotated, Literal, TypeAlias, TypedDict, cast
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     TypeAdapter,
     WithJsonSchema,
     field_validator,
@@ -23,6 +26,32 @@ from pydantic.types import StrictBool, StrictFloat, StrictInt, StrictStr
 
 from financial_dashboard.core.dates import IST
 from financial_dashboard.services.categorization.slugs import UserCategoryBucket
+
+
+PackName: TypeAlias = Literal["edit", "receivables", "reports", "categories"]
+# A JSON schema. The keys are the keywords that the strict schema code reads or
+# writes. A schema can also hold other keywords, such as title or minLength.
+JsonSchema = TypedDict(
+    "JsonSchema",
+    {
+        "$defs": dict[str, "JsonSchema"],
+        "$ref": str,
+        "additionalProperties": bool,
+        "anyOf": list["JsonSchema"],
+        "const": str,
+        "default": JsonValue,
+        "description": str,
+        "discriminator": JsonValue,
+        "enum": Sequence[str],
+        "items": "JsonSchema",
+        "maxItems": int,
+        "oneOf": list["JsonSchema"],
+        "properties": dict[str, "JsonSchema"],
+        "required": list[str],
+    },
+    total=False,
+    extra_items=JsonValue,
+)
 
 
 class StrictModel(BaseModel):
@@ -332,14 +361,37 @@ ToolCall: TypeAlias = Annotated[
 
 
 class Answer(StrictModel):
+    """A text reply to the user.
+
+    Attributes:
+        outcome: The outcome kind.
+        text: The reply text.
+        transaction_ids: The rows that the text tells the user about. The
+            application sends a card for each row that a read of this turn
+            returned.
+    """
+
     outcome: Literal["answer"]
     text: StrictStr = Field(min_length=1, max_length=4000)
+    transaction_ids: list[StrictInt] = Field(default_factory=list, max_length=20)
 
 
 class Clarification(StrictModel):
+    """A question back to the user.
+
+    Attributes:
+        outcome: The outcome kind.
+        question: The question text.
+        pending_confirmation: The change that a yes confirms, or None.
+        transaction_ids: The rows that the question tells the user about.
+            The application sends a card for each row that a read of this
+            turn returned.
+    """
+
     outcome: Literal["clarification"]
     question: StrictStr = Field(min_length=1, max_length=1000)
     pending_confirmation: "PendingConfirmation | None" = None
+    transaction_ids: list[StrictInt] = Field(default_factory=list, max_length=20)
 
 
 class MerchantRuleConfirmation(StrictModel):
@@ -607,8 +659,22 @@ class Error(StrictModel):
     )
 
 
+class RequestPacks(StrictModel):
+    """Ask the server to load tool packs that this step does not have.
+
+    The next step has the tools and the rules of these packs.
+
+    Attributes:
+        outcome: The outcome name.
+        packs: The packs to load.
+    """
+
+    outcome: Literal["request_packs"]
+    packs: list[PackName] = Field(min_length=1, max_length=4)
+
+
 AssistantResponse: TypeAlias = Annotated[
-    Answer | Clarification | CategoryProposal | ToolCalls | Error,
+    Answer | Clarification | CategoryProposal | ToolCalls | Error | RequestPacks,
     Field(discriminator="outcome"),
 ]
 
@@ -616,50 +682,147 @@ _RESPONSE_ADAPTER = TypeAdapter(AssistantResponse)
 
 
 class AssistantResponseEnvelope(StrictModel):
+    """The object root of every model reply.
+
+    Strict provider APIs need an object at the root, not a union.
+
+    Attributes:
+        response: The outcome of the step.
+    """
+
     response: AssistantResponse
 
 
-def _openai_strict_schema(value: object) -> object:
+def _openai_strict_schema(schema: JsonSchema) -> JsonSchema:
     """Make every object field required, using nullable unions for optionals.
 
-    A model's description drops the Attributes section of its docstring. That
-    section is for the reader of the code, and the schema goes with every
-    model call.
+    Strict provider APIs accept no default and no discriminator, and they
+    take anyOf, not oneOf. A model's description drops the Attributes
+    section of its docstring. That section is for the reader of the code,
+    and the schema goes with every model call.
+
+    Args:
+        schema: A pydantic JSON schema, or one of its sub-schemas.
+
+    Returns:
+        A new schema in the strict form. The input does not change.
     """
-    if isinstance(value, list):
-        return [_openai_strict_schema(item) for item in value]
-    if not isinstance(value, dict):
-        return value
-    result: dict[str, object] = {}
-    for key, item in value.items():
-        if key in {"default", "discriminator"}:
-            continue
-        if key == "description" and isinstance(item, str):
-            result[key] = item.split("\n\nAttributes:", 1)[0]
-            continue
-        output_key = "anyOf" if key == "oneOf" else key
-        result[output_key] = _openai_strict_schema(item)
-    properties = result.get("properties")
-    if result.get("type") == "object" and isinstance(properties, dict):
-        result["additionalProperties"] = False
-        result["required"] = list(properties)
-    return result
+    strict = schema.copy()
+    strict.pop("default", None)
+    strict.pop("discriminator", None)
+    if (one_of := strict.pop("oneOf", None)) is not None:
+        strict["anyOf"] = one_of
+    if "anyOf" in strict:
+        strict["anyOf"] = [_openai_strict_schema(item) for item in strict["anyOf"]]
+    if "items" in strict:
+        strict["items"] = _openai_strict_schema(strict["items"])
+    if "$defs" in strict:
+        strict["$defs"] = {
+            name: _openai_strict_schema(body) for name, body in strict["$defs"].items()
+        }
+    if "description" in strict:
+        strict["description"] = strict["description"].split("\n\nAttributes:", 1)[0]
+    if "properties" in strict:
+        strict["properties"] = {
+            name: _openai_strict_schema(body)
+            for name, body in strict["properties"].items()
+        }
+        strict["additionalProperties"] = False
+        strict["required"] = list(strict["properties"])
+    return strict
 
 
-def response_json_schema() -> dict[str, object]:
-    """Return an object-root schema accepted by strict provider APIs."""
-    return cast(
-        dict[str, object],
-        _openai_strict_schema(AssistantResponseEnvelope.model_json_schema()),
-    )
+def _model_schema(model: type[BaseModel]) -> JsonSchema:
+    """Return the strict provider schema of a pydantic model.
+
+    Args:
+        model: The model to describe.
+
+    Returns:
+        The model's JSON schema in the strict form.
+    """
+    # Pydantic types its JSON schema as a plain dict.
+    return _openai_strict_schema(cast(JsonSchema, model.model_json_schema()))
 
 
-def screenshot_json_schema() -> dict[str, object]:
+_FULL_RESPONSE_SCHEMA = _model_schema(AssistantResponseEnvelope)
+# The docstring is for the reader of the code. The model does not need it.
+del _FULL_RESPONSE_SCHEMA["description"]
+
+
+def response_json_schema(
+    tool_names: frozenset[str], requestable: Sequence[PackName]
+) -> JsonSchema:
+    """Return the strict provider schema of one step, for the given tools only.
+
+    The full schema drops the tools that the step cannot call, and the
+    definitions that nothing then uses.
+
+    Args:
+        tool_names: The names of the tools that the step can call.
+        requestable: The packs that the step can ask for. With none, the
+            schema has no ``request_packs`` outcome.
+
+    Returns:
+        An object-root schema that strict provider APIs accept.
+    """
+    schema = copy.deepcopy(_FULL_RESPONSE_SCHEMA)
+    defs = schema["$defs"]
+    calls = defs["ToolCalls"]["properties"]["calls"]["items"]
+    calls["anyOf"] = [
+        ref
+        for ref in calls["anyOf"]
+        if defs[_ref_name(ref)]["properties"]["name"]["const"] in tool_names
+    ]
+    outcomes = schema["properties"]["response"]
+    if requestable:
+        packs = defs["RequestPacks"]["properties"]["packs"]
+        packs["items"]["enum"] = list(requestable)
+        packs["maxItems"] = len(requestable)
+    else:
+        outcomes["anyOf"] = [
+            ref for ref in outcomes["anyOf"] if _ref_name(ref) != "RequestPacks"
+        ]
+    used = _used_defs(schema, defs)
+    schema["$defs"] = {name: body for name, body in defs.items() if name in used}
+    return schema
+
+
+def _ref_name(ref: JsonSchema) -> str:
+    """Return the definition name of a ``{"$ref": "#/$defs/Name"}`` entry."""
+    return ref["$ref"].rsplit("/", 1)[1]
+
+
+def _used_defs(schema: JsonSchema, defs: dict[str, JsonSchema]) -> set[str]:
+    """Name the definitions that the schema root reaches through its refs.
+
+    The walk follows only the keywords that hold sub-schemas. A field name
+    in properties is never read as a keyword.
+
+    Args:
+        schema: The schema root.
+        defs: The definitions that the refs point to.
+
+    Returns:
+        The names of the reached definitions.
+    """
+    used: set[str] = set()
+    pending = [schema]
+    while pending:
+        node = pending.pop()
+        if "$ref" in node and (name := _ref_name(node)) not in used:
+            used.add(name)
+            pending.append(defs[name])
+        pending.extend(node.get("properties", {}).values())
+        pending.extend(node.get("anyOf", []))
+        if "items" in node:
+            pending.append(node["items"])
+    return used
+
+
+def screenshot_json_schema() -> JsonSchema:
     """Return the strict provider schema of a screenshot read."""
-    return cast(
-        dict[str, object],
-        _openai_strict_schema(ScreenshotTransaction.model_json_schema()),
-    )
+    return _model_schema(ScreenshotTransaction)
 
 
 def parse_response(data: object) -> AssistantResponse:

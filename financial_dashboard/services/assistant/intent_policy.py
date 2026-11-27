@@ -23,6 +23,26 @@ _ASSISTANT_WRITE_CUE = re.compile(
     r"|\b(?:upi|vpa|phone|number|mobile)\s+is\b",
     re.IGNORECASE,
 )
+_EDIT_CUE = re.compile(
+    r"\b(?:exclude|include|cash\s*flow|notes?|categor(?:y|ies|i[sz]e)|mark|void|"
+    r"merge|duplicate|same\s+payment|failed|reversed|never\s+happened|rule)\b",
+    re.IGNORECASE,
+)
+_RECEIVABLE_CUE = re.compile(
+    r"\b(?:receivables?|payables?|owes?|owed|owing|lent|borrowed|settled?|link|"
+    r"write\s+off|written\s+off|vpa|upi\s+id)\b"
+    r"|\b(?:upi|vpa|phone|number|mobile)\s+is\b",
+    re.IGNORECASE,
+)
+_REPORT_CUE = re.compile(
+    r"\b(?:show|list|how\s+much|totals?|summary|report|net\s*worth|holdings?|"
+    r"portfolio|spends?|spent|spending|dues?|balances?|income|investments?)\b",
+    re.IGNORECASE,
+)
+_NEW_CATEGORY_CUE = re.compile(
+    r"\b(?:create|new)\b|\b(?:add|make)\b.{0,32}\bcategor(?:y|ies)\b",
+    re.IGNORECASE,
+)
 _GENERIC_PATTERNS = frozenset(
     {
         "ach",
@@ -147,6 +167,29 @@ _NON_MUTATING_START = re.compile(
 )
 
 
+class IntentSignals(NamedTuple):
+    """The fixed signals in a user message that pick the tool packs.
+
+    Attributes:
+        edit: The message asks to change, void or merge a transaction.
+        receivables: The message is about money that a person owes.
+        reports: The message asks for figures or a list of rows.
+        categories: The message can ask for a new category.
+    """
+
+    edit: bool
+    receivables: bool
+    reports: bool
+    categories: bool
+
+
+class InstructionParts(NamedTuple):
+    text: str
+    note_payload: str | None
+    note_requires_category: bool
+    note_shorthand: bool
+
+
 def _find_closing_quote(text: str, start: int, closing: str) -> int | None:
     """Find a quoted note terminator without treating contractions as quotes."""
     index = start + 1
@@ -192,13 +235,6 @@ def has_ambiguous_intent(text: str) -> bool:
 def has_non_mutating_intent(text: str) -> bool:
     """Return whether the turn begins as a read or preservation request."""
     return bool(_NON_MUTATING_START.search(normalize_text(text).strip()))
-
-
-class InstructionParts(NamedTuple):
-    text: str
-    note_payload: str | None
-    note_requires_category: bool
-    note_shorthand: bool
 
 
 def _safe_shorthand_note(payload: str) -> bool:
@@ -442,6 +478,26 @@ def is_assistant_write_request(user_text: str) -> bool:
         and not user_text.rstrip().endswith("?")
         and not has_non_mutating_intent(user_text)
         and not has_global_no_change(user_text)
+    )
+
+
+def intent_signals(user_text: str) -> IntentSignals:
+    """Find the fixed signals that pick the tool packs of a turn.
+
+    A signal only adds a pack, so a false signal costs prompt size and never
+    allows a write. The write checks stay the same.
+
+    Args:
+        user_text: One user message.
+
+    Returns:
+        The signals in the message.
+    """
+    return IntentSignals(
+        edit=is_assistant_write_request(user_text) or bool(_EDIT_CUE.search(user_text)),
+        receivables=bool(_RECEIVABLE_CUE.search(user_text)),
+        reports=bool(_REPORT_CUE.search(user_text)),
+        categories=bool(_NEW_CATEGORY_CUE.search(user_text)),
     )
 
 

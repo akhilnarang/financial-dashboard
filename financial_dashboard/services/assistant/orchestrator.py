@@ -70,6 +70,8 @@ from financial_dashboard.services.assistant.contracts import (
     UpdateReceivable,
     VoidTransaction,
     MerchantRuleConfirmation,
+    PackName,
+    RequestPacks,
     ScreenshotTransaction,
     ScreenshotTransactionConfirmation,
     SetTextValue,
@@ -103,6 +105,7 @@ from financial_dashboard.services.assistant.mutations import (
     unnamed_category,
     unrequested_exclusion,
 )
+from financial_dashboard.services.assistant.packs import choose_packs, pack_refusal
 from financial_dashboard.services.assistant.prompt import PromptContext
 from financial_dashboard.services.assistant.reports import render_report
 from financial_dashboard.services.assistant.assistant_writes import (
@@ -168,6 +171,11 @@ EMPTY_LIST_HINT = (
     "such rows: answer that. If a name did not fit, list_accounts gives the "
     "account and card names with the ids for account_id and card_id, and "
     "the category filter takes a slug from ACTIVE CATEGORY SLUGS."
+)
+INVALID_OUTPUT = Error(
+    outcome="error",
+    message="I couldn't safely interpret that request. Please rephrase it.",
+    code="invalid_model_output",
 )
 _CALLBACK_TRIGGERS = frozenset({"category_button", "undo", "confirm_button"})
 _REREAD_KEPT_FIELDS = ("counterparty", "vpa", "utr", "amount", "occurred_at")
@@ -572,6 +580,13 @@ async def run_turn(
         decision_id: int | None = None,
         error_detail: str | None = None,
     ) -> OrchestrationResult:
+        # Only the rows that the reply tells about get a card, and only when a
+        # read of this turn returned them.
+        shown = (
+            response.transaction_ids
+            if isinstance(response, Answer | Clarification)
+            else []
+        )
         return OrchestrationResult(
             response,
             mutation_result,
@@ -590,7 +605,7 @@ async def run_turn(
                 for record in output_records
                 if isinstance(record.get("latency_ms"), int)
             ),
-            tuple(sorted(read_rows)),
+            tuple(dict.fromkeys(row for row in shown if row in read_rows)),
             False,
             error_detail,
         )
@@ -600,6 +615,10 @@ async def run_turn(
         await _fitting_slugs(session, target, active_categories)
         if target is not None
         else ()
+    )
+    packs: frozenset[PackName] = choose_packs(
+        [user_message, *(turn["text"] for turn in history if turn["role"] == "user")],
+        has_target=target is not None,
     )
     while calls_used < 4:
         if calls_used and renew_lease is not None and not await renew_lease():
@@ -612,6 +631,7 @@ async def run_turn(
             categories=active_categories,
             fitting_categories=fitting_categories,
             today=datetime.datetime.now(IST).date(),
+            packs=packs,
         )
         if prompt_context.data_size() > MAX_CONTEXT_CHARS:
             return completed(
@@ -627,18 +647,20 @@ async def run_turn(
             last_result = result
             prompt_records.append(result.prompt)
             output_records.append(
-                {"payload": dict(result.raw_payload), "latency_ms": result.latency_ms}
+                {
+                    "payload": dict(result.raw_payload),
+                    "latency_ms": result.latency_ms,
+                    "packs": sorted(packs),
+                }
             )
             response = parse_response(result.response.model_dump())
         except (ProviderFailure, ValueError, TypeError) as exc:
-            return completed(
-                Error(
-                    outcome="error",
-                    message="I couldn't safely interpret that request. Please rephrase it.",
-                    code="invalid_model_output",
-                ),
-                error_detail=_format_exception_detail(exc),
-            )
+            return completed(INVALID_OUTPUT, error_detail=_format_exception_detail(exc))
+        if (refusal := pack_refusal(response, packs)) is not None:
+            return completed(INVALID_OUTPUT, error_detail=refusal)
+        if isinstance(response, RequestPacks):
+            packs |= set(response.packs)
+            continue
         writes_target = (
             isinstance(response, CategoryProposal)
             or isinstance(response, Clarification)
@@ -734,7 +756,8 @@ async def run_turn(
                                 "question": _confirmation_question(
                                     pending,
                                     stored.counterparty if stored else None,
-                                )
+                                ),
+                                "transaction_ids": [],
                             }
                         )
                         await _persist_pending(
@@ -2284,9 +2307,8 @@ async def _queue_result(
                     separators=(",", ":"),
                 )
         delivery_ids.append(delivery.id)
-    # Each row read gets its own card. A reply then targets a row that the
-    # user can see, never a row that the answer text does not show.
-    # A found-row question shows its rows already.
+    # Each row of the reply gets its own card. A reply then targets a row
+    # that the user can see. A found-row question shows its rows already.
     if (
         transaction_id is None
         and result.transaction_ids
