@@ -77,7 +77,7 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 # An Indian PAN, which a CAS snapshot label can hold.
-PAN = re.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b")
+PAN = re.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b", re.IGNORECASE)
 HTML_TAG = re.compile(r"<[^>]+>")
 READ_TOOLS = (ListTransactions, ListAccounts, ListReceivables)
 REPORT_TOOLS = (
@@ -116,7 +116,7 @@ TOOL_DESCRIPTIONS = {
     ),
     "show_transactions": (
         "Report the rows that match one set of filters, with their count, "
-        "debit and credit totals, and a dashboard link."
+        "debit and credit totals."
     ),
     "get_cashflow_summary": (
         "Report income, spending, investment and cashflow totals of the bank "
@@ -331,7 +331,7 @@ async def handle_message(
     if "method" not in message:
         # A client response. This server sends no requests, so it drops it.
         is_response = message.get("jsonrpc") == "2.0" and (
-            "result" in message or "error" in message
+            ("result" in message) != ("error" in message)
         )
         if is_response and valid_id:
             return None
@@ -470,7 +470,7 @@ def _redact(text: str, tokens: tuple[str, ...]) -> str:
     Redact one line at a time: the name rule joins nearby markers, and across
     lines it would merge two report rows into one.
     """
-    return PAN.sub("[redacted-pan]", redact_names(redact_pii(text), tokens))
+    return redact_names(redact_pii(PAN.sub("[redacted-pan]", text)), tokens)
 
 
 def _tool(name: str) -> McpTool:

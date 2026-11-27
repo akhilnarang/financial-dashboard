@@ -1,6 +1,8 @@
 """The read tools of the assistant, shared by the Telegram turn and MCP.
 
-Each read returns the redacted rows that a model sees, never database rows.
+Each read returns the rows that a model sees, never database rows. Transaction
+and account rows come redacted. A receivable keeps its person, which the
+Telegram assistant needs to match a write; MCP redacts it itself.
 """
 
 import datetime
